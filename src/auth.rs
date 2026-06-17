@@ -9,6 +9,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
+/// Best-effort launch of the user's default browser at `url`.
+/// Errors are ignored: every OAuth caller also prints the URL to stderr
+/// so the user can copy-paste manually if the auto-open fails.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
+
+    // Linux, BSD, illumos, etc. — xdg-open is the freedesktop standard.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 // Claude Code OAuth client — same as the official CLI
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -623,8 +640,7 @@ pub async fn login() -> Result<()> {
     eprintln!("Opening browser for Claude authorization...");
     eprintln!("If the browser doesn't open, visit:\n\n  {}\n", auth_url);
 
-    // Try to open the default browser
-    let _ = std::process::Command::new("open").arg(&auth_url).spawn();
+    open_browser(&auth_url);
 
     let code = wait_for_callback().await?;
 
@@ -683,7 +699,7 @@ pub async fn login_chatgpt() -> Result<()> {
     eprintln!("Opening browser for ChatGPT Codex authorization...");
     eprintln!("If the browser doesn't open, visit:\n\n  {}\n", auth_url);
 
-    let _ = std::process::Command::new("open").arg(&auth_url).spawn();
+    open_browser(&auth_url);
 
     let code =
         wait_for_callback_on(CHATGPT_REDIRECT_PORT, CHATGPT_REDIRECT_PATH, Some(&state)).await?;

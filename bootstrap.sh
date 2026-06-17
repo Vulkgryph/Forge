@@ -106,12 +106,16 @@ echo
 # When this bootstrap is invoked via `curl ... | bash`, our stdin is the curl
 # pipe (consumed by bash) and reads from it would EOF immediately. install.sh
 # has an interactive wizard for first-time config, so redirect its stdin to the
-# controlling terminal when one is available.
-if [[ -e /dev/tty ]]; then
+# controlling terminal. The probe `true </dev/tty` actually opens /dev/tty —
+# `[[ -e /dev/tty ]]` only checks that the device file exists, which is always
+# true even when no controlling terminal is attached.
+if (true </dev/tty) 2>/dev/null; then
     bash install.sh </dev/tty
 else
-    warn "No interactive terminal detected — install.sh's config wizard will be skipped."
-    warn "After this completes, re-run install.sh manually to configure your endpoint:"
+    echo
+    warn "No interactive terminal detected (running without a controlling TTY)."
+    warn "Source is ready at $DEST, but the config wizard requires a terminal."
+    warn "To finish the install, run from a real shell:"
     warn "  cd $DEST && ./install.sh"
-    bash install.sh </dev/null || true
+    exit 0
 fi

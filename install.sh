@@ -35,8 +35,20 @@ info "Detected $OS $ARCH"
 # -------------------------------------------------------------------
 # 2. Check system dependencies
 # -------------------------------------------------------------------
-if ! command -v git &>/dev/null; then
-    error "git is required but not installed. Install it first:\n  macOS: xcode-select --install\n  Linux: sudo apt install git"
+MISSING_APT=()
+command -v git    &>/dev/null || MISSING_APT+=(git)
+command -v unzip  &>/dev/null || MISSING_APT+=(unzip)     # bun installer requires unzip
+command -v cc     &>/dev/null || MISSING_APT+=(build-essential)  # Rust crates with C deps need a linker
+
+if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
+    case "$OS" in
+        Linux)
+            error "Missing system packages: ${MISSING_APT[*]}\n  Install them first:\n    sudo apt-get update && sudo apt-get install -y ${MISSING_APT[*]}"
+            ;;
+        Darwin)
+            error "Missing tools: ${MISSING_APT[*]}\n  On macOS these usually come from Xcode CLI tools:\n    xcode-select --install"
+            ;;
+    esac
 fi
 
 if ! command -v cargo &>/dev/null; then
@@ -84,7 +96,8 @@ ln -sf "$(pwd)/ui/dist/forge.js" "$INSTALL_SHARE/ui/dist/forge.js"
 ln -sf "$(pwd)/update.sh" "$INSTALL_BIN/forge-update"
 cp -r ui/node_modules          "$INSTALL_SHARE/ui/node_modules"
 cp ui/package.json             "$INSTALL_SHARE/ui/package.json"
-git rev-parse HEAD           > "$INSTALL_SHARE/version"
+# Stamp the install with the source SHA if we're in a git checkout — non-fatal for tarball installs.
+git rev-parse HEAD 2>/dev/null > "$INSTALL_SHARE/version" || echo "unknown" > "$INSTALL_SHARE/version"
 
 # Write wrapper script
 cat > "$INSTALL_BIN/forge" << 'WRAPPER'

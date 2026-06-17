@@ -429,7 +429,7 @@ max_context_tokens = 32768
 max_output_tokens = 8192
 endpoint_type = "open_ai"
 CONFIG
-            POST_INSTALL_HINT="Edit $CONFIG_FILE to point at your LLM before running forge."
+            POST_INSTALL_HINT="Edit the config file before running forge:\n    $CONFIG_FILE\n  The file is annotated with examples for local servers, OAuth subscriptions, and direct API keys.\n  Or re-run ./install.sh to use the interactive wizard."
             ;;
     esac
 

@@ -29,6 +29,14 @@ The project root is the default working directory, not a sandbox. File tools and
 - **Bun** (installed automatically by `install.sh` if missing)
 - **An LLM endpoint** — OpenAI-compatible, Anthropic, or ChatGPT Codex
 
+**Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `install.sh`:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git build-essential unzip
+```
+
+`install.sh` will detect these and tell you exactly what to install if any are missing.
+
 ## Installation
 
 ```bash

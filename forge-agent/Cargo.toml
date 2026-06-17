@@ -1,0 +1,82 @@
+[package]
+name = "forge"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vulkgryph LLC"]
+description = "An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints."
+license = "Apache-2.0"
+repository = "https://github.com/Vulkgryph/Forge"
+homepage = "https://github.com/Vulkgryph/Forge"
+readme = "README.md"
+keywords = ["ai", "agent", "llm", "coding", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "io-std", "sync"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# File operations
+walkdir = "2"
+ignore = "0.4"
+similar = "2"
+glob = "0.3"
+fxhash = "0.2"
+
+# For applying unified diffs
+diffy = "0.3"
+
+# For temporary files
+tempfile = "3"
+
+# Config
+toml = "0.8"
+dirs = "6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Streaming
+futures-util = "0.3"
+futures = "0.3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Command execution
+clap = { version = "4", features = ["derive"] }
+
+# For shell command parsing
+shell-words = "1"
+
+# HTML parsing
+scraper = "0.22"
+
+# Timestamps and IDs for conversation log
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# OAuth / crypto (for Claude subscription login)
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+urlencoding = "2"
+
+# PTY support (Unix only)
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["term", "process", "fs"] }
+libc = "0.2"
+
+[[bin]]
+name = "forge-agent"
+path = "src/main.rs"

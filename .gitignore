@@ -1,0 +1,10 @@
+/target
+/.agent
+/.opencode
+/ui/node_modules
+/ui/bun.lockb
+/ui/bun.lock
+/ui/dist/
+/ui/.forge/
+*.txt
+/.forge/

@@ -39,6 +39,21 @@ sudo apt-get update && sudo apt-get install -y git build-essential unzip
 
 ## Installation
 
+### One-command install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Vulkgryph/Forge/main/bootstrap.sh | bash
+```
+
+The bootstrap script handles the preflight (apt deps on Linux, Xcode CLI tools on macOS), clones to `~/forge`, and runs `install.sh`. On Linux it will prompt for `sudo` once to install `git`, `build-essential`, and `unzip` if missing.
+
+Override defaults with environment variables:
+- `FORGE_DEST=~/code/forge` — clone destination (default: `~/forge`)
+- `FORGE_BRANCH=stable` — branch to check out (default: `main`)
+- `FORGE_REPO=https://...` — alternative repo URL
+
+### Manual install
+
 ```bash
 git clone https://github.com/Vulkgryph/Forge.git forge
 cd forge

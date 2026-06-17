@@ -326,7 +326,8 @@ max_context_tokens = 200000
 max_output_tokens = 8192
 endpoint_type = "anthropic"
 CONFIG
-            POST_INSTALL_HINT="To authenticate, run:\n    forge-agent --login\n  If you're on a remote machine over SSH, forward port 8976 in your SSH session:\n    ssh -L 8976:localhost:8976 ...   then run forge-agent --login on the remote host."
+            LOGIN_CMD="--login"
+            LOGIN_LABEL="Claude"
             ;;
 
         3)
@@ -343,7 +344,8 @@ max_context_tokens = 200000
 max_output_tokens = 16384
 endpoint_type = "chatgpt_codex"
 CONFIG
-            POST_INSTALL_HINT="To authenticate, run:\n    forge-agent --login-chatgpt\n  If you're on a remote machine over SSH, forward port 8976 in your SSH session first."
+            LOGIN_CMD="--login-chatgpt"
+            LOGIN_LABEL="ChatGPT Codex"
             ;;
 
         4)
@@ -452,6 +454,39 @@ default_model = "$DEFAULT_MODEL"
 CONFIG
 
     ok "Config written to $CONFIG_FILE"
+
+    # OAuth login flow for subscription choices (2, 3).
+    # Offer to run the login inline; warn first if we're on a remote SSH session
+    # since the OAuth callback hits localhost:8976 (needs port forwarding).
+    if [[ "$LLM_CHOICE" == "2" || "$LLM_CHOICE" == "3" ]]; then
+        echo ""
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            warn "You're on a remote SSH session. The $LOGIN_LABEL OAuth flow opens a browser"
+            warn "and waits for a callback on port 8976 — which only works if you've already"
+            warn "forwarded that port from your local machine. To forward it, exit and reconnect with:"
+            warn "    ssh -L 8976:localhost:8976 <user>@<host>"
+            warn "Then re-run:  forge-agent $LOGIN_CMD"
+            echo ""
+            read -r -p "Try running login now anyway? [y/N]: " RUN_LOGIN
+            [[ "$RUN_LOGIN" =~ ^[Yy] ]] && DO_LOGIN=1 || DO_LOGIN=0
+        else
+            read -r -p "Run $LOGIN_LABEL OAuth login now? [Y/n]: " RUN_LOGIN
+            [[ "$RUN_LOGIN" =~ ^[Nn] ]] && DO_LOGIN=0 || DO_LOGIN=1
+        fi
+
+        if [[ "$DO_LOGIN" == "1" ]]; then
+            echo ""
+            info "Launching $LOGIN_LABEL OAuth login..."
+            if "$INSTALL_BIN/forge-agent" "$LOGIN_CMD"; then
+                ok "Logged in to $LOGIN_LABEL"
+            else
+                warn "Login did not complete. You can retry later with:  forge-agent $LOGIN_CMD"
+                POST_INSTALL_HINT="To authenticate later, run:  forge-agent $LOGIN_CMD"
+            fi
+        else
+            POST_INSTALL_HINT="To authenticate later, run:  forge-agent $LOGIN_CMD"
+        fi
+    fi
 
     # Connection test only makes sense for choices 1 and 4.
     if [[ "$LLM_CHOICE" == "1" || "$LLM_CHOICE" == "4" ]]; then

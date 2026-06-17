@@ -60,7 +60,22 @@ cd forge
 ./install.sh
 ```
 
-Follow the prompts to configure your LLM endpoint, then run:
+The installer's first question is how you want Forge to reach an LLM:
+
+```
+  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.)
+  2) Claude subscription   (claude.ai / Pro / Max — OAuth login)
+  3) ChatGPT Codex subscription   (OAuth login)
+  4) Direct API key   (Anthropic, OpenAI, OpenRouter, custom OpenAI-compatible)
+  5) Skip — I'll edit the config file myself
+```
+
+- **Local (1):** you'll be asked for the base URL, model ID, and context window. No defaults — paste whatever your server uses.
+- **Claude / ChatGPT subscription (2, 3):** writes a minimal config and tells you to run `forge-agent --login` or `forge-agent --login-chatgpt` afterward. The OAuth flow opens a browser locally — on a remote VM you'll need to SSH-forward port 8976.
+- **Direct API key (4):** you'll pick a provider, paste your key, choose a model. The key is stored in `~/.config/forge/config.toml` (so file permissions matter — `chmod 600` it if you're paranoid).
+- **Skip (5):** writes a placeholder config you can edit by hand. The config file is annotated with the schema.
+
+When the wizard finishes:
 
 ```bash
 forge

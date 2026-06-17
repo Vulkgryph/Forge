@@ -249,79 +249,192 @@ PYEOF2
     done
 else
     echo ""
-    echo -e "${BOLD}Configure your LLM endpoints${RESET}"
-    echo "Forge works with any OpenAI-compatible server (LM Studio, llama.cpp, Ollama, vLLM, etc.)"
+    echo -e "${BOLD}Configure Forge${RESET}"
+    echo "Choose how you want Forge to reach an LLM."
     echo ""
 
-    EP_NAMES=()
-    EP_URLS=()
-    EP_MODELS=()
-    EP_CONTEXTS=()
-
-    # Collect one or more endpoints
-    FIRST=true
-    while true; do
-        if [[ "$FIRST" == true ]]; then
-            echo -e "  ${BOLD}Endpoint 1${RESET} (this will be your default)"
-        else
-            IDX=$(( ${#EP_NAMES[@]} + 1 ))
-            echo -e "  ${BOLD}Endpoint $IDX${RESET}"
-        fi
-
-        DEFAULT_NAME="local"
-        [[ "$FIRST" == false ]] && DEFAULT_NAME="model-$(( ${#EP_NAMES[@]} + 1 ))"
-        read -r -p "    Name [$DEFAULT_NAME]: " EP_NAME
-        EP_NAME="${EP_NAME:-$DEFAULT_NAME}"
-
-        DEFAULT_URL="http://127.0.0.1:1234/v1"
-        read -r -p "    URL (press Enter to accept default) [$DEFAULT_URL]: " EP_URL
-        EP_URL="${EP_URL:-$DEFAULT_URL}"
-
-        EP_MODEL=""
-        while [[ -z "$EP_MODEL" ]]; do
-            read -r -p "    Model ID (e.g. qwen2.5-coder-32b): " EP_MODEL
-            [[ -z "$EP_MODEL" ]] && echo "    Model ID is required."
+    # Helper — read a non-empty value, looping until the user types something.
+    prompt_required() {
+        # $1 = prompt text, $2 = variable name to write into
+        local __prompt="$1" __var="$2" __value=""
+        while [[ -z "$__value" ]]; do
+            read -r -p "$__prompt" __value
+            [[ -z "$__value" ]] && echo "    Required."
         done
+        printf -v "$__var" "%s" "$__value"
+    }
 
-        read -r -p "    Context window size [32768]: " EP_CONTEXT
-        EP_CONTEXT="${EP_CONTEXT:-32768}"
-        EP_CONTEXT="${EP_CONTEXT//,/}"  # strip commas (e.g. 32,768 → 32768)
+    # Top-level: what kind of LLM access?
+    echo "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.)"
+    echo "  2) Claude subscription   (claude.ai / Pro / Max — OAuth login)"
+    echo "  3) ChatGPT Codex subscription   (OAuth login)"
+    echo "  4) Direct API key   (Anthropic API, OpenAI API, OpenRouter, custom OpenAI-compatible)"
+    echo "  5) Skip — I'll edit the config file myself"
+    echo ""
 
-        EP_NAMES+=("$EP_NAME")
-        EP_URLS+=("$EP_URL")
-        EP_MODELS+=("$EP_MODEL")
-        EP_CONTEXTS+=("$EP_CONTEXT")
-        FIRST=false
-
-        echo ""
-        read -r -p "  Add another endpoint? [y/N]: " ADD_MORE
-        ADD_MORE="${ADD_MORE:-N}"
-        echo ""
-        [[ "$ADD_MORE" =~ ^[Yy] ]] || break
+    LLM_CHOICE=""
+    while [[ ! "$LLM_CHOICE" =~ ^[1-5]$ ]]; do
+        read -r -p "  Choice [1-5]: " LLM_CHOICE
     done
+    echo ""
 
     mkdir -p "$CONFIG_DIR"
+    POST_INSTALL_HINT=""
 
-    # Write config header
-    cat > "$CONFIG_FILE" << CONFIG
+    case "$LLM_CHOICE" in
+        1)
+            # ---------- Local LLM server ----------
+            echo "  Examples:"
+            echo "    LM Studio default base URL:  http://127.0.0.1:1234/v1"
+            echo "    Ollama default base URL:     http://127.0.0.1:11434/v1"
+            echo "    llama.cpp server default:    http://127.0.0.1:8080/v1"
+            echo ""
+
+            prompt_required "    Endpoint name (any label you'll recognize): " EP_NAME
+            prompt_required "    Base URL: " EP_URL
+            echo "    Model ID — the exact identifier your server expects."
+            echo "    Tip: enter \"auto\" to have Forge query /v1/models on startup."
+            prompt_required "    Model ID: " EP_MODEL
+            prompt_required "    Context window in tokens (e.g. 32768, 131072): " EP_CONTEXT
+            EP_CONTEXT="${EP_CONTEXT//,/}"   # tolerate "131,072"
+
+            cat > "$CONFIG_FILE" << CONFIG
 [models]
-default = "${EP_NAMES[0]}"
-CONFIG
-
-    # Write each endpoint
-    for i in "${!EP_NAMES[@]}"; do
-        cat >> "$CONFIG_FILE" << CONFIG
+default = "$EP_NAME"
 
 [[models.endpoints]]
-name = "${EP_NAMES[$i]}"
-base_url = "${EP_URLS[$i]}"
-model_id = "${EP_MODELS[$i]}"
-max_context_tokens = ${EP_CONTEXTS[$i]}
+name = "$EP_NAME"
+base_url = "$EP_URL"
+model_id = "$EP_MODEL"
+max_context_tokens = $EP_CONTEXT
 max_output_tokens = 8192
+endpoint_type = "open_ai"
 CONFIG
-    done
+            ;;
 
-    # Write agent config
+        2)
+            # ---------- Claude subscription ----------
+            cat > "$CONFIG_FILE" << CONFIG
+[models]
+default = "claude"
+
+[[models.endpoints]]
+name = "claude"
+base_url = "https://api.anthropic.com"
+model_id = "auto"
+max_context_tokens = 200000
+max_output_tokens = 8192
+endpoint_type = "anthropic"
+CONFIG
+            POST_INSTALL_HINT="To authenticate, run:\n    forge-agent --login\n  If you're on a remote machine over SSH, forward port 8976 in your SSH session:\n    ssh -L 8976:localhost:8976 ...   then run forge-agent --login on the remote host."
+            ;;
+
+        3)
+            # ---------- ChatGPT Codex subscription ----------
+            cat > "$CONFIG_FILE" << CONFIG
+[models]
+default = "chatgpt-codex"
+
+[[models.endpoints]]
+name = "chatgpt-codex"
+base_url = "https://chatgpt.com/backend-api/codex"
+model_id = "auto"
+max_context_tokens = 200000
+max_output_tokens = 16384
+endpoint_type = "chatgpt_codex"
+CONFIG
+            POST_INSTALL_HINT="To authenticate, run:\n    forge-agent --login-chatgpt\n  If you're on a remote machine over SSH, forward port 8976 in your SSH session first."
+            ;;
+
+        4)
+            # ---------- Direct API key ----------
+            echo "  Which provider?"
+            echo "    1) Anthropic API     (api.anthropic.com — keys start with sk-ant-)"
+            echo "    2) OpenAI API        (api.openai.com — keys start with sk-)"
+            echo "    3) OpenRouter        (openrouter.ai/api)"
+            echo "    4) Custom OpenAI-compatible endpoint"
+            echo ""
+            API_PROVIDER=""
+            while [[ ! "$API_PROVIDER" =~ ^[1-4]$ ]]; do
+                read -r -p "    Provider [1-4]: " API_PROVIDER
+            done
+
+            case "$API_PROVIDER" in
+                1) EP_URL="https://api.anthropic.com"; EP_TYPE="anthropic"; EP_NAME="anthropic" ;;
+                2) EP_URL="https://api.openai.com/v1"; EP_TYPE="open_ai"; EP_NAME="openai" ;;
+                3) EP_URL="https://openrouter.ai/api/v1"; EP_TYPE="open_ai"; EP_NAME="openrouter" ;;
+                4)
+                    prompt_required "    Endpoint name (any label): " EP_NAME
+                    prompt_required "    Base URL: " EP_URL
+                    EP_TYPE="open_ai"
+                    ;;
+            esac
+
+            prompt_required "    API key: " EP_KEY
+            prompt_required "    Model ID (e.g. claude-sonnet-4-6, gpt-4o, anthropic/claude-opus-4): " EP_MODEL
+            prompt_required "    Context window in tokens (e.g. 200000): " EP_CONTEXT
+            EP_CONTEXT="${EP_CONTEXT//,/}"
+
+            cat > "$CONFIG_FILE" << CONFIG
+[models]
+default = "$EP_NAME"
+
+[[models.endpoints]]
+name = "$EP_NAME"
+base_url = "$EP_URL"
+model_id = "$EP_MODEL"
+api_key = "$EP_KEY"
+max_context_tokens = $EP_CONTEXT
+max_output_tokens = 8192
+endpoint_type = "$EP_TYPE"
+CONFIG
+            ;;
+
+        5)
+            # ---------- Skip ----------
+            cat > "$CONFIG_FILE" << CONFIG
+# Forge config — edit this file to point at your LLM, then run "forge".
+#
+# Examples:
+#
+# Local OpenAI-compatible server (LM Studio, Ollama, llama.cpp, vLLM):
+#
+#   [models]
+#   default = "local"
+#
+#   [[models.endpoints]]
+#   name = "local"
+#   base_url = "http://127.0.0.1:1234/v1"
+#   model_id = "auto"
+#   max_context_tokens = 32768
+#   max_output_tokens = 8192
+#   endpoint_type = "open_ai"
+#
+# Claude / ChatGPT subscription — set endpoint_type to "anthropic" or
+# "chatgpt_codex" with no api_key, then run "forge-agent --login" or
+# "forge-agent --login-chatgpt" to authenticate via OAuth.
+#
+# Direct API key — add api_key = "..." to the endpoint block.
+#
+# See ARCHITECTURE.md for the full config reference.
+
+[models]
+default = "placeholder"
+
+[[models.endpoints]]
+name = "placeholder"
+base_url = "http://127.0.0.1:1234/v1"
+model_id = "auto"
+max_context_tokens = 32768
+max_output_tokens = 8192
+endpoint_type = "open_ai"
+CONFIG
+            POST_INSTALL_HINT="Edit $CONFIG_FILE to point at your LLM before running forge."
+            ;;
+    esac
+
+    # Common agent block — same for every choice.
+    DEFAULT_MODEL=$(awk -F\" '/^default *=/ {print $2; exit}' "$CONFIG_FILE")
     cat >> "$CONFIG_FILE" << CONFIG
 
 [agent]
@@ -335,23 +448,23 @@ compaction_threshold = 150
 enabled = true
 max_depth = 2
 max_concurrent = 4
-default_model = "${EP_NAMES[0]}"
+default_model = "$DEFAULT_MODEL"
 CONFIG
 
     ok "Config written to $CONFIG_FILE"
-    [[ ${#EP_NAMES[@]} -gt 1 ]] && echo "  Tip: use /model inside Forge to switch between your endpoints."
 
-    echo ""
-    read -r -p "Test connections now? [Y/n]: " TEST_CONN
-    TEST_CONN="${TEST_CONN:-Y}"
-    if [[ "$TEST_CONN" =~ ^[Yy] ]]; then
-        for i in "${!EP_NAMES[@]}"; do
-            if curl -sf --max-time 5 "${EP_URLS[$i]}/models" > /dev/null 2>&1; then
-                ok "${EP_NAMES[$i]}: connected to ${EP_URLS[$i]}"
+    # Connection test only makes sense for choices 1 and 4.
+    if [[ "$LLM_CHOICE" == "1" || "$LLM_CHOICE" == "4" ]]; then
+        echo ""
+        read -r -p "Test the endpoint now? [y/N]: " TEST_CONN
+        if [[ "$TEST_CONN" =~ ^[Yy] ]]; then
+            if curl -sf --max-time 5 "${EP_URL}/models" > /dev/null 2>&1 || \
+               curl -sf --max-time 5 "${EP_URL%/v1}/v1/models" > /dev/null 2>&1; then
+                ok "Endpoint reachable: $EP_URL"
             else
-                warn "${EP_NAMES[$i]}: could not reach ${EP_URLS[$i]} — start your LLM server, then run forge."
+                warn "Could not reach $EP_URL — start your server, then run forge."
             fi
-        done
+        fi
     fi
 fi
 
@@ -366,4 +479,10 @@ echo "  forge-agent    Launch in headless mode (for scripting)"
 echo "  forge-update   Update, rebuild, and reinstall Forge"
 echo ""
 echo "  Config: $CONFIG_FILE"
+if [[ -n "${POST_INSTALL_HINT:-}" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Next step:${RESET}"
+    # shellcheck disable=SC2059
+    echo -e "  $POST_INSTALL_HINT"
+fi
 echo ""

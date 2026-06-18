@@ -29,6 +29,21 @@ Write-Info "Detected Windows $arch"
 # -------------------------------------------------------------------
 # 2. Check / install preflight tooling via winget
 # -------------------------------------------------------------------
+# Pre-load PATHs for tools that install under $env:USERPROFILE but may not
+# have propagated into this PowerShell session yet (winget can be slow to
+# update PATH; bun's installer puts itself under ~/.bun/bin which often
+# isn't on PATH on a fresh shell). Without this the presence checks would
+# spuriously re-install on every install.ps1 invocation.
+$knownToolDirs = @(
+    (Join-Path $env:USERPROFILE ".cargo\bin"),
+    (Join-Path $env:USERPROFILE ".bun\bin")
+)
+foreach ($d in $knownToolDirs) {
+    if ((Test-Path $d) -and -not ($env:PATH -split ';' | Where-Object { $_ -ieq $d })) {
+        $env:PATH = "$d;$env:PATH"
+    }
+}
+
 function Ensure-Tool {
     param([string]$cmdName, [string]$wingetId, [string]$friendlyName)
     if (Get-Command $cmdName -ErrorAction SilentlyContinue) {
@@ -43,7 +58,14 @@ function Ensure-Tool {
         winget install --id $wingetId --silent --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -ne 0) { Write-Err "winget failed to install $friendlyName" }
         # winget may not refresh PATH in the current shell - pull from registry
+        # and also re-add the known tool dirs in case the tool installed there
+        # before winget got around to writing PATH.
         $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
+        foreach ($d in $knownToolDirs) {
+            if ((Test-Path $d) -and -not ($env:PATH -split ';' | Where-Object { $_ -ieq $d })) {
+                $env:PATH = "$d;$env:PATH"
+            }
+        }
         Write-Ok "$friendlyName installed"
     }
 }

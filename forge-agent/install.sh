@@ -35,6 +35,13 @@ info "Detected $OS $ARCH"
 # -------------------------------------------------------------------
 # 2. Check system dependencies
 # -------------------------------------------------------------------
+# Pre-load PATHs for tools installed under $HOME. rustup and bun both write
+# their PATH update to ~/.bashrc / ~/.zshrc, which only takes effect for new
+# shells — not for this script's subshell or any re-run from the same parent.
+# Pulling these in explicitly makes the presence check idempotent.
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+[[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
+
 MISSING_APT=()
 command -v git    &>/dev/null || MISSING_APT+=(git)
 command -v unzip  &>/dev/null || MISSING_APT+=(unzip)     # bun installer requires unzip

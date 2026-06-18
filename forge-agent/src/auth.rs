@@ -738,8 +738,15 @@ fn parse_anthropic_model(m: &serde_json::Value) -> Option<AnthropicModel> {
     })
 }
 
-/// Run the OAuth login flow interactively. Opens browser, waits for callback, saves tokens.
-pub async fn login() -> Result<()> {
+/// Run the OAuth login flow. Opens browser, waits for callback, saves tokens.
+///
+/// `interactive` controls the paste-the-code fallback: when true (called from
+/// `forge-agent --login` standalone), if the localhost port is busy we drop into
+/// stdin-paste mode. When false (called from the headless protocol session where
+/// stdin is already owned by the JSON message reader), we bail with a clear
+/// error pointing at the standalone command — competing for stdin would hang
+/// silently otherwise.
+pub async fn login(interactive: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
 
     let auth_url = format!(
@@ -757,7 +764,7 @@ pub async fn login() -> Result<()> {
 
     open_browser(&auth_url);
 
-    let code = wait_for_callback().await?;
+    let code = wait_for_callback(interactive).await?;
 
     let http = reqwest::Client::new();
     let resp = http
@@ -789,7 +796,7 @@ pub async fn login() -> Result<()> {
 
 /// Run the ChatGPT/Codex OAuth login flow. This mirrors the public Codex CLI
 /// browser flow and stores tokens separately from Claude credentials.
-pub async fn login_chatgpt() -> Result<()> {
+pub async fn login_chatgpt(interactive: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
     let state = {
         let mut bytes = [0u8; 32];
@@ -817,7 +824,7 @@ pub async fn login_chatgpt() -> Result<()> {
     open_browser(&auth_url);
 
     let code =
-        wait_for_callback_on(CHATGPT_REDIRECT_PORT, CHATGPT_REDIRECT_PATH, Some(&state)).await?;
+        wait_for_callback_on(CHATGPT_REDIRECT_PORT, CHATGPT_REDIRECT_PATH, Some(&state), interactive).await?;
 
     let http = reqwest::Client::new();
     let resp = http
@@ -852,8 +859,8 @@ pub async fn login_chatgpt() -> Result<()> {
 }
 
 /// Binds port 53692, waits for the OAuth redirect, returns the authorization code.
-async fn wait_for_callback() -> Result<String> {
-    wait_for_callback_on(53692, "/callback", None).await
+async fn wait_for_callback(interactive: bool) -> Result<String> {
+    wait_for_callback_on(53692, "/callback", None, interactive).await
 }
 
 /// Wait for an OAuth authorization code via two parallel paths, whichever wins first:
@@ -871,6 +878,7 @@ async fn wait_for_callback_on(
     port: u16,
     expected_path: &str,
     expected_state: Option<&str>,
+    interactive: bool,
 ) -> Result<String> {
     let bind_result = TcpListener::bind(("127.0.0.1", port)).await;
 
@@ -904,31 +912,51 @@ async fn wait_for_callback_on(
             }
         }
         Err(e) => {
-            // Port is in use — common culprits: a stuck previous login attempt,
-            // VS Code (which uses 1455 internally), the official Claude Code or
-            // codex CLI running in parallel, or anything else that happened to
-            // grab the same port. Fall through to paste-only mode rather than
-            // refusing to proceed, but try to name the process so the user
-            // knows whether to close it or accept the manual flow.
-            eprintln!();
-            match identify_port_holder(port) {
-                Some(holder) => {
-                    eprintln!("Note: port {} is already in use ({}: {}).", port, e, holder);
-                    if let Some(suggestion) = suggestion_for_holder(&holder) {
-                        eprintln!("      {}", suggestion);
+            // Port is in use. The handling forks based on whether we have
+            // exclusive access to stdin (`interactive=true`, the standalone
+            // forge-agent --login path) or whether stdin is owned by the
+            // headless JSON protocol reader (`interactive=false`, the
+            // /login-in-TUI path).
+            let holder = identify_port_holder(port);
+            match holder {
+                Some(ref h) => {
+                    eprintln!();
+                    eprintln!("Port {} is already in use ({}: {}).", port, e, h);
+                    if let Some(suggestion) = suggestion_for_holder(h) {
+                        eprintln!("  {}", suggestion);
                     }
                 }
                 None => {
-                    eprintln!("Note: port {} is already in use ({}).", port, e);
-                    eprintln!("      To find the process holding it:");
+                    eprintln!();
+                    eprintln!("Port {} is already in use ({}).", port, e);
+                    eprintln!("  To find the process holding it:");
                     if cfg!(target_os = "windows") {
-                        eprintln!("        Get-NetTCPConnection -LocalPort {} -State Listen", port);
+                        eprintln!("    Get-NetTCPConnection -LocalPort {} -State Listen", port);
                     } else {
-                        eprintln!("        lsof -nP -iTCP:{} -sTCP:LISTEN", port);
+                        eprintln!("    lsof -nP -iTCP:{} -sTCP:LISTEN", port);
                     }
                 }
             }
             eprintln!();
+
+            if !interactive {
+                // Inside the headless protocol session — stdin is owned by the
+                // JSON message reader, so the paste fallback would hang
+                // competing for input. Bail with a clear error instead.
+                let cmd = match port {
+                    53692 => "forge --login",
+                    1455 => "forge --login-chatgpt",
+                    _ => "forge --login",
+                };
+                anyhow::bail!(
+                    "Port {} is busy and the manual paste flow isn't available from inside forge. \
+                     Quit forge (/quit) and run `{}` from your shell — that path supports paste-the-URL \
+                     and works even when the callback port is occupied.",
+                    port,
+                    cmd
+                );
+            }
+
             eprintln!("The automatic browser callback can't be received here, but you can");
             eprintln!("still complete login manually:");
             eprintln!();

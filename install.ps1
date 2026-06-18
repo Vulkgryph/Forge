@@ -133,10 +133,18 @@ Write-Ok "Installed forge-update-> $INSTALL_BIN\forge-update.cmd"
 # 5. PATH
 # -------------------------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+$script:PATH_RELOAD_NEEDED = $false
 if (-not ($userPath -split ';' | Where-Object { $_ -ieq $INSTALL_BIN })) {
     $newPath = if ($userPath) { "$userPath;$INSTALL_BIN" } else { $INSTALL_BIN }
     [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
-    Write-Warn "Added $INSTALL_BIN to your user PATH. Open a new PowerShell window to pick it up."
+    Write-Ok "Added $INSTALL_BIN to your user PATH"
+    $script:PATH_RELOAD_NEEDED = $true
+}
+
+# Always update the current session's PATH so post-install steps (OAuth login,
+# connection test, etc.) can find forge-agent without restarting PowerShell.
+if (-not ($env:PATH -split ';' | Where-Object { $_ -ieq $INSTALL_BIN })) {
+    $env:PATH = "$INSTALL_BIN;$env:PATH"
 }
 
 # -------------------------------------------------------------------
@@ -407,6 +415,14 @@ Write-Host "  forge-agent    Launch in headless mode (for scripting)"
 Write-Host "  forge-update   Update, rebuild, and reinstall Forge"
 Write-Host ""
 Write-Host "  Config: $CONFIG_FILE"
+
+if ($script:PATH_RELOAD_NEEDED) {
+    Write-Host ""
+    Write-Host "  To run ``forge`` from new terminals:" -ForegroundColor White
+    Write-Host "    Open a new PowerShell window - PATH will pick up automatically."
+    Write-Host "    (This session already has the updated PATH.)"
+}
+
 if ($POST_INSTALL_HINT) {
     Write-Host ""
     Write-Host "  Next step:" -ForegroundColor White

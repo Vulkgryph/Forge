@@ -118,25 +118,38 @@ ok "Installed forge-update → $INSTALL_BIN/forge-update"
 # -------------------------------------------------------------------
 # 5. PATH setup
 # -------------------------------------------------------------------
+PATH_RELOAD_HINT=""
 if [[ ":$PATH:" != *":$INSTALL_BIN:"* ]]; then
     SHELL_NAME="$(basename "$SHELL")"
     case "$SHELL_NAME" in
         zsh)  RC_FILE="$HOME/.zshrc" ;;
         bash) RC_FILE="$HOME/.bashrc" ;;
+        fish) RC_FILE="$HOME/.config/fish/config.fish" ;;
         *)    RC_FILE="" ;;
     esac
 
     if [[ -n "$RC_FILE" ]]; then
         if ! grep -qF "$INSTALL_BIN" "$RC_FILE" 2>/dev/null; then
+            mkdir -p "$(dirname "$RC_FILE")"
             echo "" >> "$RC_FILE"
             echo "# Added by Forge installer" >> "$RC_FILE"
-            echo "export PATH=\"$INSTALL_BIN:\$PATH\"" >> "$RC_FILE"
-            warn "Added $INSTALL_BIN to PATH in $RC_FILE"
-            warn "Run: source $RC_FILE  (or open a new terminal)"
+            if [[ "$SHELL_NAME" == "fish" ]]; then
+                echo "set -gx PATH $INSTALL_BIN \$PATH" >> "$RC_FILE"
+            else
+                echo "export PATH=\"$INSTALL_BIN:\$PATH\"" >> "$RC_FILE"
+            fi
+            ok "Added $INSTALL_BIN to PATH in $RC_FILE"
+        else
+            warn "$INSTALL_BIN is already in $RC_FILE but not loaded in this shell."
         fi
+        PATH_RELOAD_HINT="source $RC_FILE   # or open a new terminal"
     else
-        warn "$INSTALL_BIN is not in your PATH. Add it manually:\n  export PATH=\"$INSTALL_BIN:\$PATH\""
+        PATH_RELOAD_HINT="export PATH=\"$INSTALL_BIN:\$PATH\"   # add to your shell's rc file to make permanent"
     fi
+
+    # Export for this subshell so the post-install steps (wizard, OAuth login,
+    # connection test) can find forge-agent without restarting.
+    export PATH="$INSTALL_BIN:$PATH"
 fi
 
 # -------------------------------------------------------------------
@@ -516,6 +529,13 @@ echo "  forge-agent    Launch in headless mode (for scripting)"
 echo "  forge-update   Update, rebuild, and reinstall Forge"
 echo ""
 echo "  Config: $CONFIG_FILE"
+
+if [[ -n "$PATH_RELOAD_HINT" ]]; then
+    echo ""
+    echo -e "  ${BOLD}To run \`forge\` in this terminal right now:${RESET}"
+    echo "    $PATH_RELOAD_HINT"
+fi
+
 if [[ -n "${POST_INSTALL_HINT:-}" ]]; then
     echo ""
     echo -e "  ${BOLD}Next step:${RESET}"

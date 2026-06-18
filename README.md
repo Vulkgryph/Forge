@@ -204,9 +204,9 @@ max_concurrent = 4
 default_model = "fast"
 ```
 
-### ChatGPT Codex subscription login
+### Subscription login
 
-Forge can also use a ChatGPT account with Codex access. Log in from the UI:
+Forge can use your existing Claude or ChatGPT subscription via OAuth — no API key purchase required. The login flow handles both providers:
 
 From the command line:
 
@@ -267,10 +267,12 @@ If `--cwd` is not specified, Forge uses the current directory as the project roo
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Shift+Enter` | New line in input |
+| `Ctrl+N` &nbsp;*or*&nbsp; `\` then `Enter` | New line in input |
 | `Ctrl+C` | Quit |
 | `Escape` | Cancel current run when the agent is thinking |
 | `Shift+Tab` | Cycle permission mode |
+
+Forge uses `Ctrl+N` and the trailing-backslash idiom instead of `Shift+Enter` because `Shift+Enter` is not reliably distinguishable from plain `Enter` across terminal emulators.
 
 ### Slash commands
 
@@ -362,6 +364,10 @@ Forge runs the script from the project root. Tool arguments are passed as JSON o
 **Forge hangs on startup** — your LLM server isn't running or the endpoint URL is wrong. Check that your server is up at the URL in your config, or re-run `./install.sh` to reconfigure.
 
 **Config reset** — delete `~/.config/forge/config.toml` and re-run `./install.sh` to go through the setup wizard again.
+
+## Known Issues
+
+**Occasional streamed-message truncation or duplication.** Under some streaming conditions the assistant's reply can appear cut off or partially duplicated in the UI. This has been practically mitigated through streaming-parser fixes but still surfaces rarely. The full, authoritative version of every turn is preserved in `.forge/sessions/{session_id}/conversation.jsonl` regardless of how it rendered in the UI — so the session log is the source of truth if you suspect a display issue. Work in progress; please file an issue if you reproduce a case that lets us nail the remaining edge.
 
 ## Project layout
 

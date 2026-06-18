@@ -13,6 +13,33 @@ import type {
 import { activeEndpoint, thinkingIntensityDisplay } from "../model-display.js";
 import { nextStartupTip } from "../startup-tips.js";
 
+/**
+ * Best-effort system clipboard copy. Returns true on success. Used so OAuth
+ * URLs (which Ink wraps with hard newlines, breaking copy-paste) can be made
+ * available cleanly to the user — they just hit Cmd+V / Ctrl+V in their
+ * browser instead of trying to select the wrapped text from the TUI.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  let cmd: string[];
+  if (process.platform === "darwin") cmd = ["pbcopy"];
+  else if (process.platform === "win32") cmd = ["clip"];
+  else if (process.env["WAYLAND_DISPLAY"]) cmd = ["wl-copy"];
+  else cmd = ["xclip", "-selection", "clipboard"];
+
+  try {
+    const proc = Bun.spawn(cmd, { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+    const writer = proc.stdin;
+    if (writer && typeof writer !== "number") {
+      writer.write(text);
+      writer.end();
+    }
+    const exitCode = await proc.exited;
+    return exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
 export interface ChatEntry {
   id: string;
   kind: "user" | "assistant" | "streaming" | "tool_call" | "tool_result" | "tool_output" | "system" | "error" | "plan_content" | "plan_status" | "subagent_header";
@@ -304,9 +331,37 @@ export function useAgent(options: UseAgentOptions = {}) {
     // inheriting it so the raw text doesn't paint over Ink's rendering;
     // this hook decides what to do with each line. Cap line length to
     // prevent a single very long line from blowing up the layout.
+    //
+    // Special case: OAuth URLs. Ink's text wrapping inserts actual newline
+    // characters into the rendered output, so a wrapped URL becomes broken
+    // on copy-paste. We detect a bare URL line and copy it to the system
+    // clipboard automatically, then emit a confirmation so the user knows
+    // they can just paste straight into the browser without selecting.
     bridge.on("stderr", (line: string) => {
       if (generation !== bridgeGenerationRef.current) return;
       const trimmed = line.length > 2000 ? line.slice(0, 2000) + "..." : line;
+
+      const urlMatch = trimmed.match(/^\s*(https?:\/\/\S+)\s*$/);
+      if (urlMatch) {
+        const url = urlMatch[1]!;
+        // Fire-and-forget; the OS-level copy is best-effort. Appends a tip
+        // entry after the URL itself when the copy succeeds.
+        copyToClipboard(url).then((ok) => {
+          if (!ok || generation !== bridgeGenerationRef.current) return;
+          setState((prev) => ({
+            ...prev,
+            scrollback: [
+              ...prev.scrollback,
+              {
+                id: nextId(),
+                kind: "system",
+                content: "Tip: URL copied to clipboard — paste it into your browser.",
+              },
+            ],
+          }));
+        }).catch(() => { /* no-op */ });
+      }
+
       setState((prev) => ({
         ...prev,
         scrollback: [

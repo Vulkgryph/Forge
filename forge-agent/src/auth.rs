@@ -741,6 +741,12 @@ async fn wait_for_callback() -> Result<String> {
     wait_for_callback_on(53692, "/callback", None).await
 }
 
+/// Wait for an OAuth authorization code via two parallel paths, whichever wins first:
+///   1. The browser hits the localhost TCP listener (works on local machines and
+///      when SSH port forwarding is set up).
+///   2. The user pastes the code (or full callback URL) into stdin. This is the
+///      fallback for remote machines without port forwarding, firewall-blocked
+///      ports, or airgapped hosts.
 async fn wait_for_callback_on(
     port: u16,
     expected_path: &str,
@@ -754,7 +760,27 @@ async fn wait_for_callback_on(
         "Waiting for browser callback on http://localhost:{}{} ...",
         port, expected_path
     );
+    eprintln!();
+    eprintln!("If the redirect can't reach this machine (remote SSH without port forwarding,");
+    eprintln!("firewall, etc.), your browser will show a \"site can't be reached\" page after");
+    eprintln!("you approve. Look at the URL bar — it will contain `?code=...&state=...`.");
+    eprintln!("Paste either the code value or the entire URL below and press Enter:");
+    eprintln!();
 
+    let expected_state_owned = expected_state.map(str::to_string);
+    let expected_path_owned = expected_path.to_string();
+
+    tokio::select! {
+        result = accept_oauth_callback(listener, expected_path_owned, expected_state_owned.clone()) => result,
+        result = read_code_from_stdin(expected_state_owned) => result,
+    }
+}
+
+async fn accept_oauth_callback(
+    listener: TcpListener,
+    expected_path: String,
+    expected_state: Option<String>,
+) -> Result<String> {
     let (mut stream, _) = listener.accept().await?;
 
     let mut buf = vec![0u8; 8192];
@@ -777,6 +803,56 @@ async fn wait_for_callback_on(
         );
     }
 
+    let code = extract_code_from_query(query, expected_state.as_deref())?;
+
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+        <html><body><h2>Login successful!</h2><p>You can close this window and return to forge.</p></body></html>";
+    let _ = stream.write_all(html.as_bytes()).await;
+
+    Ok(code)
+}
+
+/// Read either a bare authorization code or a full callback URL from stdin
+/// and extract the code parameter from it.
+async fn read_code_from_stdin(expected_state: Option<String>) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+
+    // Read lines until we get something usable. Empty lines (just Enter) are
+    // ignored so the user can correct stray newlines without aborting.
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("Failed to read paste from stdin")?;
+        if n == 0 {
+            // EOF — stdin was closed without input. Let the TCP listener handle it.
+            std::future::pending::<()>().await;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // If it looks like a full URL, pull the code out of the query string.
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+            return extract_code_from_query(query, expected_state.as_deref());
+        }
+        // Otherwise assume the user pasted just the code value.
+        if let Some(expected) = expected_state.as_deref() {
+            eprintln!(
+                "(note: state was not validated — paste the full URL to verify state={})",
+                expected
+            );
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
+fn extract_code_from_query(query: &str, expected_state: Option<&str>) -> Result<String> {
     let params: std::collections::HashMap<String, String> = query
         .split('&')
         .filter_map(|part| {
@@ -802,16 +878,10 @@ async fn wait_for_callback_on(
         }
     }
 
-    let code = params
+    params
         .get("code")
         .cloned()
-        .context("OAuth callback did not contain a code parameter")?;
-
-    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-        <html><body><h2>Login successful!</h2><p>You can close this window and return to forge.</p></body></html>";
-    let _ = stream.write_all(html.as_bytes()).await;
-
-    Ok(code)
+        .context("OAuth callback did not contain a code parameter")
 }
 
 #[cfg(test)]

@@ -861,41 +861,71 @@ async fn wait_for_callback() -> Result<String> {
 ///      when SSH port forwarding is set up).
 ///   2. The user pastes the code (or full callback URL) into stdin. This is the
 ///      fallback for remote machines without port forwarding, firewall-blocked
-///      ports, or airgapped hosts.
+///      ports, airgapped hosts, OR when something else on the machine is already
+///      using the OAuth callback port.
+///
+/// If the TCP bind fails (port already in use), we still proceed in paste-only
+/// mode rather than aborting — the user can complete login by copying the
+/// callback URL from their browser's "site can't be reached" page.
 async fn wait_for_callback_on(
     port: u16,
     expected_path: &str,
     expected_state: Option<&str>,
 ) -> Result<String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("Failed to bind port {} for OAuth callback", port))?;
+    let bind_result = TcpListener::bind(("127.0.0.1", port)).await;
 
-    eprintln!(
-        "Waiting for browser callback on http://localhost:{}{} ...",
-        port, expected_path
-    );
-    eprintln!();
-    eprintln!("---");
-    eprintln!("If the redirect can't reach this machine (remote SSH without port forwarding,");
-    eprintln!("firewall, etc.), use the manual paste flow:");
-    eprintln!();
-    eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
-    eprintln!("  2. After approving, your browser will try to load");
-    eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
-    eprintln!("     and show \"site can't be reached\". THAT is the page you want.");
-    eprintln!("  3. Copy the URL from your browser's address bar (the localhost one,");
-    eprintln!("     NOT the auth.openai.com / claude.ai one) and paste it below.");
-    eprintln!();
-    eprintln!("Waiting for browser callback OR pasted URL:");
-    eprintln!();
+    match bind_result {
+        Ok(listener) => {
+            eprintln!(
+                "Waiting for browser callback on http://localhost:{}{} ...",
+                port, expected_path
+            );
+            eprintln!();
+            eprintln!("---");
+            eprintln!("If the redirect can't reach this machine (remote SSH without port forwarding,");
+            eprintln!("firewall, etc.), use the manual paste flow:");
+            eprintln!();
+            eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
+            eprintln!("  2. After approving, your browser will try to load");
+            eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
+            eprintln!("     and show \"site can't be reached\". THAT is the page you want.");
+            eprintln!("  3. Copy the URL from your browser's address bar (the localhost one,");
+            eprintln!("     NOT the auth.openai.com / claude.ai one) and paste it below.");
+            eprintln!();
+            eprintln!("Waiting for browser callback OR pasted URL:");
+            eprintln!();
 
-    let expected_state_owned = expected_state.map(str::to_string);
-    let expected_path_owned = expected_path.to_string();
+            let expected_state_owned = expected_state.map(str::to_string);
+            let expected_path_owned = expected_path.to_string();
 
-    tokio::select! {
-        result = accept_oauth_callback(listener, expected_path_owned, expected_state_owned.clone()) => result,
-        result = read_code_from_stdin(expected_state_owned) => result,
+            tokio::select! {
+                result = accept_oauth_callback(listener, expected_path_owned, expected_state_owned.clone()) => result,
+                result = read_code_from_stdin(expected_state_owned) => result,
+            }
+        }
+        Err(e) => {
+            // Port is in use — common culprits: a stuck previous login attempt,
+            // VS Code (which uses 1455 internally), or anything else that
+            // happened to grab the same port. Fall through to paste-only mode
+            // rather than refusing to proceed.
+            eprintln!();
+            eprintln!("Note: port {} is already in use ({}), so the automatic", port, e);
+            eprintln!("browser callback can't be received on this machine. You can still");
+            eprintln!("complete login manually:");
+            eprintln!();
+            eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
+            eprintln!("  2. After approving, your browser will try to load");
+            eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
+            eprintln!("     and show \"site can't be reached\". That's expected.");
+            eprintln!("  3. Copy the URL from your browser's address bar and paste it below.");
+            eprintln!();
+            eprintln!("(Tip: if the port collision is unexpected, run `lsof -nP -iTCP:{} -sTCP:LISTEN`", port);
+            eprintln!(" to find the process holding it.)");
+            eprintln!();
+
+            let expected_state_owned = expected_state.map(str::to_string);
+            read_code_from_stdin(expected_state_owned).await
+        }
     }
 }
 

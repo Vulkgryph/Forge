@@ -761,10 +761,18 @@ async fn wait_for_callback_on(
         port, expected_path
     );
     eprintln!();
+    eprintln!("---");
     eprintln!("If the redirect can't reach this machine (remote SSH without port forwarding,");
-    eprintln!("firewall, etc.), your browser will show a \"site can't be reached\" page after");
-    eprintln!("you approve. Look at the URL bar — it will contain `?code=...&state=...`.");
-    eprintln!("Paste either the code value or the entire URL below and press Enter:");
+    eprintln!("firewall, etc.), use the manual paste flow:");
+    eprintln!();
+    eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
+    eprintln!("  2. After approving, your browser will try to load");
+    eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
+    eprintln!("     and show \"site can't be reached\". THAT is the page you want.");
+    eprintln!("  3. Copy the URL from your browser's address bar (the localhost one,");
+    eprintln!("     NOT the auth.openai.com / claude.ai one) and paste it below.");
+    eprintln!();
+    eprintln!("Waiting for browser callback OR pasted URL:");
     eprintln!();
 
     let expected_state_owned = expected_state.map(str::to_string);
@@ -839,6 +847,30 @@ async fn read_code_from_stdin(expected_state: Option<String>) -> Result<String> 
         // If it looks like a full URL, pull the code out of the query string.
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+
+            // Detect a common mistake: pasting the authorize URL (the one we
+            // told the user to OPEN in their browser) instead of the callback
+            // URL their browser ended up on after approving. The authorize URL
+            // contains client_id and scope; the callback URL contains code.
+            let is_authorize_url = query.contains("client_id=")
+                || query.contains("response_type=")
+                || trimmed.contains("/oauth/authorize")
+                || trimmed.contains("claude.ai/oauth")
+                || trimmed.contains("auth.openai.com");
+            let has_code = query.contains("code=");
+
+            if is_authorize_url && !has_code {
+                anyhow::bail!(
+                    "That looks like the authorize URL (the one you were supposed to OPEN \
+                     in your browser), not the callback URL.\n\n  \
+                     After approving in your browser, your address bar will switch to \
+                     something starting with `http://localhost:...?code=...&state=...`. \
+                     That \"site can't be reached\" page IS the right one — copy its URL \
+                     and paste THAT here.\n\n  \
+                     Re-run forge --login to try again."
+                );
+            }
+
             return extract_code_from_query(query, expected_state.as_deref());
         }
         // Otherwise assume the user pasted just the code value.

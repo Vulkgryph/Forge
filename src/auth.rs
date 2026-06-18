@@ -45,6 +45,11 @@ pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: u64, // Unix timestamp (seconds)
+    /// If we got a 429 from the refresh endpoint, the unix timestamp until
+    /// which we should not retry. Cleared on next successful refresh.
+    /// Default = 0 (never rate-limited).
+    #[serde(default)]
+    pub rate_limited_until: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +62,9 @@ pub struct ChatGptTokens {
     pub account_id: Option<String>,
     pub plan_type: Option<String>,
     pub expires_at: Option<u64>,
+    /// Same as OAuthTokens::rate_limited_until.
+    #[serde(default)]
+    pub rate_limited_until: u64,
 }
 
 /// A model discovered from the ChatGPT Codex subscription model cache.
@@ -595,7 +603,36 @@ pub async fn get_valid_token_force_refresh(http: &reqwest::Client) -> Result<Str
     Ok(refreshed.access_token)
 }
 
+/// Default backoff applied to OAuth refresh attempts that hit 429 without a
+/// `Retry-After` header. Anthropic's rate-limit window for this endpoint is
+/// roughly 5 minutes in practice.
+const DEFAULT_REFRESH_BACKOFF_SECS: u64 = 300;
+
+/// Parse the `Retry-After` header (RFC 7231: seconds-as-integer OR HTTP-date)
+/// into a number of seconds from now. Returns None if absent or unparseable;
+/// the caller can apply a default backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get("retry-after")?.to_str().ok()?;
+    // Numeric form: "300"
+    if let Ok(secs) = value.trim().parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date form (e.g. "Wed, 21 Oct 2024 07:28:00 GMT") — best-effort,
+    // not bothering with a full parser; just fall back to default.
+    None
+}
+
 async fn refresh_tokens(http: &reqwest::Client, old_tokens: &OAuthTokens) -> Result<OAuthTokens> {
+    // Short-circuit if we're still inside a previous 429 backoff window.
+    let now = unix_now();
+    if old_tokens.rate_limited_until > now {
+        let secs = old_tokens.rate_limited_until - now;
+        anyhow::bail!(
+            "Refresh is rate-limited by the auth server. Wait ~{}s, or run forge --login to get fresh tokens.",
+            secs
+        );
+    }
+
     let resp = http
         .post(TOKEN_URL)
         .json(&serde_json::json!({
@@ -609,7 +646,22 @@ async fn refresh_tokens(http: &reqwest::Client, old_tokens: &OAuthTokens) -> Res
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 {
+            // Persist the cooldown so subsequent forge startups don't hammer
+            // the endpoint and dig the rate-limit hole deeper.
+            let retry_after = parse_retry_after(&headers).unwrap_or(DEFAULT_REFRESH_BACKOFF_SECS);
+            let until = now + retry_after;
+            let mut t = old_tokens.clone();
+            t.rate_limited_until = until;
+            let _ = save_tokens(&t);
+            anyhow::bail!(
+                "Refresh rate-limited by the auth server (HTTP 429). Cooldown ~{}s. Wait, or run forge --login to get fresh tokens.",
+                retry_after
+            );
+        }
         anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
     }
 
@@ -620,6 +672,15 @@ async fn refresh_chatgpt_tokens(
     http: &reqwest::Client,
     old_tokens: &ChatGptTokens,
 ) -> Result<ChatGptTokens> {
+    let now = unix_now();
+    if old_tokens.rate_limited_until > now {
+        let secs = old_tokens.rate_limited_until - now;
+        anyhow::bail!(
+            "Refresh is rate-limited by the auth server. Wait ~{}s, or run forge --login-chatgpt to get fresh tokens.",
+            secs
+        );
+    }
+
     let resp = http
         .post(format!("{}/oauth/token", CHATGPT_ISSUER))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -634,7 +695,20 @@ async fn refresh_chatgpt_tokens(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 {
+            let retry_after = parse_retry_after(&headers).unwrap_or(DEFAULT_REFRESH_BACKOFF_SECS);
+            let until = now + retry_after;
+            let mut t = old_tokens.clone();
+            t.rate_limited_until = until;
+            let _ = save_chatgpt_tokens(&t);
+            anyhow::bail!(
+                "Refresh rate-limited by the auth server (HTTP 429). Cooldown ~{}s. Wait, or run forge --login-chatgpt to get fresh tokens.",
+                retry_after
+            );
+        }
         anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
     }
 
@@ -736,6 +810,8 @@ async fn parse_token_response(
         access_token,
         refresh_token,
         expires_at,
+        // Fresh tokens → clear any prior rate-limit cooldown.
+        rate_limited_until: 0,
     })
 }
 
@@ -784,6 +860,8 @@ async fn parse_chatgpt_token_response(
         account_id,
         plan_type,
         expires_at,
+        // Fresh tokens → clear any prior rate-limit cooldown.
+        rate_limited_until: 0,
     })
 }
 

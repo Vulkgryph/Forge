@@ -190,6 +190,7 @@ impl ApiClient {
                         account_id: None,
                         plan_type: None,
                         expires_at: None,
+                        rate_limited_until: 0,
                     });
                 if let Some(access_token) = auth_token {
                     tokens.access_token = access_token;

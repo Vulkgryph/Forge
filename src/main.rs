@@ -23,7 +23,9 @@ fn print_oauth_refresh_error(provider: &str, error: &str, relogin_command: &str)
     eprintln!("forge: cannot use saved {} credentials.", provider);
 
     // Pull out a human-readable cause based on the parsed error code.
-    let cause = if error.contains("refresh_token_reused") {
+    let cause = if error.contains("rate-limited") || error.contains("HTTP 429") {
+        "The auth server is rate-limiting refresh attempts. forge will not retry until the cooldown lifts; you can wait it out, or skip the wait by getting fresh tokens via a full re-login."
+    } else if error.contains("refresh_token_reused") {
         "Your refresh token was already used elsewhere (another login replaced it)."
     } else if error.contains("invalid_grant") || error.contains("expired_token") {
         "Your saved session has expired or been revoked."

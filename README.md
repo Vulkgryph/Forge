@@ -24,9 +24,9 @@ The project root is the default working directory, not a sandbox. File tools and
 
 ## Requirements
 
-- **macOS or Linux**
-- **Rust** (installed automatically by `install.sh` if missing)
-- **Bun** (installed automatically by `install.sh` if missing)
+- **macOS, Linux, or Windows**
+- **Rust** (installed automatically by the installer if missing)
+- **Bun** (installed automatically by the installer if missing)
 - **An LLM endpoint** — OpenAI-compatible, Anthropic, or ChatGPT Codex
 
 **Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `install.sh`:
@@ -37,27 +37,47 @@ sudo apt-get update && sudo apt-get install -y git build-essential unzip
 
 `install.sh` will detect these and tell you exactly what to install if any are missing.
 
+**Windows preflight** — `install.ps1` uses `winget` to install missing prerequisites (Git, Rust via rustup, Bun). It assumes Visual Studio Build Tools 2022 (or higher) is already installed for the MSVC linker — install from [aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the "Desktop development with C++" workload if missing.
+
 ## Installation
 
-### One-command install (recommended)
+### macOS / Linux — one-command install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vulkgryph/Forge/main/bootstrap.sh | bash
 ```
 
-The bootstrap script handles the preflight (apt deps on Linux, Xcode CLI tools on macOS), clones to `~/forge`, and runs `install.sh`. On Linux it will prompt for `sudo` once to install `git`, `build-essential`, and `unzip` if missing.
+### Windows — one-command install
 
-Override defaults with environment variables:
-- `FORGE_DEST=~/code/forge` — clone destination (default: `~/forge`)
-- `FORGE_BRANCH=stable` — branch to check out (default: `main`)
-- `FORGE_REPO=https://...` — alternative repo URL
+In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Vulkgryph/Forge/main/bootstrap.ps1 | iex
+```
+
+Both bootstrap scripts handle the preflight, clone the repo to `~/forge` (or `$env:USERPROFILE\forge` on Windows), and run the appropriate installer.
+
+Override defaults via environment variables:
+- `FORGE_DEST` — clone destination (default: `~/forge` or `$env:USERPROFILE\forge`)
+- `FORGE_BRANCH` — branch to check out (default: `main`)
+- `FORGE_REPO` — alternative repo URL
 
 ### Manual install
+
+**macOS / Linux:**
 
 ```bash
 git clone https://github.com/Vulkgryph/Forge.git forge
 cd forge
 ./install.sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+git clone https://github.com/Vulkgryph/Forge.git forge
+cd forge
+.\install.ps1
 ```
 
 The installer's first question is how you want Forge to reach an LLM:

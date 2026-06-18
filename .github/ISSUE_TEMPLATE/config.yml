@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Vulkgryph/Forge/security/advisories/new
+    about: Report a security issue privately via GitHub's advisory flow. See SECURITY.md for details.

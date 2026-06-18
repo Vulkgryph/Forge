@@ -186,50 +186,34 @@ async fn fetch_chatgpt_codex_models_from_cli() -> Option<Vec<ChatGptCodexModel>>
 ///      to be present — bonus safety net for users who have the CLI.
 ///   5. Hardcoded baseline `0.140.0`.
 async fn detect_codex_client_version() -> String {
-    const FALLBACK: &str = "0.140.0";
-    const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-
-    // 1) Fresh forge cache
-    if let Some(cached) = read_codex_version_cache() {
-        if !cached.is_stale(CACHE_MAX_AGE_SECS) {
-            return cached.version;
-        }
-    }
-
-    // 2) GitHub
-    if let Some(latest) = fetch_latest_codex_version_from_github().await {
-        let _ = write_codex_version_cache(&latest);
-        return latest;
-    }
-
-    // 3) Stale cache beats nothing
-    if let Some(cached) = read_codex_version_cache() {
-        return cached.version;
-    }
-
-    // 4) Borrow from the codex CLI's cache if the user has it
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".codex").join("models_cache.json");
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(v) = json.get("client_version").and_then(|v| v.as_str()) {
-                    return v.to_string();
+    // Primary path: shared resolver (forge cache → GitHub → stale cache → fallback)
+    let v = resolve_client_version("openai/codex", "codex_client_version.json", "0.140.0").await;
+    // Bonus: if forge cache is missing AND GitHub failed AND we're falling back,
+    // peek at the codex CLI's own cache if the user happens to have it installed.
+    // We only bother when v matches the hardcoded fallback, since otherwise
+    // we already have something fresher.
+    if v == "0.140.0" {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".codex").join("models_cache.json");
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(s) = json.get("client_version").and_then(|v| v.as_str()) {
+                        return s.to_string();
+                    }
                 }
             }
         }
     }
-
-    // 5) Last resort
-    FALLBACK.to_string()
+    v
 }
 
 #[derive(Serialize, Deserialize)]
-struct CodexVersionCache {
+struct ClientVersionCache {
     version: String,
     fetched_at: u64,
 }
 
-impl CodexVersionCache {
+impl ClientVersionCache {
     fn is_stale(&self, max_age_secs: u64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -239,19 +223,19 @@ impl CodexVersionCache {
     }
 }
 
-fn codex_version_cache_path() -> Option<PathBuf> {
+fn client_version_cache_path(filename: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    Some(home.join(".config").join("forge").join("codex_client_version.json"))
+    Some(home.join(".config").join("forge").join(filename))
 }
 
-fn read_codex_version_cache() -> Option<CodexVersionCache> {
-    let path = codex_version_cache_path()?;
+fn read_version_cache(filename: &str) -> Option<ClientVersionCache> {
+    let path = client_version_cache_path(filename)?;
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-fn write_codex_version_cache(version: &str) -> std::io::Result<()> {
-    let path = codex_version_cache_path()
+fn write_version_cache(filename: &str, version: &str) -> std::io::Result<()> {
+    let path = client_version_cache_path(filename)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no home dir"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -260,7 +244,7 @@ fn write_codex_version_cache(version: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let cache = CodexVersionCache {
+    let cache = ClientVersionCache {
         version: version.to_string(),
         fetched_at,
     };
@@ -269,13 +253,17 @@ fn write_codex_version_cache(version: &str) -> std::io::Result<()> {
     std::fs::write(&path, content)
 }
 
-async fn fetch_latest_codex_version_from_github() -> Option<String> {
+/// Query GitHub's "latest release" endpoint for a public repo. Returns the
+/// version string (stripped of `rust-` and leading `v` prefixes) or None on
+/// failure.
+async fn fetch_latest_github_release(repo: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .ok()?;
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let resp = client
-        .get("https://api.github.com/repos/openai/codex/releases/latest")
+        .get(&url)
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "forge-agent")
         .send()
@@ -285,21 +273,62 @@ async fn fetch_latest_codex_version_from_github() -> Option<String> {
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    // `name` is the cleaned version ("0.141.0"); `tag_name` is "rust-v0.141.0"
-    // and would need stripping. Prefer `name`.
+    // `name` is usually cleaned ("0.141.0"); `tag_name` may be prefixed
+    // ("rust-v0.141.0" / "v2.1.181"). Prefer the cleaner of the two.
+    let clean = |s: &str| -> String {
+        s.trim()
+            .trim_start_matches("rust-")
+            .trim_start_matches('v')
+            .to_string()
+    };
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
-        let cleaned = name.trim().trim_start_matches('v');
-        if !cleaned.is_empty() {
-            return Some(cleaned.to_string());
+        let c = clean(name);
+        if !c.is_empty() && c.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            return Some(c);
         }
     }
     if let Some(tag) = body.get("tag_name").and_then(|v| v.as_str()) {
-        let cleaned = tag.trim_start_matches("rust-").trim_start_matches('v');
-        if !cleaned.is_empty() {
-            return Some(cleaned.to_string());
+        let c = clean(tag);
+        if !c.is_empty() {
+            return Some(c);
         }
     }
     None
+}
+
+/// Generic "resolve current client version" helper for any GitHub-published
+/// CLI we're impersonating. Used by both Codex and Claude detection.
+async fn resolve_client_version(repo: &str, cache_file: &str, fallback: &str) -> String {
+    const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+    if let Some(cached) = read_version_cache(cache_file) {
+        if !cached.is_stale(CACHE_MAX_AGE_SECS) {
+            return cached.version;
+        }
+    }
+    if let Some(latest) = fetch_latest_github_release(repo).await {
+        let _ = write_version_cache(cache_file, &latest);
+        return latest;
+    }
+    if let Some(cached) = read_version_cache(cache_file) {
+        return cached.version;
+    }
+    fallback.to_string()
+}
+
+/// Resolve the Claude Code client version Forge should pose as. Anthropic's
+/// API rejects (or rate-limits) requests with very old user-agents; tracking
+/// the upstream CLI version keeps us looking current.
+pub async fn claude_client_version() -> String {
+    use tokio::sync::OnceCell;
+    static CACHED: OnceCell<String> = OnceCell::const_new();
+    CACHED
+        .get_or_init(|| async {
+            resolve_client_version("anthropics/claude-code", "claude_client_version.json", "2.1.75")
+                .await
+        })
+        .await
+        .clone()
 }
 
 fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
@@ -394,19 +423,26 @@ fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel
         None => return None,
     };
 
+    // Known internal-use models that the Codex backend lists but that aren't
+    // meant for general chat. `codex-auto-review` is the code-review sub-model
+    // the codex CLI uses internally during reviews — it's not callable as a
+    // regular chat target.
+    const INTERNAL_SLUGS: &[&str] = &["codex-auto-review"];
+
     let mut discovered = Vec::new();
     for model in models {
         // ChatGPT marks some models as visibility: "hide" — these are usually
         // deprecated, internal, or otherwise hidden from the default ChatGPT
         // web UI, but they remain callable via the Codex API for users who
-        // know the slug. Surface them in Forge's picker too; users probably
-        // want to see (and choose) anything their account can actually use.
-        // The same applies to "enterprise-only" or other gated visibility
-        // values — we don't filter on them either.
+        // know the slug. Surface them in Forge's picker too EXCEPT for slugs
+        // we know are internal sub-models (see INTERNAL_SLUGS above).
         let _ = model.get("visibility");
         let Some(id) = model.get("slug").and_then(|v| v.as_str()) else {
             continue;
         };
+        if INTERNAL_SLUGS.contains(&id) {
+            continue;
+        }
         let display_name = model
             .get("display_name")
             .and_then(|v| v.as_str())
@@ -801,10 +837,11 @@ pub async fn fetch_anthropic_models(http: &reqwest::Client, token: &str) -> Vec<
         }
 
         if is_oauth {
+            let ua = format!("claude-cli/{}", claude_client_version().await);
             req = req
                 .header("authorization", format!("Bearer {}", token))
                 .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-                .header("user-agent", "claude-cli/2.1.75")
+                .header("user-agent", ua)
                 .header("x-app", "cli")
                 .header("anthropic-dangerous-direct-browser-access", "true");
         } else {

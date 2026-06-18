@@ -91,7 +91,9 @@ The installer's first question is how you want Forge to reach an LLM:
 ```
 
 - **Local (1):** you'll be asked for the base URL, model ID, and context window. No defaults — paste whatever your server uses.
-- **Claude / ChatGPT subscription (2, 3):** writes a minimal config and offers to run the OAuth login inline. On a local machine, just say yes and a browser opens. On a remote VM over SSH, the installer detects this and tells you to first re-connect with `ssh -L 8976:localhost:8976` to forward the OAuth callback port — you can still trigger the login from the installer once that's done.
+- **Claude / ChatGPT subscription (2, 3):** writes a minimal config and offers to run the OAuth login inline. On a local machine, just say yes and a browser opens. On a remote VM over SSH, the installer detects this and tells you to first re-connect with port forwarding so the OAuth callback can reach the listener on the remote host:
+  - Claude OAuth uses port **53692**: `ssh -L 53692:localhost:53692 <user>@<host>`
+  - ChatGPT Codex OAuth uses port **1455**: `ssh -L 1455:localhost:1455 <user>@<host>`
 - **Direct API key (4):** you'll pick a provider, paste your key, choose a model. The key is stored in `~/.config/forge/config.toml` (so file permissions matter — `chmod 600` it if you're paranoid).
 - **Skip (5):** writes a placeholder config you can edit by hand at `~/.config/forge/config.toml`. The file is annotated with examples for every endpoint type. Re-run `./install.sh` later if you want the interactive wizard.
 

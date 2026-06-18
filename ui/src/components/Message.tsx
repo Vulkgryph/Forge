@@ -200,17 +200,79 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
       );
     }
 
-    case "system":
+    case "system": {
+      const lines = entry.content.split("\n");
+      // Pattern-match the first line to choose a severity. The agent emits
+      // these prefixes consistently from auth.rs / install.sh / wizard text,
+      // so this stays in sync with where they're written.
+      const first = lines[0] ?? "";
+      const lower = first.toLowerCase();
+
+      // Detect a single bare URL line (frequently the OAuth auth_url) — make
+      // it bold cyan so the user can find it instantly to copy-paste.
+      const urlOnly = lines.length === 1 && /^\s*https?:\/\/\S+\s*$/.test(first);
+
+      let color: string | undefined;
+      let prefix = "";
+      if (urlOnly) {
+        color = "cyan";
+      } else if (lower.startsWith("error:") || lower.startsWith("login failed")) {
+        color = "red";
+        prefix = "✗ ";
+      } else if (
+        lower.startsWith("warning:") ||
+        lower.startsWith("note:") ||
+        lower.startsWith("port ") && lower.includes("in use")
+      ) {
+        color = "yellow";
+        prefix = "⚠ ";
+      } else if (lower.startsWith("tip:") || lower.startsWith("hint:") || lower.startsWith("looks like")) {
+        color = "cyan";
+        prefix = "ℹ ";
+      } else if (lower.startsWith("opening browser") || lower.startsWith("waiting for")) {
+        color = "green";
+        prefix = "▸ ";
+      }
+
+      if (urlOnly) {
+        return (
+          <Box>
+            <Text color={color} bold>{lines[0]!.trim()}</Text>
+          </Box>
+        );
+      }
+
+      if (color) {
+        return (
+          <Box flexDirection="column">
+            {lines.map((line, idx) => (
+              <Text key={idx} color={color}>
+                {idx === 0 ? prefix : "  "}
+                {line}
+              </Text>
+            ))}
+          </Box>
+        );
+      }
+
+      // Default: plain dim. Multi-line entries still render correctly because
+      // <Text> preserves embedded newlines.
       return (
         <Box>
           <Text dimColor>{entry.content}</Text>
         </Box>
       );
+    }
 
     case "error":
       return (
-        <Box marginTop={1}>
-          <Text color="red">{"⚠ "}{entry.content}</Text>
+        <Box marginTop={1} flexDirection="column">
+          {entry.content.split("\n").map((line, idx) => (
+            <Text key={idx} color="red" bold={idx === 0}>
+              {idx === 0 ? "✗ " : "  "}
+              {line}
+            </Text>
+          ))}
         </Box>
       );
 

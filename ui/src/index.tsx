@@ -16,6 +16,7 @@ const VALID_OPTIONS = [
   "--dangerously-allow-all",
   "--resume-session",
   "--login",
+  "--login-claude",
   "--login-chatgpt",
 ] as const;
 
@@ -32,8 +33,10 @@ function usage(): string {
     "      --cwd <path>              Start Forge in a specific project directory",
     "      --dangerously-allow-all   Bypass all tool approval prompts",
     "      --resume-session <id>     Resume a session by ID",
-    "      --login                   Log in to Claude via OAuth (claude.ai / Pro / Max)",
-    "      --login-chatgpt           Log in to ChatGPT via OAuth (Codex subscription)",
+    "      --login [provider]        OAuth login. Without a provider, shows a menu.",
+    "                                Providers: claude, chatgpt",
+    "      --login-claude            Shortcut for: --login claude",
+    "      --login-chatgpt           Shortcut for: --login chatgpt",
   ].join("\n");
 }
 
@@ -111,24 +114,103 @@ function parseArgs(argv: string[]): { agentArgs: string[]; cwd?: string } {
 }
 
 /**
- * Intercept --login / --login-chatgpt at the wrapper level so users coming
+ * Map a user-facing provider name to the forge-agent OAuth flag.
+ * Returns null if the name is unknown.
+ */
+function providerToAgentFlag(name: string): string | null {
+  const normalized = name.trim().toLowerCase();
+  if (["claude", "anthropic", "claude.ai"].includes(normalized)) return "--login";
+  if (["chatgpt", "codex", "openai", "gpt"].includes(normalized)) return "--login-chatgpt";
+  return null;
+}
+
+/** Print the login provider menu and read the user's choice. */
+async function chooseLoginProvider(): Promise<string> {
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log("");
+  console.log("Which subscription do you want to log in to?");
+  console.log("");
+  console.log("  1) Claude          (claude.ai / Pro / Max)");
+  console.log("  2) ChatGPT Codex   (Plus / Pro / Team with Codex)");
+  console.log("");
+
+  try {
+    while (true) {
+      const answer = (await rl.question("  Choice [1-2]: ")).trim();
+      const flag = (() => {
+        if (answer === "1") return providerToAgentFlag("claude");
+        if (answer === "2") return providerToAgentFlag("chatgpt");
+        return providerToAgentFlag(answer);   // also accept "claude" / "chatgpt" typed
+      })();
+      if (flag) return flag;
+      console.log(`  '${answer}' is not a recognized choice.`);
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Intercept the login family of flags at the wrapper level so users coming
  * from Claude Code or ChatGPT Codex see the convention they expect — i.e.
  * `forge --login` works, not just `forge-agent --login`. We bypass the Ink
  * TUI entirely and run forge-agent inline with inherited stdio so the OAuth
  * prompts (and the paste-the-code fallback) feel native.
+ *
+ * Accepts:
+ *   forge --login                  → show menu, then dispatch
+ *   forge --login <provider>       → direct OAuth for that provider
+ *   forge --login-claude           → shortcut for --login claude
+ *   forge --login-chatgpt          → shortcut for --login chatgpt
  */
 async function maybeRunLogin(argv: string[]): Promise<void> {
-  const loginArg = argv.find((a) => a === "--login" || a === "--login-chatgpt");
-  if (!loginArg) return;
-
-  const otherArgs = argv.filter((a) => a !== loginArg);
-  if (otherArgs.length > 0) {
-    console.error(`forge: ${loginArg} cannot be combined with other options. Got: ${otherArgs.join(" ")}`);
-    process.exit(2);
+  // Shortcut forms — easy to handle first.
+  if (argv.includes("--login-claude")) {
+    return runLogin("--login", argv, "--login-claude");
+  }
+  if (argv.includes("--login-chatgpt")) {
+    return runLogin("--login-chatgpt", argv, "--login-chatgpt");
   }
 
+  // --login [provider] form.
+  const idx = argv.indexOf("--login");
+  if (idx < 0) return;
+
+  const providerArg = argv[idx + 1];
+  let agentFlag: string;
+
+  if (providerArg && !providerArg.startsWith("-")) {
+    const flag = providerToAgentFlag(providerArg);
+    if (!flag) {
+      console.error(`forge: unknown login provider '${providerArg}'. Known: claude, chatgpt.`);
+      console.error(`  (Gemini, DeepSeek, etc. can be used today via OpenRouter — log in with --login-chatgpt or set up an API key in the /model menu.)`);
+      process.exit(2);
+    }
+    agentFlag = flag;
+    // Validate nothing else weird was passed
+    const rest = [...argv.slice(0, idx), ...argv.slice(idx + 2)];
+    if (rest.length > 0) {
+      console.error(`forge: --login <provider> cannot be combined with other options. Got: ${rest.join(" ")}`);
+      process.exit(2);
+    }
+  } else {
+    // Bare --login with no provider — show menu.
+    const rest = [...argv.slice(0, idx), ...argv.slice(idx + 1)];
+    if (rest.length > 0) {
+      console.error(`forge: --login cannot be combined with other options. Got: ${rest.join(" ")}`);
+      process.exit(2);
+    }
+    agentFlag = await chooseLoginProvider();
+  }
+
+  return runLogin(agentFlag, [], "--login");
+}
+
+async function runLogin(agentFlag: string, _argv: string[], _userForm: string): Promise<void> {
   const binary = findAgentBinary();
-  const proc = Bun.spawn([binary, loginArg], {
+  const proc = Bun.spawn([binary, agentFlag], {
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",

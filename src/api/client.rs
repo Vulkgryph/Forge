@@ -784,7 +784,7 @@ impl ApiClient {
                 req = req
                     .header("authorization", format!("Bearer {}", current_token))
                     .header("anthropic-beta", ANTHROPIC_BETA)
-                    .header("user-agent", "claude-cli/2.1.75")
+                    .header("user-agent", format!("claude-cli/{}", crate::auth::claude_client_version().await))
                     .header("x-app", "cli")
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
@@ -969,12 +969,12 @@ impl ApiClient {
         let _ = tx.send(StreamEvent::Done { usage });
     }
 
-    fn anthropic_request(
+    async fn anthropic_request(
         &self,
         base_url: &str,
         token: &str,
         body: &serde_json::Value,
-    ) -> impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + '_ {
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let is_oauth = token.contains("sk-ant-oat");
         let mut req = self
             .client
@@ -984,17 +984,18 @@ impl ApiClient {
             .header("accept", "application/json");
 
         if is_oauth {
+            let ua = format!("claude-cli/{}", crate::auth::claude_client_version().await);
             req = req
                 .header("authorization", format!("Bearer {}", token))
                 .header("anthropic-beta", ANTHROPIC_BETA)
-                .header("user-agent", "claude-cli/2.1.75")
+                .header("user-agent", ua)
                 .header("x-app", "cli")
                 .header("anthropic-dangerous-direct-browser-access", "true");
         } else {
             req = req.header("x-api-key", token);
         }
 
-        req.json(body).send()
+        req.json(body).send().await
     }
 
     // ── Responses API backend (ChatGPT/Codex subscription auth) ──────────────
@@ -1360,7 +1361,7 @@ impl ApiClient {
             req = req
                 .header("authorization", format!("Bearer {}", auth_token))
                 .header("anthropic-beta", ANTHROPIC_BETA)
-                .header("user-agent", "claude-cli/2.1.75")
+                .header("user-agent", format!("claude-cli/{}", crate::auth::claude_client_version().await))
                 .header("x-app", "cli")
                 .header("anthropic-dangerous-direct-browser-access", "true");
         } else {

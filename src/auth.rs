@@ -114,21 +114,23 @@ pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
 }
 
 pub async fn fetch_chatgpt_codex_models() -> Vec<ChatGptCodexModel> {
-    // 1) Local Codex CLI cache, if the user happens to have it installed.
-    //    Fast, no network. Most Forge users won't have this.
+    // 1) Live backend query using the user's ChatGPT OAuth token. This is
+    //    the source of truth — the codex CLI's local cache seeds from this
+    //    same endpoint. We don't need the CLI installed; we just need the
+    //    `client_version` query parameter the backend requires, and the
+    //    same originator/user-agent the CLI sends.
+    if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
+        return models;
+    }
+
+    // 2) Local Codex CLI cache, if the user happens to have it installed
+    //    AND the network call above failed (offline, rate-limited, etc.).
     if let Some(models) = fetch_chatgpt_codex_models_from_cli().await {
         return models;
     }
     let cached = fetch_chatgpt_codex_models_from_cache();
     if !cached.is_empty() {
         return cached;
-    }
-
-    // 2) Live backend query using the user's ChatGPT OAuth token. This is
-    //    the path most Forge users will take — they logged in via
-    //    `forge --login chatgpt` but never installed the official codex CLI.
-    if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
-        return models;
     }
 
     // 3) Last-ditch hardcoded fallback. Better than letting "default" reach
@@ -197,21 +199,34 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
         .build()
         .ok()?;
 
-    // Try the most likely endpoints. The backend layout has shifted over time
-    // (codex/models, models?filter=codex). Take the first one that returns a
-    // parseable model list. Caching this would be nice but the codex CLI
-    // already does it - we only fall here when its cache is absent.
+    // The backend requires a `client_version` query parameter; missing it
+    // returns 400 ("Field required: query.client_version"). We pin to a
+    // recent codex CLI release. OpenAI accepts older versions for a while,
+    // so this stays valid until they drop support — at which point we bump
+    // the constant. (The official codex CLI sends its own real version
+    // here; we just need a value the backend accepts.)
+    const CODEX_CLIENT_VERSION: &str = "0.140.0";
+
+    // Try the most likely endpoints. /codex/models is the documented one; the
+    // bare /models exists too but historically requires different params.
+    // Take the first that returns a parseable list with at least one model.
     let urls = [
-        "https://chatgpt.com/backend-api/codex/models",
-        "https://chatgpt.com/backend-api/models",
+        format!(
+            "https://chatgpt.com/backend-api/codex/models?client_version={}",
+            CODEX_CLIENT_VERSION
+        ),
+        format!(
+            "https://chatgpt.com/backend-api/models?client_version={}",
+            CODEX_CLIENT_VERSION
+        ),
     ];
 
     for url in urls {
         let Ok(resp) = http
-            .get(url)
+            .get(&url)
             .bearer_auth(bearer)
             .header("accept", "application/json")
-            .header("user-agent", "codex_cli_rs/0.1.0")
+            .header("user-agent", format!("codex_cli_rs/{}", CODEX_CLIENT_VERSION))
             .header("originator", "codex_cli_rs")
             .send()
             .await

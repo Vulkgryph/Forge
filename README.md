@@ -192,31 +192,28 @@ default_model = "fast"
 
 Forge can also use a ChatGPT account with Codex access. Log in from the UI:
 
-```text
-/login --chatgpt
-```
-
-Or from the command line:
+From the command line:
 
 ```bash
-forge --login-chatgpt           # preferred
-forge-agent --login-chatgpt     # equivalent (skips the wrapper)
+forge --login                   # show a menu and pick a provider
+forge --login claude            # direct OAuth for Claude
+forge --login chatgpt           # direct OAuth for ChatGPT Codex
+forge --login-claude            # shortcut form
+forge --login-chatgpt           # shortcut form
+
+# Lower-level equivalents (skip the wrapper):
+forge-agent --login
+forge-agent --login-chatgpt
 ```
 
-After login, Forge adds a `chatgpt-codex` endpoint that uses ChatGPT OAuth credentials stored at `~/.config/forge/chatgpt_auth.json`.
-
-Claude subscription login is also available:
+Or from inside the TUI:
 
 ```text
 /login --anthropic
+/login --chatgpt
 ```
 
-Or:
-
-```bash
-forge --login                   # preferred
-forge-agent --login             # equivalent
-```
+After login, Forge stores OAuth credentials at `~/.config/forge/auth.json` (Claude) or `~/.config/forge/chatgpt_auth.json` (ChatGPT Codex), and adds the corresponding endpoint to your config.
 
 > **Remote / firewall users:** the OAuth flow listens on `localhost:53692` (Claude) or `localhost:1455` (ChatGPT Codex). If your browser can't reach those (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar and paste it into forge.
 

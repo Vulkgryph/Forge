@@ -231,7 +231,7 @@ Or from inside the TUI:
 
 After login, Forge stores OAuth credentials at `~/.config/forge/auth.json` (Claude) or `~/.config/forge/chatgpt_auth.json` (ChatGPT Codex), and adds the corresponding endpoint to your config.
 
-> **Remote / firewall users:** the OAuth flow listens on `localhost:53692` (Claude) or `localhost:1455` (ChatGPT Codex). If your browser can't reach those (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar and paste it into forge.
+> **Remote / firewall users:** the OAuth flow listens on `localhost:53692` (Claude) or `localhost:1455` (ChatGPT Codex). If your browser can't reach those (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar after it fails to load, and paste it into forge.
 
 ### Config reference
 

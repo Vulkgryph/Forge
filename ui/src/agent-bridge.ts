@@ -17,11 +17,43 @@ export class AgentBridge extends EventEmitter {
     this.proc = spawn([agentPath, "--headless", ...args], {
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "inherit",
+      // Pipe (not inherit) so the agent's eprintln! output doesn't paint
+      // over Ink's screen rendering. Particularly bad during OAuth login,
+      // where auth.rs prints the URL and instructions to stderr — those
+      // would otherwise interleave with the TUI mid-render.
+      stderr: "pipe",
       ...(cwd ? { cwd } : {}),
     });
 
     this.readLoop();
+    this.stderrLoop();
+  }
+
+  private async stderrLoop() {
+    const stderr = this.proc.stderr;
+    if (!stderr || typeof stderr === "number") return;
+
+    const reader = (stderr as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        // Split on newlines, emit each non-empty line to anyone subscribed.
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trimEnd();
+          buf = buf.slice(nl + 1);
+          if (line) this.emit("stderr", line);
+        }
+      }
+      if (buf.trim()) this.emit("stderr", buf.trimEnd());
+    } catch (_err) {
+      // Process ended
+    }
   }
 
   private async readLoop() {

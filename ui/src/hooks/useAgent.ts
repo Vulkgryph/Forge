@@ -299,6 +299,23 @@ export function useAgent(options: UseAgentOptions = {}) {
 
     bridge.on("message", handleMessage);
 
+    // Surface agent stderr (e.g. OAuth URL prints, model-detect warnings)
+    // as system entries in scrollback. The bridge pipes stderr instead of
+    // inheriting it so the raw text doesn't paint over Ink's rendering;
+    // this hook decides what to do with each line. Cap line length to
+    // prevent a single very long line from blowing up the layout.
+    bridge.on("stderr", (line: string) => {
+      if (generation !== bridgeGenerationRef.current) return;
+      const trimmed = line.length > 2000 ? line.slice(0, 2000) + "..." : line;
+      setState((prev) => ({
+        ...prev,
+        scrollback: [
+          ...prev.scrollback,
+          { id: nextId(), kind: "system", content: trimmed },
+        ],
+      }));
+    });
+
     bridge.on("exit", () => {
       if (generation !== bridgeGenerationRef.current) return;
       bridgeReadyRef.current = false;

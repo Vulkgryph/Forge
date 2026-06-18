@@ -245,13 +245,14 @@ fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel
 
     let mut discovered = Vec::new();
     for model in models {
-        if model
-            .get("visibility")
-            .and_then(|v| v.as_str())
-            .is_some_and(|visibility| visibility == "hide")
-        {
-            continue;
-        }
+        // ChatGPT marks some models as visibility: "hide" — these are usually
+        // deprecated, internal, or otherwise hidden from the default ChatGPT
+        // web UI, but they remain callable via the Codex API for users who
+        // know the slug. Surface them in Forge's picker too; users probably
+        // want to see (and choose) anything their account can actually use.
+        // The same applies to "enterprise-only" or other gated visibility
+        // values — we don't filter on them either.
+        let _ = model.get("visibility");
         let Some(id) = model.get("slug").and_then(|v| v.as_str()) else {
             continue;
         };

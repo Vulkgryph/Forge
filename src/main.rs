@@ -14,6 +14,33 @@ mod config;
 mod headless;
 mod tools;
 
+/// Format an OAuth token-refresh failure into a clean multi-line message.
+/// The underlying error has already been distilled to "<message> (code: X)" by
+/// auth::parse_oauth_error_body — we just decide what next-step advice to give
+/// based on common codes, and frame it nicely.
+fn print_oauth_refresh_error(provider: &str, error: &str, relogin_command: &str) {
+    eprintln!();
+    eprintln!("forge: cannot use saved {} credentials.", provider);
+
+    // Pull out a human-readable cause based on the parsed error code.
+    let cause = if error.contains("refresh_token_reused") {
+        "Your refresh token was already used elsewhere (another login replaced it)."
+    } else if error.contains("invalid_grant") || error.contains("expired_token") {
+        "Your saved session has expired or been revoked."
+    } else if error.contains("invalid_client") || error.contains("unauthorized_client") {
+        "The OAuth client is no longer authorized."
+    } else if error.contains("HTTP 5") {
+        "The auth server is temporarily unavailable. Try again in a moment."
+    } else {
+        // Fall back to whatever the server told us.
+        error
+    };
+
+    eprintln!("        {}", cause);
+    eprintln!("        Re-authenticate: {}", relogin_command);
+    eprintln!();
+}
+
 #[derive(Parser)]
 #[command(name = "forge-agent", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
@@ -126,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match auth::get_valid_token(&http).await {
                     Ok(t) => Some(t),
                     Err(e) => {
-                        eprintln!("forge: Claude OAuth token refresh failed: {}. Run forge-agent --login to re-authenticate.", e);
+                        print_oauth_refresh_error("Claude", &e.to_string(), "forge --login");
                         None
                     }
                 }
@@ -138,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match auth::get_valid_chatgpt_token(&http).await {
                 Ok(t) => Some(t.access_token),
                 Err(e) => {
-                    eprintln!("forge: ChatGPT Codex token refresh failed: {}. Run forge-agent --login-chatgpt to re-authenticate.", e);
+                    print_oauth_refresh_error("ChatGPT Codex", &e.to_string(), "forge --login-chatgpt");
                     None
                 }
             }

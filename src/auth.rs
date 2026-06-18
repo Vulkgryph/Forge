@@ -422,7 +422,7 @@ async fn refresh_tokens(http: &reqwest::Client, old_tokens: &OAuthTokens) -> Res
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Token refresh failed ({}): {}", status, body);
+        anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
     }
 
     parse_token_response(resp, &old_tokens.refresh_token).await
@@ -447,12 +447,43 @@ async fn refresh_chatgpt_tokens(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("ChatGPT token refresh failed ({}): {}", status, body);
+        anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
     }
 
     let mut tokens = parse_chatgpt_token_response(resp, Some(old_tokens)).await?;
     tokens.api_key = obtain_chatgpt_api_key(http, &tokens.id_token).await.ok();
     Ok(tokens)
+}
+
+/// Convert an OAuth error response body into a short, human-readable string.
+/// Handles both the OpenAI-style `{"error": {"code": ..., "message": ...}}`
+/// shape and the RFC 6749 flat `{"error": "...", "error_description": "..."}`
+/// shape. Falls back to the raw body if it isn't recognizable JSON.
+fn parse_oauth_error_body(status: u16, body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        // OpenAI nested shape
+        if let Some(err) = value.get("error").and_then(|e| e.as_object()) {
+            let code = err.get("code").and_then(|v| v.as_str());
+            let message = err.get("message").and_then(|v| v.as_str());
+            if let (Some(c), Some(m)) = (code, message) {
+                return format!("{} (code: {})", m, c);
+            }
+            if let Some(m) = message {
+                return m.to_string();
+            }
+        }
+        // RFC 6749 flat shape
+        if let (Some(err), desc) = (
+            value.get("error").and_then(|v| v.as_str()),
+            value.get("error_description").and_then(|v| v.as_str()),
+        ) {
+            return match desc {
+                Some(d) => format!("{} (code: {})", d, err),
+                None => err.to_string(),
+            };
+        }
+    }
+    format!("HTTP {}: {}", status, body.trim())
 }
 
 async fn obtain_chatgpt_api_key(http: &reqwest::Client, id_token: &str) -> Result<String> {

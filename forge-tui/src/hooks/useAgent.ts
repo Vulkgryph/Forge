@@ -986,7 +986,16 @@ export function useAgent(options: UseAgentOptions = {}) {
             loginInProgress: false,
             anthropicLoggedIn: msg.success && msg.message.includes("Claude") ? true : prev.anthropicLoggedIn,
             chatgptLoggedIn: msg.success && msg.message.includes("ChatGPT") ? true : prev.chatgptLoggedIn,
-            scrollback: [...prev.scrollback, { id: nextId(), kind: "system", content: msg.message }],
+            // Failure is an error, not a neutral system note — render with the
+            // error styling so the user actually notices it.
+            scrollback: [
+              ...prev.scrollback,
+              {
+                id: nextId(),
+                kind: msg.success ? "system" : "error",
+                content: msg.message,
+              },
+            ],
           }));
           break;
 

@@ -170,6 +170,138 @@ async fn fetch_chatgpt_codex_models_from_cli() -> Option<Vec<ChatGptCodexModel>>
     parse_chatgpt_codex_models(&output.stdout)
 }
 
+/// Resolve the `client_version` to send to the Codex backend. OpenAI's
+/// model-catalog endpoint requires this query parameter and rejects
+/// outdated values. Forge keeps it current automatically — no codex CLI
+/// install or manual intervention required.
+///
+/// Resolution order (first hit wins):
+///   1. Forge's own cache at `~/.config/forge/codex_client_version.json`
+///      if the cached value is less than 7 days old.
+///   2. Live query to `api.github.com/repos/openai/codex/releases/latest`
+///      (no auth required, 60 req/hr rate limit is comfortable). Result
+///      is written to the cache.
+///   3. Stale cache, if the GitHub query failed (offline, rate-limited).
+///   4. The codex CLI's own `~/.codex/models_cache.json` if it happens
+///      to be present — bonus safety net for users who have the CLI.
+///   5. Hardcoded baseline `0.140.0`.
+async fn detect_codex_client_version() -> String {
+    const FALLBACK: &str = "0.140.0";
+    const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+    // 1) Fresh forge cache
+    if let Some(cached) = read_codex_version_cache() {
+        if !cached.is_stale(CACHE_MAX_AGE_SECS) {
+            return cached.version;
+        }
+    }
+
+    // 2) GitHub
+    if let Some(latest) = fetch_latest_codex_version_from_github().await {
+        let _ = write_codex_version_cache(&latest);
+        return latest;
+    }
+
+    // 3) Stale cache beats nothing
+    if let Some(cached) = read_codex_version_cache() {
+        return cached.version;
+    }
+
+    // 4) Borrow from the codex CLI's cache if the user has it
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".codex").join("models_cache.json");
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(v) = json.get("client_version").and_then(|v| v.as_str()) {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+
+    // 5) Last resort
+    FALLBACK.to_string()
+}
+
+#[derive(Serialize, Deserialize)]
+struct CodexVersionCache {
+    version: String,
+    fetched_at: u64,
+}
+
+impl CodexVersionCache {
+    fn is_stale(&self, max_age_secs: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(self.fetched_at) > max_age_secs
+    }
+}
+
+fn codex_version_cache_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".config").join("forge").join("codex_client_version.json"))
+}
+
+fn read_codex_version_cache() -> Option<CodexVersionCache> {
+    let path = codex_version_cache_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_codex_version_cache(version: &str) -> std::io::Result<()> {
+    let path = codex_version_cache_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no home dir"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cache = CodexVersionCache {
+        version: version.to_string(),
+        fetched_at,
+    };
+    let content = serde_json::to_string_pretty(&cache)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&path, content)
+}
+
+async fn fetch_latest_codex_version_from_github() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.github.com/repos/openai/codex/releases/latest")
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "forge-agent")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    // `name` is the cleaned version ("0.141.0"); `tag_name` is "rust-v0.141.0"
+    // and would need stripping. Prefer `name`.
+    if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
+        let cleaned = name.trim().trim_start_matches('v');
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+    if let Some(tag) = body.get("tag_name").and_then(|v| v.as_str()) {
+        let cleaned = tag.trim_start_matches("rust-").trim_start_matches('v');
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
 fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
@@ -200,12 +332,16 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
         .ok()?;
 
     // The backend requires a `client_version` query parameter; missing it
-    // returns 400 ("Field required: query.client_version"). We pin to a
-    // recent codex CLI release. OpenAI accepts older versions for a while,
-    // so this stays valid until they drop support — at which point we bump
-    // the constant. (The official codex CLI sends its own real version
-    // here; we just need a value the backend accepts.)
-    const CODEX_CLIENT_VERSION: &str = "0.140.0";
+    // returns 400 ("Field required: query.client_version"). OpenAI accepts
+    // older versions for a long time but eventually drops support — so
+    // we want this value to stay reasonably current.
+    //
+    // Strategy: if the user happens to have the official codex CLI
+    // installed, read the version it last cached. That CLI auto-updates,
+    // so forge auto-picks-up the latest accepted value for free. If
+    // they don't have the CLI, fall back to a baseline pinned here that
+    // we bump in releases as needed.
+    let codex_client_version = detect_codex_client_version().await;
 
     // Try the most likely endpoints. /codex/models is the documented one; the
     // bare /models exists too but historically requires different params.
@@ -213,11 +349,11 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
     let urls = [
         format!(
             "https://chatgpt.com/backend-api/codex/models?client_version={}",
-            CODEX_CLIENT_VERSION
+            codex_client_version
         ),
         format!(
             "https://chatgpt.com/backend-api/models?client_version={}",
-            CODEX_CLIENT_VERSION
+            codex_client_version
         ),
     ];
 
@@ -226,7 +362,7 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
             .get(&url)
             .bearer_auth(bearer)
             .header("accept", "application/json")
-            .header("user-agent", format!("codex_cli_rs/{}", CODEX_CLIENT_VERSION))
+            .header("user-agent", format!("codex_cli_rs/{}", codex_client_version))
             .header("originator", "codex_cli_rs")
             .send()
             .await

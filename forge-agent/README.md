@@ -4,6 +4,22 @@ Created by **Vulkgryph LLC**.
 
 An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project via a terminal UI and a headless JSON protocol.
 
+## Philosophy
+
+Forge is built for engineers who want a tool they can rely on, not a tool they chase. The aim is a small, readable codebase with a stable interface — so the command you learn today behaves the same way the next time you use it, and your config file doesn't need to be rewritten between releases.
+
+**Versioning and compatibility:**
+
+- Every release is built to be as backwards-compatible as possible. Commands, config keys, file formats, and the headless JSON protocol stay valid across minor versions by default.
+- Major versions are reserved for changes that genuinely need a break. When one ships, it includes a clear explanation of *why* the change was required and *what* it affects, plus either a straightforward manual migration or automatic migration.
+- Deprecations are flagged in advance. Nothing that worked in the last release gets removed in a surprise patch.
+
+Forge is intentionally not chasing the newest agent architecture every month. If you want a tool that ships a new "workflow paradigm" every release, Forge is probably not for you. If you want a tool whose interfaces stay stable while the implementation gets smaller, faster, and more reliable underneath, that's what Forge is trying to be.
+
+**Inspection is the point.** The source is here. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md). The public roadmap lives at [vulkgryph.com/roadmap](https://vulkgryph.com/roadmap/). If something looks wrong, file an issue or email `contact@vulkgryph.com` — that's a more useful signal than any marketing claim could be.
+
+**On limitations.** Forge is maintained by a small team, and catching every edge case after a patch is beyond what testing alone can cover. After an update, the maintainers know roughly what changed; the community is what surfaces the edge cases and unexpected behavior that a release notes line can miss. If a patch breaks something for you — a workflow that worked before, an integration that no longer behaves the same, a config that stopped being honored — file an issue. That signal is how regressions actually get found.
+
 ## Features
 
 - **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, web search/fetch
@@ -399,6 +415,21 @@ For security issues, see [SECURITY.md](SECURITY.md) — please do not file publi
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). See the [NOTICE](NOTICE) file for attribution.
+Forge is licensed under the [Apache License, Version 2.0](LICENSE). See the [NOTICE](NOTICE) file for attribution.
 
 Copyright © 2026 Vulkgryph LLC.
+
+### Disclaimer
+
+Forge is provided **"AS IS"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement.
+
+Forge is a tool that reads, writes, and executes code on the user's machine. It can modify or delete files, run arbitrary shell commands, and call out to external LLM providers and other network services. In no event shall Vulkgryph LLC or any contributor be liable for any claim, damages, or other liability — whether in contract, tort, or otherwise — arising from the use of Forge, including but not limited to:
+
+- Lost, corrupted, or overwritten files
+- System damage or unintended state changes
+- Commands executed by the agent that the user did not anticipate
+- Leaked credentials, secrets, or API keys via model output, tool output, or session logs
+- Financial costs incurred through LLM API or subscription usage
+- Indirect, incidental, special, consequential, or punitive damages of any kind
+
+Use of Forge implies acceptance of these terms. The full legal language is in [LICENSE](LICENSE), which is the binding document; the plain-English summary above is provided for clarity, not as a replacement.

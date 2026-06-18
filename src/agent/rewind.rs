@@ -189,8 +189,8 @@ pub fn diff_summary(
                     &snapshot.commit,
                     "--",
                     ".",
-                    ":(exclude).forge",
-                    ":(exclude).agent",
+                    ":(exclude,top).forge",
+                    ":(exclude,top).agent",
                 ],
             )?;
             let root_label = snapshot
@@ -220,8 +220,8 @@ pub fn diff_summary(
             commit,
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ]
     } else if let Some(sha) = git_stash_sha.filter(|sha| !sha.trim().is_empty()) {
         vec![
@@ -230,8 +230,8 @@ pub fn diff_summary(
             sha,
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ]
     } else if let Some(head) = git_base_head.filter(|head| !head.trim().is_empty()) {
         vec![
@@ -240,8 +240,8 @@ pub fn diff_summary(
             head,
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ]
     } else {
         vec![
@@ -250,8 +250,8 @@ pub fn diff_summary(
             "HEAD",
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ]
     };
 
@@ -290,8 +290,8 @@ fn diff_summary_for_args(project_root: &Path, args: &[&str]) -> Result<RewindDif
             "--exclude-standard",
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ],
     )?;
     for path in untracked.lines().filter(|line| !line.trim().is_empty()) {
@@ -380,18 +380,35 @@ pub fn create_turn_snapshot(
         )?;
     }
 
-    git_output_with_env(
+    // git add can fail when the project's .gitignore lists .forge / .agent
+    // AND git decides our exclude pathspecs aren't enough to suppress the
+    // "addIgnoredFile" check. Snapshotting is best-effort — if this fails,
+    // skip the snapshot for this turn rather than scaring the user.
+    let add_result = git_output_with_env(
         project_root,
         &[
             "add",
             "-A",
             "--",
             ".",
-            ":(exclude).forge",
-            ":(exclude).agent",
+            ":(exclude,top).forge",
+            ":(exclude,top).agent",
         ],
         &[("GIT_INDEX_FILE", index_path_string.as_str())],
-    )?;
+    );
+    if let Err(err) = add_result {
+        let msg = err.to_string();
+        // Recognized non-fatal cases: the user has .forge/.agent in their
+        // .gitignore but the pathspec exclusion didn't fully suppress git's
+        // safety check. Snapshot is skipped silently for this turn.
+        if msg.contains("ignored by one of your .gitignore")
+            || msg.contains("addIgnoredFile")
+        {
+            let _ = std::fs::remove_file(&index_path);
+            return Ok(None);
+        }
+        return Err(err);
+    }
     let tree = git_output_with_env(
         project_root,
         &["write-tree"],

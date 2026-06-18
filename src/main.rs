@@ -81,12 +81,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    // Resolve "auto" model ID: query the endpoint's /v1/models and use
-    // the first result. This lets Oxide (and other local servers) be
-    // configured without knowing the model name in advance.
+    // Resolve "auto" model ID. The strategy differs by endpoint:
+    //   - OpenAI-compatible / Anthropic: query /v1/models and pick the first.
+    //   - ChatGPT Codex: there's no usable /v1/models endpoint, so query the
+    //     Codex subscription model catalog (cached locally by the CLI) and
+    //     pick the first.
     let model_id = if endpoint.model_id == "auto" {
-        let probe_client = api::ApiClient::from_endpoint(endpoint, None);
-        match probe_client.resolve_auto_model_id().await {
+        let resolved = match endpoint.endpoint_type {
+            config::EndpointType::ChatGptCodex => {
+                let models = auth::fetch_chatgpt_codex_models().await;
+                models.first().map(|m| m.id.clone())
+            }
+            _ => {
+                let probe_client = api::ApiClient::from_endpoint(endpoint, None);
+                probe_client.resolve_auto_model_id().await
+            }
+        };
+        match resolved {
             Some(id) => {
                 eprintln!(
                     "forge: auto-detected model '{}' from {}",
@@ -95,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id
             }
             None => {
-                eprintln!("forge: warning — model_id = \"auto\" but /v1/models returned nothing; using \"default\"");
+                eprintln!("forge: warning — model_id = \"auto\" but no models could be discovered; using \"default\"");
                 "default".to_string()
             }
         }

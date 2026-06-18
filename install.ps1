@@ -231,6 +231,7 @@ endpoint_type = "anthropic"
             $defaultModel = "claude"
             $LOGIN_CMD = "--login"
             $LOGIN_LABEL = "Claude"
+            $LOGIN_PORT = "53692"
         }
 
         '3' {
@@ -249,6 +250,7 @@ endpoint_type = "chatgpt_codex"
             $defaultModel = "chatgpt-codex"
             $LOGIN_CMD = "--login-chatgpt"
             $LOGIN_LABEL = "ChatGPT Codex"
+            $LOGIN_PORT = "1455"
         }
 
         '4' {

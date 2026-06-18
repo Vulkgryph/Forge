@@ -328,6 +328,7 @@ endpoint_type = "anthropic"
 CONFIG
             LOGIN_CMD="--login"
             LOGIN_LABEL="Claude"
+            LOGIN_PORT="53692"
             ;;
 
         3)
@@ -346,6 +347,7 @@ endpoint_type = "chatgpt_codex"
 CONFIG
             LOGIN_CMD="--login-chatgpt"
             LOGIN_LABEL="ChatGPT Codex"
+            LOGIN_PORT="1455"
             ;;
 
         4)
@@ -457,14 +459,14 @@ CONFIG
 
     # OAuth login flow for subscription choices (2, 3).
     # Offer to run the login inline; warn first if we're on a remote SSH session
-    # since the OAuth callback hits localhost:8976 (needs port forwarding).
+    # since the OAuth callback hits localhost:$LOGIN_PORT (needs port forwarding).
     if [[ "$LLM_CHOICE" == "2" || "$LLM_CHOICE" == "3" ]]; then
         echo ""
         if [[ -n "${SSH_CONNECTION:-}" ]]; then
             warn "You're on a remote SSH session. The $LOGIN_LABEL OAuth flow opens a browser"
-            warn "and waits for a callback on port 8976 — which only works if you've already"
+            warn "and waits for a callback on port $LOGIN_PORT — which only works if you've already"
             warn "forwarded that port from your local machine. To forward it, exit and reconnect with:"
-            warn "    ssh -L 8976:localhost:8976 <user>@<host>"
+            warn "    ssh -L $LOGIN_PORT:localhost:$LOGIN_PORT <user>@<host>"
             warn "Then re-run:  forge-agent $LOGIN_CMD"
             echo ""
             read -r -p "Try running login now anyway? [y/N]: " RUN_LOGIN

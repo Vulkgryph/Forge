@@ -406,12 +406,22 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
         addSystemEntry("Login already in progress.");
         return;
       }
+      addSystemEntry(
+        "Tip: if the browser opens but login never completes (callback port may be busy — e.g. VS Code, codex CLI),\n" +
+        "quit forge (/quit) and run  forge --login  from your shell. That path supports manual code-paste\n" +
+        "even when the localhost callback can't bind."
+      );
       send({ type: "login_anthropic" });
     } else if (flag === "--chatgpt" || flag === "--codex") {
       if (state.loginInProgress) {
         addSystemEntry("Login already in progress.");
         return;
       }
+      addSystemEntry(
+        "Tip: if the browser opens but login never completes (callback port may be busy — e.g. VS Code, codex CLI),\n" +
+        "quit forge (/quit) and run  forge --login-chatgpt  from your shell. That path supports manual code-paste\n" +
+        "even when the localhost callback can't bind."
+      );
       send({ type: "login_chatgpt" });
     } else {
       addSystemEntry(`Unknown provider: ${flag}\nUsage: /login --help`);

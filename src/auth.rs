@@ -905,13 +905,32 @@ async fn wait_for_callback_on(
         }
         Err(e) => {
             // Port is in use — common culprits: a stuck previous login attempt,
-            // VS Code (which uses 1455 internally), or anything else that
-            // happened to grab the same port. Fall through to paste-only mode
-            // rather than refusing to proceed.
+            // VS Code (which uses 1455 internally), the official Claude Code or
+            // codex CLI running in parallel, or anything else that happened to
+            // grab the same port. Fall through to paste-only mode rather than
+            // refusing to proceed, but try to name the process so the user
+            // knows whether to close it or accept the manual flow.
             eprintln!();
-            eprintln!("Note: port {} is already in use ({}), so the automatic", port, e);
-            eprintln!("browser callback can't be received on this machine. You can still");
-            eprintln!("complete login manually:");
+            match identify_port_holder(port) {
+                Some(holder) => {
+                    eprintln!("Note: port {} is already in use ({}: {}).", port, e, holder);
+                    if let Some(suggestion) = suggestion_for_holder(&holder) {
+                        eprintln!("      {}", suggestion);
+                    }
+                }
+                None => {
+                    eprintln!("Note: port {} is already in use ({}).", port, e);
+                    eprintln!("      To find the process holding it:");
+                    if cfg!(target_os = "windows") {
+                        eprintln!("        Get-NetTCPConnection -LocalPort {} -State Listen", port);
+                    } else {
+                        eprintln!("        lsof -nP -iTCP:{} -sTCP:LISTEN", port);
+                    }
+                }
+            }
+            eprintln!();
+            eprintln!("The automatic browser callback can't be received here, but you can");
+            eprintln!("still complete login manually:");
             eprintln!();
             eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
             eprintln!("  2. After approving, your browser will try to load");
@@ -919,13 +938,80 @@ async fn wait_for_callback_on(
             eprintln!("     and show \"site can't be reached\". That's expected.");
             eprintln!("  3. Copy the URL from your browser's address bar and paste it below.");
             eprintln!();
-            eprintln!("(Tip: if the port collision is unexpected, run `lsof -nP -iTCP:{} -sTCP:LISTEN`", port);
-            eprintln!(" to find the process holding it.)");
-            eprintln!();
 
             let expected_state_owned = expected_state.map(str::to_string);
             read_code_from_stdin(expected_state_owned).await
         }
+    }
+}
+
+/// Best-effort probe of what process is holding a TCP listener port. Returns
+/// a short human-readable string like "PID 12345 (Code Helper)" or None if
+/// the probe failed (lsof / netstat unavailable, etc.).
+fn identify_port_holder(port: u16) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("lsof")
+            .args([
+                "-nP",
+                &format!("-iTCP:{}", port),
+                "-sTCP:LISTEN",
+                "-F",
+                "pcn",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut pid: Option<String> = None;
+        let mut command: Option<String> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix('p') {
+                pid = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix('c') {
+                command = Some(rest.to_string());
+            }
+        }
+        let pid = pid?;
+        // lsof escapes spaces in process names as \x20 — undo for readability.
+        let cmd = command.map(|c| c.replace("\\x20", " "));
+        Some(match cmd {
+            Some(c) => format!("PID {} ({})", pid, c),
+            None => format!("PID {}", pid),
+        })
+    }
+    #[cfg(windows)]
+    {
+        // PowerShell one-liner: find the listener, look up the process name.
+        let cmd = format!(
+            "$c = Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) {{ $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) {{ \"PID $($p.Id) ($($p.ProcessName))\" }} else {{ \"PID $($c.OwningProcess)\" }} }}",
+            port
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &cmd])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+}
+
+/// If we recognize the conflicting process, suggest a specific resolution.
+fn suggestion_for_holder(holder: &str) -> Option<&'static str> {
+    let lower = holder.to_lowercase();
+    if lower.contains("claude") {
+        Some("Looks like Claude Code is also running. Quit it for a one-click login, or use the manual flow below.")
+    } else if lower.contains("codex") {
+        Some("Looks like the codex CLI is also running. Quit it for a one-click login, or use the manual flow below.")
+    } else if lower.contains("code helper") || lower.contains("code\\x20h") {
+        Some("VS Code is holding this port for one of its internal helpers. Quit VS Code for a one-click login, or just use the manual flow below — it's only a few extra clicks.")
+    } else {
+        None
     }
 }
 

@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::process::Command;
 
 /// Best-effort launch of the user's default browser at `url`.
 /// Errors are ignored: every OAuth caller also prints the URL to stderr
@@ -115,16 +114,48 @@ pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
 }
 
 pub async fn fetch_chatgpt_codex_models() -> Vec<ChatGptCodexModel> {
+    // 1) Local Codex CLI cache, if the user happens to have it installed.
+    //    Fast, no network. Most Forge users won't have this.
     if let Some(models) = fetch_chatgpt_codex_models_from_cli().await {
         return models;
     }
-    fetch_chatgpt_codex_models_from_cache()
+    let cached = fetch_chatgpt_codex_models_from_cache();
+    if !cached.is_empty() {
+        return cached;
+    }
+
+    // 2) Live backend query using the user's ChatGPT OAuth token. This is
+    //    the path most Forge users will take — they logged in via
+    //    `forge --login chatgpt` but never installed the official codex CLI.
+    if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
+        return models;
+    }
+
+    // 3) Last-ditch hardcoded fallback. Better than letting "default" reach
+    //    the API and getting a 400. The agent's model picker can flip to
+    //    something more current if these slugs eventually retire.
+    vec![
+        ChatGptCodexModel {
+            id: "gpt-5-codex".to_string(),
+            display_name: "GPT-5 Codex".to_string(),
+            context_window: 272_000,
+            max_output_tokens: 16_384,
+        },
+        ChatGptCodexModel {
+            id: "gpt-5".to_string(),
+            display_name: "GPT-5".to_string(),
+            context_window: 272_000,
+            max_output_tokens: 16_384,
+        },
+    ]
 }
 
 async fn fetch_chatgpt_codex_models_from_cli() -> Option<Vec<ChatGptCodexModel>> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        Command::new("codex").args(["debug", "models"]).output(),
+        tokio::process::Command::new("codex")
+            .args(["debug", "models"])
+            .output(),
     )
     .await
     .ok()?
@@ -147,6 +178,59 @@ fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
         Err(_) => return vec![],
     };
     parse_chatgpt_codex_models(content.as_bytes()).unwrap_or_default()
+}
+
+/// Query the ChatGPT Codex backend's model catalog directly using the user's
+/// OAuth tokens. The official codex CLI seeds its local cache from this same
+/// endpoint, but Forge users typically don't have that CLI installed.
+///
+/// We pose as codex CLI in the request headers — same originator id the
+/// official tool uses, matching User-Agent — so the backend treats us
+/// identically. Tokens are obtained via the same OAuth flow with
+/// `originator=codex_cli_rs` already baked into the auth URL.
+async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexModel>> {
+    let tokens = load_chatgpt_tokens()?;
+    let bearer = tokens.api_key.as_deref().or(Some(tokens.access_token.as_str()))?;
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+
+    // Try the most likely endpoints. The backend layout has shifted over time
+    // (codex/models, models?filter=codex). Take the first one that returns a
+    // parseable model list. Caching this would be nice but the codex CLI
+    // already does it - we only fall here when its cache is absent.
+    let urls = [
+        "https://chatgpt.com/backend-api/codex/models",
+        "https://chatgpt.com/backend-api/models",
+    ];
+
+    for url in urls {
+        let Ok(resp) = http
+            .get(url)
+            .bearer_auth(bearer)
+            .header("accept", "application/json")
+            .header("user-agent", "codex_cli_rs/0.1.0")
+            .header("originator", "codex_cli_rs")
+            .send()
+            .await
+        else {
+            continue;
+        };
+
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.bytes().await else { continue };
+        if let Some(models) = parse_chatgpt_codex_models(&body) {
+            if !models.is_empty() {
+                return Some(models);
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel>> {

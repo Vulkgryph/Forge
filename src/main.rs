@@ -71,11 +71,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle --login before anything else
     if cli.login {
-        auth::login().await?;
+        // Standalone forge-agent --login. We own stdin, so the paste fallback
+        // is available if the localhost callback port is busy.
+        auth::login(true).await?;
         return Ok(());
     }
     if cli.login_chatgpt {
-        auth::login_chatgpt().await?;
+        auth::login_chatgpt(true).await?;
         return Ok(());
     }
 

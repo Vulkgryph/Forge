@@ -753,7 +753,11 @@ pub async fn run_headless(
                                         if let Ok(s) = serde_json::to_string(&status) {
                                             let _ = tx.send(s);
                                         }
-                                        match crate::auth::login().await {
+                                        // Inside the headless protocol — stdin is owned by the
+                                        // message reader, so the paste fallback isn't available.
+                                        // login() will bail with a clear error if the callback
+                                        // port is busy, pointing the user at `forge --login`.
+                                        match crate::auth::login(false).await {
                                             Ok(()) => {
                                                 // Fetch available models and push them to the UI
                                                 let http = reqwest::Client::new();
@@ -798,7 +802,7 @@ pub async fn run_headless(
                                         if let Ok(s) = serde_json::to_string(&status) {
                                             let _ = tx.send(s);
                                         }
-                                        match crate::auth::login_chatgpt().await {
+                                        match crate::auth::login_chatgpt(false).await {
                                             Ok(()) => {
                                                 let mut models =
                                                     crate::auth::fetch_chatgpt_codex_models().await;

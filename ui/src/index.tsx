@@ -3,6 +3,7 @@
 import React from "react";
 import { render } from "ink";
 import { App } from "./components/App.js";
+import { findAgentBinary } from "./agent-bridge.js";
 
 const VERSION = "0.1.0";
 
@@ -14,6 +15,8 @@ const VALID_OPTIONS = [
   "--cwd",
   "--dangerously-allow-all",
   "--resume-session",
+  "--login",
+  "--login-chatgpt",
 ] as const;
 
 function usage(): string {
@@ -29,6 +32,8 @@ function usage(): string {
     "      --cwd <path>              Start Forge in a specific project directory",
     "      --dangerously-allow-all   Bypass all tool approval prompts",
     "      --resume-session <id>     Resume a session by ID",
+    "      --login                   Log in to Claude via OAuth (claude.ai / Pro / Max)",
+    "      --login-chatgpt           Log in to ChatGPT via OAuth (Codex subscription)",
   ].join("\n");
 }
 
@@ -104,6 +109,35 @@ function parseArgs(argv: string[]): { agentArgs: string[]; cwd?: string } {
 
   return { agentArgs, cwd };
 }
+
+/**
+ * Intercept --login / --login-chatgpt at the wrapper level so users coming
+ * from Claude Code or ChatGPT Codex see the convention they expect — i.e.
+ * `forge --login` works, not just `forge-agent --login`. We bypass the Ink
+ * TUI entirely and run forge-agent inline with inherited stdio so the OAuth
+ * prompts (and the paste-the-code fallback) feel native.
+ */
+async function maybeRunLogin(argv: string[]): Promise<void> {
+  const loginArg = argv.find((a) => a === "--login" || a === "--login-chatgpt");
+  if (!loginArg) return;
+
+  const otherArgs = argv.filter((a) => a !== loginArg);
+  if (otherArgs.length > 0) {
+    console.error(`forge: ${loginArg} cannot be combined with other options. Got: ${otherArgs.join(" ")}`);
+    process.exit(2);
+  }
+
+  const binary = findAgentBinary();
+  const proc = Bun.spawn([binary, loginArg], {
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const exitCode = await proc.exited;
+  process.exit(exitCode);
+}
+
+await maybeRunLogin(process.argv.slice(2));
 
 const cli = parseArgs(process.argv.slice(2));
 

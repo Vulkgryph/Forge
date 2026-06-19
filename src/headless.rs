@@ -725,6 +725,9 @@ pub async fn run_headless(
     }
 
     let mut line_buf = String::new();
+    // Per-message size cap. A single JSON-newline frame must fit in 10 MB; any
+    // longer is treated as a protocol error rather than an unbounded allocation.
+    const MAX_HEADLESS_LINE_BYTES: usize = 10 * 1024 * 1024;
     // Channel for OAuth login background task to send JSON strings back to stdout
     let (login_tx, mut login_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -741,6 +744,18 @@ pub async fn run_headless(
                         break;
                     }
                     Ok(_) => {
+                        // Guard against unbounded growth: a partial line that
+                        // grows past the cap without a newline is dropped and
+                        // we resync on the next newline.
+                        if line_buf.len() > MAX_HEADLESS_LINE_BYTES {
+                            eprintln!(
+                                "headless: dropping oversized message ({} bytes > {} cap)",
+                                line_buf.len(),
+                                MAX_HEADLESS_LINE_BYTES
+                            );
+                            line_buf.clear();
+                            continue;
+                        }
                         let trimmed = line_buf.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<IncomingMessage>(trimmed) {

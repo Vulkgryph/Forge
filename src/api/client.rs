@@ -165,8 +165,14 @@ impl ApiClient {
     /// Build an ApiClient from a config endpoint + optional OAuth token.
     /// Pass `auth_token` for Anthropic endpoints (loaded from auth.json at startup).
     pub fn from_endpoint(endpoint: &ModelEndpoint, auth_token: Option<String>) -> Self {
+        // Cap redirects at 3 hops. reqwest's default of 10 happily forwards
+        // Authorization / x-api-key headers across hosts, so a malicious or
+        // misconfigured endpoint could chain redirects to exfiltrate tokens.
+        // We talk to known LLM APIs that don't legitimately need redirects,
+        // but allow a small budget for benign rewrites (http→https, etc.).
         let client = Client::builder()
             .timeout(Duration::from_secs(endpoint.request_timeout_secs))
+            .redirect(reqwest::redirect::Policy::limited(3))
             .build()
             .expect("Failed to build HTTP client");
 

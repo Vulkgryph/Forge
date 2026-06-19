@@ -306,18 +306,29 @@ async fn fetch_latest_github_release(repo: &str) -> Option<String> {
 
 /// Generic "resolve current client version" helper for any GitHub-published
 /// CLI we're impersonating. Used by both Codex and Claude detection.
+///
+/// Set `FORGE_NO_AUTO_VERSION_CHECK=1` in the environment to skip the GitHub
+/// API call entirely. Cached values are still used; the fallback applies if
+/// the cache is empty. Useful for airgapped environments or anyone auditing
+/// outgoing network traffic.
 async fn resolve_client_version(repo: &str, cache_file: &str, fallback: &str) -> String {
     const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+    let auto_check_disabled = std::env::var("FORGE_NO_AUTO_VERSION_CHECK").is_ok();
 
     if let Some(cached) = read_version_cache(cache_file) {
-        if !cached.is_stale(CACHE_MAX_AGE_SECS) {
+        // When auto-check is disabled, accept the cache regardless of age.
+        if auto_check_disabled || !cached.is_stale(CACHE_MAX_AGE_SECS) {
             return cached.version;
         }
     }
-    if let Some(latest) = fetch_latest_github_release(repo).await {
-        let _ = write_version_cache(cache_file, &latest);
-        return latest;
+
+    if !auto_check_disabled {
+        if let Some(latest) = fetch_latest_github_release(repo).await {
+            let _ = write_version_cache(cache_file, &latest);
+            return latest;
+        }
     }
+
     if let Some(cached) = read_version_cache(cache_file) {
         return cached.version;
     }
@@ -435,7 +446,11 @@ fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel
     // meant for general chat. `codex-auto-review` is the code-review sub-model
     // the codex CLI uses internally during reviews — it's not callable as a
     // regular chat target.
+    //
+    // Users who explicitly want them in the picker can set
+    // `FORGE_SHOW_INTERNAL_MODELS=1` to bypass this filter.
     const INTERNAL_SLUGS: &[&str] = &["codex-auto-review"];
+    let show_internal = std::env::var("FORGE_SHOW_INTERNAL_MODELS").is_ok();
 
     let mut discovered = Vec::new();
     for model in models {
@@ -443,12 +458,13 @@ fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel
         // deprecated, internal, or otherwise hidden from the default ChatGPT
         // web UI, but they remain callable via the Codex API for users who
         // know the slug. Surface them in Forge's picker too EXCEPT for slugs
-        // we know are internal sub-models (see INTERNAL_SLUGS above).
+        // we know are internal sub-models (see INTERNAL_SLUGS above), unless
+        // the user opted in via FORGE_SHOW_INTERNAL_MODELS.
         let _ = model.get("visibility");
         let Some(id) = model.get("slug").and_then(|v| v.as_str()) else {
             continue;
         };
-        if INTERNAL_SLUGS.contains(&id) {
+        if !show_internal && INTERNAL_SLUGS.contains(&id) {
             continue;
         }
         let display_name = model
@@ -510,11 +526,7 @@ fn save_tokens(tokens: &OAuthTokens) -> Result<()> {
     }
     let content = serde_json::to_string_pretty(tokens)?;
     std::fs::write(&path, &content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    restrict_to_owner(&path);
     Ok(())
 }
 
@@ -525,12 +537,39 @@ fn save_chatgpt_tokens(tokens: &ChatGptTokens) -> Result<()> {
     }
     let content = serde_json::to_string_pretty(tokens)?;
     std::fs::write(&path, &content)?;
+    restrict_to_owner(&path);
+    Ok(())
+}
+
+/// Restrict a credentials file so only the current user can read or write it.
+/// Unix: chmod 0o600. Windows: icacls to remove inherited ACEs and grant
+/// access exclusively to the current user — the default per-user profile dir
+/// ACL is usually fine, but profiles vary (junction-redirected home,
+/// roaming, shared workstations), so we set it explicitly.
+fn restrict_to_owner(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        // icacls is shipped on every supported Windows version. We:
+        //   /inheritance:r   — drop inherited ACEs (e.g. BUILTIN\Users)
+        //   /grant:r "%USERNAME%":F — sole full-control entry for the owner
+        // Failures are non-fatal: better to keep the file with default ACLs
+        // than to abort the login flow if icacls is missing or fails.
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "%USERNAME%".to_string());
+        let _ = std::process::Command::new("icacls")
+            .arg(path.as_os_str())
+            .arg("/inheritance:r")
+            .output();
+        let _ = std::process::Command::new("icacls")
+            .arg(path.as_os_str())
+            .arg("/grant:r")
+            .arg(format!("{}:F", user))
+            .output();
+    }
 }
 
 fn generate_pkce() -> (String, String) {
@@ -544,6 +583,14 @@ fn generate_pkce() -> (String, String) {
     let challenge = URL_SAFE_NO_PAD.encode(hash);
 
     (verifier, challenge)
+}
+
+/// 256-bit random nonce for the OAuth `state` parameter (CSRF protection on
+/// the redirect callback). Must be independent of the PKCE verifier.
+fn generate_oauth_state() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn unix_now() -> u64 {
@@ -1015,6 +1062,12 @@ fn parse_anthropic_model(m: &serde_json::Value) -> Option<AnthropicModel> {
 /// silently otherwise.
 pub async fn login(interactive: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
+    // `state` must be an independent random nonce, not the PKCE verifier:
+    // PKCE binds the code redemption to this client, while `state` is the
+    // CSRF check that the callback we receive corresponds to the request
+    // we just sent. Reusing one for the other collapses two distinct
+    // protections into one.
+    let state = generate_oauth_state();
 
     let auth_url = format!(
         "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
@@ -1023,7 +1076,7 @@ pub async fn login(interactive: bool) -> Result<()> {
         urlencoding::encode(REDIRECT_URI),
         urlencoding::encode(SCOPES),
         challenge,
-        verifier,
+        urlencoding::encode(&state),
     );
 
     eprintln!("Opening browser for Claude authorization...");
@@ -1031,7 +1084,7 @@ pub async fn login(interactive: bool) -> Result<()> {
 
     open_browser(&auth_url);
 
-    let code = wait_for_callback(interactive).await?;
+    let code = wait_for_callback(&state, interactive).await?;
 
     let http = reqwest::Client::new();
     let resp = http
@@ -1040,7 +1093,7 @@ pub async fn login(interactive: bool) -> Result<()> {
             "grant_type": "authorization_code",
             "client_id": CLIENT_ID,
             "code": code,
-            "state": verifier,
+            "state": state,
             "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
         }))
@@ -1065,11 +1118,7 @@ pub async fn login(interactive: bool) -> Result<()> {
 /// browser flow and stores tokens separately from Claude credentials.
 pub async fn login_chatgpt(interactive: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
-    let state = {
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        URL_SAFE_NO_PAD.encode(bytes)
-    };
+    let state = generate_oauth_state();
     let redirect_uri = format!(
         "http://localhost:{}{}",
         CHATGPT_REDIRECT_PORT, CHATGPT_REDIRECT_PATH
@@ -1126,8 +1175,8 @@ pub async fn login_chatgpt(interactive: bool) -> Result<()> {
 }
 
 /// Binds port 53692, waits for the OAuth redirect, returns the authorization code.
-async fn wait_for_callback(interactive: bool) -> Result<String> {
-    wait_for_callback_on(53692, "/callback", None, interactive).await
+async fn wait_for_callback(expected_state: &str, interactive: bool) -> Result<String> {
+    wait_for_callback_on(53692, "/callback", Some(expected_state), interactive).await
 }
 
 /// Wait for an OAuth authorization code via two parallel paths, whichever wins first:

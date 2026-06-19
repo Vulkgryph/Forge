@@ -21,11 +21,26 @@ impl ConversationLog {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        // Conversation logs include full tool args, tool output, and file
+        // before/after snapshots — any of which can carry secrets. Restrict
+        // to the owner so a shared host doesn't leak across users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(path)
             .with_context(|| format!("Failed to open conversation log: {}", path.display()))?;
+        // If the file already existed (created before this mode change, or on
+        // a platform without OpenOptionsExt), force the mode now.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
 
         Ok(Self {
             path: path.to_path_buf(),

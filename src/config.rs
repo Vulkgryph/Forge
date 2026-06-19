@@ -283,12 +283,37 @@ impl AppConfig {
                 .with_context(|| format!("Failed to read config at {}", config_path.display()))?;
             let config: AppConfig =
                 toml::from_str(&contents).with_context(|| "Failed to parse config")?;
+            config.validate_endpoints()?;
             Ok(config)
         } else {
             let config = AppConfig::default();
             config.save()?;
             Ok(config)
         }
+    }
+
+    /// Reject endpoints whose `base_url` isn't an http(s) URL. Without this
+    /// check, a config could point at `file://`, `gopher://`, etc., and the
+    /// HTTP client would happily attach bearer tokens to whatever it dialed.
+    fn validate_endpoints(&self) -> Result<()> {
+        for endpoint in &self.models.endpoints {
+            let url = reqwest::Url::parse(&endpoint.base_url).with_context(|| {
+                format!(
+                    "endpoint '{}' has an invalid base_url: {}",
+                    endpoint.name, endpoint.base_url
+                )
+            })?;
+            match url.scheme() {
+                "http" | "https" => {}
+                other => anyhow::bail!(
+                    "endpoint '{}' uses unsupported scheme '{}' in base_url (only http/https allowed): {}",
+                    endpoint.name,
+                    other,
+                    endpoint.base_url
+                ),
+            }
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {

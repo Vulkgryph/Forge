@@ -187,6 +187,73 @@ fn output_tail(output: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// Cap on in-memory shell-output buffers. A runaway child (or a deliberately
+/// hostile one) can stream gigabytes to stdout; we keep only the last 10 MB
+/// to bound memory while still preserving recent context for the agent.
+const MAX_OUTPUT_BUF_BYTES: usize = 10 * 1024 * 1024;
+
+/// Heuristic match for paths that probably contain secrets. Used to keep
+/// such files out of the rewind log and git snapshot history. Conservative
+/// on purpose — false positives just disable rewind-restore for that file.
+fn is_likely_secret_path(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
+        return true;
+    }
+
+    const SECRET_SUFFIXES: &[&str] = &[
+        ".key", ".pem", ".p12", ".pfx", ".keystore", ".jks", ".crt", ".cer", ".der",
+    ];
+    if SECRET_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+
+    const SECRET_NAMES: &[&str] = &[
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "credentials",
+        "secrets",
+        "secret",
+    ];
+    if SECRET_NAMES.iter().any(|n| name == *n) {
+        return true;
+    }
+
+    // Common credential directories: ~/.ssh, ~/.aws, ~/.gnupg, etc.
+    for component in path.components() {
+        if let Some(s) = component.as_os_str().to_str() {
+            let lc = s.to_ascii_lowercase();
+            if matches!(lc.as_str(), ".ssh" | ".aws" | ".gnupg" | ".kube") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Append `chunk` to `buf`, dropping oldest bytes from the front when the
+/// buffer would exceed `MAX_OUTPUT_BUF_BYTES`. Drains on UTF-8 char boundaries.
+fn push_capped(buf: &mut String, chunk: &str) {
+    buf.push_str(chunk);
+    if buf.len() <= MAX_OUTPUT_BUF_BYTES {
+        return;
+    }
+    let excess = buf.len() - MAX_OUTPUT_BUF_BYTES;
+    let drain_to = buf
+        .char_indices()
+        .find(|(i, _)| *i >= excess)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
+    buf.drain(..drain_to);
+}
+
 #[derive(Debug, Clone)]
 pub enum ToolKindEvent {
     Read,
@@ -2026,6 +2093,20 @@ impl Agent {
             if before_content == after_content {
                 continue;
             }
+            // Rewind snapshots are persisted to disk (conversation log) and to
+            // git refs. For likely-secret files (.env, *.key, *.pem, etc.) we
+            // record that the file changed but elide the contents so secrets
+            // don't end up in the JSONL or git history. Restore from these
+            // entries is a no-op, which is the right behavior — Forge will
+            // tell the user it can't auto-restore a redacted secret file.
+            let (before_content, after_content) = if is_likely_secret_path(&path) {
+                (
+                    before_content.map(|_| "[redacted: likely-secret file]".to_string()),
+                    after_content.map(|_| "[redacted: likely-secret file]".to_string()),
+                )
+            } else {
+                (before_content, after_content)
+            };
             self.pending_file_snapshots.push(FileSnapshot {
                 path,
                 before_content,
@@ -2954,7 +3035,7 @@ impl Agent {
                 // 3. Unified output channel (PTY master or piped stdout/stderr)
                 chunk = async { if out_done { std::future::pending().await } else { out_rx.recv().await } } => {
                     if let Some(chunk) = chunk {
-                        output_buf.push_str(&chunk);
+                        push_capped(&mut output_buf, &chunk);
                         // Pattern-based prompt detection: fire immediately on prompt-shaped output.
                         if !input_prompt_sent && !child_done && looks_like_prompt(&chunk) {
                             input_prompt_sent = true;
@@ -3082,7 +3163,7 @@ impl Agent {
                             match chunk {
                                 Some(c) => {
                                     let mut state = bg_state.lock().unwrap();
-                                    state.output.push_str(&c);
+                                    push_capped(&mut state.output, &c);
                                     // PTY watchdog: detect interactive prompts on background output.
                                     if looks_like_prompt(&c) {
                                         let prompt_text = state.output.lines().rev()

@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { EndpointInfo } from "./protocol.js";
 
+/**
+ * Replace the user's $HOME prefix with "~" in a path for display.
+ * Used so paths surfaced in the TUI (plan file, session log, etc.) don't
+ * leak the local username — useful for screenshots, screencasts, and
+ * shared sessions.
+ */
+export function collapseHome(p: string | undefined | null): string {
+  if (!p) return "";
+  const home = process.env["HOME"] || process.env["USERPROFILE"];
+  if (!home) return p;
+  if (p === home) return "~";
+  if (p.startsWith(home + "/")) return "~" + p.slice(home.length);
+  if (p.startsWith(home + "\\")) return "~" + p.slice(home.length);
+  return p;
+}
+
 function toggleLabel(value: "provider_default" | "on" | "off"): string {
   return ({
     provider_default: "default",

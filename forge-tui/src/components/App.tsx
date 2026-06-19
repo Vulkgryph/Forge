@@ -14,7 +14,7 @@ import { SubagentStatus } from "./SubagentStatus.js";
 import { QuestionDialog } from "./QuestionDialog.js";
 import { BgPromptDialog } from "./BgPromptDialog.js";
 import type { EndpointInfo } from "../protocol.js";
-import { activeEndpoint, thinkingIntensityDisplay } from "../model-display.js";
+import { activeEndpoint, collapseHome, thinkingIntensityDisplay } from "../model-display.js";
 
 interface SessionMeta {
   id: string;
@@ -486,7 +486,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
         enterPlanMode();
         break;
       case "/log":
-        addSystemEntry(`Log: ${state.logPath}`);
+        addSystemEntry(`Log: ${collapseHome(state.logPath)}`);
         break;
       case "/sessions":
       case "/resume":

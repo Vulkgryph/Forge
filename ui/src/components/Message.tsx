@@ -125,12 +125,16 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
       // Cap by estimated rendered lines, not raw newlines. Long wrapped
       // paragraphs can otherwise grow beyond the viewport and make Ink redraws
       // visibly jitter while tokens stream.
+      //
+      // The Spinner / "Writing response…" line shown below the scrollback
+      // already indicates the streaming state, so we don't render a separate
+      // cursor-style ▋ here — it ended up floating on its own row under the
+      // text, which read as visual noise rather than a writing indicator.
       const tail = streamingTail(entry.content, columns, streamingMaxLines);
       return (
         <Box flexDirection="column" marginTop={1}>
           {tail.hiddenLines > 0 && <Text dimColor>  ↑ {tail.hiddenLines} lines above</Text>}
           <MarkdownRenderer content={tail.text} />
-          <Text color="cyan">▋</Text>
         </Box>
       );
     }

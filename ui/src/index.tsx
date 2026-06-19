@@ -277,4 +277,23 @@ if (
   }
 }
 
+// Hide the OS-level terminal cursor while the TUI is rendering. Ink writes
+// new content as the agent streams, and the terminal cursor parks itself
+// wherever the last write landed — which means it shows up in the middle of
+// streaming assistant text, in scrollback, anywhere. The input box has its
+// own visible cursor (rendered by PromptInput), so we don't need the OS one
+// at all while we own the screen.
+//
+// Restore on any normal exit so the user's shell behaves correctly afterward.
+const CURSOR_HIDE = "\x1b[?25l";
+const CURSOR_SHOW = "\x1b[?25h";
+
+process.stdout.write(CURSOR_HIDE);
+const restoreCursor = () => {
+  try { process.stdout.write(CURSOR_SHOW); } catch { /* ignore */ }
+};
+process.on("exit", restoreCursor);
+process.on("SIGINT", () => { restoreCursor(); process.exit(130); });
+process.on("SIGTERM", () => { restoreCursor(); process.exit(143); });
+
 render(<App initialAgentArgs={cli.agentArgs} initialCwd={cli.cwd} />);

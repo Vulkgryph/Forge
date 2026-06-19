@@ -4,6 +4,8 @@ Created by **Vulkgryph LLC**.
 
 An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project via a terminal UI and a headless JSON protocol.
 
+![Forge — terminal demo](assets/forge-demo.gif)
+
 ## Philosophy
 
 Forge is built for engineers who want a tool they can rely on, not a tool they chase. The aim is a small, readable codebase with a stable interface — so the command you learn today behaves the same way the next time you use it, and your config file doesn't need to be rewritten between releases.

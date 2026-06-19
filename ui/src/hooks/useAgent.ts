@@ -148,8 +148,11 @@ function startupEntries(
     ...(dangerouslyAllowAll
       ? [{
           id: nextId(),
-          kind: "system" as const,
-          content: "\u26A0 --dangerously-allow-all enabled. All tools run without approval.",
+          // "error" kind to render red \u2014 this is a session-wide danger state,
+          // not just an informational note. Message.tsx's error renderer adds
+          // the \u2717 prefix and bold first line.
+          kind: "error" as const,
+          content: "--dangerously-allow-all enabled. All tools run without approval.",
         }]
       : []),
     {

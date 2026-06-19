@@ -76,11 +76,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Standalone forge-agent --login. We own stdin, so the paste fallback
         // is available if the localhost callback port is busy.
         auth::login(true).await?;
-        return Ok(());
+        // wait_for_callback_on races the TCP listener against a tokio stdin
+        // reader. When the listener wins, the stdin future is dropped but the
+        // underlying blocking worker thread keeps holding stdin, preventing
+        // tokio's runtime from shutting down cleanly. Explicit exit bypasses
+        // the hang.
+        std::process::exit(0);
     }
     if cli.login_chatgpt {
         auth::login_chatgpt(true).await?;
-        return Ok(());
+        std::process::exit(0);
     }
 
     // Load configuration

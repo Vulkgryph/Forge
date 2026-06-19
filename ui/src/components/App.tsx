@@ -1175,29 +1175,32 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
   }
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" height={terminalRows}>
       {/* Archived scrollback is printed once and never participates in live redraws. */}
       <Static items={archivedScrollback}>
         {(entry) => <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />}
       </Static>
 
-      {/* Recent scrollback remains live so menus, revert, and active UI stay coherent. */}
-      {liveScrollback.map((entry) => (
-        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
-      ))}
+      {/* Live scrollback fills available space so the input bar anchors to the
+          bottom of the terminal instead of floating up during streaming. */}
+      <Box flexDirection="column" flexGrow={1} overflow="hidden">
+        {liveScrollback.map((entry) => (
+          <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
+        ))}
 
-      {/* Transient */}
-      {state.transient.map((entry) => (
-        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
-      ))}
+        {/* Transient */}
+        {state.transient.map((entry) => (
+          <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
+        ))}
 
-      {/* Thinking spinner */}
-      {state.isThinking && !state.waitingForInput && !state.pendingApproval && !state.pendingPlan && (
-        <Spinner label={state.activityLabel} />
-      )}
+        {/* Thinking spinner */}
+        {state.isThinking && !state.waitingForInput && !state.pendingApproval && !state.pendingPlan && (
+          <Spinner label={state.activityLabel} />
+        )}
 
-      {/* Active subagents */}
-      <SubagentStatus subagents={state.activeSubagents} />
+        {/* Active subagents */}
+        <SubagentStatus subagents={state.activeSubagents} />
+      </Box>
 
       {/* Approval dialog */}
       {state.pendingApproval && (

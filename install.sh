@@ -58,9 +58,57 @@ if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
     esac
 fi
 
+# fetch_and_run <url> <expected_sha256_or_empty> <label> <args...>
+# Downloads a remote installer to a temp file, prints its SHA-256 so you can
+# pin it on the next run, optionally verifies against an expected hash, then
+# executes it with the given args. Replaces the classic `curl ... | sh`,
+# which executes arbitrary code with no integrity check.
+fetch_and_run() {
+    local url="$1"; shift
+    local expected="$1"; shift
+    local label="$1"; shift
+
+    local tmp
+    tmp="$(mktemp -t "forge-${label}-installer.XXXXXX")"
+    trap "rm -f \"$tmp\"" RETURN
+
+    info "Downloading $label installer from $url"
+    if ! curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$tmp"; then
+        error "Failed to download $label installer from $url"
+    fi
+
+    local actual
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$tmp" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+    else
+        warn "No sha256sum/shasum found — cannot verify $label installer integrity"
+        actual=""
+    fi
+
+    if [[ -n "$actual" ]]; then
+        info "$label installer SHA-256: $actual"
+    fi
+
+    if [[ -n "$expected" ]]; then
+        if [[ -z "$actual" ]]; then
+            error "Cannot verify $label installer: no sha256 tool available"
+        fi
+        if [[ "$actual" != "$expected" ]]; then
+            error "$label installer SHA-256 mismatch.\n  expected: $expected\n  got:      $actual\n  Refusing to execute."
+        fi
+        ok "$label installer SHA-256 verified"
+    else
+        warn "$label installer not pinned — to pin, re-run with FORGE_${label^^}_SHA256=$actual"
+    fi
+
+    bash "$tmp" "$@"
+}
+
 if ! command -v cargo &>/dev/null; then
     warn "Rust not found — installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    fetch_and_run "https://sh.rustup.rs" "${FORGE_RUSTUP_SHA256:-}" "rustup" -y
     # shellcheck source=/dev/null
     source "$HOME/.cargo/env"
     ok "Rust installed"
@@ -70,7 +118,7 @@ fi
 
 if ! command -v bun &>/dev/null; then
     warn "Bun not found — installing..."
-    curl -fsSL https://bun.sh/install | bash
+    fetch_and_run "https://bun.sh/install" "${FORGE_BUN_SHA256:-}" "bun"
     export PATH="$HOME/.bun/bin:$PATH"
     ok "Bun installed"
 else

@@ -223,4 +223,44 @@ await maybeRunLogin(process.argv.slice(2));
 
 const cli = parseArgs(process.argv.slice(2));
 
+// --dangerously-allow-all is exactly what it says: every tool approval gate
+// is bypassed for the whole session. The flag name is the warning, but a
+// confirmation gate that defaults to NO catches the case where someone (or
+// some other tool) launched forge with this flag without the user actually
+// reading what it does. Skip when FORGE_SKIP_DANGEROUS_CONFIRM=1 is set,
+// for scripted / CI usage where the operator wants to opt out of the prompt.
+if (
+  cli.agentArgs.includes("--dangerously-allow-all") &&
+  !process.env["FORGE_SKIP_DANGEROUS_CONFIRM"]
+) {
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log("");
+  console.log("\x1b[31m\x1b[1mDANGER: --dangerously-allow-all is set.\x1b[0m");
+  console.log("");
+  console.log("This bypasses EVERY tool approval prompt for this entire session.");
+  console.log("Forge can read, write, edit, and execute anything on this machine");
+  console.log("(within your user's permissions) without asking you first.");
+  console.log("");
+  console.log("Only continue if you are in a sandbox, a VM, or a disposable workspace");
+  console.log("where you have already accepted that risk.");
+  console.log("");
+  console.log("To skip this prompt in scripted environments:");
+  console.log("    FORGE_SKIP_DANGEROUS_CONFIRM=1 forge --dangerously-allow-all");
+  console.log("");
+  let confirmed = false;
+  try {
+    const answer = (await rl.question("Type 'yes' to continue, anything else to exit: "))
+      .trim()
+      .toLowerCase();
+    confirmed = answer === "yes" || answer === "y";
+  } finally {
+    rl.close();
+  }
+  if (!confirmed) {
+    console.log("Cancelled.");
+    process.exit(0);
+  }
+}
+
 render(<App initialAgentArgs={cli.agentArgs} initialCwd={cli.cwd} />);

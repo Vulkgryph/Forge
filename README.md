@@ -39,6 +39,8 @@ Forge does **not** provide practical isolation from the host machine. Its safety
 
 The project root is the default working directory, not a sandbox. File tools and shell commands can access paths outside the project when the underlying operating system permissions allow it. Use Forge only in workspaces and user accounts where that level of access is acceptable, review commands before approving them, and treat auto-approval modes as trusted-session features.
 
+**Launching with `--dangerously-allow-all` requires an interactive confirmation.** The flag is exactly what it says — every tool approval gate is bypassed for the whole session — so Forge stops before rendering the TUI and asks you to type `yes` to continue. Anything else exits. Set `FORGE_SKIP_DANGEROUS_CONFIRM=1` for scripted / CI use where the operator has already accepted the risk.
+
 ## Offline use
 
 Forge runs with no internet when paired with a local LLM. Useful for airgapped environments, secure facilities, weak connections, or anyone who simply doesn't want their code shipped to a cloud provider.
@@ -61,8 +63,25 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
    [agent]
    disabled_tools = ["web_search", "web_fetch"]
    ```
+4. Set `FORGE_NO_AUTO_VERSION_CHECK=1` to suppress the once-a-week GitHub poll Forge uses to keep its Codex/Claude impersonation user-agents current (only relevant if you'd ever use cloud providers anyway):
+   ```bash
+   export FORGE_NO_AUTO_VERSION_CHECK=1
+   ```
 
 After that, Forge has zero outgoing network traffic outside your local LLM.
+
+### Environment variables
+
+Forge respects a small set of environment variables for users who want to override defaults. None are required.
+
+| Variable | Effect |
+|---|---|
+| `FORGE_NO_AUTO_VERSION_CHECK=1` | Skip the weekly GitHub poll that keeps Codex/Claude `client_version` / user-agent strings current. Cached values are still used; a hardcoded baseline applies if the cache is empty. |
+| `FORGE_SHOW_INTERNAL_MODELS=1` | Show ChatGPT Codex models marked as internal (e.g. `codex-auto-review`). These aren't general chat targets — selecting one will likely fail at the API. Hidden by default. |
+| `FORGE_SKIP_DANGEROUS_CONFIRM=1` | Skip the confirmation prompt that fires when launching with `--dangerously-allow-all`. Intended for scripted / CI usage; never set in interactive shells. |
+| `FORGE_AGENT_PATH` | Override the path the wrapper uses to find `forge-agent`. Useful for testing local builds. |
+| `FORGE_RUSTUP_SHA256` / `FORGE_BUN_SHA256` | Pin the expected SHA-256 of the rustup / bun installers when `install.sh` fetches them. If unset, the script prints the hash so you can pin it on a future run. |
+| `FORGE_REPO` / `FORGE_DEST` / `FORGE_BRANCH` | Override defaults in `bootstrap.sh` / `bootstrap.ps1`. |
 
 ## Requirements
 

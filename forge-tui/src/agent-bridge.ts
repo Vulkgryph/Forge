@@ -3,9 +3,15 @@ import { spawn, type Subprocess } from "bun";
 import { EventEmitter } from "events";
 import { AgentMessageSchema, type AgentMessage, type UserMessage } from "./protocol.js";
 
+// Per-message size cap. The Rust agent's outgoing JSON-newline frames must
+// fit in 10 MB; anything larger is treated as a protocol error rather than an
+// unbounded allocation. Mirrored on the Rust side in src/headless.rs.
+const MAX_AGENT_LINE_BYTES = 10 * 1024 * 1024;
+
 export class AgentBridge extends EventEmitter {
   private proc: Subprocess;
   private buffer: string = "";
+  private bufferOverflowed = false;
   private eventQueue: AgentMessage[] = [];
   private drainScheduled = false;
   private pendingAssistantToken = "";
@@ -88,7 +94,24 @@ export class AgentBridge extends EventEmitter {
     while ((newlineIdx = this.buffer.indexOf("\n")) !== -1) {
       const line = this.buffer.slice(0, newlineIdx).trim();
       this.buffer = this.buffer.slice(newlineIdx + 1);
+      // If we previously dropped data while overflowing, the next newline
+      // marks the start of a fresh frame — skip the partial line we kept.
+      if (this.bufferOverflowed) {
+        this.bufferOverflowed = false;
+        continue;
+      }
       if (line) this.enqueueLine(line);
+    }
+
+    // No newline yet but the buffer is past the cap → the agent is either
+    // misbehaving or compromised. Discard the partial frame and resync on
+    // the next newline.
+    if (this.buffer.length > MAX_AGENT_LINE_BYTES) {
+      console.error(
+        `agent-bridge: dropping oversized message (${this.buffer.length} bytes > ${MAX_AGENT_LINE_BYTES} cap)`
+      );
+      this.buffer = "";
+      this.bufferOverflowed = true;
     }
   }
 

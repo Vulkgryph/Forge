@@ -245,15 +245,29 @@ if (
   console.log("Only continue if you are in a sandbox, a VM, or a disposable workspace");
   console.log("where you have already accepted that risk.");
   console.log("");
-  console.log("To skip this prompt in scripted environments:");
-  console.log("    FORGE_SKIP_DANGEROUS_CONFIRM=1 forge --dangerously-allow-all");
+  console.log("  1. No  — exit and run forge without --dangerously-allow-all");
+  console.log("  2. Yes — proceed at your own risk");
   console.log("");
+  console.log("(To skip this prompt in scripted environments, set");
+  console.log(" FORGE_SKIP_DANGEROUS_CONFIRM=1 before launching forge.)");
+  console.log("");
+
   let confirmed = false;
   try {
-    const answer = (await rl.question("Type 'yes' to continue, anything else to exit: "))
-      .trim()
-      .toLowerCase();
-    confirmed = answer === "yes" || answer === "y";
+    // Loop until we get a recognized choice. Default behavior on empty input
+    // or anything ambiguous: No (exit).
+    while (true) {
+      const raw = (await rl.question("Choice [1-2, default: 1]: ")).trim().toLowerCase();
+      if (raw === "" || raw === "1" || raw === "no" || raw === "n") {
+        confirmed = false;
+        break;
+      }
+      if (raw === "2" || raw === "yes" || raw === "y") {
+        confirmed = true;
+        break;
+      }
+      console.log(`  '${raw}' is not a recognized choice. Type 1 (No) or 2 (Yes).`);
+    }
   } finally {
     rl.close();
   }

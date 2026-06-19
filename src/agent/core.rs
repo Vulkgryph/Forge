@@ -3764,9 +3764,20 @@ impl Agent {
                     self.update_meta();
                     let _ = self.log.log_run_state(RunState::Running);
 
-                    // Clear history to just system prompt + plan
+                    // Clear history to just system prompt + the approved plan.
+                    // refresh_rolling_plan_context only re-injects under the
+                    // RollingWindow context strategy; in Compaction mode (the
+                    // default) it's a no-op. We need to seed the cleared
+                    // history with the plan unconditionally — otherwise the
+                    // model wakes up with nothing but the system prompt and
+                    // can't recall what it just promised to implement.
                     let system_msg = Message::system(&self.system_prompt);
-                    self.history = vec![system_msg];
+                    let plan_msg = Message::user(&format!(
+                        "Approved plan to implement (context was cleared after approval — \
+                         this is the only record of what was agreed). Follow this plan:\n\n{}",
+                        content
+                    ));
+                    self.history = vec![system_msg, plan_msg];
                     self.refresh_rolling_plan_context();
                     self.last_prompt_tokens = 0;
                     self.last_completion_tokens = 0;
@@ -3781,7 +3792,7 @@ impl Agent {
                             total_completion_tokens: self.total_completion_tokens,
                             total_requests: self.total_requests,
                             max_context_tokens: self.max_context_tokens,
-                            history_messages: 2,
+                            history_messages: self.history.len(),
                         }));
 
                     let _ = self.event_tx.send(AgentEvent::PlanModeExited {

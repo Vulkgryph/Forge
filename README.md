@@ -4,7 +4,9 @@ Created by **Vulkgryph LLC**.
 
 An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project via a terminal UI and a headless JSON protocol.
 
-![Forge — terminal demo](assets/forge-demo.gif)
+![Forge writing a zero-dependency VM runtime in Rust](assets/forge-demo.gif)
+
+> _Forge writing a zero-dependency VM runtime in Rust — ~2 min 19 sec, played at 2× speed._
 
 ## Philosophy
 

@@ -20,7 +20,7 @@ Forge is built for engineers who want a tool they can rely on, not a tool they c
 
 Forge is intentionally not chasing the newest agent architecture every month. If you want a tool that ships a new "workflow paradigm" every release, Forge is probably not for you. If you want a tool whose interfaces stay stable while the implementation gets smaller, faster, and more reliable underneath, that's what Forge is trying to be.
 
-**Inspection is the point.** The source is here. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md). The public roadmap lives at [vulkgryph.com/roadmap](https://vulkgryph.com/roadmap/). If something looks wrong, file an issue or email `contact@vulkgryph.com` — that's a more useful signal than any marketing claim could be.
+**Inspection is the point.** The source is here. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md). The public roadmap lives at [vulkgryph.com/roadmap](https://vulkgryph.com/roadmap/). Read it, verify it, disagree with it. If something looks wrong, file an issue or email `contact@vulkgryph.com`. If you want to take it a different direction, fork it.
 
 **On limitations.** Forge is maintained by a small team, and catching every edge case after a patch is beyond what testing alone can cover. After an update, the maintainers know roughly what changed; the community is what surfaces the edge cases and unexpected behavior that a release notes line can miss. If a patch breaks something for you — a workflow that worked before, an integration that no longer behaves the same, a config that stopped being honored — file an issue. That signal is how regressions actually get found.
 

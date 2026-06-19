@@ -231,33 +231,24 @@ impl Default for SubagentConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        // This default is only reached when no ~/.config/forge/config.toml
+        // exists yet. install.sh's wizard always writes a real config, so in
+        // practice users never see these values. They're here as a sensible
+        // fallback (loopback localhost defaults matching LM Studio's port).
         Self {
             models: ModelsConfig {
-                endpoints: vec![
-                    ModelEndpoint {
-                        name: "local-80b".to_string(),
-                        base_url: "http://127.0.0.1:1234/v1".to_string(),
-                        model_id: "default".to_string(),
-                        api_key: None,
-                        max_context_tokens: 262144,
-                        max_output_tokens: 16384,
-                        request_timeout_secs: 500,
-                        endpoint_type: EndpointType::OpenAi,
-                        reasoning: EndpointReasoningConfig::default(),
-                    },
-                    ModelEndpoint {
-                        name: "local-30b".to_string(),
-                        base_url: "http://127.0.0.1:1235/v1".to_string(),
-                        model_id: "default".to_string(),
-                        api_key: None,
-                        max_context_tokens: 136069,
-                        max_output_tokens: 16384,
-                        request_timeout_secs: 500,
-                        endpoint_type: EndpointType::OpenAi,
-                        reasoning: EndpointReasoningConfig::default(),
-                    },
-                ],
-                default: "local-80b".to_string(),
+                endpoints: vec![ModelEndpoint {
+                    name: "local".to_string(),
+                    base_url: "http://127.0.0.1:1234/v1".to_string(),
+                    model_id: "auto".to_string(),
+                    api_key: None,
+                    max_context_tokens: 32768,
+                    max_output_tokens: 16384,
+                    request_timeout_secs: 500,
+                    endpoint_type: EndpointType::OpenAi,
+                    reasoning: EndpointReasoningConfig::default(),
+                }],
+                default: "local".to_string(),
                 web_tool_model: None,
             },
             agent: AgentConfig {

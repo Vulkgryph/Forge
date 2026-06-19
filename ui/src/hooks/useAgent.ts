@@ -10,7 +10,7 @@ import type {
   EndpointReasoningConfig,
   QuestionItem,
 } from "../protocol.js";
-import { activeEndpoint, thinkingIntensityDisplay } from "../model-display.js";
+import { activeEndpoint, collapseHome, thinkingIntensityDisplay } from "../model-display.js";
 import { nextStartupTip } from "../startup-tips.js";
 
 /**
@@ -1063,7 +1063,7 @@ export function useAgent(options: UseAgentOptions = {}) {
             planMode: true,
             scrollback: [
               ...prev.scrollback,
-              { id: nextId(), kind: "plan_status", content: `Plan file: ${msg.plan_path}` },
+              { id: nextId(), kind: "plan_status", content: `Plan file: ${collapseHome(msg.plan_path)}` },
             ],
           }));
           break;

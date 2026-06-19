@@ -22,6 +22,7 @@ Forge is intentionally not chasing the newest agent architecture every month. If
 
 ## Features
 
+- **Fully offline-capable** — runs with no internet when paired with a local LLM (LM Studio, Ollama, llama.cpp, vLLM, etc.). See [Offline use](#offline-use) below.
 - **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, web search/fetch
 - **Parallel subagents** — delegate subtasks to specialized agents running concurrently
 - **Planning mode** — agent drafts a plan for your approval before making changes
@@ -37,6 +38,31 @@ Forge is a sharp tool: powerful, useful, and dangerous if mishandled.
 Forge does **not** provide practical isolation from the host machine. Its safety mechanism is approval-based command gating: it asks before write and execute tools unless you enable auto-approval modes or `--dangerously-allow-all`. Once a tool is approved, Forge runs with the same filesystem, shell, network, credential, and process access as the user account that launched it.
 
 The project root is the default working directory, not a sandbox. File tools and shell commands can access paths outside the project when the underlying operating system permissions allow it. Use Forge only in workspaces and user accounts where that level of access is acceptable, review commands before approving them, and treat auto-approval modes as trusted-session features.
+
+## Offline use
+
+Forge runs with no internet when paired with a local LLM. Useful for airgapped environments, secure facilities, weak connections, or anyone who simply doesn't want their code shipped to a cloud provider.
+
+**What requires network**:
+
+| Component | When it talks to the network |
+|---|---|
+| LLM endpoint | Always — but if it's local (`127.0.0.1:1234`, etc.) that traffic stays on your machine |
+| `web_search` / `web_fetch` tools | Only when the model invokes them. Disable both via `agent.disabled_tools = ["web_search", "web_fetch"]` if you want them off the table |
+| Codex / Claude subscription auth | Only on login + periodic token refresh, only if you're using those providers |
+| Codex/Claude version self-check | Background, once a week, only if you're actively using those providers; if GitHub is unreachable forge falls back to a cached value |
+
+**Minimum offline setup**:
+
+1. Local LLM running (LM Studio / Ollama / llama.cpp / vLLM)
+2. Wizard option 1 (Local LLM server) when running `install.sh`
+3. Disable network tools in `~/.config/forge/config.toml`:
+   ```toml
+   [agent]
+   disabled_tools = ["web_search", "web_fetch"]
+   ```
+
+After that, Forge has zero outgoing network traffic outside your local LLM.
 
 ## Requirements
 

@@ -199,7 +199,7 @@ if (Test-Path $CONFIG_FILE) {
     Write-Host "Configure Forge" -ForegroundColor White
     Write-Host "Choose how you want Forge to reach an LLM."
     Write-Host ""
-    Write-Host "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.)"
+    Write-Host "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.) - runs fully offline"
     Write-Host "  2) Claude subscription   (claude.ai / Pro / Max - OAuth login)"
     Write-Host "  3) ChatGPT Codex subscription   (OAuth login)"
     Write-Host "  4) Direct API key   (Anthropic API, OpenAI API, OpenRouter, custom OpenAI-compatible)"

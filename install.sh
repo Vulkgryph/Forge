@@ -285,7 +285,7 @@ else
     }
 
     # Top-level: what kind of LLM access?
-    echo "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.)"
+    echo "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.) — runs fully offline"
     echo "  2) Claude subscription   (claude.ai / Pro / Max — OAuth login)"
     echo "  3) ChatGPT Codex subscription   (OAuth login)"
     echo "  4) Direct API key   (Anthropic API, OpenAI API, OpenRouter, custom OpenAI-compatible)"

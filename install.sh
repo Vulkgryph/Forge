@@ -334,7 +334,7 @@ else
 
     # Top-level: what kind of LLM access?
     echo "  1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.) — runs fully offline"
-    echo "  2) Claude subscription   (claude.ai / Pro / Max — OAuth login)"
+    echo "  2) Claude   (Anthropic API key — subscription OAuth login is not supported)"
     echo "  3) ChatGPT Codex subscription   (OAuth login)"
     echo "  4) Direct API key   (Anthropic API, OpenAI API, OpenRouter, custom OpenAI-compatible)"
     echo "  5) Skip — I'll edit the config file myself"
@@ -381,22 +381,33 @@ CONFIG
             ;;
 
         2)
-            # ---------- Claude subscription ----------
+            # ---------- Claude (Anthropic API key) ----------
+            # Claude Pro/Max subscription OAuth is intentionally not offered:
+            # Anthropic's Terms restrict subscription credentials to its own
+            # apps (see CHANGELOG). Claude users authenticate with an API key.
+            echo "  Claude is reached via an Anthropic API key (subscription login is not supported)."
+            echo ""
+            EP_URL="https://api.anthropic.com"
+            EP_TYPE="anthropic"
+            EP_NAME="anthropic"
+            prompt_required "    Anthropic API key (starts with sk-ant-): " EP_KEY
+            prompt_required "    Model ID (e.g. claude-sonnet-4-6): " EP_MODEL
+            prompt_required "    Context window in tokens (e.g. 200000): " EP_CONTEXT
+            EP_CONTEXT="${EP_CONTEXT//,/}"
+
             cat > "$CONFIG_FILE" << CONFIG
 [models]
-default = "claude"
+default = "$EP_NAME"
 
 [[models.endpoints]]
-name = "claude"
-base_url = "https://api.anthropic.com"
-model_id = "auto"
-max_context_tokens = 200000
+name = "$EP_NAME"
+base_url = "$EP_URL"
+model_id = "$EP_MODEL"
+api_key = "$EP_KEY"
+max_context_tokens = $EP_CONTEXT
 max_output_tokens = 8192
 endpoint_type = "anthropic"
 CONFIG
-            LOGIN_CMD="--login"
-            LOGIN_LABEL="Claude"
-            LOGIN_PORT="53692"
             ;;
 
         3)
@@ -482,9 +493,13 @@ CONFIG
 #   max_output_tokens = 8192
 #   endpoint_type = "open_ai"
 #
-# Claude / ChatGPT subscription — set endpoint_type to "anthropic" or
-# "chatgpt_codex" with no api_key, then run "forge-agent --login" or
-# "forge-agent --login-chatgpt" to authenticate via OAuth.
+# Claude (Anthropic) — set endpoint_type = "anthropic" and add your
+# Anthropic API key as api_key = "sk-ant-...". Claude Pro/Max subscription
+# OAuth login is not supported (Anthropic restricts subscription credentials
+# to its own apps).
+#
+# ChatGPT Codex subscription — set endpoint_type = "chatgpt_codex" with no
+# api_key, then run "forge-agent --login-chatgpt" to authenticate via OAuth.
 #
 # Direct API key — add api_key = "..." to the endpoint block.
 #
@@ -525,10 +540,10 @@ CONFIG
 
     ok "Config written to $CONFIG_FILE"
 
-    # OAuth login flow for subscription choices (2, 3).
+    # OAuth login flow for the ChatGPT Codex subscription choice (3).
     # Offer to run the login inline; warn first if we're on a remote SSH session
     # since the OAuth callback hits localhost:$LOGIN_PORT (needs port forwarding).
-    if [[ "$LLM_CHOICE" == "2" || "$LLM_CHOICE" == "3" ]]; then
+    if [[ "$LLM_CHOICE" == "3" ]]; then
         echo ""
         if [[ -n "${SSH_CONNECTION:-}" ]]; then
             warn "You're on a remote SSH session. The $LOGIN_LABEL OAuth flow opens a browser"
@@ -558,8 +573,9 @@ CONFIG
         fi
     fi
 
-    # Connection test only makes sense for choices 1 and 4.
-    if [[ "$LLM_CHOICE" == "1" || "$LLM_CHOICE" == "4" ]]; then
+    # Connection test only makes sense for choices that wrote a usable endpoint
+    # URL up front: local server (1), Claude API key (2), and direct API key (4).
+    if [[ "$LLM_CHOICE" == "1" || "$LLM_CHOICE" == "2" || "$LLM_CHOICE" == "4" ]]; then
         echo ""
         read -r -p "Test the endpoint now? [y/N]: " TEST_CONN
         if [[ "$TEST_CONN" =~ ^[Yy] ]]; then

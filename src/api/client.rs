@@ -8,9 +8,7 @@ use reqwest::Client;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-// Beta features required for OAuth-based Claude Code subscriptions
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 enum Backend {
@@ -162,8 +160,9 @@ fn strip_think_blocks(text: &str) -> String {
 }
 
 impl ApiClient {
-    /// Build an ApiClient from a config endpoint + optional OAuth token.
-    /// Pass `auth_token` for Anthropic endpoints (loaded from auth.json at startup).
+    /// Build an ApiClient from a config endpoint + optional auth token.
+    /// `auth_token` carries the ChatGPT Codex subscription access token; Anthropic
+    /// and OpenAI-compatible endpoints authenticate with the endpoint's API key.
     pub fn from_endpoint(endpoint: &ModelEndpoint, auth_token: Option<String>) -> Self {
         // Cap redirects at 3 hops. reqwest's default of 10 happily forwards
         // Authorization / x-api-key headers across hosts, so a malicious or
@@ -675,7 +674,6 @@ impl ApiClient {
     ) -> Result<ChatResponse, String> {
         let (system_prompt, anthropic_messages) = convert_messages_to_anthropic(messages);
         let anthropic_tools = convert_tools_to_anthropic(tools);
-        let is_oauth = auth_token.contains("sk-ant-oat");
 
         let mut body = serde_json::json!({
             "model": model,
@@ -683,15 +681,7 @@ impl ApiClient {
             "messages": anthropic_messages,
         });
 
-        if is_oauth {
-            let mut system_blocks = vec![
-                serde_json::json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
-            ];
-            if let Some(sys) = system_prompt {
-                system_blocks.push(serde_json::json!({"type": "text", "text": sys}));
-            }
-            body["system"] = serde_json::Value::Array(system_blocks);
-        } else if let Some(sys) = system_prompt {
+        if let Some(sys) = system_prompt {
             body["system"] = serde_json::Value::String(sys);
         }
         if !anthropic_tools.is_empty() {
@@ -699,39 +689,23 @@ impl ApiClient {
         }
         self.apply_anthropic_reasoning(&mut body);
 
-        // On 401 with an OAuth token, refresh and retry once — Anthropic invalidates
-        // tokens server-side before our local expiry.
-        let mut current_token = auth_token.to_string();
-        let mut retry = is_oauth;
+        let response = self
+            .anthropic_request(base_url, auth_token, &body)
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
 
-        loop {
-            let response = self
-                .anthropic_request(base_url, &current_token, &body)
-                .await
-                .map_err(|e| format!("Network error: {}", e))?;
-
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && retry {
-                retry = false;
-                let http = reqwest::Client::new();
-                match crate::auth::get_valid_token_force_refresh(&http).await {
-                    Ok(new_token) => { current_token = new_token; continue; }
-                    Err(e) => return Err(format!("Auth error (token refresh failed: {}). Run /login --anthropic to re-authenticate.", e)),
-                }
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                return Err(format!("Anthropic API error ({}): {}", status, err_body));
-            }
-
-            let json: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| format!("JSON error: {}", e))?;
-
-            return convert_anthropic_response(json);
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_body = response.text().await.unwrap_or_default();
+            return Err(format!("Anthropic API error ({}): {}", status, err_body));
         }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("JSON error: {}", e))?;
+
+        convert_anthropic_response(json)
     }
 
     async fn chat_stream_anthropic(
@@ -748,7 +722,6 @@ impl ApiClient {
 
         let (system_prompt, anthropic_messages) = convert_messages_to_anthropic(messages);
         let anthropic_tools = convert_tools_to_anthropic(tools);
-        let is_oauth = auth_token.contains("sk-ant-oat");
 
         let mut body = serde_json::json!({
             "model": model,
@@ -757,15 +730,7 @@ impl ApiClient {
             "stream": true,
         });
 
-        if is_oauth {
-            let mut system_blocks = vec![
-                serde_json::json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
-            ];
-            if let Some(sys) = system_prompt {
-                system_blocks.push(serde_json::json!({"type": "text", "text": sys}));
-            }
-            body["system"] = serde_json::Value::Array(system_blocks);
-        } else if let Some(sys) = system_prompt {
+        if let Some(sys) = system_prompt {
             body["system"] = serde_json::Value::String(sys);
         }
         if !anthropic_tools.is_empty() {
@@ -773,30 +738,15 @@ impl ApiClient {
         }
         self.apply_anthropic_reasoning(&mut body);
 
-        // Build request with token refresh on 401
-        let mut current_token = auth_token.to_string();
-        let mut retry = is_oauth;
-
-        let response = loop {
-            let is_oauth_now = current_token.contains("sk-ant-oat");
-            let mut req = self
+        let response = {
+            let req = self
                 .client
                 .post(format!("{}/v1/messages", base_url))
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .header("accept-encoding", "identity");
-
-            if is_oauth_now {
-                req = req
-                    .header("authorization", format!("Bearer {}", current_token))
-                    .header("anthropic-beta", ANTHROPIC_BETA)
-                    .header("user-agent", format!("claude-cli/{}", crate::auth::claude_client_version().await))
-                    .header("x-app", "cli")
-                    .header("anthropic-dangerous-direct-browser-access", "true");
-            } else {
-                req = req.header("x-api-key", &current_token);
-            }
+                .header("accept-encoding", "identity")
+                .header("x-api-key", auth_token);
 
             let resp = match req.json(&body).send().await {
                 Ok(r) => r,
@@ -805,21 +755,6 @@ impl ApiClient {
                     return;
                 }
             };
-
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && retry {
-                retry = false;
-                let http = reqwest::Client::new();
-                match crate::auth::get_valid_token_force_refresh(&http).await {
-                    Ok(new_token) => {
-                        current_token = new_token;
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(format!("Auth error: {}", e)));
-                        return;
-                    }
-                }
-            }
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -831,7 +766,7 @@ impl ApiClient {
                 return;
             }
 
-            break resp;
+            resp
         };
 
         // Parse Anthropic SSE stream
@@ -982,25 +917,13 @@ impl ApiClient {
         token: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let is_oauth = token.contains("sk-ant-oat");
-        let mut req = self
+        let req = self
             .client
             .post(format!("{}/v1/messages", base_url))
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .header("accept", "application/json");
-
-        if is_oauth {
-            let ua = format!("claude-cli/{}", crate::auth::claude_client_version().await);
-            req = req
-                .header("authorization", format!("Bearer {}", token))
-                .header("anthropic-beta", ANTHROPIC_BETA)
-                .header("user-agent", ua)
-                .header("x-app", "cli")
-                .header("anthropic-dangerous-direct-browser-access", "true");
-        } else {
-            req = req.header("x-api-key", token);
-        }
+            .header("accept", "application/json")
+            .header("x-api-key", token);
 
         req.json(body).send().await
     }
@@ -1359,21 +1282,11 @@ impl ApiClient {
         model_id: &str,
     ) -> Option<usize> {
         let url = format!("{}/v1/models/{}", base_url, model_id);
-        let is_oauth = auth_token.contains("sk-ant-oat");
-        let mut req = self
+        let req = self
             .client
             .get(&url)
-            .header("anthropic-version", ANTHROPIC_VERSION);
-        if is_oauth {
-            req = req
-                .header("authorization", format!("Bearer {}", auth_token))
-                .header("anthropic-beta", ANTHROPIC_BETA)
-                .header("user-agent", format!("claude-cli/{}", crate::auth::claude_client_version().await))
-                .header("x-app", "cli")
-                .header("anthropic-dangerous-direct-browser-access", "true");
-        } else {
-            req = req.header("x-api-key", auth_token);
-        }
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("x-api-key", auth_token);
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), req.send())
             .await
             .ok()?

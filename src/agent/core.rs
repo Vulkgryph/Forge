@@ -852,16 +852,14 @@ impl Agent {
 
                     let http = reqwest::Client::new();
                     let auth_token = match endpoint.endpoint_type {
-                        crate::config::EndpointType::Anthropic => {
-                            crate::auth::get_valid_token(&http).await.ok()
-                        }
                         crate::config::EndpointType::ChatGptCodex => {
                             crate::auth::get_valid_chatgpt_token(&http)
                                 .await
                                 .ok()
                                 .map(|t| t.access_token)
                         }
-                        crate::config::EndpointType::OpenAi => None,
+                        crate::config::EndpointType::Anthropic
+                        | crate::config::EndpointType::OpenAi => endpoint.api_key.clone(),
                     };
                     // Build the new client early so we can probe the server
                     let mut new_client = ApiClient::from_endpoint(&endpoint, auth_token);
@@ -963,16 +961,14 @@ impl Agent {
                     {
                         let http = reqwest::Client::new();
                         let auth_token = match endpoint.endpoint_type {
-                            crate::config::EndpointType::Anthropic => {
-                                crate::auth::get_valid_token(&http).await.ok()
-                            }
                             crate::config::EndpointType::ChatGptCodex => {
                                 crate::auth::get_valid_chatgpt_token(&http)
                                     .await
                                     .ok()
                                     .map(|t| t.access_token)
                             }
-                            crate::config::EndpointType::OpenAi => None,
+                            crate::config::EndpointType::Anthropic
+                            | crate::config::EndpointType::OpenAi => endpoint.api_key.clone(),
                         };
                         let mut client = ApiClient::from_endpoint(&endpoint, auth_token);
                         client.apply_agent_reasoning_defaults(&self.app_config.agent);

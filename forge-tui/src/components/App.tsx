@@ -398,20 +398,15 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
   const handleLoginCommand = (args: string) => {
     const flag = args.trim().toLowerCase();
     if (!flag || flag === "--help") {
-      addSystemEntry("Usage: /login --anthropic | --chatgpt\nProviders: --anthropic, --chatgpt");
+      addSystemEntry("Usage: /login --chatgpt\n(Claude uses an Anthropic API key — set one via /model — not subscription login.)");
       return;
     }
-    if (flag === "--anthropic") {
-      if (state.loginInProgress) {
-        addSystemEntry("Login already in progress.");
-        return;
-      }
+    if (flag === "--anthropic" || flag === "--claude") {
       addSystemEntry(
-        "Tip: if the browser opens but login never completes (callback port may be busy — e.g. VS Code, codex CLI),\n" +
-        "quit forge (/quit) and run  forge --login  from your shell. That path supports manual code-paste\n" +
-        "even when the localhost callback can't bind."
+        "Claude subscription login is not supported. Anthropic restricts subscription credentials\n" +
+        "to its own apps, so Forge uses an Anthropic API key instead — add one via /model or in\n" +
+        "~/.config/forge/config.toml."
       );
-      send({ type: "login_anthropic" });
     } else if (flag === "--chatgpt" || flag === "--codex") {
       if (state.loginInProgress) {
         addSystemEntry("Login already in progress.");
@@ -578,7 +573,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
    * endpointMap[i] is the EndpointInfo for item i, null for headers,
    * or a login action item.
    */
-  type EndpointMenuEntry = EndpointInfo | null | "login_anthropic" | "login_chatgpt";
+  type EndpointMenuEntry = EndpointInfo | null | "login_chatgpt";
   const isCurrentEndpoint = (ep: EndpointInfo) =>
     ep.model_id === state.modelId && ep.max_context_tokens === state.maxContextTokens;
 
@@ -614,13 +609,6 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
       });
       endpointMap.push(ep);
     }
-    if (!state.anthropicLoggedIn) {
-      items.push({
-        label: state.loginInProgress ? "Logging in…" : "Login to Claude →",
-        description: "Authorize with your Claude subscription",
-      });
-      endpointMap.push("login_anthropic");
-    }
 
     items.push({ label: "ChatGPT Codex", description: "", header: true });
     endpointMap.push(null);
@@ -645,7 +633,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
 
   const buildMainModelMenu = (): { items: MenuOption[]; endpointMap: EndpointMenuEntry[]; initial: number } => {
     const { items, endpointMap } = buildGroupedEndpoints();
-    const initial = Math.max(0, endpointMap.findIndex((ep) => ep && ep !== "login_anthropic" && ep !== "login_chatgpt" && isCurrentEndpoint(ep as EndpointInfo)));
+    const initial = Math.max(0, endpointMap.findIndex((ep) => ep && ep !== "login_chatgpt" && isCurrentEndpoint(ep as EndpointInfo)));
     return { items, endpointMap, initial };
   };
 
@@ -877,10 +865,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
   const handleMainModelSelect = (idx: number) => {
     const { endpointMap } = buildMainModelMenu();
     const entry = endpointMap[idx];
-    if (entry === "login_anthropic") {
-      send({ type: "login_anthropic" });
-      closeMenus();
-    } else if (entry === "login_chatgpt") {
+    if (entry === "login_chatgpt") {
       send({ type: "login_chatgpt" });
       closeMenus();
     } else if (entry) {
@@ -892,7 +877,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
   };
 
   const resolveEndpoint = (entry: EndpointMenuEntry): EndpointInfo | null =>
-    entry && entry !== "login_anthropic" && entry !== "login_chatgpt" ? entry as EndpointInfo : null;
+    entry && entry !== "login_chatgpt" ? entry as EndpointInfo : null;
 
   const handleSubagentModelSelect = (idx: number) => {
     const { endpointMap } = buildEndpointListMenu();

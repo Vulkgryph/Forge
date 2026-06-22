@@ -109,7 +109,6 @@ export const AgentMessageSchema = z.discriminatedUnion("type", [
     session_id: z.string().optional(),
     available_tools: z.array(ToolInfoSchema).default([]),
     context_strategy: z.string().default("compaction"),
-    anthropic_logged_in: z.boolean().default(false),
     chatgpt_logged_in: z.boolean().default(false),
   }),
   z.object({ type: z.literal("thinking") }),
@@ -268,7 +267,6 @@ export type UserMessage =
   | { type: "clear_session" }
   | { type: "process_input"; content: string }
   | { type: "bg_process_input"; bg_id: string; content: string }
-  | { type: "login_anthropic" }
   | { type: "login_chatgpt" }
   | { type: "cancel_run" }
   | { type: "update_context_strategy"; strategy: string }

@@ -33,7 +33,6 @@ enum OutgoingMessage {
         session_id: Option<String>,
         available_tools: Vec<ToolInfo>,
         context_strategy: String,
-        anthropic_logged_in: bool,
         chatgpt_logged_in: bool,
     },
     Thinking,
@@ -489,7 +488,6 @@ enum IncomingMessage {
         endpoint_name: String,
         reasoning: crate::config::EndpointReasoningConfig,
     },
-    LoginAnthropic,
     LoginChatgpt,
     ListSessions,
     ResumeSession {
@@ -671,7 +669,7 @@ fn json_to_user_action(
         IncomingMessage::CancelRun => Some(UserAction::CancelRun),
         IncomingMessage::Quit => Some(UserAction::Quit),
         // Handled directly in the headless loop before this function is called
-        IncomingMessage::LoginAnthropic | IncomingMessage::LoginChatgpt => None,
+        IncomingMessage::LoginChatgpt => None,
     }
 }
 
@@ -700,7 +698,6 @@ pub async fn run_headless(
         session_id: init_info.session_id,
         available_tools: init_info.available_tools,
         context_strategy: init_info.context_strategy,
-        anthropic_logged_in: init_info.anthropic_logged_in,
         chatgpt_logged_in: init_info.chatgpt_logged_in,
     };
     let json = serde_json::to_string(&init_msg)?;
@@ -759,55 +756,6 @@ pub async fn run_headless(
                         let trimmed = line_buf.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<IncomingMessage>(trimmed) {
-                                Ok(IncomingMessage::LoginAnthropic) => {
-                                    let tx = login_tx.clone();
-                                    tokio::spawn(async move {
-                                        let status = OutgoingMessage::LoginStatus {
-                                            message: "Opening browser for Claude authorization...".to_string(),
-                                        };
-                                        if let Ok(s) = serde_json::to_string(&status) {
-                                            let _ = tx.send(s);
-                                        }
-                                        // Inside the headless protocol — stdin is owned by the
-                                        // message reader, so the paste fallback isn't available.
-                                        // login() will bail with a clear error if the callback
-                                        // port is busy, pointing the user at `forge --login`.
-                                        match crate::auth::login(false).await {
-                                            Ok(()) => {
-                                                // Fetch available models and push them to the UI
-                                                let http = reqwest::Client::new();
-                                                if let Ok(token) = crate::auth::get_valid_token(&http).await {
-                                                    let models = crate::auth::fetch_anthropic_models(&http, &token).await;
-                                                    let endpoints: Vec<EndpointInfo> = models.iter().map(|m| EndpointInfo {
-                                                        name: m.display_name.clone(),
-                                                        base_url: "https://api.anthropic.com".to_string(),
-                                                        model_id: m.id.clone(),
-                                                        max_context_tokens: m.context_window,
-                                                        max_output_tokens: m.max_output_tokens,
-                                                        endpoint_type: "anthropic".to_string(),
-                                                        reasoning: crate::config::EndpointReasoningConfig::default(),
-                                                    }).collect();
-                                                    if !endpoints.is_empty() {
-                                                        let msg = OutgoingMessage::EndpointsUpdated { endpoints };
-                                                        if let Ok(s) = serde_json::to_string(&msg) { let _ = tx.send(s); }
-                                                    }
-                                                }
-                                                let msg = OutgoingMessage::LoginComplete {
-                                                    success: true,
-                                                    message: "Logged in to Claude successfully.".to_string(),
-                                                };
-                                                if let Ok(s) = serde_json::to_string(&msg) { let _ = tx.send(s); }
-                                            }
-                                            Err(e) => {
-                                                let msg = OutgoingMessage::LoginComplete {
-                                                    success: false,
-                                                    message: format!("Login failed: {}", e),
-                                                };
-                                                if let Ok(s) = serde_json::to_string(&msg) { let _ = tx.send(s); }
-                                            }
-                                        }
-                                    });
-                                }
                                 Ok(IncomingMessage::LoginChatgpt) => {
                                     let tx = login_tx.clone();
                                     tokio::spawn(async move {
@@ -926,7 +874,6 @@ pub struct HeadlessInit {
     pub rewind_checkpoints: Vec<RewindCheckpointJson>,
     pub available_tools: Vec<ToolInfo>,
     pub context_strategy: String,
-    pub anthropic_logged_in: bool,
     pub chatgpt_logged_in: bool,
 }
 

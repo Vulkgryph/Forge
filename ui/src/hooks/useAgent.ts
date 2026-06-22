@@ -121,7 +121,6 @@ export interface AgentState {
   activeSubagents: Map<string, ActiveSubagent>;
   availableTools: import("../protocol.js").ToolInfo[];
   contextStrategy: string;
-  anthropicLoggedIn: boolean;
   chatgptLoggedIn: boolean;
   loginInProgress: boolean;
   streamingId: string | null;
@@ -230,7 +229,6 @@ export function useAgent(options: UseAgentOptions = {}) {
     activeSubagents: new Map(),
     availableTools: [],
     contextStrategy: "compaction",
-    anthropicLoggedIn: false,
     chatgptLoggedIn: false,
     loginInProgress: false,
     streamingId: null,
@@ -484,7 +482,6 @@ export function useAgent(options: UseAgentOptions = {}) {
             endpoints: msg.endpoints,
             availableTools: msg.available_tools ?? [],
             contextStrategy: msg.context_strategy ?? "compaction",
-            anthropicLoggedIn: msg.anthropic_logged_in ?? false,
             chatgptLoggedIn: msg.chatgpt_logged_in ?? false,
             scrollback: [...prev.scrollback, ...startupEntries(
               msg.model_name,
@@ -1042,7 +1039,6 @@ export function useAgent(options: UseAgentOptions = {}) {
           setState((prev) => ({
             ...prev,
             loginInProgress: false,
-            anthropicLoggedIn: msg.success && msg.message.includes("Claude") ? true : prev.anthropicLoggedIn,
             chatgptLoggedIn: msg.success && msg.message.includes("ChatGPT") ? true : prev.chatgptLoggedIn,
             // Failure is an error, not a neutral system note — render with the
             // error styling so the user actually notices it.

@@ -6,11 +6,11 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Removed
 
-- **Claude subscription (Pro/Max) OAuth login.** `forge --login` / `forge --login claude` / the in-TUI `/login --anthropic` flow now refuse with a message pointing to API-key auth, and any previously stored `~/.config/forge/auth.json` subscription token is no longer loaded or sent.
+- **Claude subscription (Pro/Max) OAuth login — removed entirely.** The Claude OAuth flow (`forge --login` / `--login-claude` / the in-TUI `/login --anthropic`), the embedded Claude Code OAuth client id, the `claude-cli` user-agent and `claude-code` beta-header impersonation, the Claude token store (`~/.config/forge/auth.json`), and the weekly Claude `client_version` self-check are all gone. Forge no longer contains any code path that authenticates to Anthropic with subscription credentials.
 
-  **Why:** Anthropic's Consumer Terms and the Claude Code legal terms restrict subscription OAuth tokens to Anthropic's own applications and prohibit "routing requests through Free, Pro, or Max plan credentials" in any other product, tool, or service. Forge had been authenticating to Anthropic with the Claude Code OAuth client and a `claude-cli` user-agent — i.e. using subscription credentials outside a native Anthropic app. We were not aware of this restriction until recently; this release removes the behavior to bring Forge into compliance. The risk this avoids lands on the end user's Claude account (which can be flagged or suspended without notice), so we are erring firmly on the side of caution.
+  **Why:** Anthropic's Consumer Terms and the Claude Code legal terms restrict subscription OAuth tokens to Anthropic's own applications and prohibit "routing requests through Free, Pro, or Max plan credentials" in any other product, tool, or service. Forge had been authenticating to Anthropic with the Claude Code OAuth client and a `claude-cli` user-agent — i.e. using subscription credentials outside a native Anthropic app. We were not aware of this restriction until recently; this release removes the behavior outright to respect Anthropic's terms. The risk it avoided lands on the end user's Claude account (which can be flagged or suspended without notice), so removal is the right call. We will not reintroduce Anthropic subscription sign-in unless and until Anthropic permits it.
 
-  **Not affected:** Anthropic **API-key** auth (set a key on an endpoint in `~/.config/forge/config.toml`) continues to work unchanged, as does **ChatGPT Codex** subscription login.
+  **Anthropic is still fully supported via an API key** — set `endpoint_type = "anthropic"` with `api_key = "sk-ant-…"` in `~/.config/forge/config.toml` (or pick **Claude** in the installer wizard). **ChatGPT Codex** subscription login is unchanged and remains the only supported subscription sign-in.
 
 ## [0.1.0] — 2026-06-18
 

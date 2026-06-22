@@ -277,7 +277,7 @@ After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.jso
 
 > **Remote / firewall users:** the OAuth flow listens on `localhost:1455` (ChatGPT Codex). If your browser can't reach it (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar after it fails to load, and paste it into forge.
 
-> **Claude (Anthropic):** subscription (Pro/Max) login via Forge is **not supported**. Anthropic's terms restrict subscription OAuth credentials to its own applications and prohibit routing requests through Pro/Max credentials in third-party tools, so `forge --login claude` will refuse. Use an **Anthropic API key** instead — add it to an `endpoint_type = "anthropic"` endpoint in `~/.config/forge/config.toml`. See the [CHANGELOG](CHANGELOG.md) for details.
+> **Claude (Anthropic):** subscription (Pro/Max) login via Forge is **not supported** — there is no Claude OAuth code path in Forge, and `forge --login claude` exits with an error. Anthropic's terms restrict subscription OAuth credentials to its own applications and prohibit routing requests through Pro/Max credentials in third-party tools, so we don't. Use an **Anthropic API key** instead — add it to an `endpoint_type = "anthropic"` endpoint in `~/.config/forge/config.toml` (or pick **Claude** in the installer wizard). See the [CHANGELOG](CHANGELOG.md) for details.
 
 ### Config reference
 

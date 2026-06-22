@@ -58,10 +58,6 @@ struct Cli {
     #[arg(long)]
     resume_session: Option<String>,
 
-    /// Log in to Claude via OAuth (for Claude subscription / claude.ai/pro)
-    #[arg(long)]
-    login: bool,
-
     /// Log in to ChatGPT Codex via OAuth (for ChatGPT subscription Codex)
     #[arg(long)]
     login_chatgpt: bool,
@@ -71,19 +67,16 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Handle --login before anything else
-    if cli.login {
-        // Standalone forge-agent --login. We own stdin, so the paste fallback
-        // is available if the localhost callback port is busy.
-        auth::login(true).await?;
+    // Handle --login-chatgpt before anything else.
+    if cli.login_chatgpt {
+        // Standalone forge-agent --login-chatgpt. We own stdin, so the paste
+        // fallback is available if the localhost callback port is busy.
+        //
         // wait_for_callback_on races the TCP listener against a tokio stdin
         // reader. When the listener wins, the stdin future is dropped but the
         // underlying blocking worker thread keeps holding stdin, preventing
         // tokio's runtime from shutting down cleanly. Explicit exit bypasses
         // the hang.
-        std::process::exit(0);
-    }
-    if cli.login_chatgpt {
         auth::login_chatgpt(true).await?;
         std::process::exit(0);
     }
@@ -98,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "Usage: forge-agent --headless [--resume-session <id>] [--dangerously-allow-all]"
         );
-        eprintln!("       forge-agent --login   (log in to Claude subscription)");
+        eprintln!("       forge-agent --login-chatgpt   (log in to ChatGPT Codex subscription)");
         std::process::exit(1);
     }
 
@@ -151,24 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut max_context_tokens = endpoint.max_context_tokens;
 
-    // Load OAuth token for Anthropic endpoints
-    let saved_tokens = auth::load_tokens();
-    let anthropic_logged_in = saved_tokens.is_some();
-
+    // Anthropic and OpenAI-compatible endpoints authenticate with the endpoint's
+    // API key (carried in config). Only the ChatGPT Codex subscription uses an
+    // OAuth access token, loaded here.
     let oauth_token = match endpoint.endpoint_type {
-        config::EndpointType::Anthropic => match saved_tokens {
-            Some(_) => {
-                let http = reqwest::Client::new();
-                match auth::get_valid_token(&http).await {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        print_oauth_refresh_error("Claude", &e.to_string(), "forge --login");
-                        None
-                    }
-                }
-            }
-            None => None,
-        },
         config::EndpointType::ChatGptCodex => {
             let http = reqwest::Client::new();
             match auth::get_valid_chatgpt_token(&http).await {
@@ -179,40 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        config::EndpointType::OpenAi => None,
+        config::EndpointType::Anthropic | config::EndpointType::OpenAi => None,
     };
 
     let client = api::ApiClient::from_endpoint(endpoint, oauth_token.clone());
 
-    // If logged in to Anthropic, fetch available models and merge into endpoints list.
-    // We always have the token available at this point if anthropic_logged_in is true
-    // (either from oauth_token for Anthropic default endpoints, or we re-load it).
     let mut all_endpoints = app_config.models.endpoints.clone();
-    if anthropic_logged_in {
-        let http = reqwest::Client::new();
-        if let Ok(token) = auth::get_valid_token(&http).await {
-            let discovered = auth::fetch_anthropic_models(&http, &token).await;
-            for model in discovered {
-                if !all_endpoints.iter().any(|e| {
-                    e.endpoint_type == config::EndpointType::Anthropic
-                        && e.model_id == model.id
-                        && e.max_context_tokens == model.context_window
-                }) {
-                    all_endpoints.push(config::ModelEndpoint {
-                        name: model.display_name,
-                        base_url: "https://api.anthropic.com".to_string(),
-                        model_id: model.id,
-                        api_key: None,
-                        max_context_tokens: model.context_window,
-                        max_output_tokens: model.max_output_tokens,
-                        request_timeout_secs: config::default_request_timeout_secs(),
-                        endpoint_type: config::EndpointType::Anthropic,
-                        reasoning: config::EndpointReasoningConfig::default(),
-                    });
-                }
-            }
-        }
-    }
 
     let chatgpt_logged_in = auth::load_chatgpt_tokens().is_some();
     if chatgpt_logged_in {
@@ -321,11 +272,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .find(|e| e.name == meta.model || e.model_id == meta.model)
         {
             let token = match ep.endpoint_type {
-                config::EndpointType::Anthropic => auth::load_tokens().map(|t| t.access_token),
                 config::EndpointType::ChatGptCodex => {
                     auth::load_chatgpt_tokens().map(|t| t.access_token)
                 }
-                config::EndpointType::OpenAi => None,
+                config::EndpointType::Anthropic | config::EndpointType::OpenAi => None,
             };
             let c = api::ApiClient::from_endpoint(ep, token);
             (c, ep.model_id.clone(), ep.max_context_tokens)
@@ -485,7 +435,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             crate::config::ContextStrategy::RollingWindow => "rolling_window".to_string(),
             crate::config::ContextStrategy::Compaction => "compaction".to_string(),
         },
-        anthropic_logged_in,
         chatgpt_logged_in,
     };
     headless::run_headless(event_rx, action_tx, init, app_config.clone()).await?;

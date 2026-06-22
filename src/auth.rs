@@ -25,21 +25,12 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-// Claude Code OAuth client — same as the official CLI
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const REDIRECT_URI: &str = "http://localhost:53692/callback";
-const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-
-/// Claude subscription (Pro/Max) OAuth login is disabled to comply with
-/// Anthropic's Terms of Service, which restrict subscription OAuth tokens to
-/// Anthropic's own applications (Claude Code and other native Anthropic apps)
-/// and prohibit routing requests through Free/Pro/Max credentials in any other
-/// product, tool, or service. We were not aware of this restriction until
-/// recently. The acquisition and use of Claude subscription tokens are gated
-/// below; Anthropic API-key auth and ChatGPT Codex login are unaffected.
-const CLAUDE_OAUTH_DISABLED: &str = "Claude subscription (Pro/Max) login via Forge is disabled to comply with Anthropic's Terms of Service, which restrict subscription OAuth tokens to Anthropic's own applications. Use an Anthropic API key instead — add it to an endpoint in ~/.config/forge/config.toml. (ChatGPT Codex login is unaffected.)";
+// Anthropic subscription (Claude Pro/Max) OAuth login is intentionally NOT
+// supported. Anthropic's Terms restrict subscription OAuth credentials to its
+// own applications and prohibit routing requests through Pro/Max credentials in
+// third-party tools, so Forge talks to Anthropic only via a user-supplied API
+// key (the `x-api-key` path in src/api/client.rs). ChatGPT Codex subscription
+// OAuth (below) remains supported.
 
 // ChatGPT/Codex OAuth client id used by the public Codex CLI.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -48,18 +39,6 @@ const CHATGPT_REDIRECT_PORT: u16 = 1455;
 const CHATGPT_REDIRECT_PATH: &str = "/auth/callback";
 const CHATGPT_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthTokens {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at: u64, // Unix timestamp (seconds)
-    /// If we got a 429 from the refresh endpoint, the unix timestamp until
-    /// which we should not retry. Cleared on next successful refresh.
-    /// Default = 0 (never rate-limited).
-    #[serde(default)]
-    pub rate_limited_until: u64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptTokens {
@@ -94,40 +73,12 @@ impl ChatGptTokens {
     }
 }
 
-impl OAuthTokens {
-    fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Refresh 60 seconds before actual expiry
-        now >= self.expires_at.saturating_sub(60)
-    }
-}
-
-pub fn auth_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not find home directory")?;
-    Ok(home.join(".config").join("forge").join("auth.json"))
-}
-
 pub fn chatgpt_auth_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
     Ok(home
         .join(".config")
         .join("forge")
         .join("chatgpt_auth.json"))
-}
-
-#[allow(unreachable_code)]
-pub fn load_tokens() -> Option<OAuthTokens> {
-    // Disabled for ToS compliance (see CLAUDE_OAUTH_DISABLED): never surface a
-    // stored Claude subscription token to the request path, even if a stale
-    // ~/.config/forge/auth.json exists from before this change.
-    return None;
-
-    let path = auth_path().ok()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
 }
 
 pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
@@ -350,21 +301,6 @@ async fn resolve_client_version(repo: &str, cache_file: &str, fallback: &str) ->
     fallback.to_string()
 }
 
-/// Resolve the Claude Code client version Forge should pose as. Anthropic's
-/// API rejects (or rate-limits) requests with very old user-agents; tracking
-/// the upstream CLI version keeps us looking current.
-pub async fn claude_client_version() -> String {
-    use tokio::sync::OnceCell;
-    static CACHED: OnceCell<String> = OnceCell::const_new();
-    CACHED
-        .get_or_init(|| async {
-            resolve_client_version("anthropics/claude-code", "claude_client_version.json", "2.1.75")
-                .await
-        })
-        .await
-        .clone()
-}
-
 fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
@@ -534,17 +470,6 @@ fn parse_chatgpt_codex_models(json_bytes: &[u8]) -> Option<Vec<ChatGptCodexModel
     Some(discovered)
 }
 
-fn save_tokens(tokens: &OAuthTokens) -> Result<()> {
-    let path = auth_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(tokens)?;
-    std::fs::write(&path, &content)?;
-    restrict_to_owner(&path);
-    Ok(())
-}
-
 fn save_chatgpt_tokens(tokens: &ChatGptTokens) -> Result<()> {
     let path = chatgpt_auth_path()?;
     if let Some(parent) = path.parent() {
@@ -615,22 +540,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Get a valid access token, refreshing if expired. Returns error if not logged in.
-#[allow(unreachable_code, unused_variables)]
-pub async fn get_valid_token(http: &reqwest::Client) -> Result<String> {
-    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
-
-    let mut tokens =
-        load_tokens().context("Not logged in to Claude. Run `forge-agent --login` first.")?;
-
-    if tokens.is_expired() {
-        tokens = refresh_tokens(http, &tokens).await?;
-        save_tokens(&tokens)?;
-    }
-
-    Ok(tokens.access_token.clone())
-}
-
 pub async fn get_valid_chatgpt_token(http: &reqwest::Client) -> Result<ChatGptTokens> {
     let mut tokens = load_chatgpt_tokens()
         .context("Not logged in to ChatGPT Codex. Run `/login --chatgpt` first.")?;
@@ -659,18 +568,6 @@ pub async fn get_valid_chatgpt_token_force_refresh(
     Ok(refreshed)
 }
 
-/// Force-refresh the token regardless of local expiry (used when server returns 401).
-#[allow(unreachable_code, unused_variables)]
-pub async fn get_valid_token_force_refresh(http: &reqwest::Client) -> Result<String> {
-    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
-
-    let tokens =
-        load_tokens().context("Not logged in to Claude. Run `forge-agent --login` first.")?;
-    let refreshed = refresh_tokens(http, &tokens).await?;
-    save_tokens(&refreshed)?;
-    Ok(refreshed.access_token)
-}
-
 /// Default backoff applied to OAuth refresh attempts that hit 429 without a
 /// `Retry-After` header. Anthropic's rate-limit window for this endpoint is
 /// roughly 5 minutes in practice.
@@ -688,52 +585,6 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     // HTTP-date form (e.g. "Wed, 21 Oct 2024 07:28:00 GMT") — best-effort,
     // not bothering with a full parser; just fall back to default.
     None
-}
-
-async fn refresh_tokens(http: &reqwest::Client, old_tokens: &OAuthTokens) -> Result<OAuthTokens> {
-    // Short-circuit if we're still inside a previous 429 backoff window.
-    let now = unix_now();
-    if old_tokens.rate_limited_until > now {
-        let secs = old_tokens.rate_limited_until - now;
-        anyhow::bail!(
-            "Refresh is rate-limited by the auth server. Wait ~{}s, or run forge --login to get fresh tokens.",
-            secs
-        );
-    }
-
-    let resp = http
-        .post(TOKEN_URL)
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "refresh_token": old_tokens.refresh_token,
-        }))
-        .send()
-        .await
-        .context("Token refresh request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body = resp.text().await.unwrap_or_default();
-
-        if status.as_u16() == 429 {
-            // Persist the cooldown so subsequent forge startups don't hammer
-            // the endpoint and dig the rate-limit hole deeper.
-            let retry_after = parse_retry_after(&headers).unwrap_or(DEFAULT_REFRESH_BACKOFF_SECS);
-            let until = now + retry_after;
-            let mut t = old_tokens.clone();
-            t.rate_limited_until = until;
-            let _ = save_tokens(&t);
-            anyhow::bail!(
-                "Refresh rate-limited by the auth server (HTTP 429). Cooldown ~{}s. Wait, or run forge --login to get fresh tokens.",
-                retry_after
-            );
-        }
-        anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
-    }
-
-    parse_token_response(resp, &old_tokens.refresh_token).await
 }
 
 async fn refresh_chatgpt_tokens(
@@ -848,41 +699,6 @@ async fn obtain_chatgpt_api_key(http: &reqwest::Client, id_token: &str) -> Resul
         .context("Missing access_token in ChatGPT API token exchange response")
 }
 
-async fn parse_token_response(
-    resp: reqwest::Response,
-    fallback_refresh_token: &str,
-) -> Result<OAuthTokens> {
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("Failed to parse token response")?;
-
-    let access_token = json["access_token"]
-        .as_str()
-        .context("Missing access_token in response")?
-        .to_string();
-    // Some OAuth servers don't rotate the refresh token — keep the old one if absent.
-    let refresh_token = json["refresh_token"]
-        .as_str()
-        .unwrap_or(fallback_refresh_token)
-        .to_string();
-    let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
-
-    let expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        + expires_in;
-
-    Ok(OAuthTokens {
-        access_token,
-        refresh_token,
-        expires_at,
-        // Fresh tokens → clear any prior rate-limit cooldown.
-        rate_limited_until: 0,
-    })
-}
-
 async fn parse_chatgpt_token_response(
     resp: reqwest::Response,
     fallback: Option<&ChatGptTokens>,
@@ -957,192 +773,8 @@ fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// A Claude model discovered from the Anthropic models API.
-pub struct AnthropicModel {
-    pub id: String,
-    pub display_name: String,
-    pub context_window: usize,
-    pub max_output_tokens: u32,
-}
-
-/// Fetch available models from the Anthropic API using the given OAuth/API token.
-/// Returns an empty vec on any error (non-fatal — caller falls back to configured endpoints).
-pub async fn fetch_anthropic_models(http: &reqwest::Client, token: &str) -> Vec<AnthropicModel> {
-    let is_oauth = token.contains("sk-ant-oat");
-    let mut models = Vec::new();
-    let mut after_id: Option<String> = None;
-
-    for _ in 0..20 {
-        let mut req = http
-            .get("https://api.anthropic.com/v1/models")
-            .query(&[("limit", "100")])
-            .header("anthropic-version", "2023-06-01");
-
-        if let Some(cursor) = after_id.as_deref() {
-            req = req.query(&[("after_id", cursor)]);
-        }
-
-        if is_oauth {
-            let ua = format!("claude-cli/{}", claude_client_version().await);
-            req = req
-                .header("authorization", format!("Bearer {}", token))
-                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-                .header("user-agent", ua)
-                .header("x-app", "cli")
-                .header("anthropic-dangerous-direct-browser-access", "true");
-        } else {
-            req = req.header("x-api-key", token);
-        }
-
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(8), req.send()).await {
-            Ok(Ok(r)) => r,
-            _ => break,
-        };
-
-        if !resp.status().is_success() {
-            break;
-        }
-
-        let json: serde_json::Value = match resp.json().await {
-            Ok(j) => j,
-            Err(_) => break,
-        };
-
-        let data = match json.get("data").and_then(|d| d.as_array()) {
-            Some(d) => d,
-            None => break,
-        };
-
-        for m in data {
-            if let Some(model) = parse_anthropic_model(m) {
-                if !models
-                    .iter()
-                    .any(|existing: &AnthropicModel| existing.id == model.id)
-                {
-                    if model.context_window > 200_000 {
-                        models.push(AnthropicModel {
-                            id: model.id.clone(),
-                            display_name: format!("{} (200k)", model.display_name),
-                            context_window: 200_000,
-                            max_output_tokens: model.max_output_tokens,
-                        });
-                    }
-                    models.push(model);
-                }
-            }
-        }
-
-        let has_more = json
-            .get("has_more")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let next_after_id = json
-            .get("last_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        if !has_more || next_after_id.is_none() || next_after_id == after_id {
-            break;
-        }
-        after_id = next_after_id;
-    }
-
-    models
-}
-
-fn parse_anthropic_model(m: &serde_json::Value) -> Option<AnthropicModel> {
-    let id = m.get("id")?.as_str()?.to_string();
-    let display_name = m
-        .get("display_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&id)
-        .to_string();
-    let context_window = ["max_input_tokens", "context_window", "context_length"]
-        .iter()
-        .find_map(|field| m.get(field).and_then(|v| v.as_u64()))
-        .unwrap_or(200_000) as usize;
-    let max_output_tokens = m
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(16384) as u32;
-    Some(AnthropicModel {
-        id,
-        display_name,
-        context_window,
-        max_output_tokens,
-    })
-}
-
-/// Run the OAuth login flow. Opens browser, waits for callback, saves tokens.
-///
-/// `interactive` controls the paste-the-code fallback: when true (called from
-/// `forge-agent --login` standalone), if the localhost port is busy we drop into
-/// stdin-paste mode. When false (called from the headless protocol session where
-/// stdin is already owned by the JSON message reader), we bail with a clear
-/// error pointing at the standalone command — competing for stdin would hang
-/// silently otherwise.
-#[allow(unreachable_code, unused_variables)]
-pub async fn login(interactive: bool) -> Result<()> {
-    // Disabled for ToS compliance — see CLAUDE_OAUTH_DISABLED. We refuse to
-    // initiate the Claude subscription OAuth grant at all; the flow below is
-    // retained (unreachable) to keep the diff minimal and reversible.
-    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
-
-    let (verifier, challenge) = generate_pkce();
-    // `state` must be an independent random nonce, not the PKCE verifier:
-    // PKCE binds the code redemption to this client, while `state` is the
-    // CSRF check that the callback we receive corresponds to the request
-    // we just sent. Reusing one for the other collapses two distinct
-    // protections into one.
-    let state = generate_oauth_state();
-
-    let auth_url = format!(
-        "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
-        AUTHORIZE_URL,
-        CLIENT_ID,
-        urlencoding::encode(REDIRECT_URI),
-        urlencoding::encode(SCOPES),
-        challenge,
-        urlencoding::encode(&state),
-    );
-
-    eprintln!("Opening browser for Claude authorization...");
-    eprintln!("If the browser doesn't open, visit:\n\n  {}\n", auth_url);
-
-    open_browser(&auth_url);
-
-    let code = wait_for_callback(&state, interactive).await?;
-
-    let http = reqwest::Client::new();
-    let resp = http
-        .post(TOKEN_URL)
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": code,
-            "state": state,
-            "redirect_uri": REDIRECT_URI,
-            "code_verifier": verifier,
-        }))
-        .send()
-        .await
-        .context("Token exchange request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Token exchange failed ({}): {}", status, body);
-    }
-
-    let tokens = parse_token_response(resp, "").await?;
-    save_tokens(&tokens)?;
-
-    eprintln!("Login successful. Token saved to ~/.config/forge/auth.json");
-    Ok(())
-}
-
 /// Run the ChatGPT/Codex OAuth login flow. This mirrors the public Codex CLI
-/// browser flow and stores tokens separately from Claude credentials.
+/// browser flow and stores tokens in `~/.config/forge/chatgpt_auth.json`.
 pub async fn login_chatgpt(interactive: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
     let state = generate_oauth_state();
@@ -1201,11 +833,6 @@ pub async fn login_chatgpt(interactive: bool) -> Result<()> {
     Ok(())
 }
 
-/// Binds port 53692, waits for the OAuth redirect, returns the authorization code.
-async fn wait_for_callback(expected_state: &str, interactive: bool) -> Result<String> {
-    wait_for_callback_on(53692, "/callback", Some(expected_state), interactive).await
-}
-
 /// Wait for an OAuth authorization code via two parallel paths, whichever wins first:
 ///   1. The browser hits the localhost TCP listener (works on local machines and
 ///      when SSH port forwarding is set up).
@@ -1241,7 +868,7 @@ async fn wait_for_callback_on(
             eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
             eprintln!("     and show \"site can't be reached\". THAT is the page you want.");
             eprintln!("  3. Copy the URL from your browser's address bar (the localhost one,");
-            eprintln!("     NOT the auth.openai.com / claude.ai one) and paste it below.");
+            eprintln!("     NOT the auth.openai.com one) and paste it below.");
             eprintln!();
             eprintln!("Waiting for browser callback OR pasted URL:");
             eprintln!();
@@ -1286,11 +913,7 @@ async fn wait_for_callback_on(
                 // Inside the headless protocol session — stdin is owned by the
                 // JSON message reader, so the paste fallback would hang
                 // competing for input. Bail with a clear error instead.
-                let cmd = match port {
-                    53692 => "forge --login",
-                    1455 => "forge --login-chatgpt",
-                    _ => "forge --login",
-                };
+                let cmd = "forge --login-chatgpt";
                 anyhow::bail!(
                     "Port {} is busy and the manual paste flow isn't available from inside forge. \
                      Quit forge (/quit) and run `{}` from your shell — that path supports paste-the-URL \
@@ -1375,9 +998,7 @@ fn identify_port_holder(port: u16) -> Option<String> {
 /// If we recognize the conflicting process, suggest a specific resolution.
 fn suggestion_for_holder(holder: &str) -> Option<&'static str> {
     let lower = holder.to_lowercase();
-    if lower.contains("claude") {
-        Some("Looks like Claude Code is also running. Quit it for a one-click login, or use the manual flow below.")
-    } else if lower.contains("codex") {
+    if lower.contains("codex") {
         Some("Looks like the codex CLI is also running. Quit it for a one-click login, or use the manual flow below.")
     } else if lower.contains("code helper") || lower.contains("code\\x20h") {
         Some("VS Code is holding this port for one of its internal helpers. Quit VS Code for a one-click login, or just use the manual flow below — it's only a few extra clicks.")
@@ -1457,7 +1078,6 @@ async fn read_code_from_stdin(expected_state: Option<String>) -> Result<String> 
             let is_authorize_url = query.contains("client_id=")
                 || query.contains("response_type=")
                 || trimmed.contains("/oauth/authorize")
-                || trimmed.contains("claude.ai/oauth")
                 || trimmed.contains("auth.openai.com");
             let has_code = query.contains("code=");
 
@@ -1469,7 +1089,7 @@ async fn read_code_from_stdin(expected_state: Option<String>) -> Result<String> 
                      something starting with `http://localhost:...?code=...&state=...`. \
                      That \"site can't be reached\" page IS the right one — copy its URL \
                      and paste THAT here.\n\n  \
-                     Re-run forge --login to try again."
+                     Re-run forge --login-chatgpt to try again."
                 );
             }
 

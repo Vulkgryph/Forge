@@ -4,7 +4,7 @@
 
 Forge is an autonomous AI coding assistant built around a Rust headless agent and a Bun/Ink terminal UI. The UI speaks a JSON-newline protocol to `forge-agent --headless`; the agent calls OpenAI-compatible chat APIs, Anthropic Messages APIs, or ChatGPT Codex Responses APIs, then executes local tools for code reading, editing, testing, and search.
 
-The public build includes the core coding workflow: approval-gated tools, planning mode, context compaction or rolling-window trimming, parallel subagents, session persistence, revert checkpoints, OAuth-backed provider login, and local custom agent/tool definitions.
+The public build includes the core coding workflow: approval-gated tools, planning mode, context compaction or rolling-window trimming, parallel subagents, session persistence, revert checkpoints, ChatGPT Codex subscription login (OAuth) alongside API-key auth, and local custom agent/tool definitions.
 
 ## Core Purpose
 
@@ -219,7 +219,7 @@ Remote note: interactive SSH sessions are blocked inside `shell_exec`. Non-inter
 - `fetch_context_length()`: best-effort context-window detection
 - Backend adapters:
   - `OpenAi`: OpenAI-compatible `/chat/completions` plus `/models` discovery
-  - `Anthropic`: Anthropic Messages API with OAuth support
+  - `Anthropic`: Anthropic Messages API with API-key auth (`x-api-key`)
   - `ChatGptCodex`: ChatGPT Codex backend using Responses-style input/output conversion
 - Converts Forge's internal messages and tool definitions into provider-specific wire formats
 - Converts provider tool calls back into Forge `ToolCall` objects
@@ -230,9 +230,9 @@ Remote note: interactive SSH sessions are blocked inside `shell_exec`. Non-inter
 - Internal `Message`, `ToolDefinition`, and `ToolCall` types
 
 **`auth.rs`**
-- Claude OAuth login/refresh stored at `~/.config/forge/auth.json`
 - ChatGPT Codex OAuth login/refresh stored at `~/.config/forge/chatgpt_auth.json`
-- Runtime endpoint discovery for authenticated Anthropic and ChatGPT Codex accounts
+- Runtime model-catalog discovery for the authenticated ChatGPT Codex account
+- Anthropic and OpenAI-compatible endpoints authenticate with an API key from config; there is no Claude subscription OAuth (Anthropic restricts subscription credentials to its own apps)
 
 ### Config Layer (`src/config.rs`)
 
@@ -289,7 +289,7 @@ UI to agent commands include:
 - `enter_plan_mode`, `approve_plan`, `reject_plan`, `clear_and_approve_plan`
 - `answer_question`
 - `process_input`, `bg_process_input`
-- `login_anthropic`, `login_chatgpt`
+- `login_chatgpt`
 - `cancel_run`, `quit`
 - `resume_session`
 

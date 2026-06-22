@@ -16,7 +16,6 @@ const VALID_OPTIONS = [
   "--dangerously-allow-all",
   "--resume-session",
   "--login",
-  "--login-claude",
   "--login-chatgpt",
 ] as const;
 
@@ -33,10 +32,9 @@ function usage(): string {
     "      --cwd <path>              Start Forge in a specific project directory",
     "      --dangerously-allow-all   Bypass all tool approval prompts",
     "      --resume-session <id>     Resume a session by ID",
-    "      --login [provider]        OAuth login. Without a provider, shows a menu.",
-    "                                Providers: claude, chatgpt",
-    "      --login-claude            Shortcut for: --login claude",
+    "      --login [chatgpt]         OAuth login for ChatGPT Codex subscription.",
     "      --login-chatgpt           Shortcut for: --login chatgpt",
+    "                                (Claude uses an Anthropic API key, not subscription login.)",
   ].join("\n");
 }
 
@@ -115,97 +113,72 @@ function parseArgs(argv: string[]): { agentArgs: string[]; cwd?: string } {
 
 /**
  * Map a user-facing provider name to the forge-agent OAuth flag.
- * Returns null if the name is unknown.
+ * ChatGPT Codex is the only subscription provider. Returns null otherwise.
  */
 function providerToAgentFlag(name: string): string | null {
   const normalized = name.trim().toLowerCase();
-  if (["claude", "anthropic", "claude.ai"].includes(normalized)) return "--login";
   if (["chatgpt", "codex", "openai", "gpt"].includes(normalized)) return "--login-chatgpt";
   return null;
 }
 
-/** Print the login provider menu and read the user's choice. */
-async function chooseLoginProvider(): Promise<string> {
-  const readline = await import("node:readline/promises");
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  console.log("");
-  console.log("Which subscription do you want to log in to?");
-  console.log("");
-  console.log("  1) Claude          (claude.ai / Pro / Max)");
-  console.log("  2) ChatGPT Codex   (Plus / Pro / Team with Codex)");
-  console.log("");
-
-  try {
-    while (true) {
-      const answer = (await rl.question("  Choice [1-2]: ")).trim();
-      const flag = (() => {
-        if (answer === "1") return providerToAgentFlag("claude");
-        if (answer === "2") return providerToAgentFlag("chatgpt");
-        return providerToAgentFlag(answer);   // also accept "claude" / "chatgpt" typed
-      })();
-      if (flag) return flag;
-      console.log(`  '${answer}' is not a recognized choice.`);
-    }
-  } finally {
-    rl.close();
-  }
+/** True for names that mean "Claude/Anthropic" — recognized only to error clearly. */
+function isClaudeProvider(name: string): boolean {
+  return ["claude", "anthropic", "claude.ai"].includes(name.trim().toLowerCase());
 }
 
+const CLAUDE_LOGIN_UNSUPPORTED =
+  "forge: Claude subscription login is not supported. Anthropic restricts subscription " +
+  "credentials to its own apps, so Forge uses an Anthropic API key instead — add one in the " +
+  "/model menu or in ~/.config/forge/config.toml.";
+
 /**
- * Intercept the login family of flags at the wrapper level so users coming
- * from Claude Code or ChatGPT Codex see the convention they expect — i.e.
- * `forge --login` works, not just `forge-agent --login`. We bypass the Ink
- * TUI entirely and run forge-agent inline with inherited stdio so the OAuth
- * prompts (and the paste-the-code fallback) feel native.
+ * Intercept the login flags at the wrapper level so `forge --login-chatgpt`
+ * works, not just `forge-agent --login-chatgpt`. We bypass the Ink TUI entirely
+ * and run forge-agent inline with inherited stdio so the OAuth prompts (and the
+ * paste-the-code fallback) feel native. ChatGPT Codex is the only subscription
+ * provider; Claude authenticates via an Anthropic API key.
  *
  * Accepts:
- *   forge --login                  → show menu, then dispatch
- *   forge --login <provider>       → direct OAuth for that provider
- *   forge --login-claude           → shortcut for --login claude
- *   forge --login-chatgpt          → shortcut for --login chatgpt
+ *   forge --login            → ChatGPT Codex OAuth (only supported provider)
+ *   forge --login chatgpt    → ChatGPT Codex OAuth
+ *   forge --login-chatgpt    → shortcut
  */
 async function maybeRunLogin(argv: string[]): Promise<void> {
-  // Shortcut forms — easy to handle first.
-  if (argv.includes("--login-claude")) {
-    return runLogin("--login", argv, "--login-claude");
-  }
   if (argv.includes("--login-chatgpt")) {
     return runLogin("--login-chatgpt", argv, "--login-chatgpt");
   }
 
-  // --login [provider] form.
   const idx = argv.indexOf("--login");
   if (idx < 0) return;
 
   const providerArg = argv[idx + 1];
-  let agentFlag: string;
 
   if (providerArg && !providerArg.startsWith("-")) {
-    const flag = providerToAgentFlag(providerArg);
-    if (!flag) {
-      console.error(`forge: unknown login provider '${providerArg}'. Known: claude, chatgpt.`);
-      console.error(`  (Gemini, DeepSeek, etc. can be used today via OpenRouter — log in with --login-chatgpt or set up an API key in the /model menu.)`);
+    if (isClaudeProvider(providerArg)) {
+      console.error(CLAUDE_LOGIN_UNSUPPORTED);
       process.exit(2);
     }
-    agentFlag = flag;
-    // Validate nothing else weird was passed
+    const flag = providerToAgentFlag(providerArg);
+    if (!flag) {
+      console.error(`forge: unknown login provider '${providerArg}'. Supported: chatgpt.`);
+      console.error(`  (Claude uses an Anthropic API key; Gemini, DeepSeek, etc. work via OpenRouter or an API key in the /model menu.)`);
+      process.exit(2);
+    }
     const rest = [...argv.slice(0, idx), ...argv.slice(idx + 2)];
     if (rest.length > 0) {
       console.error(`forge: --login <provider> cannot be combined with other options. Got: ${rest.join(" ")}`);
       process.exit(2);
     }
-  } else {
-    // Bare --login with no provider — show menu.
-    const rest = [...argv.slice(0, idx), ...argv.slice(idx + 1)];
-    if (rest.length > 0) {
-      console.error(`forge: --login cannot be combined with other options. Got: ${rest.join(" ")}`);
-      process.exit(2);
-    }
-    agentFlag = await chooseLoginProvider();
+    return runLogin(flag, [], "--login");
   }
 
-  return runLogin(agentFlag, [], "--login");
+  // Bare --login — ChatGPT Codex is the only subscription provider.
+  const rest = [...argv.slice(0, idx), ...argv.slice(idx + 1)];
+  if (rest.length > 0) {
+    console.error(`forge: --login cannot be combined with other options. Got: ${rest.join(" ")}`);
+    process.exit(2);
+  }
+  return runLogin("--login-chatgpt", [], "--login");
 }
 
 async function runLogin(agentFlag: string, _argv: string[], _userForm: string): Promise<void> {

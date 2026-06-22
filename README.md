@@ -18,6 +18,8 @@ Forge is built for engineers who want a tool they can rely on, not a tool they c
 - Major versions are reserved for changes that genuinely need a break. When one ships, it includes a clear explanation of *why* the change was required and *what* it affects, plus either a straightforward manual migration or automatic migration.
 - Deprecations are flagged in advance. Nothing that worked in the last release gets removed in a surprise patch.
 
+While Forge is in the pre-1.0 phase, [SemVer's `0.y.z` exception](https://semver.org/#spec-item-4) applies: breaking changes may ship within minor or patch versions when correctness requires it (for example, removing a feature that conflicts with an upstream provider's terms). The full commitments above lock in at v1.0.0.
+
 Forge is intentionally not chasing the newest agent architecture every month. If you want a tool that ships a new "workflow paradigm" every release, Forge is probably not for you. If you want a tool whose interfaces stay stable while the implementation gets smaller, faster, and more reliable underneath, that's what Forge is trying to be.
 
 **Inspection is the point.** The source is here. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md). The public roadmap lives at [vulkgryph.com/roadmap](https://vulkgryph.com/roadmap/). Read it, verify it, disagree with it. If something looks wrong, file an issue or email `contact@vulkgryph.com`. If you want to take it a different direction, fork it.

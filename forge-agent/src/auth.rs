@@ -32,6 +32,15 @@ const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const REDIRECT_URI: &str = "http://localhost:53692/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
+/// Claude subscription (Pro/Max) OAuth login is disabled to comply with
+/// Anthropic's Terms of Service, which restrict subscription OAuth tokens to
+/// Anthropic's own applications (Claude Code and other native Anthropic apps)
+/// and prohibit routing requests through Free/Pro/Max credentials in any other
+/// product, tool, or service. We were not aware of this restriction until
+/// recently. The acquisition and use of Claude subscription tokens are gated
+/// below; Anthropic API-key auth and ChatGPT Codex login are unaffected.
+const CLAUDE_OAUTH_DISABLED: &str = "Claude subscription (Pro/Max) login via Forge is disabled to comply with Anthropic's Terms of Service, which restrict subscription OAuth tokens to Anthropic's own applications. Use an Anthropic API key instead — add it to an endpoint in ~/.config/forge/config.toml. (ChatGPT Codex login is unaffected.)";
+
 // ChatGPT/Codex OAuth client id used by the public Codex CLI.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_ISSUER: &str = "https://auth.openai.com";
@@ -109,7 +118,13 @@ pub fn chatgpt_auth_path() -> Result<PathBuf> {
         .join("chatgpt_auth.json"))
 }
 
+#[allow(unreachable_code)]
 pub fn load_tokens() -> Option<OAuthTokens> {
+    // Disabled for ToS compliance (see CLAUDE_OAUTH_DISABLED): never surface a
+    // stored Claude subscription token to the request path, even if a stale
+    // ~/.config/forge/auth.json exists from before this change.
+    return None;
+
     let path = auth_path().ok()?;
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
@@ -601,7 +616,10 @@ fn unix_now() -> u64 {
 }
 
 /// Get a valid access token, refreshing if expired. Returns error if not logged in.
+#[allow(unreachable_code, unused_variables)]
 pub async fn get_valid_token(http: &reqwest::Client) -> Result<String> {
+    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
+
     let mut tokens =
         load_tokens().context("Not logged in to Claude. Run `forge-agent --login` first.")?;
 
@@ -642,7 +660,10 @@ pub async fn get_valid_chatgpt_token_force_refresh(
 }
 
 /// Force-refresh the token regardless of local expiry (used when server returns 401).
+#[allow(unreachable_code, unused_variables)]
 pub async fn get_valid_token_force_refresh(http: &reqwest::Client) -> Result<String> {
+    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
+
     let tokens =
         load_tokens().context("Not logged in to Claude. Run `forge-agent --login` first.")?;
     let refreshed = refresh_tokens(http, &tokens).await?;
@@ -1060,7 +1081,13 @@ fn parse_anthropic_model(m: &serde_json::Value) -> Option<AnthropicModel> {
 /// stdin is already owned by the JSON message reader), we bail with a clear
 /// error pointing at the standalone command — competing for stdin would hang
 /// silently otherwise.
+#[allow(unreachable_code, unused_variables)]
 pub async fn login(interactive: bool) -> Result<()> {
+    // Disabled for ToS compliance — see CLAUDE_OAUTH_DISABLED. We refuse to
+    // initiate the Claude subscription OAuth grant at all; the flow below is
+    // retained (unreachable) to keep the diff minimal and reversible.
+    anyhow::bail!(CLAUDE_OAUTH_DISABLED);
+
     let (verifier, challenge) = generate_pkce();
     // `state` must be an independent random nonce, not the PKCE verifier:
     // PKCE binds the code redemption to this client, while `state` is the

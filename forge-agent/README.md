@@ -55,8 +55,8 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
 |---|---|
 | LLM endpoint | Always — but if it's local (`127.0.0.1:1234`, etc.) that traffic stays on your machine |
 | `web_search` / `web_fetch` tools | Only when the model invokes them. Disable both via `agent.disabled_tools = ["web_search", "web_fetch"]` if you want them off the table |
-| Codex / Claude subscription auth | Only on login + periodic token refresh, only if you're using those providers |
-| Codex/Claude version self-check | Background, once a week, only if you're actively using those providers; if GitHub is unreachable forge falls back to a cached value |
+| Codex subscription auth | Only on login + periodic token refresh, only if you're using the ChatGPT Codex provider |
+| Codex version self-check | Background, once a week, only if you're actively using Codex; if GitHub is unreachable forge falls back to a cached value |
 
 **Minimum offline setup**:
 
@@ -67,7 +67,7 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
    [agent]
    disabled_tools = ["web_search", "web_fetch"]
    ```
-4. Set `FORGE_NO_AUTO_VERSION_CHECK=1` to suppress the once-a-week GitHub poll Forge uses to keep its Codex/Claude impersonation user-agents current (only relevant if you'd ever use cloud providers anyway):
+4. Set `FORGE_NO_AUTO_VERSION_CHECK=1` to suppress the once-a-week GitHub poll Forge uses to keep its Codex `client_version` current (only relevant if you'd ever use the ChatGPT Codex provider anyway):
    ```bash
    export FORGE_NO_AUTO_VERSION_CHECK=1
    ```
@@ -80,7 +80,7 @@ Forge respects a small set of environment variables for users who want to overri
 
 | Variable | Effect |
 |---|---|
-| `FORGE_NO_AUTO_VERSION_CHECK=1` | Skip the weekly GitHub poll that keeps Codex/Claude `client_version` / user-agent strings current. Cached values are still used; a hardcoded baseline applies if the cache is empty. |
+| `FORGE_NO_AUTO_VERSION_CHECK=1` | Skip the weekly GitHub poll that keeps the Codex `client_version` string current. Cached values are still used; a hardcoded baseline applies if the cache is empty. |
 | `FORGE_SHOW_INTERNAL_MODELS=1` | Show ChatGPT Codex models marked as internal (e.g. `codex-auto-review`). These aren't general chat targets — selecting one will likely fail at the API. Hidden by default. |
 | `FORGE_SKIP_DANGEROUS_CONFIRM=1` | Skip the confirmation prompt that fires when launching with `--dangerously-allow-all`. Intended for scripted / CI usage; never set in interactive shells. |
 | `FORGE_AGENT_PATH` | Override the path the wrapper uses to find `forge-agent`. Useful for testing local builds. |
@@ -149,15 +149,15 @@ The installer's first question is how you want Forge to reach an LLM:
 
 ```
   1) Local LLM server   (LM Studio, Ollama, llama.cpp, vLLM, etc.)
-  2) Claude subscription   (claude.ai / Pro / Max — OAuth login)
+  2) Claude   (Anthropic API key — subscription OAuth login is not supported)
   3) ChatGPT Codex subscription   (OAuth login)
   4) Direct API key   (Anthropic, OpenAI, OpenRouter, custom OpenAI-compatible)
   5) Skip — I'll edit the config file myself
 ```
 
 - **Local (1):** you'll be asked for the base URL, model ID, and context window. No defaults — paste whatever your server uses.
-- **Claude / ChatGPT subscription (2, 3):** writes a minimal config and offers to run the OAuth login inline. On a local machine, just say yes and a browser opens. On a remote VM over SSH, the installer detects this and tells you to first re-connect with port forwarding so the OAuth callback can reach the listener on the remote host:
-  - Claude OAuth uses port **53692**: `ssh -L 53692:localhost:53692 <user>@<host>`
+- **Claude (2):** you'll paste an Anthropic API key and pick a model. Claude Pro/Max *subscription* login is not supported — Anthropic's terms restrict subscription credentials to its own apps (see CHANGELOG).
+- **ChatGPT Codex subscription (3):** writes a minimal config and offers to run the OAuth login inline. On a local machine, just say yes and a browser opens. On a remote VM over SSH, the installer detects this and tells you to first re-connect with port forwarding so the OAuth callback can reach the listener on the remote host:
   - ChatGPT Codex OAuth uses port **1455**: `ssh -L 1455:localhost:1455 <user>@<host>`
 - **Direct API key (4):** you'll pick a provider, paste your key, choose a model. The key is stored in `~/.config/forge/config.toml` (so file permissions matter — `chmod 600` it if you're paranoid).
 - **Skip (5):** writes a placeholder config you can edit by hand at `~/.config/forge/config.toml`. The file is annotated with examples for every endpoint type. Re-run `./install.sh` later if you want the interactive wizard.
@@ -255,32 +255,29 @@ default_model = "fast"
 
 ### Subscription login
 
-Forge can use your existing Claude or ChatGPT subscription via OAuth — no API key purchase required. The login flow handles both providers:
+Forge can use your existing **ChatGPT Codex** subscription via OAuth — no API key purchase required:
 
 From the command line:
 
 ```bash
-forge --login                   # show a menu and pick a provider
-forge --login claude            # direct OAuth for Claude
-forge --login chatgpt           # direct OAuth for ChatGPT Codex
-forge --login-claude            # shortcut form
+forge --login chatgpt           # OAuth for ChatGPT Codex
 forge --login-chatgpt           # shortcut form
 
-# Lower-level equivalents (skip the wrapper):
-forge-agent --login
+# Lower-level equivalent (skip the wrapper):
 forge-agent --login-chatgpt
 ```
 
 Or from inside the TUI:
 
 ```text
-/login --anthropic
 /login --chatgpt
 ```
 
-After login, Forge stores OAuth credentials at `~/.config/forge/auth.json` (Claude) or `~/.config/forge/chatgpt_auth.json` (ChatGPT Codex), and adds the corresponding endpoint to your config.
+After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.json` and adds the corresponding endpoint to your config.
 
-> **Remote / firewall users:** the OAuth flow listens on `localhost:53692` (Claude) or `localhost:1455` (ChatGPT Codex). If your browser can't reach those (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar after it fails to load, and paste it into forge.
+> **Remote / firewall users:** the OAuth flow listens on `localhost:1455` (ChatGPT Codex). If your browser can't reach it (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar after it fails to load, and paste it into forge.
+
+> **Claude (Anthropic):** subscription (Pro/Max) login via Forge is **not supported**. Anthropic's terms restrict subscription OAuth credentials to its own applications and prohibit routing requests through Pro/Max credentials in third-party tools, so `forge --login claude` will refuse. Use an **Anthropic API key** instead — add it to an `endpoint_type = "anthropic"` endpoint in `~/.config/forge/config.toml`. See the [CHANGELOG](CHANGELOG.md) for details.
 
 ### Config reference
 
@@ -336,8 +333,7 @@ Forge uses `Ctrl+N` and the trailing-backslash idiom instead of `Shift+Enter` be
 | `/revert` | Restore a previous user turn and code snapshot |
 | `/usage` | Show token usage for the current session |
 | `/log` | Show the current session log path |
-| `/login --anthropic` | Start Claude OAuth login |
-| `/login --chatgpt` | Start ChatGPT Codex OAuth login |
+| `/login --chatgpt` | Start ChatGPT Codex OAuth login (Claude subscription login is not supported — use an Anthropic API key) |
 | `/help` | Show command help |
 
 ### Tool approval
@@ -458,7 +454,7 @@ See [ADDING_TOOLS.md](ADDING_TOOLS.md) for the complete checklist. Every tool re
 
 ## Headless mode
 
-`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types and `ui/src/agent-bridge.ts` for a reference client implementation. OAuth login is also available through `forge-agent --login` and `forge-agent --login-chatgpt`.
+`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types and `ui/src/agent-bridge.ts` for a reference client implementation. ChatGPT Codex OAuth login is also available through `forge-agent --login-chatgpt`.
 
 ## Contributions
 

@@ -49,6 +49,8 @@ pub enum AgentEvent {
     },
     Thinking,
     Reasoning,
+    /// Streamed reasoning text (offline / OpenAI-compatible models).
+    ReasoningToken(String),
     Done,
     Usage(TokenUsageSnapshot),
     UsageUpdate(TokenUsageSnapshot),
@@ -1170,6 +1172,9 @@ impl Agent {
                             }
                             Some(crate::api::StreamEvent::Reasoning) => {
                                 let _ = self.event_tx.send(AgentEvent::Reasoning);
+                            }
+                            Some(crate::api::StreamEvent::ReasoningToken(text)) => {
+                                let _ = self.event_tx.send(AgentEvent::ReasoningToken(text));
                             }
                             Some(crate::api::StreamEvent::ToolCall(tc)) => {
                                 streaming_tool_calls.push(tc);

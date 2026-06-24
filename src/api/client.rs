@@ -69,6 +69,8 @@ pub enum StreamEvent {
     Token(String),
     /// Hidden provider reasoning was observed and intentionally not forwarded.
     Reasoning,
+    /// Streamed reasoning text from an offline / OpenAI-compatible model.
+    ReasoningToken(String),
     /// A complete tool call (assembled from streaming deltas).
     ToolCall(ToolCall),
     /// Stream finished successfully.
@@ -566,17 +568,22 @@ impl ApiClient {
                     // Some local OpenAI-compatible servers stream internal
                     // reasoning in separate fields. Forge deliberately ignores
                     // those fields and only forwards visible assistant content.
-                    let ignored_reasoning = delta
+                    // Offline / OpenAI-compatible servers stream internal reasoning
+                    // in a separate field. Forward it as ReasoningToken so headless
+                    // clients can see and stream it (online paths are unchanged).
+                    let reasoning_delta = delta
                         .get("reasoning_content")
                         .or_else(|| delta.get("reasoning"))
-                        .or_else(|| delta.get("thinking"));
-                    if !reasoning_emitted
-                        && ignored_reasoning
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|s| !s.is_empty())
-                    {
-                        reasoning_emitted = true;
-                        let _ = tx.send(StreamEvent::Reasoning);
+                        .or_else(|| delta.get("thinking"))
+                        .and_then(|v| v.as_str());
+                    if let Some(rtext) = reasoning_delta {
+                        if !rtext.is_empty() {
+                            if !reasoning_emitted {
+                                reasoning_emitted = true;
+                                let _ = tx.send(StreamEvent::Reasoning);
+                            }
+                            let _ = tx.send(StreamEvent::ReasoningToken(rtext.to_string()));
+                        }
                     }
 
                     // Text token
@@ -959,6 +966,7 @@ impl ApiClient {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
                 StreamEvent::Reasoning => {}
+                StreamEvent::ReasoningToken(_) => {}
                 StreamEvent::ToolCall(tc) => tool_calls.push(tc),
                 StreamEvent::Done { usage: done_usage } => {
                     usage = done_usage;

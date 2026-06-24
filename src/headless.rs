@@ -37,6 +37,9 @@ enum OutgoingMessage {
     },
     Thinking,
     Reasoning,
+    ReasoningToken {
+        content: String,
+    },
     AssistantMessage {
         content: String,
     },
@@ -276,6 +279,9 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
     match event {
         AgentEvent::Thinking => OutgoingMessage::Thinking,
         AgentEvent::Reasoning => OutgoingMessage::Reasoning,
+        AgentEvent::ReasoningToken(content) => OutgoingMessage::ReasoningToken {
+            content: content.clone(),
+        },
         AgentEvent::AssistantMessage(content) => OutgoingMessage::AssistantMessage {
             content: content.clone(),
         },

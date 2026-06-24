@@ -121,6 +121,20 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
         </Box>
       );
 
+    case "reasoning": {
+      // Reasoning is displayed as dimmed/secondary text, visually distinct from the assistant answer.
+      // It appears live as the model streams its chain-of-thought.
+      const tail = streamingTail(entry.content, columns, streamingMaxLines);
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          {tail.hiddenLines > 0 && <Text dimColor>  ↑ {tail.hiddenLines} lines above</Text>}
+          <Text dimColor>
+            <Text color="gray">[{tail.text}]</Text>
+          </Text>
+        </Box>
+      );
+    }
+
     case "streaming": {
       // Cap by estimated rendered lines, not raw newlines. Long wrapped
       // paragraphs can otherwise grow beyond the viewport and make Ink redraws

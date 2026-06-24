@@ -15,6 +15,7 @@ export class AgentBridge extends EventEmitter {
   private eventQueue: AgentMessage[] = [];
   private drainScheduled = false;
   private pendingAssistantToken = "";
+  private pendingReasoningToken = "";
   private tokenFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(agentPath: string, args: string[] = [], cwd?: string) {
@@ -133,7 +134,14 @@ export class AgentBridge extends EventEmitter {
       return;
     }
 
+    if (msg.type === "reasoning_token") {
+      this.pendingReasoningToken += msg.content;
+      this.scheduleTokenFlush();
+      return;
+    }
+
     this.flushAssistantToken();
+    this.flushReasoningToken();
     this.eventQueue.push(msg);
     this.scheduleDrain();
   }
@@ -143,6 +151,7 @@ export class AgentBridge extends EventEmitter {
     this.tokenFlushTimer = setTimeout(() => {
       this.tokenFlushTimer = null;
       this.flushAssistantToken();
+      this.flushReasoningToken();
     }, 75);
   }
 
@@ -151,6 +160,14 @@ export class AgentBridge extends EventEmitter {
     const content = this.pendingAssistantToken;
     this.pendingAssistantToken = "";
     this.eventQueue.push({ type: "assistant_token", content });
+    this.scheduleDrain();
+  }
+
+  private flushReasoningToken() {
+    if (!this.pendingReasoningToken) return;
+    const content = this.pendingReasoningToken;
+    this.pendingReasoningToken = "";
+    this.eventQueue.push({ type: "reasoning_token", content });
     this.scheduleDrain();
   }
 
@@ -188,6 +205,8 @@ export class AgentBridge extends EventEmitter {
       clearTimeout(this.tokenFlushTimer);
       this.tokenFlushTimer = null;
     }
+    this.pendingAssistantToken = "";
+    this.pendingReasoningToken = "";
     this.proc.kill();
   }
 }

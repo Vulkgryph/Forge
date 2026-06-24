@@ -113,6 +113,7 @@ export const AgentMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("thinking") }),
   z.object({ type: z.literal("reasoning") }),
+  z.object({ type: z.literal("reasoning_token"), content: z.string() }),
   z.object({ type: z.literal("assistant_message"), content: z.string() }),
   z.object({ type: z.literal("assistant_token"), content: z.string() }),
   z.object({ type: z.literal("assistant_done"), content: z.string().default("") }),

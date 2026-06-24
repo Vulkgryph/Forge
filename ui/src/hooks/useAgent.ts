@@ -42,7 +42,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
 
 export interface ChatEntry {
   id: string;
-  kind: "user" | "assistant" | "streaming" | "tool_call" | "tool_result" | "tool_output" | "system" | "error" | "plan_content" | "plan_status" | "subagent_header";
+  kind: "user" | "assistant" | "streaming" | "tool_call" | "tool_result" | "tool_output" | "system" | "error" | "plan_content" | "plan_status" | "subagent_header" | "reasoning";
   content: string;
   success?: boolean;
   toolName?: string;
@@ -124,6 +124,7 @@ export interface AgentState {
   chatgptLoggedIn: boolean;
   loginInProgress: boolean;
   streamingId: string | null;
+  reasoningId: string | null;
   rewindCheckpoints: RewindCheckpointState[];
 }
 
@@ -232,6 +233,7 @@ export function useAgent(options: UseAgentOptions = {}) {
     chatgptLoggedIn: false,
     loginInProgress: false,
     streamingId: null,
+    reasoningId: null,
     rewindCheckpoints: [],
   });
   const stateRef = useRef(state);
@@ -626,6 +628,39 @@ export function useAgent(options: UseAgentOptions = {}) {
           break;
         }
 
+        case "reasoning_token": {
+          // Streaming reasoning token — append to the live transient reasoning entry (or create it).
+          setState((prev) => {
+            if (prev.reasoningId) {
+              // Append to the existing reasoning entry
+              return {
+                ...prev,
+                isThinking: true,
+                activityLabel: "Thinking",
+                transient: prev.transient.map((e) =>
+                  e.id === prev.reasoningId
+                    ? { ...e, content: e.content + msg.content }
+                    : e
+                ),
+              };
+            } else {
+              // First reasoning token — create the live reasoning entry
+              const id = nextId();
+              return {
+                ...prev,
+                isThinking: true,
+                activityLabel: "Thinking",
+                reasoningId: id,
+                transient: [
+                  ...prev.transient,
+                  { id, kind: "reasoning" as const, content: msg.content },
+                ],
+              };
+            }
+          });
+          break;
+        }
+
         case "session_cleared": {
           pendingUserTurnsRef.current = [];
           toolCountRef.current = 0;
@@ -650,6 +685,7 @@ export function useAgent(options: UseAgentOptions = {}) {
             pendingQuestion: null,
             pendingRewind: null,
             streamingId: null,
+            reasoningId: null,
             transient: [],
             scrollback: startupEntries(
               prev.modelName,
@@ -873,7 +909,7 @@ export function useAgent(options: UseAgentOptions = {}) {
               ? [{ id: nextId(), kind: "assistant" as const, content: streaming.content }]
               : [];
             const toCommit = prev.transient.filter(
-              (e) => e.kind !== "tool_call" && e.id !== prev.streamingId
+              (e) => e.kind !== "tool_call" && e.id !== prev.streamingId && e.kind !== "reasoning"
             );
             return {
               ...prev,
@@ -883,6 +919,7 @@ export function useAgent(options: UseAgentOptions = {}) {
               pendingApproval: null,
               pendingRewind: null,
               streamingId: null,
+              reasoningId: null,
               scrollback: [
                 ...prev.scrollback,
                 ...committedStreaming,
@@ -903,6 +940,7 @@ export function useAgent(options: UseAgentOptions = {}) {
             activityLabel: "Idle",
             waitingForInput: false,
             pendingApproval: null,
+            reasoningId: null,
             scrollback: [
               ...prev.scrollback,
               ...prev.transient,

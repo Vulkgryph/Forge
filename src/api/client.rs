@@ -405,7 +405,7 @@ impl ApiClient {
     ) -> Result<ChatResponse, String> {
         let mut request = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": build_openai_messages(messages),
             "temperature": 0.7,
             "max_tokens": self.max_output_tokens,
             "stream": false,
@@ -462,7 +462,7 @@ impl ApiClient {
 
         let mut body = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": build_openai_messages(messages),
             "stream": true,
             "temperature": 0.7,
             "max_tokens": self.max_output_tokens,
@@ -1471,6 +1471,46 @@ fn responses_output_has_incomplete_item(response: &serde_json::Value) -> bool {
         })
 }
 
+/// Build the OpenAI-compatible `messages` array from Forge history.
+///
+/// Forge injects mid-conversation `system`-role messages (continuation nudges,
+/// loop reminders, plan-mode addenda, shell-repeat warnings, etc.). Permissive
+/// servers (OpenAI, vLLM, llama.cpp) accept `system` anywhere, but stricter
+/// ones — notably mlx_lm — reject any `system` message that isn't first
+/// ("System message must be at the beginning."). We keep the leading system
+/// prompt and demote every later `system` message to `user`, preserving its
+/// text and tagging unmarked entries so the model still reads them as
+/// directives.
+fn build_openai_messages(messages: &[Message]) -> serde_json::Value {
+    let mut leading_system_seen = false;
+    let arr: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
+            if m.role == "system" {
+                if leading_system_seen {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("role".to_string(), serde_json::Value::String("user".to_string()));
+                        if let Some(c) = obj.get("content").and_then(|c| c.as_str()) {
+                            if !c.trim_start().starts_with('[') {
+                                let tagged = format!("[System] {}", c);
+                                obj.insert(
+                                    "content".to_string(),
+                                    serde_json::Value::String(tagged),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    leading_system_seen = true;
+                }
+            }
+            v
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
 fn convert_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
     let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
     let mut emitted_function_call_ids = std::collections::HashSet::new();
@@ -1856,6 +1896,37 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_openai_messages_demotes_trailing_system() {
+        // First system stays; later system messages become `user` (mlx_lm rejects
+        // a system message that isn't first). Unmarked text is tagged "[System]";
+        // already-bracketed text is left as-is.
+        let msgs = vec![
+            Message::system("You are Forge."),
+            Message::user("hi"),
+            Message::assistant("Let me work through this."),
+            Message::system("Your last response described a next action but returned no tool calls."),
+            Message::system("[System: you have run `ls` 3 times.]"),
+        ];
+        let v = build_openai_messages(&msgs);
+        let arr = v.as_array().unwrap();
+        let role = |i: usize| arr[i]["role"].as_str().unwrap();
+        let content = |i: usize| arr[i]["content"].as_str().unwrap();
+
+        assert_eq!(role(0), "system", "leading system prompt preserved");
+        assert_eq!(role(1), "user");
+        assert_eq!(role(2), "assistant");
+        assert_eq!(role(3), "user", "trailing system demoted to user");
+        assert_eq!(role(4), "user", "trailing system demoted to user");
+        assert!(content(3).starts_with("[System] "), "unmarked nudge gets tagged");
+        assert_eq!(content(4), "[System: you have run `ls` 3 times.]", "already-bracketed left as-is");
+        // No system message after index 0.
+        assert!(
+            arr.iter().skip(1).all(|m| m["role"].as_str() != Some("system")),
+            "no system message may follow the first"
+        );
+    }
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall {

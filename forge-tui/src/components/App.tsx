@@ -218,6 +218,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     sendProcessInput,
     sendBgProcessInput,
     cancelRun,
+    toggleReasoningExpanded,
     quit,
     restartAgent,
     resumeSession,
@@ -250,6 +251,10 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     }
     if (input === "f" && key.ctrl && !state.pendingApproval && !state.pendingPlan && !activeMenu) {
       toggleCopyMode();
+      return;
+    }
+    if (input === "t" && key.ctrl && !state.pendingApproval && !state.pendingPlan && !activeMenu) {
+      toggleReasoningExpanded();
       return;
     }
     if (key.escape && state.isThinking && !state.pendingApproval && !state.pendingPlan && !activeMenu) {
@@ -369,10 +374,23 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     terminalColumns,
     liveLineBudget
   );
-  const archiveSplit = Math.max(
+  let archiveSplit = Math.max(
     lastContextBoundary >= 0 ? lastContextBoundary + 1 : 0,
     heightBudgetSplit
   );
+  // Keep the most recent "thought" entry (and everything after it) out of the
+  // <Static> archive so the ctrl+t expand toggle can re-render it — archived
+  // entries are printed once and never update. A collapsed thought is one line,
+  // so this costs nothing in the common case.
+  const lastThoughtIndex = (() => {
+    for (let i = state.scrollback.length - 1; i >= 0; i--) {
+      if (state.scrollback[i]?.kind === "thought") return i;
+    }
+    return -1;
+  })();
+  if (lastThoughtIndex >= 0) {
+    archiveSplit = Math.min(archiveSplit, lastThoughtIndex);
+  }
   const archivedScrollback = state.scrollback.slice(0, archiveSplit);
   const liveScrollback = state.scrollback.slice(archiveSplit);
 
@@ -1149,7 +1167,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     return (
       <Box flexDirection="column">
       {(copySnapshot ?? []).map((entry) => (
-          <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
+          <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} reasoningExpanded={state.reasoningExpanded} />
         ))}
         <Box marginTop={1}>
           <Text color="yellow">Copy mode</Text>
@@ -1163,21 +1181,24 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     <Box flexDirection="column">
       {/* Archived scrollback is printed once and never participates in live redraws. */}
       <Static items={archivedScrollback}>
-        {(entry) => <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />}
+        {(entry) => <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} reasoningExpanded={state.reasoningExpanded} />}
       </Static>
 
       {/* Recent scrollback remains live so menus, revert, and active UI stay coherent. */}
       {liveScrollback.map((entry) => (
-        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
+        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} reasoningExpanded={state.reasoningExpanded} />
       ))}
 
       {/* Transient */}
       {state.transient.map((entry) => (
-        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} />
+        <Message key={entry.id} entry={entry} columns={terminalColumns} streamingMaxLines={streamingMaxLines} reasoningExpanded={state.reasoningExpanded} />
       ))}
 
-      {/* Thinking spinner */}
-      {state.isThinking && !state.waitingForInput && !state.pendingApproval && !state.pendingPlan && (
+      {/* Thinking spinner — suppressed during active reasoning, where the
+          compact reasoning line is the live indicator (avoids a double
+          "Thinking" line). Still shown for tool runs and the pre-answer wait. */}
+      {state.isThinking && !state.waitingForInput && !state.pendingApproval && !state.pendingPlan &&
+        !(state.reasoningId && state.activityLabel === "Thinking") && (
         <Spinner label={state.activityLabel} />
       )}
 

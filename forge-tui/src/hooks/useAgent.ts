@@ -42,13 +42,17 @@ async function copyToClipboard(text: string): Promise<boolean> {
 
 export interface ChatEntry {
   id: string;
-  kind: "user" | "assistant" | "streaming" | "tool_call" | "tool_result" | "tool_output" | "system" | "error" | "plan_content" | "plan_status" | "subagent_header" | "reasoning";
+  kind: "user" | "assistant" | "streaming" | "tool_call" | "tool_result" | "tool_output" | "system" | "error" | "plan_content" | "plan_status" | "subagent_header" | "reasoning" | "thought";
   content: string;
   success?: boolean;
   toolName?: string;
   toolArgs?: string;
   toolId?: string;
   toolKind?: "read" | "write" | "execute";
+  /** For "thought" entries: how long the model spent reasoning, in ms. */
+  durationMs?: number;
+  /** For the live "reasoning" entry: epoch ms when reasoning started. */
+  startedAt?: number;
 }
 
 export interface PendingApproval {
@@ -125,6 +129,8 @@ export interface AgentState {
   loginInProgress: boolean;
   streamingId: string | null;
   reasoningId: string | null;
+  /** When true, committed "thought" entries render their full reasoning text. */
+  reasoningExpanded: boolean;
   rewindCheckpoints: RewindCheckpointState[];
 }
 
@@ -198,6 +204,7 @@ export function useAgent(options: UseAgentOptions = {}) {
   const approvedToolsRef = useRef<Set<string>>(new Set());
   const projectRootRef = useRef<string>("");
   const turnStartRef = useRef<number>(0);
+  const reasoningStartRef = useRef<number>(0);
   const toolCountRef = useRef<number>(0);
   const pendingUserTurnsRef = useRef<Array<{ content: string; displayIndex: number }>>([]);
   const pendingOutboundRef = useRef<UserMessage[]>([]);
@@ -234,6 +241,7 @@ export function useAgent(options: UseAgentOptions = {}) {
     loginInProgress: false,
     streamingId: null,
     reasoningId: null,
+    reasoningExpanded: false,
     rewindCheckpoints: [],
   });
   const stateRef = useRef(state);
@@ -630,6 +638,7 @@ export function useAgent(options: UseAgentOptions = {}) {
 
         case "reasoning_token": {
           // Streaming reasoning token — append to the live transient reasoning entry (or create it).
+          if (!reasoningStartRef.current) reasoningStartRef.current = Date.now();
           setState((prev) => {
             if (prev.reasoningId) {
               // Append to the existing reasoning entry
@@ -653,7 +662,7 @@ export function useAgent(options: UseAgentOptions = {}) {
                 reasoningId: id,
                 transient: [
                   ...prev.transient,
-                  { id, kind: "reasoning" as const, content: msg.content },
+                  { id, kind: "reasoning" as const, content: msg.content, startedAt: reasoningStartRef.current || Date.now() },
                 ],
               };
             }
@@ -908,6 +917,18 @@ export function useAgent(options: UseAgentOptions = {}) {
             const committedStreaming = streaming
               ? [{ id: nextId(), kind: "assistant" as const, content: streaming.content }]
               : [];
+            // Collapse the live reasoning into a persistent "thought" entry
+            // (shown as "Thought for Xs", expandable) placed before the answer.
+            const reasoning = prev.transient.find((e) => e.kind === "reasoning");
+            const committedThought =
+              reasoning && reasoning.content.trim()
+                ? [{
+                    id: nextId(),
+                    kind: "thought" as const,
+                    content: reasoning.content,
+                    durationMs: reasoningStartRef.current ? Date.now() - reasoningStartRef.current : undefined,
+                  }]
+                : [];
             const toCommit = prev.transient.filter(
               (e) => e.kind !== "tool_call" && e.id !== prev.streamingId && e.kind !== "reasoning"
             );
@@ -922,6 +943,7 @@ export function useAgent(options: UseAgentOptions = {}) {
               reasoningId: null,
               scrollback: [
                 ...prev.scrollback,
+                ...committedThought,
                 ...committedStreaming,
                 ...toCommit,
                 ...(summary ? [{ id: nextId(), kind: "system" as const, content: summary }] : []),
@@ -929,6 +951,7 @@ export function useAgent(options: UseAgentOptions = {}) {
               transient: [],
             };
           });
+          reasoningStartRef.current = 0;
           break;
         }
 
@@ -943,13 +966,25 @@ export function useAgent(options: UseAgentOptions = {}) {
             reasoningId: null,
             scrollback: [
               ...prev.scrollback,
-              // Reasoning is transient chain-of-thought — drop it on cancel too,
-              // matching the "done" path, so it never freezes into scrollback.
+              // Collapse any partial reasoning into a "thought" entry (matching
+              // the done path) rather than discarding what the model thought.
+              ...((): ChatEntry[] => {
+                const r = prev.transient.find((e) => e.kind === "reasoning");
+                return r && r.content.trim()
+                  ? [{
+                      id: nextId(),
+                      kind: "thought" as const,
+                      content: r.content,
+                      durationMs: reasoningStartRef.current ? Date.now() - reasoningStartRef.current : undefined,
+                    }]
+                  : [];
+              })(),
               ...prev.transient.filter((e) => e.kind !== "reasoning"),
               { id: nextId(), kind: "system" as const, content: summary || "Cancelled." },
             ],
             transient: [],
           }));
+          reasoningStartRef.current = 0;
           break;
         }
 
@@ -1404,6 +1439,10 @@ export function useAgent(options: UseAgentOptions = {}) {
     send({ type: "cancel_run" });
   }, [send]);
 
+  const toggleReasoningExpanded = useCallback(() => {
+    setState((prev) => ({ ...prev, reasoningExpanded: !prev.reasoningExpanded }));
+  }, []);
+
   const quit = useCallback(() => {
     const bridge = bridgeRef.current;
     send({ type: "quit" });
@@ -1447,6 +1486,7 @@ export function useAgent(options: UseAgentOptions = {}) {
     sendProcessInput,
     sendBgProcessInput,
     cancelRun,
+    toggleReasoningExpanded,
     quit,
     restartAgent,
     resumeSession,

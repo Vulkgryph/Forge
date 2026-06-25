@@ -103,6 +103,11 @@ export function PromptInput({ onSubmit, placeholder = "Type a message...  (\\+En
         return;
       }
 
+      // Any other Ctrl-modified key is a global shortcut handled in App
+      // (Ctrl+F copy mode, Ctrl+T expand reasoning, etc.). Ignore it here so the
+      // bare letter isn't inserted into the prompt.
+      if (key.ctrl) return;
+
       // ESC+CR as single raw sequence (Option+Enter on proper terminals)
       if (input === "\x1b\r" || input === "\x1b\n") {
         lastWasEsc.current = false;

@@ -8,6 +8,16 @@ interface Props {
   entry: ChatEntry;
   columns?: number;
   streamingMaxLines?: number;
+  /** When true, committed "thought" entries render their full reasoning text. */
+  reasoningExpanded?: boolean;
+}
+
+function formatDuration(ms?: number): string {
+  if (!ms || ms < 0) return "";
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  return `${mins}m ${secs % 60}s`;
 }
 
 function visualLineCount(line: string, columns: number): number {
@@ -102,7 +112,7 @@ function compactToolOutput(content: string): string[] {
   return output;
 }
 
-export const Message = React.memo(function Message({ entry, columns = 80, streamingMaxLines = 8 }: Props) {
+export const Message = React.memo(function Message({ entry, columns = 80, streamingMaxLines = 8, reasoningExpanded = false }: Props) {
   switch (entry.kind) {
     case "user":
       return (
@@ -122,15 +132,56 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
       );
 
     case "reasoning": {
-      // Reasoning is displayed as dimmed/secondary text, visually distinct from the assistant answer.
-      // It appears live as the model streams its chain-of-thought.
+      // Live chain-of-thought. Compact status line by default (elapsed + an
+      // approximate token count, which both advance as tokens stream), with the
+      // full text revealed only when expanded — so it stays separate from and
+      // far quieter than the assistant's answer.
+      const secs = entry.startedAt ? Math.max(0, Math.round((Date.now() - entry.startedAt) / 1000)) : 0;
+      const approxTokens = Math.max(1, Math.round(entry.content.length / 4));
+      const stat = `${secs}s · ~${approxTokens} tokens`;
+      if (!reasoningExpanded) {
+        return (
+          <Box marginTop={1}>
+            <Text color="magenta">✻ </Text>
+            <Text dimColor color="magenta">Thinking… ({stat})  </Text>
+            <Text dimColor>(ctrl+t to expand)</Text>
+          </Box>
+        );
+      }
       const tail = streamingTail(entry.content, columns, streamingMaxLines);
       return (
         <Box flexDirection="column" marginTop={1}>
+          <Box>
+            <Text color="magenta">✻ </Text>
+            <Text dimColor color="magenta">Thinking… ({stat})  </Text>
+            <Text dimColor>(ctrl+t to collapse)</Text>
+          </Box>
           {tail.hiddenLines > 0 && <Text dimColor>  ↑ {tail.hiddenLines} lines above</Text>}
-          <Text dimColor>
-            <Text color="gray">[{tail.text}]</Text>
-          </Text>
+          <Text dimColor color="gray">{tail.text}</Text>
+        </Box>
+      );
+    }
+
+    case "thought": {
+      // Committed reasoning: a collapsed one-liner by default, expandable with
+      // the keyboard shortcut to reveal the full chain-of-thought.
+      const dur = formatDuration(entry.durationMs);
+      const header = dur ? `✻ Thought for ${dur}` : "✻ Thought";
+      if (!reasoningExpanded) {
+        return (
+          <Box marginTop={1}>
+            <Text dimColor color="magenta">{header}  </Text>
+            <Text dimColor>(ctrl+t to expand)</Text>
+          </Box>
+        );
+      }
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Box>
+            <Text dimColor color="magenta">{header}  </Text>
+            <Text dimColor>(ctrl+t to collapse)</Text>
+          </Box>
+          <Text dimColor color="gray">{entry.content}</Text>
         </Box>
       );
     }

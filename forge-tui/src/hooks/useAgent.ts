@@ -943,7 +943,9 @@ export function useAgent(options: UseAgentOptions = {}) {
             reasoningId: null,
             scrollback: [
               ...prev.scrollback,
-              ...prev.transient,
+              // Reasoning is transient chain-of-thought — drop it on cancel too,
+              // matching the "done" path, so it never freezes into scrollback.
+              ...prev.transient.filter((e) => e.kind !== "reasoning"),
               { id: nextId(), kind: "system" as const, content: summary || "Cancelled." },
             ],
             transient: [],

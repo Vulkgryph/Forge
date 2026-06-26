@@ -446,16 +446,10 @@ impl ToolExecutor {
         let count = content.matches(old_string).count();
 
         if count == 0 {
-            return Ok(format!(
-                "Error: Could not find the specified string in {}",
-                rel_path
-            ));
+            return Ok(edit_mismatch_hint(&content, old_string, rel_path));
         }
         if count > 1 {
-            return Ok(format!(
-                "Error: Found {} occurrences of the string in {}. Must be unique.",
-                count, rel_path
-            ));
+            return Ok(edit_multimatch_hint(&content, old_string, rel_path, count));
         }
 
         let new_content = content.replacen(old_string, new_string, 1);
@@ -984,6 +978,113 @@ fn extract_patch_file_path(diff: &str) -> Option<String> {
     None
 }
 
+/// Render a window of file lines with 1-based line numbers, truncating
+/// over-long lines so a single minified line can't flood the agent's context.
+fn render_window(file_lines: &[&str], start: usize, count: usize) -> String {
+    let end = (start + count).min(file_lines.len());
+    let mut out = String::new();
+    for (i, line) in file_lines.iter().enumerate().take(end).skip(start) {
+        let shown: String = if line.chars().count() > 200 {
+            let head: String = line.chars().take(200).collect();
+            format!("{head}… (line truncated)")
+        } else {
+            line.to_string()
+        };
+        out.push_str(&format!("{:>5} | {}\n", i + 1, shown));
+    }
+    out
+}
+
+/// Produce a COMPACT, actionable hint when edit_file's old_string isn't found.
+/// Goal: give the agent enough to re-target (the exact current text) without
+/// dumping the whole file. Detects whitespace-only mismatches and otherwise
+/// shows the single closest-matching region.
+fn edit_mismatch_hint(content: &str, old_string: &str, rel_path: &str) -> String {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    let n = old_lines.len();
+
+    // 1) Whitespace-only difference: same lines after trimming each line.
+    if n > 0 && n <= file_lines.len() {
+        let old_trim: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+        for i in 0..=(file_lines.len() - n) {
+            if (0..n).all(|j| file_lines[i + j].trim() == old_trim[j]) {
+                let window = render_window(&file_lines, i, n);
+                return format!(
+                    "Error: old_string not found in {rel_path}, but the same text exists at lines {}-{} with DIFFERENT whitespace/indentation. \
+Copy the exact current text below as your old_string (note the leading spaces):\n{window}",
+                    i + 1,
+                    i + n
+                );
+            }
+        }
+    }
+
+    // 2) Closest region: anchor on the first substantive old line.
+    let anchor = old_lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.len() >= 4);
+    if let Some(anchor) = anchor {
+        let mut best: Option<(usize, usize)> = None; // (line_idx, score)
+        for (idx, fl) in file_lines.iter().enumerate() {
+            let ft = fl.trim();
+            if ft.is_empty() {
+                continue;
+            }
+            let score = if ft.contains(anchor) || anchor.contains(ft) {
+                anchor.len().min(ft.len()) + 1000 // strong: substring hit
+            } else {
+                ft.chars()
+                    .zip(anchor.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
+            if score > 0 && best.map_or(true, |(_, b)| score > b) {
+                best = Some((idx, score));
+            }
+        }
+        if let Some((idx, _)) = best {
+            let start = idx.saturating_sub(2);
+            let count = (n + 4).min(14);
+            let window = render_window(&file_lines, start, count);
+            return format!(
+                "Error: Could not find old_string in {rel_path}. Closest matching region (lines {}-{}) — re-read and copy the exact current text before editing:\n{window}",
+                start + 1,
+                (start + count).min(file_lines.len())
+            );
+        }
+    }
+
+    format!(
+        "Error: Could not find the specified string in {rel_path}. Re-read the file to get its exact current text before retrying — do not resend the same old_string."
+    )
+}
+
+/// List the line numbers where a non-unique old_string occurs, so the agent
+/// can add surrounding context to disambiguate (compact: numbers only).
+fn edit_multimatch_hint(content: &str, old_string: &str, rel_path: &str, count: usize) -> String {
+    let first_line = old_string.lines().next().unwrap_or(old_string);
+    let mut lines: Vec<usize> = Vec::new();
+    for (i, l) in content.lines().enumerate() {
+        if l.contains(first_line) {
+            lines.push(i + 1);
+        }
+        if lines.len() >= 12 {
+            break;
+        }
+    }
+    let loc = if lines.is_empty() {
+        String::new()
+    } else {
+        format!(" Occurrences near lines: {:?}.", lines)
+    };
+    format!(
+        "Error: Found {count} occurrences of the string in {rel_path}; old_string must be unique.{loc} \
+Add surrounding lines to your old_string to make it match exactly one location."
+    )
+}
+
 /// Build a structured DIFF: result by comparing old and new file content.
 /// Format: DIFF:{path}\n+{added} -{removed}\n{context and diff lines}
 fn format_edit_diff(rel_path: &str, old_content: &str, new_content: &str) -> String {
@@ -1104,8 +1205,42 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolExecutor, ToolKind};
+    use super::{edit_mismatch_hint, edit_multimatch_hint, ToolExecutor, ToolKind};
     use serde_json::json;
+
+    #[test]
+    fn mismatch_hint_detects_whitespace_only_difference() {
+        // File indents with 8 spaces; agent's old_string used 4.
+        let content = "fn f() {\n        let x = atomicAdd(&c, 1);\n}\n";
+        let old = "    let x = atomicAdd(&c, 1);";
+        let hint = edit_mismatch_hint(content, old, "k.cu");
+        assert!(hint.contains("WHITESPACE") || hint.contains("whitespace"), "got: {hint}");
+        assert!(hint.contains("atomicAdd"), "should show the real line: {hint}");
+        assert!(hint.contains("lines 2-2"), "should pinpoint the line: {hint}");
+    }
+
+    #[test]
+    fn mismatch_hint_shows_closest_region_and_is_bounded() {
+        let mut content = String::new();
+        for i in 0..500 {
+            content.push_str(&format!("line number {i} filler\n"));
+        }
+        content.push_str("    sort_fired_list(fired, n);\n");
+        let old = "sort_fired_list_device(fired, n);"; // close but not present
+        let hint = edit_mismatch_hint(&content, old, "k.cu");
+        assert!(hint.contains("Closest matching region"), "got: {hint}");
+        assert!(hint.contains("sort_fired_list"), "should anchor near the real call: {hint}");
+        // Bounded: must NOT dump the whole 500-line file.
+        assert!(hint.lines().count() < 25, "hint must stay compact, got {} lines", hint.lines().count());
+    }
+
+    #[test]
+    fn multimatch_hint_lists_line_numbers() {
+        let content = "a();\nx();\nb();\nx();\nc();\n";
+        let hint = edit_multimatch_hint(content, "x();", "f.rs", 2);
+        assert!(hint.contains("must be unique") || hint.contains("unique"), "got: {hint}");
+        assert!(hint.contains('2') && hint.contains('4'), "should list occurrence lines: {hint}");
+    }
 
     #[tokio::test]
     async fn read_file_rejects_reversed_line_range() {

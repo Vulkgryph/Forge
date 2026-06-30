@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
@@ -6,4 +8,14 @@ while [ -h "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
-exec bun run "$SCRIPT_DIR/ui/src/index.tsx" "$@"
+
+if [[ -x "$HOME/.bun/bin/bun" ]]; then
+  BUN="$HOME/.bun/bin/bun"
+elif command -v bun >/dev/null 2>&1; then
+  BUN="$(command -v bun)"
+else
+  echo "error: bun not found. Expected it at \$HOME/.bun/bin/bun or in PATH." >&2
+  exit 127
+fi
+
+exec "$BUN" run "$SCRIPT_DIR/ui/src/index.tsx" "$@"

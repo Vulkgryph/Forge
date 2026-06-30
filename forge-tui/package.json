@@ -1,6 +1,6 @@
 {
   "name": "forge-ui",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Terminal UI for the Forge AI coding agent.",
   "author": "Vulkgryph LLC",

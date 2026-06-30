@@ -464,6 +464,12 @@ impl ApiClient {
             "model": model,
             "messages": build_openai_messages(messages),
             "stream": true,
+            // Ask for a final usage chunk. Without this, spec-compliant servers
+            // (mlx_lm, vLLM, llama.cpp, LM Studio, OpenAI…) stream no token
+            // counts, leaving last_prompt_tokens at 0 — which silently disables
+            // auto-compaction and the context/usage readouts. The stream parser
+            // already reads this usage chunk when present.
+            "stream_options": { "include_usage": true },
             "temperature": 0.7,
             "max_tokens": self.max_output_tokens,
         });
@@ -508,6 +514,15 @@ impl ApiClient {
             != ProviderToggle::On)
             .then(ThinkBlockFilter::new);
         let mut reasoning_emitted = false;
+        // Defense-in-depth: some local OpenAI-compatible servers (e.g. mlx_lm at
+        // high context) fail to parse a native `<tool_call>` block into structured
+        // tool_calls and instead leak the raw text into the reasoning/content
+        // channel, ending the turn with finish_reason=stop and no tool to run.
+        // Buffer the raw text so we can recover such calls as a last resort.
+        let mut reasoning_buf = String::new();
+        let mut content_buf = String::new();
+        let mut structured_tool_emitted = false;
+        let mut saw_finish_stop = false;
 
         let stream = tokio_util::io::StreamReader::new(
             response
@@ -578,6 +593,7 @@ impl ApiClient {
                         .and_then(|v| v.as_str());
                     if let Some(rtext) = reasoning_delta {
                         if !rtext.is_empty() {
+                            reasoning_buf.push_str(rtext);
                             if !reasoning_emitted {
                                 reasoning_emitted = true;
                                 let _ = tx.send(StreamEvent::Reasoning);
@@ -588,6 +604,7 @@ impl ApiClient {
 
                     // Text token
                     if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                        content_buf.push_str(text);
                         let visible = if let Some(filter) = think_filter.as_mut() {
                             filter.push(text)
                         } else {
@@ -623,11 +640,15 @@ impl ApiClient {
 
                     // When finish_reason arrives, emit accumulated tool calls
                     if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        if reason == "stop" {
+                            saw_finish_stop = true;
+                        }
                         if reason == "tool_calls" || reason == "stop" {
                             let mut indices: Vec<u32> = tool_call_map.keys().copied().collect();
                             indices.sort();
                             for i in indices {
                                 if let Some((id, name, args)) = tool_call_map.remove(&i) {
+                                    structured_tool_emitted = true;
                                     let _ = tx.send(StreamEvent::ToolCall(ToolCall {
                                         id,
                                         call_type: "function".to_string(),
@@ -655,6 +676,7 @@ impl ApiClient {
         indices.sort();
         for i in indices {
             if let Some((id, name, args)) = tool_call_map.remove(&i) {
+                structured_tool_emitted = true;
                 let _ = tx.send(StreamEvent::ToolCall(ToolCall {
                     id,
                     call_type: "function".to_string(),
@@ -663,6 +685,30 @@ impl ApiClient {
                         arguments: args,
                     },
                 }));
+            }
+        }
+
+        // Last-resort recovery for misbehaving OpenAI-compatible servers: if the
+        // turn ended with finish_reason=stop, produced no structured tool_calls,
+        // and no real visible content, but a complete `<tool_call>…</tool_call>`
+        // block leaked into the reasoning (or content) channel, parse it and emit
+        // it as a real tool call so the session does not silently stall. Gated so
+        // a normal text answer or a properly-structured call never trips it.
+        if saw_finish_stop && !structured_tool_emitted {
+            let leaked = if reasoning_buf.contains("<tool_call>") {
+                reasoning_buf.as_str()
+            } else {
+                content_buf.as_str()
+            };
+            let recovered = extract_leaked_tool_calls(leaked);
+            if !recovered.is_empty() && !has_visible_text(&content_buf) {
+                for (name, arguments) in recovered {
+                    let _ = tx.send(StreamEvent::ToolCall(ToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall { name, arguments },
+                    }));
+                }
             }
         }
 
@@ -1511,6 +1557,109 @@ fn build_openai_messages(messages: &[Message]) -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
+/// True if `text`, after stripping `<think>` and `<tool_call>` blocks, still
+/// contains a genuine textual answer. Used to gate the leaked-tool-call
+/// recovery so it never fires when the model actually produced prose.
+fn has_visible_text(text: &str) -> bool {
+    let without_think = strip_think_blocks(text);
+    let mut remaining = without_think.as_str();
+    let mut cleaned = String::new();
+    while let Some(start) = remaining.find("<tool_call>") {
+        cleaned.push_str(&remaining[..start]);
+        let after = &remaining[start + "<tool_call>".len()..];
+        match after.find("</tool_call>") {
+            Some(end) => remaining = &after[end + "</tool_call>".len()..],
+            None => {
+                remaining = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(remaining);
+    !cleaned.trim().is_empty()
+}
+
+/// Extract leaked tool calls from raw model text that a server failed to parse
+/// into structured `tool_calls`. Returns `(name, arguments_json)` pairs for each
+/// complete `<tool_call>…</tool_call>` block, supporting both the JSON/Hermes
+/// form (`{"name":…,"arguments":{…}}`) and Qwen3-Coder's native XML dialect
+/// (`<function=name><parameter=key>value</parameter></function>`).
+fn extract_leaked_tool_calls(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        let end = match after.find("</tool_call>") {
+            Some(e) => e,
+            None => break, // unbalanced/incomplete block — do not guess
+        };
+        let block = &after[..end];
+        rest = &after[end + "</tool_call>".len()..];
+        if let Some(tc) = parse_tool_call_block(block) {
+            out.push(tc);
+        }
+    }
+    out
+}
+
+/// Parse a single `<tool_call>` block body into `(name, arguments_json)`.
+fn parse_tool_call_block(block: &str) -> Option<(String, String)> {
+    let trimmed = block.trim();
+
+    // JSON / Hermes form: { "name": "...", "arguments": { ... } }
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let name = v.get("name").and_then(|n| n.as_str())?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let args = match v.get("arguments") {
+                Some(a) if a.is_string() => a.as_str().unwrap_or("{}").to_string(),
+                Some(a) => a.to_string(),
+                None => "{}".to_string(),
+            };
+            return Some((name, args));
+        }
+    }
+
+    // Qwen3-Coder XML dialect:
+    // <function=NAME><parameter=KEY>VALUE</parameter>...</function>
+    let fstart = trimmed.find("<function=")?;
+    let after_fn = &trimmed[fstart + "<function=".len()..];
+    let name_end = after_fn.find('>')?;
+    let name = after_fn[..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut body = &after_fn[name_end + 1..];
+    let mut args = serde_json::Map::new();
+    while let Some(ps) = body.find("<parameter=") {
+        let after_p = &body[ps + "<parameter=".len()..];
+        let key_end = match after_p.find('>') {
+            Some(k) => k,
+            None => break,
+        };
+        let key = after_p[..key_end].trim().to_string();
+        let val_region = &after_p[key_end + 1..];
+        let val_end = match val_region.find("</parameter>") {
+            Some(v) => v,
+            None => break,
+        };
+        let raw_val = val_region[..val_end].trim().to_string();
+        body = &val_region[val_end + "</parameter>".len()..];
+        // Preserve JSON numbers/bools; otherwise treat as a string.
+        let jv = match serde_json::from_str::<serde_json::Value>(&raw_val) {
+            Ok(v @ serde_json::Value::Number(_)) | Ok(v @ serde_json::Value::Bool(_)) => v,
+            _ => serde_json::Value::String(raw_val),
+        };
+        if !key.is_empty() {
+            args.insert(key, jv);
+        }
+    }
+    let args_json = serde_json::Value::Object(args).to_string();
+    Some((name, args_json))
+}
+
 fn convert_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
     let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
     let mut emitted_function_call_ids = std::collections::HashSet::new();
@@ -1896,6 +2045,62 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_leaked_tool_calls_parses_qwen_xml_dialect() {
+        // The exact shape mlx_lm leaked into `reasoning` at high context.
+        let leaked = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/agent/core.rs\n</parameter>\n<parameter=start_line>\n1\n</parameter>\n<parameter=end_line>\n100\n</parameter>\n</function>\n</tool_call>";
+        let calls = extract_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        let (name, args) = &calls[0];
+        assert_eq!(name, "read_file");
+        let v: serde_json::Value = serde_json::from_str(args).unwrap();
+        assert_eq!(v["path"], "src/agent/core.rs");
+        assert_eq!(v["start_line"], 1); // numbers preserved
+        assert_eq!(v["end_line"], 100);
+    }
+
+    #[test]
+    fn extract_leaked_tool_calls_parses_json_hermes_form() {
+        let leaked = "<tool_call>{\"name\": \"search\", \"arguments\": {\"query\": \"foo\"}}</tool_call>";
+        let calls = extract_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "search");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["query"], "foo");
+    }
+
+    #[test]
+    fn extract_leaked_tool_calls_handles_multiple_and_ignores_incomplete() {
+        let leaked = "<tool_call>\n<function=a>\n<parameter=x>1</parameter>\n</function>\n</tool_call> junk <tool_call>\n<function=b>\n</function>\n</tool_call> <tool_call><function=c>"; // last is unbalanced
+        let calls = extract_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "a");
+        assert_eq!(calls[1].0, "b");
+    }
+
+    #[test]
+    fn extract_leaked_tool_calls_empty_when_no_block() {
+        assert!(extract_leaked_tool_calls("just a normal answer, no calls").is_empty());
+    }
+
+    #[test]
+    fn has_visible_text_gates_recovery() {
+        // Pure leaked tool call → no real text → recovery allowed.
+        assert!(!has_visible_text(
+            "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>"
+        ));
+        // Whitespace around a tool call → still no real text.
+        assert!(!has_visible_text(
+            "  \n <tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\n "
+        ));
+        // Genuine prose answer → has visible text → recovery suppressed.
+        assert!(has_visible_text("Here is the summary of the file."));
+        // Prose plus a tool-call block → still counts as visible prose.
+        assert!(has_visible_text(
+            "Sure, reading it now. <tool_call><function=a></function></tool_call>"
+        ));
+    }
 
     #[test]
     fn build_openai_messages_demotes_trailing_system() {

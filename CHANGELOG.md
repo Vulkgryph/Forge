@@ -4,6 +4,18 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-01
+
+### Fixed
+
+- **Break the edit_file "old_string not found" death-spiral.** When an `edit_file` target string doesn't match, Forge now returns bounded recovery hints instead of a bare error: it flags whitespace-only differences, shows the single closest-matching region with line numbers (capped — never dumps the file), and on multiple matches lists the occurrence lines to disambiguate. This stops weaker local models from looping after a failed edit.
+- **Token usage and auto-compaction restored for OpenAI-compatible streaming.** Forge now sends `stream_options: { include_usage: true }`, so spec-compliant servers (mlx_lm, vLLM, llama.cpp, LM Studio, OpenAI…) report token counts while streaming. Without it those servers sent no usage, leaving `/usage` and the context footer stuck at 0 and silently disabling auto-compaction — on a long local session context would grow unbounded until the model's real window overflowed.
+- **Recover tool calls that misbehaving servers leak as raw text.** Some OpenAI-compatible servers (notably mlx_lm at high context) fail to parse a model's `<tool_call>` block into structured `tool_calls`, instead leaking the raw markup into the content/reasoning stream and ending the turn with no tool to run — which made the agent appear to stall, loop, or return an empty turn. Forge now recovers a complete leaked `<tool_call>` block as a real tool call (handling both the JSON/Hermes form and Qwen3-Coder's `<function=…><parameter=…>` XML dialect), gated so a genuine text answer or a properly-structured call is never affected.
+
+### Changed
+
+- Installer/launcher hardening: the `forge` wrapper now locates `bun` robustly (`~/.bun/bin/bun` or `PATH`, with a clear error if absent), and `install.sh` checks for `curl` and `ripgrep` up front (the web tools and `search_code` need them).
+
 ## [0.2.0] — 2026-06-25
 
 ### Removed
@@ -54,6 +66,7 @@ Initial public release.
 - Five-way setup wizard: local LLM / Claude subscription / ChatGPT Codex subscription / direct API key / skip
 - Cross-platform browser launching for OAuth flows (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows)
 
-[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Vulkgryph/Forge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Vulkgryph/Forge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Vulkgryph/Forge/releases/tag/v0.1.0

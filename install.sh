@@ -44,8 +44,10 @@ info "Detected $OS $ARCH"
 
 MISSING_APT=()
 command -v git    &>/dev/null || MISSING_APT+=(git)
+command -v curl   &>/dev/null || MISSING_APT+=(curl)      # downloads rustup/bun installers; web_search uses curl
 command -v unzip  &>/dev/null || MISSING_APT+=(unzip)     # bun installer requires unzip
 command -v cc     &>/dev/null || MISSING_APT+=(build-essential)  # Rust crates with C deps need a linker
+command -v rg     &>/dev/null || MISSING_APT+=(ripgrep)   # search_code tool shells out to rg
 
 if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
     case "$OS" in
@@ -157,8 +159,20 @@ git rev-parse HEAD 2>/dev/null > "$INSTALL_SHARE/version" || echo "unknown" > "$
 # Write wrapper script
 cat > "$INSTALL_BIN/forge" << 'WRAPPER'
 #!/usr/bin/env bash
+set -euo pipefail
+
 FORGE_HOME="$HOME/.local/share/forge"
-exec bun run "$FORGE_HOME/ui/dist/forge.js" "$@"
+
+if [[ -x "$HOME/.bun/bin/bun" ]]; then
+  BUN="$HOME/.bun/bin/bun"
+elif command -v bun >/dev/null 2>&1; then
+  BUN="$(command -v bun)"
+else
+  echo "error: bun not found. Expected it at \$HOME/.bun/bin/bun or in PATH." >&2
+  exit 127
+fi
+
+exec "$BUN" run "$FORGE_HOME/ui/dist/forge.js" "$@"
 WRAPPER
 
 chmod +x "$INSTALL_BIN/forge" "$INSTALL_BIN/forge-agent" "$INSTALL_BIN/forge-update" update.sh

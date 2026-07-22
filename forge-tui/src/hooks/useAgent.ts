@@ -10,7 +10,7 @@ import type {
   EndpointReasoningConfig,
   QuestionItem,
 } from "../protocol.js";
-import { activeEndpoint, collapseHome, thinkingIntensityDisplay } from "../model-display.js";
+import { activeEndpoint, collapseHome, isXaiEndpoint, thinkingIntensityDisplay } from "../model-display.js";
 import { nextStartupTip } from "../startup-tips.js";
 
 /**
@@ -87,6 +87,16 @@ export interface PendingRewind {
   summary: string;
 }
 
+/** A request failed because the provider is at capacity (xAI's "at capacity"
+ * 429, tagged with a stable `Provider at capacity:` prefix by forge-agent).
+ * `endpointName` is null when the affected endpoint can't be resolved, or
+ * isn't xAI, or is already on the priority tier — in which case there's
+ * nothing to offer switching to, and the message renders as a plain error. */
+export interface PendingProviderBusy {
+  message: string;
+  endpointName: string | null;
+}
+
 export interface RewindCheckpointState {
   id: string;
   preview: string;
@@ -121,10 +131,12 @@ export interface AgentState {
   pendingPlan: PendingPlan | null;
   pendingQuestion: PendingQuestion | null;
   pendingRewind: PendingRewind | null;
+  pendingProviderBusy: PendingProviderBusy | null;
   planMode: boolean;
   activeSubagents: Map<string, ActiveSubagent>;
   availableTools: import("../protocol.js").ToolInfo[];
   contextStrategy: string;
+  offlineMode: boolean;
   chatgptLoggedIn: boolean;
   loginInProgress: boolean;
   streamingId: string | null;
@@ -233,10 +245,12 @@ export function useAgent(options: UseAgentOptions = {}) {
     pendingPlan: null,
     pendingQuestion: null,
     pendingRewind: null,
+    pendingProviderBusy: null,
     planMode: false,
     activeSubagents: new Map(),
     availableTools: [],
     contextStrategy: "compaction",
+    offlineMode: false,
     chatgptLoggedIn: false,
     loginInProgress: false,
     streamingId: null,
@@ -492,6 +506,7 @@ export function useAgent(options: UseAgentOptions = {}) {
             endpoints: msg.endpoints,
             availableTools: msg.available_tools ?? [],
             contextStrategy: msg.context_strategy ?? "compaction",
+            offlineMode: msg.offline_mode ?? false,
             chatgptLoggedIn: msg.chatgpt_logged_in ?? false,
             scrollback: [...prev.scrollback, ...startupEntries(
               msg.model_name,
@@ -874,7 +889,34 @@ export function useAgent(options: UseAgentOptions = {}) {
           }));
           break;
 
-        case "error":
+        case "error": {
+          // forge-agent tags a provider-capacity rejection (xAI's "at
+          // capacity" 429, or an equivalent from another OpenAI-compatible
+          // provider) with this stable prefix, distinct from a generic API
+          // error, specifically so a client can offer switching the
+          // affected endpoint to a paid priority tier instead of just
+          // showing red text with no path forward. Only xAI actually has
+          // a priority tier to offer; anything else still falls through to
+          // a plain error entry below.
+          const isProviderBusy = msg.message.startsWith("Provider at capacity:");
+          const busyEndpoint = isProviderBusy
+            ? activeEndpoint(
+                stateRef.current.endpoints,
+                stateRef.current.modelName,
+                stateRef.current.modelId,
+                stateRef.current.maxContextTokens,
+              )
+            : null;
+          if (isProviderBusy && busyEndpoint && isXaiEndpoint(busyEndpoint) && !busyEndpoint.xai_priority_tier) {
+            setState((prev) => ({
+              ...prev,
+              isThinking: false,
+              activityLabel: "Idle",
+              pendingProviderBusy: { message: msg.message, endpointName: busyEndpoint.name },
+              transient: [],
+            }));
+            break;
+          }
           setState((prev) => ({
             ...prev,
             isThinking: false,
@@ -887,6 +929,7 @@ export function useAgent(options: UseAgentOptions = {}) {
             transient: [],
           }));
           break;
+        }
 
         case "api_retry":
           setState((prev) => ({
@@ -1271,6 +1314,54 @@ export function useAgent(options: UseAgentOptions = {}) {
     }));
   }, [send]);
 
+  /** Opts an xAI endpoint in or out of priority processing — 2x xAI's
+   * standard per-token price, billed by xAI itself, for higher scheduling
+   * priority during high demand. Same optimistic-update shape as
+   * `updateEndpointReasoning` above (no ack broadcast for this). */
+  const updateXaiPriorityTier = useCallback((endpointName: string, enabled: boolean) => {
+    send({ type: "update_xai_priority_tier", endpoint_name: endpointName, enabled });
+    setState((prev) => ({
+      ...prev,
+      endpoints: prev.endpoints.map((ep) =>
+        ep.name === endpointName ? { ...ep, xai_priority_tier: enabled } : ep
+      ),
+    }));
+  }, [send]);
+
+  /** Resolves a pending provider-busy notice by switching that endpoint to
+   * the priority tier and dropping the notice — mirrors Forge IDE's
+   * "Switch to Priority Tier" card action. */
+  const switchProviderBusyToPriority = useCallback(() => {
+    const pending = stateRef.current.pendingProviderBusy;
+    if (pending?.endpointName) {
+      updateXaiPriorityTier(pending.endpointName, true);
+    }
+    setState((prev) => ({
+      ...prev,
+      pendingProviderBusy: null,
+      scrollback: [
+        ...prev.scrollback,
+        { id: nextId(), kind: "error", content: prev.pendingProviderBusy?.message ?? "" },
+        ...(pending?.endpointName
+          ? [{ id: nextId(), kind: "system" as const, content: `Switched ${pending.endpointName} to priority tier.` }]
+          : []),
+      ],
+    }));
+  }, [updateXaiPriorityTier]);
+
+  /** Dismisses a pending provider-busy notice without changing anything —
+   * mirrors the card's "Dismiss" action. */
+  const dismissProviderBusy = useCallback(() => {
+    setState((prev) => ({
+      ...prev,
+      pendingProviderBusy: null,
+      scrollback: [
+        ...prev.scrollback,
+        { id: nextId(), kind: "error", content: prev.pendingProviderBusy?.message ?? "" },
+      ],
+    }));
+  }, []);
+
   const compact = useCallback(() => {
     send({ type: "compact" });
     setState((prev) => ({
@@ -1477,11 +1568,15 @@ export function useAgent(options: UseAgentOptions = {}) {
     addSystemEntry,
     cyclePermissionMode,
     setContextStrategy: (strategy: string) => setState((prev) => ({ ...prev, contextStrategy: strategy })),
+    setOfflineMode: (enabled: boolean) => setState((prev) => ({ ...prev, offlineMode: enabled })),
     setToolEnabled: (tool: string, enabled: boolean) => setState((prev) => ({
       ...prev,
       availableTools: prev.availableTools.map((t) => t.name === tool ? { ...t, enabled } : t),
     })),
     updateEndpointReasoning,
+    updateXaiPriorityTier,
+    switchProviderBusyToPriority,
+    dismissProviderBusy,
     setPermissionMode: (mode: PermissionMode) => setState((prev) => ({ ...prev, permissionMode: mode })),
     sendProcessInput,
     sendBgProcessInput,

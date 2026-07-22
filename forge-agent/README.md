@@ -1,8 +1,8 @@
-# Forge
+# Forge Agent
 
 Created by **Vulkgryph LLC**.
 
-An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project via a terminal UI and a headless JSON protocol.
+An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project — driven by [`forge-tui`](../forge-tui/) (the terminal UI) or [`forge-ide`](../forge-ide/) (a full code editor), both talking to this binary over the same headless JSON protocol. See the [top-level README](../README.md) for how the three fit together.
 
 ![Forge writing a zero-dependency VM runtime in Rust](assets/forge-demo.gif)
 
@@ -306,37 +306,9 @@ forge [--cwd <path>]
 forge-agent --headless [--resume-session <id>] [--dangerously-allow-all]
 ```
 
-`forge` launches the terminal UI wrapper. `forge-agent` is the Rust agent binary; outside headless mode it exits with a usage message and expects to be driven by the UI.
+`forge` launches the terminal UI wrapper (see [`../forge-tui/`](../forge-tui/) for its keyboard shortcuts and slash commands). `forge-agent` is the Rust agent binary; outside headless mode it exits with a usage message and expects to be driven by a client — either `forge-tui` or [`forge-ide`](../forge-ide/), both of which drive the exact same binary independently.
 
 If `--cwd` is not specified, Forge uses the current directory as the project root.
-
-### Keyboard shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message |
-| `Ctrl+N` &nbsp;*or*&nbsp; `\` then `Enter` | New line in input |
-| `Ctrl+C` | Quit |
-| `Escape` | Cancel current run when the agent is thinking |
-| `Shift+Tab` | Cycle permission mode |
-
-Forge uses `Ctrl+N` and the trailing-backslash idiom instead of `Shift+Enter` because `Shift+Enter` is not reliably distinguishable from plain `Enter` across terminal emulators.
-
-### Slash commands
-
-| Command | Description |
-|---------|-------------|
-| `/model` | Open model configuration |
-| `/settings` | Open settings/tool/context menu |
-| `/subagent` or `/agents` | Open subagent/agent definition menu |
-| `/plan` | Enter planning mode |
-| `/sessions` or `/resume` | Browse and resume prior sessions |
-| `/compact` | Manually trigger context compaction |
-| `/revert` | Restore a previous user turn and code snapshot |
-| `/usage` | Show token usage for the current session |
-| `/log` | Show the current session log path |
-| `/login --chatgpt` | Start ChatGPT Codex OAuth login (Claude subscription login is not supported — use an Anthropic API key) |
-| `/help` | Show command help |
 
 ### Tool approval
 
@@ -418,8 +390,10 @@ Forge runs the script from the project root. Tool arguments are passed as JSON o
 
 ## Project layout
 
+This is one project inside a larger monorepo — see the [top-level README](../README.md) for how it relates to `forge-tui` and `forge-ide`, its two independent clients.
+
 ```text
-forge/
+forge-agent/
 ├── src/
 │   ├── main.rs                  Entry point, model/auth/bootstrap logic
 │   ├── agent/
@@ -436,15 +410,6 @@ forge/
 │   │   └── types.rs             Request/response types
 │   ├── config.rs                Config loading
 │   └── headless.rs              JSON protocol types
-├── ui/
-│   └── src/
-│       ├── index.tsx            UI entry point
-│       ├── protocol.ts          Zod schemas for agent protocol
-│       ├── agent-bridge.ts      Spawns + communicates with forge-agent
-│       ├── hooks/useAgent.ts    React hook for agent state
-│       └── components/
-│           ├── App.tsx          Main UI, menus, model hub
-│           └── SubagentStatus.tsx  Subagent progress display
 ├── ARCHITECTURE.md              Detailed architecture reference
 ├── ADDING_TOOLS.md              Guide for adding new tools
 └── install.sh                   Build + install script
@@ -456,7 +421,7 @@ See [ADDING_TOOLS.md](ADDING_TOOLS.md) for the complete checklist. Every tool re
 
 ## Headless mode
 
-`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types and `ui/src/agent-bridge.ts` for a reference client implementation. ChatGPT Codex OAuth login is also available through `forge-agent --login-chatgpt`.
+`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types, and either [`../forge-tui/src/agent-bridge.ts`](../forge-tui/src/agent-bridge.ts) or [`../forge-ide/src/agent_panel.rs`](../forge-ide/src/agent_panel.rs) for a reference client implementation. ChatGPT Codex OAuth login is also available through `forge-agent --login-chatgpt`.
 
 ## Contributions
 

@@ -34,11 +34,29 @@ pub enum AgentEvent {
         tool_args: String,
         tool_id: String,
         kind: ToolKindEvent,
+        /// `Some(slot_id)` when this call belongs to a running subagent
+        /// rather than the top-level agent — lets a client keep a
+        /// subagent's own tool-call activity (and approvals) in its own
+        /// view instead of mixed into the main conversation, since a
+        /// subagent's events share the same event stream as everything else.
+        subagent_id: Option<String>,
+        /// Whether this *specific* call will actually block waiting for an
+        /// approve/deny — computed from the session's real trust settings
+        /// (`--dangerously-allow-all`, auto-mode, `auto_approve_writes`/
+        /// `_reads`), not guessed from `kind` alone. A client previously had
+        /// to infer this itself (typically "kind == read"), which had no way
+        /// to know the call was actually auto-approved under a trust setting
+        /// it can't see — so e.g. every write/execute call under
+        /// `--dangerously-allow-all` rendered as a permanently "awaiting
+        /// approval" card that no one was ever going to answer, even though
+        /// the agent itself was never actually blocked on it.
+        needs_approval: bool,
     },
     ToolResult {
         tool_name: String,
         result: String,
         success: bool,
+        subagent_id: Option<String>,
     },
     Error(String),
     ApiRetry {
@@ -67,6 +85,11 @@ pub enum AgentEvent {
         id: String,
         agent_type: String,
         prompt: String,
+        /// `Some(parent_slot_id)` when this subagent was spawned by another
+        /// subagent's own `delegate_task` call (nesting), rather than by the
+        /// top-level agent — lets a client nest it under its parent's own
+        /// view instead of listing it as an unrelated top-level entry.
+        parent_id: Option<String>,
     },
     SubagentStatus {
         id: String,
@@ -208,7 +231,15 @@ fn is_likely_secret_path(path: &Path) -> bool {
     }
 
     const SECRET_SUFFIXES: &[&str] = &[
-        ".key", ".pem", ".p12", ".pfx", ".keystore", ".jks", ".crt", ".cer", ".der",
+        ".key",
+        ".pem",
+        ".p12",
+        ".pfx",
+        ".keystore",
+        ".jks",
+        ".crt",
+        ".cer",
+        ".der",
     ];
     if SECRET_SUFFIXES.iter().any(|s| name.ends_with(s)) {
         return true;
@@ -266,9 +297,11 @@ pub enum ToolKindEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     SendMessage(String),
-    #[allow(dead_code)] // tool_id carried from wire protocol; not yet matched against pending approval
     ApproveAction(String),
-    DenyAction(String),
+    DenyAction {
+        tool_id: String,
+        reason: String,
+    },
     ToggleAutoMode,
     SwitchModel(crate::config::ModelEndpoint),
     UpdateConfig(crate::config::AppConfig),
@@ -779,6 +812,7 @@ impl Agent {
                     let _ = self.log.log_run_state(RunState::Running);
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     let turn_preview = preview_text(&notification);
+                    self.ensure_git_repo_and_notify();
                     let turn_result = self.process_turn().await;
                     if let Err(e) = self.create_rewind_snapshot(turn_id, turn_preview) {
                         let _ = self.event_tx.send(AgentEvent::Error(format!(
@@ -1035,6 +1069,7 @@ impl Agent {
         }
 
         let _ = self.log.log_run_state(RunState::Running);
+        self.ensure_git_repo_and_notify();
         let turn_result = self.process_turn().await;
         if self.history.len() <= pre_turn_history_len + 1 {
             self.history.truncate(pre_turn_history_len);
@@ -1091,7 +1126,16 @@ impl Agent {
             let _ = self.event_tx.send(AgentEvent::Thinking);
 
             // Build tool list — filtered by plan mode and disabled_tools config
-            let disabled = &self.app_config.agent.disabled_tools;
+            let mut disabled = self.app_config.agent.disabled_tools.clone();
+            if self.app_config.agent.offline_mode {
+                // web_search/web_fetch are the only normal tools that reach
+                // the network — force them off in offline mode regardless of
+                // the user's own disabled_tools list.
+                for t in ["web_search", "web_fetch"] {
+                    if !disabled.iter().any(|d| d == t) { disabled.push(t.to_string()); }
+                }
+            }
+            let disabled = &disabled;
             let tools = if self.plan_mode {
                 let mut plan_tools = self.executor.plan_mode_tools();
                 plan_tools.push(ask_question_definition());
@@ -1248,6 +1292,17 @@ impl Agent {
                     || err_lower.contains("exceed")
                     || err_lower.contains("413")
                     || err_lower.contains("400");
+                // Provider-side rate/capacity limiting (xAI's "resource-exhausted /
+                // at capacity" 429, or an equivalent from another OpenAI-compatible
+                // provider) — not a bug in the request, just no room to serve it
+                // right now. Tagged with a stable, distinct prefix so a client can
+                // recognize this specific case (e.g. to offer switching to a paid
+                // priority tier) instead of showing a generic API error.
+                let is_provider_busy = !is_context_overflow
+                    && (err_lower.contains("resource-exhausted")
+                        || err_lower.contains("resource_exhausted")
+                        || err_lower.contains("at capacity")
+                        || err_lower.contains("429"));
 
                 if is_context_overflow {
                     self.refresh_rolling_plan_context();
@@ -1271,9 +1326,12 @@ impl Agent {
                     let _ = self.log.log_message(&partial);
                     self.history.push(partial);
                 }
-                let _ = self
-                    .event_tx
-                    .send(AgentEvent::Error(format!("API error: {}", e)));
+                let message = if is_provider_busy {
+                    format!("Provider at capacity: {}", e)
+                } else {
+                    format!("API error: {}", e)
+                };
+                let _ = self.event_tx.send(AgentEvent::Error(message));
                 return Ok(());
             }
 
@@ -1484,21 +1542,24 @@ impl Agent {
                         );
 
                         // Emit ToolRequest so TUI shows it
+                        let delegate_needs_approval = !self.auto_mode && !self.dangerously_allow_all;
                         let _ = self.event_tx.send(AgentEvent::ToolRequest {
                             tool_name: "delegate_task".to_string(),
                             tool_args: tc.function.arguments.clone(),
                             tool_id: tc.id.clone(),
                             kind: ToolKindEvent::Execute,
+                            subagent_id: None,
+                            needs_approval: delegate_needs_approval,
                         });
 
                         // Approval check (sequential — one at a time)
-                        if !self.auto_mode && !self.dangerously_allow_all {
+                        if delegate_needs_approval {
                             let _ = self.log.log_run_state(RunState::AwaitingApproval);
 
                             let mut was_denied = false;
                             loop {
                                 match self.action_rx.recv().await {
-                                    Some(UserAction::ApproveAction(_)) => {
+                                    Some(UserAction::ApproveAction(id)) if id == tc.id => {
                                         let _ = self.log.log_tool_approved(
                                             &tc.id,
                                             "delegate_task",
@@ -1507,7 +1568,9 @@ impl Agent {
                                         let _ = self.log.log_run_state(RunState::Running);
                                         break;
                                     }
-                                    Some(UserAction::DenyAction(reason)) => {
+                                    Some(UserAction::DenyAction { tool_id, reason })
+                                        if tool_id == tc.id =>
+                                    {
                                         let _ = self.log.log_tool_denied(
                                             &tc.id,
                                             "delegate_task",
@@ -1519,6 +1582,7 @@ impl Agent {
                                             tool_name: "delegate_task".to_string(),
                                             result: result.clone(),
                                             success: false,
+                                            subagent_id: None,
                                         });
                                         denied_results.push((tc, result));
                                         was_denied = true;
@@ -1527,6 +1591,11 @@ impl Agent {
                                     Some(UserAction::Quit) => {
                                         denied_results
                                             .push((tc, "Session ended by user".to_string()));
+                                        was_denied = true;
+                                        break;
+                                    }
+                                    Some(UserAction::CancelRun) => {
+                                        denied_results.push((tc, "Cancelled by user".to_string()));
                                         was_denied = true;
                                         break;
                                     }
@@ -1555,6 +1624,7 @@ impl Agent {
                                     tool_name: "delegate_task".to_string(),
                                     result: err_result.clone(),
                                     success: false,
+                                    subagent_id: None,
                                 });
                                 denied_results.push((tc, err_result));
                             }
@@ -1599,6 +1669,7 @@ impl Agent {
                                     id: id.clone(),
                                     agent_type: agent_type.clone(),
                                     prompt: prompt.clone(),
+                                    parent_id: None,
                                 });
 
                                 // Create channels
@@ -1620,6 +1691,8 @@ impl Agent {
                                     self.event_tx.clone(),
                                     Some(sub_approval_rx),
                                     id.clone(),
+                                    self.dangerously_allow_all,
+                                    self.auto_mode,
                                 );
 
                                 // Spawn the runner, tagging with the index so we can match results
@@ -1686,8 +1759,16 @@ impl Agent {
 
                                     action = self.action_rx.recv() => {
                                         match action {
-                                            Some(UserAction::ApproveAction(_)) | Some(UserAction::DenyAction(_)) => {
-                                                // Broadcast to all active subagent approval channels
+                                            Some(UserAction::ApproveAction(_)) | Some(UserAction::DenyAction { .. }) => {
+                                                // Delivered to every active subagent's approval
+                                                // channel — each subagent's own wait (see
+                                                // `SubagentRunner`) checks the action's tool_id
+                                                // against the specific tool call it's actually
+                                                // blocked on and ignores anything else, so a
+                                                // click meant for one subagent's pending approval
+                                                // can't be misdirected into unblocking another
+                                                // concurrently-running subagent that hasn't
+                                                // reached its own approval-gated call yet.
                                                 for meta in &metas {
                                                     let _ = meta.approval_tx.send(action.clone().unwrap());
                                                 }
@@ -1696,7 +1777,13 @@ impl Agent {
                                                 self.queue_user_message(msg);
                                             }
                                             Some(UserAction::CancelRun) => {
-                                                // Mark all remaining as cancelled
+                                                // Actually abort the running tasks — previously this
+                                                // only recorded a synthetic result, but the real
+                                                // runner tasks kept running (e.g. still blocked on
+                                                // approval), and the unconditional forward_handle
+                                                // await below would then hang forever waiting for a
+                                                // task that was never signaled to stop.
+                                                runner_futs.abort_all();
                                                 for (idx, _) in metas.iter().enumerate() {
                                                     if !results.iter().any(|(i, _)| *i == idx) {
                                                         results.push((idx, "Cancelled by user".to_string()));
@@ -1704,6 +1791,7 @@ impl Agent {
                                                 }
                                             }
                                             Some(UserAction::Quit) => {
+                                                runner_futs.abort_all();
                                                 for (idx, _) in metas.iter().enumerate() {
                                                     if !results.iter().any(|(i, _)| *i == idx) {
                                                         results.push((idx, "Session ended by user".to_string()));
@@ -1774,6 +1862,7 @@ impl Agent {
                                     tool_name: "delegate_task".to_string(),
                                     result: result_str.clone(),
                                     success,
+                                    subagent_id: None,
                                 });
 
                                 let tool_msg =
@@ -2175,6 +2264,34 @@ impl Agent {
             .map(|snapshot| snapshot.commit.clone())
     }
 
+    /// Auto-initializes git for this project if it isn't already tracked —
+    /// so rewind checkpoints have real git backing from the very first turn
+    /// that changes anything, instead of a project that was never version
+    /// controlled silently having nothing meaningful to restore to. Called
+    /// at the *start* of a turn (before `process_turn`), not from
+    /// `create_rewind_snapshot` itself, so a resulting notice is ordered
+    /// correctly in the conversation — as the first thing that turn says,
+    /// not something arriving after that turn's own `Done` event already
+    /// fired (which is where `create_rewind_snapshot` runs relative to the
+    /// rest of a turn — after, not before).
+    fn ensure_git_repo_and_notify(&mut self) {
+        match super::rewind::ensure_git_repo(self.executor.project_root()) {
+            Ok(true) => {
+                let _ = self.event_tx.send(AgentEvent::AssistantMessage(
+                    "[Initialized a git repository in this project so changes can be tracked and reverted]"
+                        .to_string(),
+                ));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                    "Failed to initialize a git repository for this project: {}",
+                    e
+                )));
+            }
+        }
+    }
+
     fn create_rewind_snapshot(&mut self, id: String, preview: String) -> Result<()> {
         let parent_snapshot = self
             .rewind_checkpoints
@@ -2544,6 +2661,7 @@ impl Agent {
                     tool_name: tc.function.name.clone(),
                     result: result.clone(),
                     success: false,
+                    subagent_id: None,
                 });
                 return Ok(result);
             }
@@ -2560,14 +2678,9 @@ impl Agent {
             ToolKind::Unknown => ToolKindEvent::Read,
         };
 
-        let _ = self.event_tx.send(AgentEvent::ToolRequest {
-            tool_name: tc.function.name.clone(),
-            tool_args: tc.function.arguments.clone(),
-            tool_id: tc.id.clone(),
-            kind: kind_event,
-        });
-
-        // Determine if we need permission
+        // Determine if we need permission — computed before the ToolRequest
+        // send so the event can tell a client whether this call will
+        // actually wait, rather than the client guessing from `kind` alone.
         let needs_approval = if self.dangerously_allow_all {
             false
         } else {
@@ -2579,17 +2692,26 @@ impl Agent {
             }
         };
 
+        let _ = self.event_tx.send(AgentEvent::ToolRequest {
+            tool_name: tc.function.name.clone(),
+            tool_args: tc.function.arguments.clone(),
+            tool_id: tc.id.clone(),
+            kind: kind_event,
+            subagent_id: None,
+            needs_approval,
+        });
+
         if needs_approval {
             let _ = self.log.log_run_state(RunState::AwaitingApproval);
 
             loop {
                 match self.action_rx.recv().await {
-                    Some(UserAction::ApproveAction(_)) => {
+                    Some(UserAction::ApproveAction(id)) if id == tc.id => {
                         let _ = self.log.log_tool_approved(&tc.id, &tc.function.name, false);
                         let _ = self.log.log_run_state(RunState::Running);
                         break;
                     }
-                    Some(UserAction::DenyAction(reason)) => {
+                    Some(UserAction::DenyAction { tool_id, reason }) if tool_id == tc.id => {
                         let _ = self.log.log_tool_denied(&tc.id, &tc.function.name, &reason);
                         let _ = self.log.log_run_state(RunState::Running);
                         let result = format!("DENIED: {}", reason);
@@ -2597,6 +2719,7 @@ impl Agent {
                             tool_name: tc.function.name.clone(),
                             result: result.clone(),
                             success: false,
+                            subagent_id: None,
                         });
                         return Ok(result);
                     }
@@ -2632,6 +2755,7 @@ impl Agent {
                 tool_name: tc.function.name.clone(),
                 result: result.clone(),
                 success,
+                subagent_id: None,
             });
 
             return Ok(result);
@@ -2671,6 +2795,7 @@ impl Agent {
             tool_name: tc.function.name.clone(),
             result: result.clone(),
             success,
+            subagent_id: None,
         });
 
         Ok(result)
@@ -2879,6 +3004,15 @@ impl Agent {
         let mut input_prompt_sent = false;
         // When a real interactive prompt is detected, pause the background countdown.
         let mut input_waiting = false;
+        // A prompt-shaped chunk arms this instead of firing immediately —
+        // confirmed only if `PROMPT_DEBOUNCE` passes with no further output,
+        // otherwise cleared. A single PTY read's chunk boundary can land
+        // anywhere (mid-line, right after a source line's own trailing
+        // colon, a "file.rs:454:" grep match, ...), so "this one chunk ends
+        // in a colon" alone is too weak a signal — a genuine interactive
+        // prompt is followed by silence, ordinary tool output isn't.
+        let mut pending_prompt_check: Option<(tokio::time::Instant, String)> = None;
+        const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
         // wait=true: never auto-background; run until done or timeout_secs elapsed.
         let wait_for_completion = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         // run_in_background=true: background immediately without waiting for output.
@@ -2889,10 +3023,20 @@ impl Agent {
         // timeout_secs: overrides auto-background threshold (default 120s).
         // When wait=true, this is a hard cap — command is killed and error returned if exceeded.
         // Default for wait=true: 300s. Default for auto-background: 120s.
-        let timeout_secs = args
+        let mut timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(if wait_for_completion { 300 } else { 120 });
+        // User-configured floor (`agent.min_shell_timeout_secs`, default 0 —
+        // no floor) — the model chooses `timeout_secs` per call and can
+        // simply guess wrong for a task that runs longer than it expected,
+        // getting it killed with a timeout error partway through. Only
+        // raises the model's own choice, never lowers it, and only for
+        // `wait=true` (a command running detached/auto-backgrounded was
+        // never going to be killed by this value in the first place).
+        if wait_for_completion {
+            timeout_secs = timeout_secs.max(self.app_config.agent.min_shell_timeout_secs);
+        }
 
         let event_tx = self.event_tx.clone();
         let tool_name = tc.function.name.clone();
@@ -3037,17 +3181,30 @@ impl Agent {
                 chunk = async { if out_done { std::future::pending().await } else { out_rx.recv().await } } => {
                     if let Some(chunk) = chunk {
                         push_capped(&mut output_buf, &chunk);
-                        // Pattern-based prompt detection: fire immediately on prompt-shaped output.
+                        // Pattern-based prompt detection: arm a candidate, confirmed
+                        // only by the debounce arm below once output actually stops.
                         if !input_prompt_sent && !child_done && looks_like_prompt(&chunk) {
-                            input_prompt_sent = true;
-                            input_waiting = true;
                             let prompt_text = output_buf.lines().rev()
                                 .find(|l| !l.trim().is_empty())
                                 .unwrap_or("Input needed")
                                 .to_string();
-                            let _ = event_tx.send(AgentEvent::ProcessInputNeeded { prompt: prompt_text });
+                            pending_prompt_check = Some((tokio::time::Instant::now(), prompt_text));
                         } else {
+                            // More output arrived — either this chunk isn't
+                            // prompt-shaped, or it is but the command clearly
+                            // kept going regardless, so any pending candidate
+                            // was a false read of a mid-stream chunk boundary.
+                            pending_prompt_check = None;
                             input_prompt_sent = false;
+                            // Self-heal: if a prior chunk was mistakenly flagged
+                            // as a prompt but output has since continued
+                            // normally, the command clearly wasn't actually
+                            // blocked — don't leave `input_waiting` stuck true
+                            // (which silently disables the timeout/auto-background
+                            // check above) for the rest of the command's run.
+                            // The only other place this resets is an actual
+                            // provided-input action, which no client sends yet.
+                            input_waiting = false;
                         }
                         let now = tokio::time::Instant::now();
                         if now.duration_since(last_output_emit) >= OUTPUT_THROTTLE {
@@ -3065,7 +3222,22 @@ impl Agent {
                         if child_done { break; }
                     }
                 }
-                // 4. Periodic tick — wakes up the loop so the wall-clock check runs
+                // 4. Confirm a pending prompt candidate once the debounce
+                // window passes with no further output — see the field doc
+                // on `pending_prompt_check` for why this isn't fired inline.
+                _ = async {
+                    match pending_prompt_check.as_ref() {
+                        Some((armed_at, _)) => tokio::time::sleep_until(*armed_at + PROMPT_DEBOUNCE).await,
+                        None => std::future::pending().await,
+                    }
+                }, if pending_prompt_check.is_some() => {
+                    if let Some((_, prompt_text)) = pending_prompt_check.take() {
+                        input_prompt_sent = true;
+                        input_waiting = true;
+                        let _ = event_tx.send(AgentEvent::ProcessInputNeeded { prompt: prompt_text });
+                    }
+                }
+                // 5. Periodic tick — wakes up the loop so the wall-clock check runs
                 _ = tick => {
                     let now = tokio::time::Instant::now();
                     if !child_done && now.duration_since(last_progress_emit) >= PROGRESS_INTERVAL {
@@ -3538,6 +3710,8 @@ impl Agent {
             tool_args: tc.function.arguments.clone(),
             tool_id: tc.id.clone(),
             kind: ToolKindEvent::Read,
+            subagent_id: None,
+            needs_approval: false, // waits on a QuestionRequest answer, not an approval
         });
 
         // Emit QuestionRequest so TUI shows the question and waits for input
@@ -3557,6 +3731,7 @@ impl Agent {
                         tool_name: "ask_question".to_string(),
                         result: result.clone(),
                         success: false,
+                        subagent_id: None,
                     });
                     return Ok(result);
                 }
@@ -3571,6 +3746,7 @@ impl Agent {
             tool_name: "ask_question".to_string(),
             result: answer.clone(),
             success: true,
+            subagent_id: None,
         });
 
         Ok(answer)
@@ -3608,27 +3784,28 @@ impl Agent {
     }
 
     async fn handle_enter_plan_mode(&mut self, tc: &ToolCall) -> String {
+        // Require user approval before entering plan mode
+        let needs_approval = !self.dangerously_allow_all && !self.auto_mode;
         let _ = self.event_tx.send(AgentEvent::ToolRequest {
             tool_name: "enter_plan_mode".to_string(),
             tool_args: tc.function.arguments.clone(),
             tool_id: tc.id.clone(),
             kind: ToolKindEvent::Execute,
+            subagent_id: None,
+            needs_approval,
         });
-
-        // Require user approval before entering plan mode
-        let needs_approval = !self.dangerously_allow_all && !self.auto_mode;
 
         if needs_approval {
             let _ = self.log.log_run_state(RunState::AwaitingApproval);
 
             loop {
                 match self.action_rx.recv().await {
-                    Some(UserAction::ApproveAction(_)) => {
+                    Some(UserAction::ApproveAction(id)) if id == tc.id => {
                         let _ = self.log.log_tool_approved(&tc.id, "enter_plan_mode", false);
                         let _ = self.log.log_run_state(RunState::Running);
                         break;
                     }
-                    Some(UserAction::DenyAction(reason)) => {
+                    Some(UserAction::DenyAction { tool_id, reason }) if tool_id == tc.id => {
                         let _ = self.log.log_tool_denied(&tc.id, "enter_plan_mode", &reason);
                         let _ = self.log.log_run_state(RunState::Running);
                         let result = format!("DENIED: {}", reason);
@@ -3636,6 +3813,7 @@ impl Agent {
                             tool_name: "enter_plan_mode".to_string(),
                             result: result.clone(),
                             success: false,
+                            subagent_id: None,
                         });
                         return result;
                     }
@@ -3657,6 +3835,7 @@ impl Agent {
             tool_name: "enter_plan_mode".to_string(),
             result: format!("Entered plan mode. Plan file: {}", plan_path),
             success: true,
+            subagent_id: None,
         });
 
         format!(
@@ -3677,6 +3856,8 @@ impl Agent {
             tool_args: tc.function.arguments.clone(),
             tool_id: tc.id.clone(),
             kind: ToolKindEvent::Read,
+            subagent_id: None,
+            needs_approval: false, // never gates on approval
         });
 
         if !self.plan_mode {
@@ -3687,6 +3868,7 @@ impl Agent {
                 tool_name: "write_plan".to_string(),
                 result: result.clone(),
                 success: false,
+                subagent_id: None,
             });
             return Ok(result);
         }
@@ -3699,6 +3881,7 @@ impl Agent {
                     tool_name: "write_plan".to_string(),
                     result: result.clone(),
                     success: false,
+                    subagent_id: None,
                 });
                 return Ok(result);
             }
@@ -3715,6 +3898,7 @@ impl Agent {
             tool_name: "write_plan".to_string(),
             result: result.clone(),
             success: true,
+            subagent_id: None,
         });
 
         Ok(result)
@@ -3726,6 +3910,8 @@ impl Agent {
             tool_args: tc.function.arguments.clone(),
             tool_id: tc.id.clone(),
             kind: ToolKindEvent::Read,
+            subagent_id: None,
+            needs_approval: false, // never gates on approval
         });
 
         if !self.plan_mode {
@@ -3734,6 +3920,7 @@ impl Agent {
                 tool_name: "exit_plan_mode".to_string(),
                 result: result.clone(),
                 success: false,
+                subagent_id: None,
             });
             return Ok(result);
         }
@@ -3804,6 +3991,7 @@ impl Agent {
                         result: "Plan approved (context cleared). Proceeding with implementation."
                             .to_string(),
                         success: true,
+                        subagent_id: None,
                     });
 
                     return Ok("Plan approved by user. Context cleared. Proceed with implementation using the full tool set.".to_string());
@@ -3825,6 +4013,7 @@ impl Agent {
                         tool_name: "exit_plan_mode".to_string(),
                         result: "Plan approved. Proceeding with implementation.".to_string(),
                         success: true,
+                        subagent_id: None,
                     });
 
                     return Ok("Plan approved by user. Proceed with implementation using the full tool set.".to_string());
@@ -3853,6 +4042,7 @@ impl Agent {
                             tool_name: "exit_plan_mode".to_string(),
                             result: "User wants to discuss. Ask them what they'd like to change or explore.".to_string(),
                             success: true,
+                        subagent_id: None,
                         });
                         return Ok("User wants to discuss the plan.".to_string());
                     }
@@ -3884,6 +4074,7 @@ impl Agent {
                         tool_name: "exit_plan_mode".to_string(),
                         result: result_msg.clone(),
                         success: false,
+                        subagent_id: None,
                     });
 
                     return Ok(result_msg);
@@ -3970,8 +4161,18 @@ fn looks_like_prompt(chunk: &str) -> bool {
         return false;
     }
     let t = chunk.trim_end_matches(|c: char| c == ' ' || c == '\t');
-    t.ends_with(':')
-        || t.ends_with("?]")
+    if t.ends_with(':') {
+        // A bare colon ending is the most common real-prompt shape ("Enter
+        // name:", "Password:") but it's also exactly what grep/ripgrep and
+        // compiler diagnostics end with when a read chunk happens to land
+        // right after a line number ("src/main.rs:454:", ".../foo.rs:12:5:
+        // warning:") — a real prompt essentially never ends with a bare
+        // number right before the colon, so exclude that shape rather than
+        // firing a false "waiting for input" on ordinary tool output.
+        let before_colon = t[..t.len() - 1].trim_end();
+        return !before_colon.chars().last().is_some_and(|c| c.is_ascii_digit());
+    }
+    t.ends_with("?]")
         || t.ends_with("[y/N]")
         || t.ends_with("[Y/n]")
         || t.ends_with("[yes/no]")
@@ -4267,6 +4468,23 @@ Be concise and direct in your responses. Focus on actionable feedback."#,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_heuristic_ignores_file_line_colons() {
+        // `looks_like_prompt` alone only catches the shape where the chunk
+        // boundary lands right after a line number ("file:454:") — a chunk
+        // boundary landing mid-line, after code content that just happens
+        // to end in a colon ("ui.label(egui:"), still passes this pure
+        // heuristic; that case relies on `run_shell_streaming`'s debounce
+        // (only fires `ProcessInputNeeded` if the candidate stays
+        // unconfirmed — no further output — for `PROMPT_DEBOUNCE`) rather
+        // than the heuristic alone, so it isn't exercised here.
+        assert!(!looks_like_prompt("launchers/editor/src/main.rs:454:"));
+        assert!(!looks_like_prompt("warning: unused variable: `x`\n  --> src/main.rs:12:5:"));
+        assert!(looks_like_prompt("Enter password:"));
+        assert!(looks_like_prompt("Overwrite existing file? (y/N)"));
+        assert!(!looks_like_prompt("some output\n"));
+    }
 
     #[test]
     fn interactive_ssh_is_blocked() {

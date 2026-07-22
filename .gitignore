@@ -1,0 +1,22 @@
+# Rust build artifacts (shared workspace target/)
+/target
+
+# OS / editor cruft
+.DS_Store
+
+# Runtime session/conversation state (agent, IDE, and dev-tooling variants)
+.forge/
+.agent/
+.opencode/
+
+# TUI (Bun/TypeScript)
+forge-tui/node_modules/
+forge-tui/bun.lockb
+forge-tui/dist/
+
+# Local scratch screenshots
+Screenshot*.png
+*.txt
+
+# Claude Code session runtime state (not project content)
+.claude/

@@ -1021,10 +1021,7 @@ Copy the exact current text below as your old_string (note the leading spaces):\
     }
 
     // 2) Closest region: anchor on the first substantive old line.
-    let anchor = old_lines
-        .iter()
-        .map(|l| l.trim())
-        .find(|l| l.len() >= 4);
+    let anchor = old_lines.iter().map(|l| l.trim()).find(|l| l.len() >= 4);
     if let Some(anchor) = anchor {
         let mut best: Option<(usize, usize)> = None; // (line_idx, score)
         for (idx, fl) in file_lines.iter().enumerate() {
@@ -1214,9 +1211,18 @@ mod tests {
         let content = "fn f() {\n        let x = atomicAdd(&c, 1);\n}\n";
         let old = "    let x = atomicAdd(&c, 1);";
         let hint = edit_mismatch_hint(content, old, "k.cu");
-        assert!(hint.contains("WHITESPACE") || hint.contains("whitespace"), "got: {hint}");
-        assert!(hint.contains("atomicAdd"), "should show the real line: {hint}");
-        assert!(hint.contains("lines 2-2"), "should pinpoint the line: {hint}");
+        assert!(
+            hint.contains("WHITESPACE") || hint.contains("whitespace"),
+            "got: {hint}"
+        );
+        assert!(
+            hint.contains("atomicAdd"),
+            "should show the real line: {hint}"
+        );
+        assert!(
+            hint.contains("lines 2-2"),
+            "should pinpoint the line: {hint}"
+        );
     }
 
     #[test]
@@ -1229,17 +1235,30 @@ mod tests {
         let old = "sort_fired_list_device(fired, n);"; // close but not present
         let hint = edit_mismatch_hint(&content, old, "k.cu");
         assert!(hint.contains("Closest matching region"), "got: {hint}");
-        assert!(hint.contains("sort_fired_list"), "should anchor near the real call: {hint}");
+        assert!(
+            hint.contains("sort_fired_list"),
+            "should anchor near the real call: {hint}"
+        );
         // Bounded: must NOT dump the whole 500-line file.
-        assert!(hint.lines().count() < 25, "hint must stay compact, got {} lines", hint.lines().count());
+        assert!(
+            hint.lines().count() < 25,
+            "hint must stay compact, got {} lines",
+            hint.lines().count()
+        );
     }
 
     #[test]
     fn multimatch_hint_lists_line_numbers() {
         let content = "a();\nx();\nb();\nx();\nc();\n";
         let hint = edit_multimatch_hint(content, "x();", "f.rs", 2);
-        assert!(hint.contains("must be unique") || hint.contains("unique"), "got: {hint}");
-        assert!(hint.contains('2') && hint.contains('4'), "should list occurrence lines: {hint}");
+        assert!(
+            hint.contains("must be unique") || hint.contains("unique"),
+            "got: {hint}"
+        );
+        assert!(
+            hint.contains('2') && hint.contains('4'),
+            "should list occurrence lines: {hint}"
+        );
     }
 
     #[tokio::test]

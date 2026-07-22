@@ -129,6 +129,15 @@ pub struct ModelEndpoint {
     /// Provider-specific reasoning / thinking controls for this endpoint.
     #[serde(default)]
     pub reasoning: EndpointReasoningConfig,
+    /// Opt in to xAI's priority processing tier (`service_tier: "priority"`
+    /// on every request to this endpoint) — higher scheduling priority
+    /// during high demand, at a 2x per-token premium over standard pricing.
+    /// Only meaningful for genuine xAI endpoints (`base_url` containing
+    /// `x.ai`); harmless no-op otherwise, since the API client only ever
+    /// sends the parameter when both this flag is set *and* the base URL
+    /// actually looks like xAI's.
+    #[serde(default)]
+    pub xai_priority_tier: bool,
 }
 
 fn default_model_id() -> String {
@@ -196,6 +205,22 @@ pub struct AgentConfig {
     pub disabled_tools: Vec<String>,
     #[serde(default)]
     pub context_strategy: ContextStrategy,
+    /// Floor on `shell_exec`'s `timeout_secs` (with `wait=true`) — the
+    /// model chooses that value per call and can simply guess wrong for a
+    /// task that runs longer than it expected (a long build, a data
+    /// pipeline, a simulation run), which gets the command killed with a
+    /// timeout error partway through. `0` (default) applies no floor —
+    /// today's behavior, entirely up to the model's own per-call choice.
+    /// Set higher to guarantee at least this many seconds regardless of
+    /// what the model requests for that project.
+    #[serde(default)]
+    pub min_shell_timeout_secs: u64,
+    /// When true, forces off every network touchpoint that isn't the model
+    /// API call itself: `web_search`/`web_fetch` tools, ChatGPT Codex's
+    /// periodic OAuth token refresh, and its weekly version self-check.
+    /// Off by default — nothing changes unless a user opts in.
+    #[serde(default)]
+    pub offline_mode: bool,
 }
 
 fn default_thinking_mode() -> bool {
@@ -247,6 +272,7 @@ impl Default for AppConfig {
                     request_timeout_secs: 500,
                     endpoint_type: EndpointType::OpenAi,
                     reasoning: EndpointReasoningConfig::default(),
+                    xai_priority_tier: false,
                 }],
                 default: "local".to_string(),
                 web_tool_model: None,
@@ -261,6 +287,8 @@ impl Default for AppConfig {
                 subagents: SubagentConfig::default(),
                 disabled_tools: vec![],
                 context_strategy: ContextStrategy::Compaction,
+                min_shell_timeout_secs: 0,
+                offline_mode: false,
             },
         }
     }

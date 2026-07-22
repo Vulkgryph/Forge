@@ -5,5 +5,7 @@ mod executor;
 pub mod patch;
 pub mod web;
 
-pub use definitions::{ask_question_definition, delegate_task_definition, enter_plan_mode_definition};
+pub use definitions::{
+    ask_question_definition, delegate_task_definition, enter_plan_mode_definition,
+};
 pub use executor::{SpawnedCommand, ToolExecutor, ToolKind};

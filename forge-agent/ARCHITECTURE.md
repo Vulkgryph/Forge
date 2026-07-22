@@ -2,7 +2,7 @@
 
 ## Overview
 
-Forge is an autonomous AI coding assistant built around a Rust headless agent and a Bun/Ink terminal UI. The UI speaks a JSON-newline protocol to `forge-agent --headless`; the agent calls OpenAI-compatible chat APIs, Anthropic Messages APIs, or ChatGPT Codex Responses APIs, then executes local tools for code reading, editing, testing, and search.
+Forge is an autonomous AI coding assistant built around a Rust headless agent. This document describes that agent's internals; its two independent clients — `forge-tui` (Bun/Ink terminal UI) and `forge-ide` (Rust/egui code editor) — each speak the same JSON-newline protocol to `forge-agent --headless` but are otherwise unrelated codebases, described in their own projects' docs. The agent calls OpenAI-compatible chat APIs, Anthropic Messages APIs, or ChatGPT Codex Responses APIs, then executes local tools for code reading, editing, testing, and search.
 
 The public build includes the core coding workflow: approval-gated tools, planning mode, context compaction or rolling-window trimming, parallel subagents, session persistence, revert checkpoints, ChatGPT Codex subscription login (OAuth) alongside API-key auth, and local custom agent/tool definitions.
 
@@ -32,7 +32,9 @@ This means Forge should be treated as a sharp tool. It can be very effective, bu
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Bun/Ink TUI Layer (ui/)                     │
+│              Bun/Ink TUI Layer (../forge-tui/) — one of two          │
+│              independent clients; ../forge-ide/ is the other,        │
+│              a Rust/egui code editor with its own implementation     │
 │  - React Ink terminal application                                   │
 │  - Spawns forge-agent --headless through AgentBridge               │
 │  - Validates protocol messages with zod                             │
@@ -82,7 +84,9 @@ This means Forge should be treated as a sharp tool. It can be very effective, bu
 
 ## Component Details
 
-### UI Layer (`ui/src/`)
+### UI Layer (`../forge-tui/src/`)
+
+One of two independent clients — see [`../forge-ide/README.md`](../forge-ide/README.md) for the other (a Rust/egui code editor; `src/agent_panel.rs` is its equivalent of `agent-bridge.ts` below).
 
 **`agent-bridge.ts`** - `AgentBridge`
 - Spawns `forge-agent --headless` with optional cwd/session flags

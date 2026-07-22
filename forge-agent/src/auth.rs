@@ -75,10 +75,7 @@ impl ChatGptTokens {
 
 pub fn chatgpt_auth_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
-    Ok(home
-        .join(".config")
-        .join("forge")
-        .join("chatgpt_auth.json"))
+    Ok(home.join(".config").join("forge").join("chatgpt_auth.json"))
 }
 
 pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
@@ -88,42 +85,56 @@ pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
 }
 
 pub async fn fetch_chatgpt_codex_models() -> Vec<ChatGptCodexModel> {
+    fetch_chatgpt_codex_models_with_provenance().await.0
+}
+
+/// Like `fetch_chatgpt_codex_models`, but also reports whether the result
+/// came from a genuine live backend query (`true`) or one of the offline
+/// fallbacks (`false`). That distinction matters for anything that wants to
+/// treat "not in this list" as "no longer offered" (e.g. pruning retired
+/// models out of config.toml) — doing that off a fallback result would wipe
+/// out perfectly valid entries just because the network call failed or was
+/// rate-limited, not because the model is actually gone.
+pub async fn fetch_chatgpt_codex_models_with_provenance() -> (Vec<ChatGptCodexModel>, bool) {
     // 1) Live backend query using the user's ChatGPT OAuth token. This is
     //    the source of truth — the codex CLI's local cache seeds from this
     //    same endpoint. We don't need the CLI installed; we just need the
     //    `client_version` query parameter the backend requires, and the
     //    same originator/user-agent the CLI sends.
     if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
-        return models;
+        return (models, true);
     }
 
     // 2) Local Codex CLI cache, if the user happens to have it installed
     //    AND the network call above failed (offline, rate-limited, etc.).
     if let Some(models) = fetch_chatgpt_codex_models_from_cli().await {
-        return models;
+        return (models, false);
     }
     let cached = fetch_chatgpt_codex_models_from_cache();
     if !cached.is_empty() {
-        return cached;
+        return (cached, false);
     }
 
     // 3) Last-ditch hardcoded fallback. Better than letting "default" reach
     //    the API and getting a 400. The agent's model picker can flip to
     //    something more current if these slugs eventually retire.
-    vec![
-        ChatGptCodexModel {
-            id: "gpt-5-codex".to_string(),
-            display_name: "GPT-5 Codex".to_string(),
-            context_window: 272_000,
-            max_output_tokens: 16_384,
-        },
-        ChatGptCodexModel {
-            id: "gpt-5".to_string(),
-            display_name: "GPT-5".to_string(),
-            context_window: 272_000,
-            max_output_tokens: 16_384,
-        },
-    ]
+    (
+        vec![
+            ChatGptCodexModel {
+                id: "gpt-5-codex".to_string(),
+                display_name: "GPT-5 Codex".to_string(),
+                context_window: 272_000,
+                max_output_tokens: 16_384,
+            },
+            ChatGptCodexModel {
+                id: "gpt-5".to_string(),
+                display_name: "GPT-5".to_string(),
+                context_window: 272_000,
+                max_output_tokens: 16_384,
+            },
+        ],
+        false,
+    )
 }
 
 async fn fetch_chatgpt_codex_models_from_cli() -> Option<Vec<ChatGptCodexModel>> {
@@ -323,7 +334,10 @@ fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
 /// `originator=codex_cli_rs` already baked into the auth URL.
 async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexModel>> {
     let tokens = load_chatgpt_tokens()?;
-    let bearer = tokens.api_key.as_deref().or(Some(tokens.access_token.as_str()))?;
+    let bearer = tokens
+        .api_key
+        .as_deref()
+        .or(Some(tokens.access_token.as_str()))?;
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -361,7 +375,10 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
             .get(&url)
             .bearer_auth(bearer)
             .header("accept", "application/json")
-            .header("user-agent", format!("codex_cli_rs/{}", codex_client_version))
+            .header(
+                "user-agent",
+                format!("codex_cli_rs/{}", codex_client_version),
+            )
             .header("originator", "codex_cli_rs")
             .send()
             .await
@@ -372,7 +389,9 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(body) = resp.bytes().await else { continue };
+        let Ok(body) = resp.bytes().await else {
+            continue;
+        };
         if let Some(models) = parse_chatgpt_codex_models(&body) {
             if !models.is_empty() {
                 return Some(models);
@@ -798,8 +817,13 @@ pub async fn login_chatgpt(interactive: bool) -> Result<()> {
 
     open_browser(&auth_url);
 
-    let code =
-        wait_for_callback_on(CHATGPT_REDIRECT_PORT, CHATGPT_REDIRECT_PATH, Some(&state), interactive).await?;
+    let code = wait_for_callback_on(
+        CHATGPT_REDIRECT_PORT,
+        CHATGPT_REDIRECT_PATH,
+        Some(&state),
+        interactive,
+    )
+    .await?;
 
     let http = reqwest::Client::new();
     let resp = http
@@ -860,12 +884,17 @@ async fn wait_for_callback_on(
             );
             eprintln!();
             eprintln!("---");
-            eprintln!("If the redirect can't reach this machine (remote SSH without port forwarding,");
+            eprintln!(
+                "If the redirect can't reach this machine (remote SSH without port forwarding,"
+            );
             eprintln!("firewall, etc.), use the manual paste flow:");
             eprintln!();
             eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
             eprintln!("  2. After approving, your browser will try to load");
-            eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
+            eprintln!(
+                "       http://localhost:{}{}?code=...&state=...",
+                port, expected_path
+            );
             eprintln!("     and show \"site can't be reached\". THAT is the page you want.");
             eprintln!("  3. Copy the URL from your browser's address bar (the localhost one,");
             eprintln!("     NOT the auth.openai.com one) and paste it below.");
@@ -928,7 +957,10 @@ async fn wait_for_callback_on(
             eprintln!();
             eprintln!("  1. Paste the URL ABOVE into your browser and approve the login.");
             eprintln!("  2. After approving, your browser will try to load");
-            eprintln!("       http://localhost:{}{}?code=...&state=...", port, expected_path);
+            eprintln!(
+                "       http://localhost:{}{}?code=...&state=...",
+                port, expected_path
+            );
             eprintln!("     and show \"site can't be reached\". That's expected.");
             eprintln!("  3. Copy the URL from your browser's address bar and paste it below.");
             eprintln!();
@@ -991,7 +1023,11 @@ fn identify_port_holder(port: u16) -> Option<String> {
             return None;
         }
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 }
 
@@ -1138,9 +1174,129 @@ fn extract_code_from_query(query: &str, expected_state: Option<&str>) -> Result<
         .context("OAuth callback did not contain a code parameter")
 }
 
+// ── xAI (Grok) model discovery ────────────────────────────────────────────
+//
+// Unlike ChatGPT Codex, xAI has no OAuth/login concept here — just whatever
+// `api_key` the user put in `config.toml` for an `api.x.ai` endpoint. So
+// there's no single "logged in" check; discovery runs per configured xAI
+// endpoint, keyed by (base_url, api_key), in `main.rs`.
+
+/// One model from xAI's live `/v1/models` catalog.
+pub struct XaiModel {
+    pub id: String,
+    pub context_length: Option<usize>,
+}
+
+/// Query an xAI-compatible `/models` endpoint (OpenAI wire format) for the
+/// models this API key currently has access to. Returns `None` on any
+/// network/parse failure — callers should treat that as "couldn't refresh
+/// right now" and leave existing config entries alone, not as "zero models".
+pub async fn fetch_xai_models(base_url: &str, api_key: &str) -> Option<Vec<XaiModel>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.get(&url).bearer_auth(api_key).send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let data = json.get("data")?.as_array()?;
+
+    let models = data
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            // Image/video generation models ("grok-imagine-*") aren't chat-
+            // completions models — irrelevant to (and would error for) a
+            // text/tool-calling coding agent.
+            if id.contains("imagine") {
+                return None;
+            }
+            let context_length = m
+                .get("context_length")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            Some(XaiModel { id, context_length })
+        })
+        .collect();
+    Some(models)
+}
+
+/// True if a hyphen-separated segment of a model id looks like a date-stamp
+/// snapshot code (`0309` = MMDD, `20260309` = YYYYMMDD, etc.) rather than a
+/// meaningful version number. This is the catch-all part: it doesn't know
+/// any specific provider's date convention, it just relies on the one thing
+/// that reliably tells them apart from real version numbers in these IDs —
+/// version numbers here are written with a dot (`4.20`, `0.1`), while every
+/// date-stamp convention we've seen (MMDD/YYMMDD/YYYYMMDD) is a bare run of
+/// digits with no dot. A few widely-used snapshot lengths are enough to
+/// catch both this xAI case and OpenAI's own `-MMDD`-style snapshot IDs,
+/// without needing a per-provider list to keep updated.
+fn looks_like_date_code(seg: &str) -> bool {
+    matches!(seg.len(), 4 | 6 | 8) && seg.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Turns an xAI model id into a readable display name: "grok-4.3" -> "Grok
+/// 4.3", "grok-4.20-0309-reasoning" -> "Grok 4.20 Reasoning" (the "0309"
+/// date-stamp segment is dropped — see `looks_like_date_code`). xAI's
+/// `/models` response has no display-name field of its own to use instead.
+pub fn xai_display_name(model_id: &str) -> String {
+    model_id
+        .split('-')
+        .filter(|seg| !looks_like_date_code(seg))
+        .map(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(first) if first.is_alphabetic() => {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                }
+                _ => seg.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_chatgpt_codex_models;
+    use super::{parse_chatgpt_codex_models, xai_display_name};
+
+    #[test]
+    fn xai_display_name_formats_common_ids() {
+        assert_eq!(xai_display_name("grok-4.3"), "Grok 4.3");
+        assert_eq!(
+            xai_display_name("grok-4.20-0309-reasoning"),
+            "Grok 4.20 Reasoning"
+        );
+        assert_eq!(
+            xai_display_name("grok-4.20-0309-non-reasoning"),
+            "Grok 4.20 Non Reasoning"
+        );
+        assert_eq!(
+            xai_display_name("grok-4.20-multi-agent-0309"),
+            "Grok 4.20 Multi Agent"
+        );
+        assert_eq!(xai_display_name("grok-build-0.1"), "Grok Build 0.1");
+        // Dotted version numbers must survive even though they contain digits —
+        // only a *bare*, dot-free run of digits should ever be treated as a
+        // date stamp.
+        assert_eq!(xai_display_name("grok-4.5"), "Grok 4.5");
+    }
+
+    #[test]
+    fn date_code_heuristic_ignores_version_numbers() {
+        use super::looks_like_date_code;
+        assert!(looks_like_date_code("0309")); // MMDD
+        assert!(looks_like_date_code("20260309")); // YYYYMMDD
+        assert!(!looks_like_date_code("4.20")); // dotted version number
+        assert!(!looks_like_date_code("grok")); // not numeric at all
+        assert!(!looks_like_date_code("5")); // too short to be a date
+    }
 
     #[test]
     fn chatgpt_codex_parser_adds_metadata_max_context_variant() {

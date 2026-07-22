@@ -4,8 +4,9 @@ Forge is maintained by Vulkgryph LLC. We take security issues seriously and appr
 
 ## Scope
 
-This policy covers the Forge agent (`forge-agent` binary) and the terminal UI (`ui/`). It does **not** cover:
+This policy covers the Forge agent (`forge-agent` binary) in this directory. Its two clients have their own policies: [`../forge-tui/SECURITY.md`](../forge-tui/SECURITY.md) and [`../forge-ide/SECURITY.md`](../forge-ide/SECURITY.md). This policy does **not** cover:
 
+- Either client, `forge-tui` or `forge-ide` — see their own `SECURITY.md`
 - Third-party LLM endpoints, models, or providers used through Forge
 - Misuse of Forge by an authenticated user against their own machine (see the Safety Model section in the README — Forge is a sharp tool by design)
 - Vulnerabilities in dependencies, unless Forge's use of the dependency creates a new attack surface

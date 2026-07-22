@@ -85,6 +85,12 @@ export function thinkingIntensityDisplay(ep?: EndpointInfo | null): string | nul
   }
 }
 
+/** True for a genuine xAI endpoint — the only provider the priority-tier
+ * toggle applies to. Mirrors Forge IDE's `classify_provider` "xAI" case. */
+export function isXaiEndpoint(ep: EndpointInfo): boolean {
+  return ep.base_url.includes("x.ai");
+}
+
 export function activeEndpoint(
   endpoints: EndpointInfo[],
   modelName: string,

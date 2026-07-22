@@ -312,6 +312,23 @@ fn diff_summary_for_args(project_root: &Path, args: &[&str]) -> Result<RewindDif
     Ok(summary)
 }
 
+/// Ensures `project_root` is inside a git repository, initializing a fresh
+/// one there if not — so rewind checkpoints have real git backing from the
+/// very first turn that changes anything, instead of a project that was
+/// never version controlled silently having nothing meaningful to restore
+/// to. Only touches `project_root` itself, not any nested worktree a turn
+/// might separately have touched (those are already skipped individually
+/// when they aren't a git repo — see `create_turn_snapshots`).
+/// Returns `Ok(true)` if a new repo was just created (so the caller can let
+/// the user know), `Ok(false)` if one already existed.
+pub fn ensure_git_repo(project_root: &Path) -> Result<bool> {
+    if git_worktree_root_for_path(project_root).is_some() {
+        return Ok(false);
+    }
+    git_output(project_root, &["init"])?;
+    Ok(true)
+}
+
 pub fn git_worktree_root_for_path(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() {
         path
@@ -401,9 +418,7 @@ pub fn create_turn_snapshot(
         // Recognized non-fatal cases: the user has .forge/.agent in their
         // .gitignore but the pathspec exclusion didn't fully suppress git's
         // safety check. Snapshot is skipped silently for this turn.
-        if msg.contains("ignored by one of your .gitignore")
-            || msg.contains("addIgnoredFile")
-        {
+        if msg.contains("ignored by one of your .gitignore") || msg.contains("addIgnoredFile") {
             let _ = std::fs::remove_file(&index_path);
             return Ok(None);
         }

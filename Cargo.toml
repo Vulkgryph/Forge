@@ -1,0 +1,32 @@
+[workspace]
+members = ["forge-agent", "forge-ide", "forge-ide/forge-proto", "forge-ide/forge-server"]
+# Without this, a plain `cargo build`/`cargo test` run from the workspace
+# root builds every member by default — including forge-ide, which pulls in
+# Vulkan/shaderc and needs a GPU-capable toolchain that a server, CI runner,
+# or older machine may not have. forge-agent has no such requirement, so
+# it's the safe default; `cargo build -p forge-ide` or `--workspace` still
+# builds everything else explicitly.
+default-members = ["forge-agent"]
+resolver = "2"
+
+# Local patch: winit's macOS drag-and-drop only checks the legacy
+# `NSFilenamesPboardType` pasteboard format and rejects the drop outright if
+# it's absent. Newer macOS system UI (the floating thumbnail shown after a
+# Cmd+Shift+4 screenshot, notably) only offers `NSPasteboardTypeFileURL`,
+# which the upstream implementation never checked at all. Vendored +
+# patched in forge-ide/vendor/winit-0.30.13 to fall back to that modern
+# type — see that crate's window_delegate.rs for the actual fix.
+[patch.crates-io]
+winit = { path = "forge-ide/vendor/winit-0.30.13" }
+
+# lto/strip apply cleanly across the whole workspace (`lto` in particular
+# can't be scoped per-package — it's a whole-binary-graph setting). Only
+# opt-level differs: forge-server is uploaded over SFTP to remote SSH hosts
+# on every connect (see forge-ide/src/ssh.rs), so it alone optimizes for
+# size instead of speed.
+[profile.release]
+strip = true
+lto   = true
+
+[profile.release.package.forge-server]
+opt-level = "z"

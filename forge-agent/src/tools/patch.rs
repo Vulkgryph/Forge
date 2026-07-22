@@ -132,4 +132,3 @@ fn parse_and_apply_diff(workspace_root: &str, unified_diff: &str) -> Result<()> 
         "Manual patch application not fully implemented. Use a git repo for reliable patching."
     ))
 }
-

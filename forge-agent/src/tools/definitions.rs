@@ -507,4 +507,3 @@ pub fn get_toggleable_tool_names() -> Vec<&'static str> {
         "delegate_task",
     ]
 }
-

@@ -18,8 +18,26 @@ warn()  { echo -e "${YELLOW}warning:${RESET} $1"; }
 error() { echo -e "${RED}error:${RESET} $1" >&2; exit 1; }
 ok()    { echo -e "${GREEN}✓${RESET} $1"; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
+# install.sh installs this as a symlink at ~/.local/bin/forge-update —
+# ${BASH_SOURCE[0]} doesn't auto-resolve symlinks, so a plain
+# dirname/BASH_SOURCE would give ~/.local/bin instead of the real checkout
+# (a real, pre-existing bug: this presumably went unnoticed because it was
+# usually run as ./update.sh from inside the checkout, not via the
+# installed command). Same symlink-resolution loop as forge-agent's own
+# `forge` launcher script.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# forge-agent lives inside the monorepo now (forge-agent/, forge-tui/,
+# forge-ide/ as siblings) — the actual git root is one level up, resolved
+# via git itself rather than assumed, so this still works if the monorepo's
+# own directory ever gets renamed.
+REPO_ROOT="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel 2>/dev/null)" || REPO_ROOT="$SCRIPT_DIR"
 PULL=true
 BRANCH=""
 
@@ -64,8 +82,8 @@ done
 
 cd "$REPO_ROOT"
 
-[[ -f "install.sh" ]] || error "install.sh not found. Run this from the Forge source checkout."
-[[ -d ".git" ]] || error "This updater expects a git checkout of Forge."
+[[ -f "$SCRIPT_DIR/install.sh" ]] || error "install.sh not found next to this script."
+[[ -d "$REPO_ROOT/.git" ]] || error "This updater expects a git checkout of Forge."
 
 info "Updating Forge in $REPO_ROOT"
 
@@ -101,7 +119,7 @@ else
 fi
 
 info "Building and reinstalling Forge..."
-"$REPO_ROOT/install.sh"
+"$SCRIPT_DIR/install.sh"
 
 ok "Forge update complete"
 echo ""

@@ -14,6 +14,10 @@ const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 enum Backend {
     OpenAi {
         base_url: String,
+        /// Bearer token for real cloud OpenAI-compatible providers (OpenAI
+        /// itself, OpenRouter, xAI/Grok, …). `None` for local/self-hosted
+        /// servers that don't require auth (LM Studio, llama.cpp, Oxide).
+        api_key: Option<String>,
     },
     Anthropic {
         base_url: String,
@@ -35,13 +39,18 @@ pub struct ApiClient {
     /// Forge session ID sent as X-Forge-Session header to Oxide, allowing the
     /// inference server to scope its KV cache to one conversation at a time.
     pub forge_session_id: Option<String>,
+    /// True when this endpoint opted in to xAI's priority tier *and* its
+    /// base URL actually looks like xAI's — see `ModelEndpoint::xai_priority_tier`.
+    /// Adds `service_tier: "priority"` to every request when set.
+    xai_priority: bool,
 }
 
 impl Clone for Backend {
     fn clone(&self) -> Self {
         match self {
-            Backend::OpenAi { base_url } => Backend::OpenAi {
+            Backend::OpenAi { base_url, api_key } => Backend::OpenAi {
                 base_url: base_url.clone(),
+                api_key: api_key.clone(),
             },
             Backend::Anthropic {
                 base_url,
@@ -161,6 +170,21 @@ fn strip_think_blocks(text: &str) -> String {
     out
 }
 
+/// Attaches `Authorization: Bearer <key>` when present — a no-op for local
+/// self-hosted servers (LM Studio, llama.cpp, Oxide) that don't set one,
+/// but required for any real cloud OpenAI-compatible provider (OpenAI
+/// itself, OpenRouter, xAI/Grok, …), which previously never got the key
+/// forwarded at all for the generic `open_ai` endpoint type.
+fn with_openai_auth(
+    req: reqwest::RequestBuilder,
+    api_key: &Option<String>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => req.bearer_auth(key),
+        None => req,
+    }
+}
+
 impl ApiClient {
     /// Build an ApiClient from a config endpoint + optional auth token.
     /// `auth_token` carries the ChatGPT Codex subscription access token; Anthropic
@@ -210,6 +234,7 @@ impl ApiClient {
             }
             EndpointType::OpenAi => Backend::OpenAi {
                 base_url: endpoint.base_url.clone(),
+                api_key: endpoint.api_key.clone(),
             },
         };
 
@@ -219,6 +244,7 @@ impl ApiClient {
             max_output_tokens: endpoint.max_output_tokens,
             reasoning: endpoint.reasoning.clone(),
             forge_session_id: None,
+            xai_priority: endpoint.xai_priority_tier && endpoint.base_url.contains("x.ai"),
         }
     }
 
@@ -246,18 +272,16 @@ impl ApiClient {
     /// Returns None if the endpoint is unreachable or returns no models.
     /// Only applies to OpenAI-compatible endpoints (Anthropic uses its own detection).
     pub async fn resolve_auto_model_id(&self) -> Option<String> {
-        let base_url = match self.backend.as_ref() {
-            Backend::OpenAi { base_url } => base_url,
+        let (base_url, api_key) = match self.backend.as_ref() {
+            Backend::OpenAi { base_url, api_key } => (base_url, api_key),
             _ => return None,
         };
         let url = format!("{}/models", base_url);
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.client.get(&url).send(),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        let req = with_openai_auth(self.client.get(&url), api_key);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), req.send())
+            .await
+            .ok()?
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -274,8 +298,9 @@ impl ApiClient {
         tools: &[ToolDefinition],
     ) -> Result<ChatResponse, String> {
         match self.backend.as_ref() {
-            Backend::OpenAi { base_url } => {
-                self.chat_openai(base_url, model, messages, tools).await
+            Backend::OpenAi { base_url, api_key } => {
+                self.chat_openai(base_url, api_key, model, messages, tools)
+                    .await
             }
             Backend::Anthropic {
                 base_url,
@@ -312,8 +337,8 @@ impl ApiClient {
         tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
         match self.backend.as_ref() {
-            Backend::OpenAi { base_url } => {
-                self.chat_stream_openai(base_url, model, messages, tools, tx)
+            Backend::OpenAi { base_url, api_key } => {
+                self.chat_stream_openai(base_url, api_key, model, messages, tools, tx)
                     .await;
             }
             Backend::Anthropic {
@@ -399,6 +424,7 @@ impl ApiClient {
     async fn chat_openai(
         &self,
         base_url: &str,
+        api_key: &Option<String>,
         model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -414,12 +440,16 @@ impl ApiClient {
             request["tools"] = serde_json::json!(tools);
             request["parallel_tool_calls"] = serde_json::json!(true);
         }
+        if self.xai_priority {
+            request["service_tier"] = serde_json::json!("priority");
+        }
         self.apply_openai_compatible_reasoning(&mut request);
 
-        let mut req = self
-            .client
-            .post(format!("{}/chat/completions", base_url))
-            .json(&request);
+        let mut req = with_openai_auth(
+            self.client.post(format!("{}/chat/completions", base_url)),
+            api_key,
+        )
+        .json(&request);
         if let Some(sid) = &self.forge_session_id {
             req = req.header("x-forge-session", sid.as_str());
         }
@@ -429,7 +459,9 @@ impl ApiClient {
             .map_err(|e| format!("Network error: {}", e))?;
 
         if !response.status().is_success() {
-            return Err(format!("API error: {}", response.status()));
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(format!("API error ({}): {}", status, body_text));
         }
 
         let json: serde_json::Value = response
@@ -452,6 +484,7 @@ impl ApiClient {
     async fn chat_stream_openai(
         &self,
         base_url: &str,
+        api_key: &Option<String>,
         model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -477,14 +510,18 @@ impl ApiClient {
             body["tools"] = serde_json::json!(tools);
             body["parallel_tool_calls"] = serde_json::json!(true);
         }
+        if self.xai_priority {
+            body["service_tier"] = serde_json::json!("priority");
+        }
         self.apply_openai_compatible_reasoning(&mut body);
 
-        let mut req = self
-            .client
-            .post(format!("{}/chat/completions", base_url))
-            .header("accept", "text/event-stream")
-            .header("accept-encoding", "identity")
-            .json(&body);
+        let mut req = with_openai_auth(
+            self.client.post(format!("{}/chat/completions", base_url)),
+            api_key,
+        )
+        .header("accept", "text/event-stream")
+        .header("accept-encoding", "identity")
+        .json(&body);
         if let Some(sid) = &self.forge_session_id {
             req = req.header("x-forge-session", sid.as_str());
         }
@@ -1288,20 +1325,18 @@ impl ApiClient {
             Backend::OpenAi { .. } => {}
         }
 
-        let base_url = match self.backend.as_ref() {
-            Backend::OpenAi { base_url } => base_url,
+        let (base_url, api_key) = match self.backend.as_ref() {
+            Backend::OpenAi { base_url, api_key } => (base_url, api_key),
             Backend::ChatGptCodex { .. } => unreachable!(),
             Backend::Anthropic { .. } => unreachable!(),
         };
 
         let url = format!("{}/models", base_url);
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.client.get(&url).send(),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        let req = with_openai_auth(self.client.get(&url), api_key);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), req.send())
+            .await
+            .ok()?
+            .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -1536,7 +1571,10 @@ fn build_openai_messages(messages: &[Message]) -> serde_json::Value {
             if m.role == "system" {
                 if leading_system_seen {
                     if let Some(obj) = v.as_object_mut() {
-                        obj.insert("role".to_string(), serde_json::Value::String("user".to_string()));
+                        obj.insert(
+                            "role".to_string(),
+                            serde_json::Value::String("user".to_string()),
+                        );
                         if let Some(c) = obj.get("content").and_then(|c| c.as_str()) {
                             if !c.trim_start().starts_with('[') {
                                 let tagged = format!("[System] {}", c);
@@ -2062,7 +2100,8 @@ mod tests {
 
     #[test]
     fn extract_leaked_tool_calls_parses_json_hermes_form() {
-        let leaked = "<tool_call>{\"name\": \"search\", \"arguments\": {\"query\": \"foo\"}}</tool_call>";
+        let leaked =
+            "<tool_call>{\"name\": \"search\", \"arguments\": {\"query\": \"foo\"}}</tool_call>";
         let calls = extract_leaked_tool_calls(leaked);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "search");
@@ -2111,7 +2150,9 @@ mod tests {
             Message::system("You are Forge."),
             Message::user("hi"),
             Message::assistant("Let me work through this."),
-            Message::system("Your last response described a next action but returned no tool calls."),
+            Message::system(
+                "Your last response described a next action but returned no tool calls.",
+            ),
             Message::system("[System: you have run `ls` 3 times.]"),
         ];
         let v = build_openai_messages(&msgs);
@@ -2124,11 +2165,20 @@ mod tests {
         assert_eq!(role(2), "assistant");
         assert_eq!(role(3), "user", "trailing system demoted to user");
         assert_eq!(role(4), "user", "trailing system demoted to user");
-        assert!(content(3).starts_with("[System] "), "unmarked nudge gets tagged");
-        assert_eq!(content(4), "[System: you have run `ls` 3 times.]", "already-bracketed left as-is");
+        assert!(
+            content(3).starts_with("[System] "),
+            "unmarked nudge gets tagged"
+        );
+        assert_eq!(
+            content(4),
+            "[System: you have run `ls` 3 times.]",
+            "already-bracketed left as-is"
+        );
         // No system message after index 0.
         assert!(
-            arr.iter().skip(1).all(|m| m["role"].as_str() != Some("system")),
+            arr.iter()
+                .skip(1)
+                .all(|m| m["role"].as_str() != Some("system")),
             "no system message may follow the first"
         );
     }

@@ -84,6 +84,11 @@ const EndpointInfoSchema = z.object({
       effort: "medium",
     },
   }),
+  // xAI's priority processing tier — `service_tier: "priority"` on every
+  // request to this endpoint, at 2x xAI's standard per-token price for
+  // higher scheduling priority during high demand. Only meaningful for
+  // genuine xAI endpoints; see `isXaiEndpoint` in model-display.ts.
+  xai_priority_tier: z.boolean().default(false),
 });
 
 const AgentDefInfoSchema = z.object({
@@ -110,6 +115,7 @@ export const AgentMessageSchema = z.discriminatedUnion("type", [
     available_tools: z.array(ToolInfoSchema).default([]),
     context_strategy: z.string().default("compaction"),
     chatgpt_logged_in: z.boolean().default(false),
+    offline_mode: z.boolean().default(false),
   }),
   z.object({ type: z.literal("thinking") }),
   z.object({ type: z.literal("reasoning") }),
@@ -256,6 +262,7 @@ export type UserMessage =
   | { type: "update_web_model"; model: string }
   | { type: "update_tool_config"; tool: string; enabled: boolean }
   | { type: "update_endpoint_reasoning"; endpoint_name: string; reasoning: EndpointReasoningConfig }
+  | { type: "update_xai_priority_tier"; endpoint_name: string; enabled: boolean }
   | { type: "compact" }
   | { type: "revert"; checkpoint_id?: string }
   | { type: "revert_preview"; checkpoint_id: string }
@@ -271,4 +278,5 @@ export type UserMessage =
   | { type: "login_chatgpt" }
   | { type: "cancel_run" }
   | { type: "update_context_strategy"; strategy: string }
+  | { type: "update_offline_mode"; enabled: boolean }
   | { type: "quit" };

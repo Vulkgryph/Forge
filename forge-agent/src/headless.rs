@@ -34,6 +34,7 @@ enum OutgoingMessage {
         available_tools: Vec<ToolInfo>,
         context_strategy: String,
         chatgpt_logged_in: bool,
+        offline_mode: bool,
     },
     Thinking,
     Reasoning,
@@ -54,11 +55,16 @@ enum OutgoingMessage {
         tool_args: String,
         tool_id: String,
         kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        needs_approval: bool,
     },
     ToolResult {
         tool_name: String,
         result: String,
         success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
     },
     ToolOutput {
         tool_name: String,
@@ -103,6 +109,8 @@ enum OutgoingMessage {
         id: String,
         agent_type: String,
         prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
     },
     SubagentStatus {
         id: String,
@@ -223,6 +231,7 @@ pub struct EndpointInfo {
     pub max_output_tokens: u32,
     pub endpoint_type: String,
     pub reasoning: crate::config::EndpointReasoningConfig,
+    pub xai_priority_tier: bool,
 }
 
 impl From<&ModelEndpoint> for EndpointInfo {
@@ -239,6 +248,7 @@ impl From<&ModelEndpoint> for EndpointInfo {
                 crate::config::EndpointType::OpenAi => "open_ai".to_string(),
             },
             reasoning: ep.reasoning.clone(),
+            xai_priority_tier: ep.xai_priority_tier,
         }
     }
 }
@@ -296,6 +306,8 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
             tool_args,
             tool_id,
             kind,
+            subagent_id,
+            needs_approval,
         } => {
             let kind_str = match kind {
                 ToolKindEvent::Read => "read",
@@ -307,16 +319,20 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
                 tool_args: tool_args.clone(),
                 tool_id: tool_id.clone(),
                 kind: kind_str.to_string(),
+                subagent_id: subagent_id.clone(),
+                needs_approval: *needs_approval,
             }
         }
         AgentEvent::ToolResult {
             tool_name,
             result,
             success,
+            subagent_id,
         } => OutgoingMessage::ToolResult {
             tool_name: tool_name.clone(),
             result: result.clone(),
             success: *success,
+            subagent_id: subagent_id.clone(),
         },
         AgentEvent::ToolOutput { tool_name, content } => OutgoingMessage::ToolOutput {
             tool_name: tool_name.clone(),
@@ -373,10 +389,12 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
             id,
             agent_type,
             prompt,
+            parent_id,
         } => OutgoingMessage::SubagentStarted {
             id: id.clone(),
             agent_type: agent_type.clone(),
             prompt: prompt.clone(),
+            parent_id: parent_id.clone(),
         },
         AgentEvent::SubagentStatus {
             id,
@@ -452,6 +470,8 @@ enum IncomingMessage {
     },
     DenyAction {
         #[serde(default)]
+        tool_id: String,
+        #[serde(default)]
         reason: String,
     },
     ToggleAutoMode,
@@ -494,10 +514,18 @@ enum IncomingMessage {
         endpoint_name: String,
         reasoning: crate::config::EndpointReasoningConfig,
     },
+    UpdateXaiPriorityTier {
+        endpoint_name: String,
+        enabled: bool,
+    },
+    UpdateOfflineMode {
+        enabled: bool,
+    },
     LoginChatgpt,
     ListSessions,
     ResumeSession {
-        #[allow(dead_code)] // resume is wired via --resume-session CLI flag; runtime resume path not yet implemented
+        #[allow(dead_code)]
+        // resume is wired via --resume-session CLI flag; runtime resume path not yet implemented
         session_id: String,
     },
     Compact,
@@ -548,7 +576,9 @@ fn json_to_user_action(
     match msg {
         IncomingMessage::SendMessage { content } => Some(UserAction::SendMessage(content)),
         IncomingMessage::ApproveAction { tool_id } => Some(UserAction::ApproveAction(tool_id)),
-        IncomingMessage::DenyAction { reason } => Some(UserAction::DenyAction(reason)),
+        IncomingMessage::DenyAction { tool_id, reason } => {
+            Some(UserAction::DenyAction { tool_id, reason })
+        }
         IncomingMessage::ToggleAutoMode => Some(UserAction::ToggleAutoMode),
         IncomingMessage::SwitchModel {
             name,
@@ -564,16 +594,29 @@ fn json_to_user_action(
                 "chatgpt_codex" => crate::config::EndpointType::ChatGptCodex,
                 _ => crate::config::EndpointType::OpenAi,
             };
+            // The client only ever sees `EndpointInfo` (no `api_key` field —
+            // that never leaves the server), so look the real key up from
+            // our own config by name instead of trusting the incoming
+            // message. This used to always be `None`, meaning switching to
+            // an authenticated endpoint silently dropped its key for the
+            // rest of the session.
+            let existing = app_config.models.endpoints.iter().find(|e| e.name == name);
+            let api_key = existing.and_then(|e| e.api_key.clone());
+            // Same reasoning as `api_key` above — not part of what the client
+            // sends in `switch_model`, so carried over from our own stored
+            // config instead of defaulting to off on every switch.
+            let xai_priority_tier = existing.map(|e| e.xai_priority_tier).unwrap_or(false);
             Some(UserAction::SwitchModel(ModelEndpoint {
                 name,
                 base_url,
                 model_id,
-                api_key: None,
+                api_key,
                 max_context_tokens,
                 max_output_tokens,
                 request_timeout_secs: crate::config::default_request_timeout_secs(),
                 endpoint_type: ep_type,
                 reasoning,
+                xai_priority_tier,
             }))
         }
         IncomingMessage::UpdateSubagentConfig {
@@ -621,6 +664,12 @@ fn json_to_user_action(
             let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));
             None
         }
+        IncomingMessage::UpdateOfflineMode { enabled } => {
+            app_config.agent.offline_mode = enabled;
+            let _ = app_config.save();
+            let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));
+            None
+        }
         IncomingMessage::UpdateToolConfig { tool, enabled } => {
             if enabled {
                 app_config.agent.disabled_tools.retain(|t| t != &tool);
@@ -642,6 +691,22 @@ fn json_to_user_action(
                 .find(|ep| ep.name == endpoint_name)
             {
                 endpoint.reasoning = reasoning;
+                let _ = app_config.save();
+                let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));
+            }
+            None
+        }
+        IncomingMessage::UpdateXaiPriorityTier {
+            endpoint_name,
+            enabled,
+        } => {
+            if let Some(endpoint) = app_config
+                .models
+                .endpoints
+                .iter_mut()
+                .find(|ep| ep.name == endpoint_name)
+            {
+                endpoint.xai_priority_tier = enabled;
                 let _ = app_config.save();
                 let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));
             }
@@ -705,6 +770,7 @@ pub async fn run_headless(
         available_tools: init_info.available_tools,
         context_strategy: init_info.context_strategy,
         chatgpt_logged_in: init_info.chatgpt_logged_in,
+        offline_mode: init_info.offline_mode,
     };
     let json = serde_json::to_string(&init_msg)?;
     stdout.write_all(json.as_bytes()).await?;
@@ -793,6 +859,7 @@ pub async fn run_headless(
                                                         max_output_tokens: model.max_output_tokens,
                                                         endpoint_type: "chatgpt_codex".to_string(),
                                                         reasoning: crate::config::EndpointReasoningConfig::default(),
+                                                        xai_priority_tier: false,
                                                     })
                                                     .collect();
                                                 let msg = OutgoingMessage::EndpointsUpdated { endpoints };
@@ -881,6 +948,7 @@ pub struct HeadlessInit {
     pub available_tools: Vec<ToolInfo>,
     pub context_strategy: String,
     pub chatgpt_logged_in: bool,
+    pub offline_mode: bool,
 }
 
 impl HeadlessInit {

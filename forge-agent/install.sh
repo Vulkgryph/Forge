@@ -47,7 +47,12 @@ command -v git    &>/dev/null || MISSING_APT+=(git)
 command -v curl   &>/dev/null || MISSING_APT+=(curl)      # downloads rustup/bun installers; web_search uses curl
 command -v unzip  &>/dev/null || MISSING_APT+=(unzip)     # bun installer requires unzip
 command -v cc     &>/dev/null || MISSING_APT+=(build-essential)  # Rust crates with C deps need a linker
-command -v rg     &>/dev/null || MISSING_APT+=(ripgrep)   # search_code tool shells out to rg
+# ripgrep tracked separately from the rest: on macOS it does NOT come from
+# Xcode CLI tools (unlike git/curl/unzip/cc), so it needs its own remedy —
+# lumping it into the generic CLT message below would tell a user missing
+# only this one tool to run a command that can't actually fix it.
+MISSING_RG=false
+command -v rg     &>/dev/null || MISSING_RG=true
 
 if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
     case "$OS" in
@@ -56,6 +61,17 @@ if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
             ;;
         Darwin)
             error "Missing tools: ${MISSING_APT[*]}\n  On macOS these usually come from Xcode CLI tools:\n    xcode-select --install"
+            ;;
+    esac
+fi
+
+if [[ "$MISSING_RG" == true ]]; then
+    case "$OS" in
+        Linux)
+            error "Missing system package: ripgrep\n  Install it first:\n    sudo apt-get update && sudo apt-get install -y ripgrep"
+            ;;
+        Darwin)
+            error "Missing tool: ripgrep (not part of Xcode CLI tools — needs its own install)\n  Either:\n    brew install ripgrep\n  or download a prebuilt binary directly:\n    https://github.com/BurntSushi/ripgrep/releases/latest"
             ;;
     esac
 fi
@@ -102,7 +118,11 @@ fetch_and_run() {
         fi
         ok "$label installer SHA-256 verified"
     else
-        warn "$label installer not pinned — to pin, re-run with FORGE_${label^^}_SHA256=$actual"
+        # `${label^^}` (bash 4+ case conversion) breaks on macOS's stock
+        # /bin/bash 3.2 (Apple never shipped a GPLv3 bash) — tr is portable.
+        local label_upper
+        label_upper="$(echo "$label" | tr '[:lower:]' '[:upper:]')"
+        warn "$label installer not pinned — to pin, re-run with FORGE_${label_upper}_SHA256=$actual"
     fi
 
     bash "$tmp" "$@"
@@ -130,15 +150,23 @@ fi
 # -------------------------------------------------------------------
 # 3. Build
 # -------------------------------------------------------------------
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$REPO_ROOT"
+# forge-agent is a member of the monorepo's shared workspace (forge-agent/,
+# forge-tui/, forge-ide/ all live as siblings under one repo root) — build
+# output lands in the shared workspace root's target/, not a local
+# forge-agent/target/, and the TUI is a sibling directory now, not a nested
+# ui/ subdirectory.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TUI_DIR="$REPO_ROOT/forge-tui"
+BUILD_DIR="$REPO_ROOT/target/release"
+cd "$SCRIPT_DIR"
 
 info "Building forge-agent (Rust)..."
 cargo build --release
 ok "forge-agent built"
 
 info "Building UI (Bun)..."
-(cd ui && bun install && bun run build)
+(cd "$TUI_DIR" && bun install && bun run build)
 ok "UI built"
 
 # -------------------------------------------------------------------
@@ -148,13 +176,13 @@ info "Installing to $INSTALL_BIN and $INSTALL_SHARE..."
 
 mkdir -p "$INSTALL_BIN" "$INSTALL_SHARE/ui/dist"
 
-ln -sf "$(pwd)/target/release/forge-agent" "$INSTALL_BIN/forge-agent"
-ln -sf "$(pwd)/ui/dist/forge.js" "$INSTALL_SHARE/ui/dist/forge.js"
-ln -sf "$(pwd)/update.sh" "$INSTALL_BIN/forge-update"
-cp -r ui/node_modules          "$INSTALL_SHARE/ui/node_modules"
-cp ui/package.json             "$INSTALL_SHARE/ui/package.json"
+ln -sf "$BUILD_DIR/forge-agent" "$INSTALL_BIN/forge-agent"
+ln -sf "$TUI_DIR/dist/forge.js" "$INSTALL_SHARE/ui/dist/forge.js"
+ln -sf "$SCRIPT_DIR/update.sh" "$INSTALL_BIN/forge-update"
+cp -r "$TUI_DIR/node_modules"   "$INSTALL_SHARE/ui/node_modules"
+cp "$TUI_DIR/package.json"      "$INSTALL_SHARE/ui/package.json"
 # Stamp the install with the source SHA if we're in a git checkout — non-fatal for tarball installs.
-git rev-parse HEAD 2>/dev/null > "$INSTALL_SHARE/version" || echo "unknown" > "$INSTALL_SHARE/version"
+git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null > "$INSTALL_SHARE/version" || echo "unknown" > "$INSTALL_SHARE/version"
 
 # Write wrapper script
 cat > "$INSTALL_BIN/forge" << 'WRAPPER'

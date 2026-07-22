@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load configuration
-    let app_config = config::AppConfig::load()?;
+    let mut app_config = config::AppConfig::load()?;
 
     if !cli.headless {
         eprintln!(
@@ -95,8 +95,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Owned rather than borrowed: the ChatGPT Codex discovery block below
+    // needs `&mut app_config.models.endpoints` (to persist newly discovered
+    // and pruned models), which can't coexist with a borrow of one of its
+    // own elements held across that point.
     let endpoint = match app_config.default_endpoint() {
-        Some(ep) => ep,
+        Some(ep) => ep.clone(),
         None => {
             let err = serde_json::json!({
                 "type": "error",
@@ -122,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 models.first().map(|m| m.id.clone())
             }
             _ => {
-                let probe_client = api::ApiClient::from_endpoint(endpoint, None);
+                let probe_client = api::ApiClient::from_endpoint(&endpoint, None);
                 probe_client.resolve_auto_model_id().await
             }
         };
@@ -153,7 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match auth::get_valid_chatgpt_token(&http).await {
                 Ok(t) => Some(t.access_token),
                 Err(e) => {
-                    print_oauth_refresh_error("ChatGPT Codex", &e.to_string(), "forge --login-chatgpt");
+                    print_oauth_refresh_error(
+                        "ChatGPT Codex",
+                        &e.to_string(),
+                        "forge --login-chatgpt",
+                    );
                     None
                 }
             }
@@ -161,15 +169,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::EndpointType::Anthropic | config::EndpointType::OpenAi => None,
     };
 
-    let client = api::ApiClient::from_endpoint(endpoint, oauth_token.clone());
+    let client = api::ApiClient::from_endpoint(&endpoint, oauth_token.clone());
 
     let mut all_endpoints = app_config.models.endpoints.clone();
 
+    // In offline mode, this whole block only runs if the active endpoint is
+    // itself ChatGPT Codex — otherwise it's pure incidental network traffic
+    // for a catalog of models this session isn't even using.
     let chatgpt_logged_in = auth::load_chatgpt_tokens().is_some();
-    if chatgpt_logged_in {
+    if chatgpt_logged_in
+        && (!app_config.agent.offline_mode
+            || endpoint.endpoint_type == config::EndpointType::ChatGptCodex)
+    {
         let http = reqwest::Client::new();
         let _ = auth::get_valid_chatgpt_token(&http).await;
-        let mut discovered = auth::fetch_chatgpt_codex_models().await;
+        let (mut discovered, is_live) = auth::fetch_chatgpt_codex_models_with_provenance().await;
+        // Only a genuine, non-empty live response is trustworthy enough to
+        // prune by — an empty *live* result is more likely a transient
+        // parsing/API hiccup than "you now have zero Codex models", and any
+        // offline fallback (cache/CLI/hardcoded) is by definition not
+        // current, so "missing from it" doesn't mean "no longer offered".
+        let can_prune = is_live && !discovered.is_empty();
+        let live_ids: std::collections::HashSet<String> =
+            discovered.iter().map(|m| m.id.clone()).collect();
         if discovered.is_empty() {
             discovered.push(auth::ChatGptCodexModel {
                 id: "gpt-5.4".to_string(),
@@ -205,10 +227,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     request_timeout_secs: config::default_request_timeout_secs(),
                     endpoint_type: config::EndpointType::ChatGptCodex,
                     reasoning: config::EndpointReasoningConfig::default(),
+                    xai_priority_tier: false,
                 });
             }
         }
+
+        // Remove ChatGPT Codex endpoints that are no longer offered — e.g. a
+        // retired model like an old "gpt-5.4" entry once superseded models
+        // take over. Scoped to ChatGPT Codex only: it's the only provider
+        // here with a live catalog to check against; Anthropic, real
+        // OpenAI, OpenRouter, and self-hosted/local endpoints have no
+        // equivalent live discovery and are never touched by this.
+        if can_prune {
+            let before = all_endpoints.len();
+            all_endpoints.retain(|e| {
+                e.endpoint_type != config::EndpointType::ChatGptCodex
+                    || live_ids.contains(&e.model_id)
+            });
+            if all_endpoints.len() != before {
+                eprintln!(
+                    "forge: removed {} ChatGPT Codex model(s) no longer offered",
+                    before - all_endpoints.len()
+                );
+            }
+        }
     }
+
+    // ── xAI (Grok) model auto-discovery ──────────────────────────────────
+    // Same idea as the Codex block above, but there's no login/OAuth concept
+    // here — just whatever `api_key` a configured `api.x.ai` endpoint
+    // already has. Grouped by (base_url, api_key) so multiple xAI accounts
+    // would each get their own discovery pass, though in practice there's
+    // usually just one. A failed/empty live query leaves that account's
+    // entries untouched rather than deleting them.
+    {
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let xai_accounts: Vec<(String, String)> = all_endpoints
+            .iter()
+            .filter(|e| {
+                e.endpoint_type == config::EndpointType::OpenAi
+                    && e.base_url.contains("api.x.ai")
+                    && e.api_key.as_ref().is_some_and(|k| !k.is_empty())
+            })
+            .filter_map(|e| {
+                let key = (e.base_url.clone(), e.api_key.clone().unwrap());
+                seen.insert(key.clone()).then_some(key)
+            })
+            .collect();
+
+        for (xai_base_url, xai_api_key) in xai_accounts {
+            let Some(discovered) = auth::fetch_xai_models(&xai_base_url, &xai_api_key).await else {
+                continue; // couldn't reach xAI right now — leave existing entries alone
+            };
+            if discovered.is_empty() {
+                continue; // more likely a transient hiccup than "zero models available"
+            }
+
+            let live_ids: std::collections::HashSet<String> =
+                discovered.iter().map(|m| m.id.clone()).collect();
+
+            for model in &discovered {
+                if endpoint.endpoint_type == config::EndpointType::OpenAi
+                    && endpoint.base_url == xai_base_url
+                    && endpoint.model_id == model.id
+                {
+                    if let Some(ctx) = model.context_length {
+                        max_context_tokens = ctx;
+                    }
+                }
+
+                if let Some(existing) = all_endpoints.iter_mut().find(|e| {
+                    e.endpoint_type == config::EndpointType::OpenAi
+                        && e.base_url == xai_base_url
+                        && e.model_id == model.id
+                }) {
+                    if let Some(ctx) = model.context_length {
+                        existing.max_context_tokens = ctx;
+                    }
+                    existing.api_key = Some(xai_api_key.clone());
+                } else {
+                    all_endpoints.push(config::ModelEndpoint {
+                        name: auth::xai_display_name(&model.id),
+                        base_url: xai_base_url.clone(),
+                        model_id: model.id.clone(),
+                        api_key: Some(xai_api_key.clone()),
+                        max_context_tokens: model.context_length.unwrap_or(131_072),
+                        max_output_tokens: 16_384,
+                        request_timeout_secs: config::default_request_timeout_secs(),
+                        endpoint_type: config::EndpointType::OpenAi,
+                        reasoning: config::EndpointReasoningConfig::default(),
+                        xai_priority_tier: false,
+                    });
+                }
+            }
+
+            let before = all_endpoints.len();
+            all_endpoints.retain(|e| {
+                !(e.endpoint_type == config::EndpointType::OpenAi && e.base_url == xai_base_url)
+                    || live_ids.contains(&e.model_id)
+            });
+            if all_endpoints.len() != before {
+                eprintln!(
+                    "forge: removed {} xAI model(s) no longer offered",
+                    before - all_endpoints.len()
+                );
+            }
+        }
+    }
+
+    // Persist additions/updates/removals from both discovery passes above so
+    // they don't have to be rediscovered (and re-pruned) fresh every launch.
+    app_config.models.endpoints = all_endpoints.clone();
+    let _ = app_config.save();
 
     // Channels
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -333,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Probe context window in background — updates the agent once resolved.
     // This must not block the main thread since Init hasn't been sent yet.
     {
-        let probe_client = api::ApiClient::from_endpoint(endpoint, oauth_token);
+        let probe_client = api::ApiClient::from_endpoint(&endpoint, oauth_token);
         let probe_model = model_id.clone();
         let probe_tx = action_tx.clone();
         let configured = max_context_tokens;
@@ -436,6 +567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             crate::config::ContextStrategy::Compaction => "compaction".to_string(),
         },
         chatgpt_logged_in,
+        offline_mode: app_config.agent.offline_mode,
     };
     headless::run_headless(event_rx, action_tx, init, app_config.clone()).await?;
     let _ = agent_handle.await;

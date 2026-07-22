@@ -115,4 +115,3 @@ pub struct Usage {
     pub completion_tokens: u32,
     pub total_tokens: u32,
 }
-

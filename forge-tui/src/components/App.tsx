@@ -13,8 +13,9 @@ import { Menu, type MenuOption } from "./Menu.js";
 import { SubagentStatus } from "./SubagentStatus.js";
 import { QuestionDialog } from "./QuestionDialog.js";
 import { BgPromptDialog } from "./BgPromptDialog.js";
+import { ProviderBusyDialog } from "./ProviderBusyDialog.js";
 import type { EndpointInfo } from "../protocol.js";
-import { activeEndpoint, collapseHome, thinkingIntensityDisplay } from "../model-display.js";
+import { activeEndpoint, collapseHome, isXaiEndpoint, thinkingIntensityDisplay } from "../model-display.js";
 
 interface SessionMeta {
   id: string;
@@ -175,6 +176,7 @@ type MenuScreen =
   | { kind: "settings_tools_basic" }
   | { kind: "settings_tools_advanced" }
   | { kind: "settings_context" }
+  | { kind: "settings_offline" }
   | { kind: "subagent" }
   | { kind: "revert" }
   | { kind: "revert_confirm" }
@@ -212,9 +214,13 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     answerQuestion,
     cyclePermissionMode,
     setContextStrategy,
+    setOfflineMode,
     setPermissionMode,
     setToolEnabled,
     updateEndpointReasoning,
+    updateXaiPriorityTier,
+    switchProviderBusyToPriority,
+    dismissProviderBusy,
     sendProcessInput,
     sendBgProcessInput,
     cancelRun,
@@ -690,6 +696,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
         { label: "Basic tools", description: basicDisabled > 0 ? `${basicDisabled} disabled` : "All enabled" },
         { label: "Advanced tools", description: advDisabled > 0 ? `${advDisabled} disabled` : "All enabled" },
         { label: "Context strategy", description: state.contextStrategy === "rolling_window" ? "Rolling window" : "Compaction" },
+        { label: "Offline mode", description: state.offlineMode ? "On" : "Off" },
       ],
       footer: ["Configure Forge behaviour and which tools the agent can use."],
     };
@@ -701,6 +708,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
       case 1: pushMenu({ kind: "settings_tools_basic" }); break;
       case 2: pushMenu({ kind: "settings_tools_advanced" }); break;
       case 3: pushMenu({ kind: "settings_context" }); break;
+      case 4: pushMenu({ kind: "settings_offline" }); break;
     }
   };
 
@@ -754,6 +762,27 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
       send({ type: "update_context_strategy", strategy: next });
       setContextStrategy(next);
       addSystemEntry(`Context strategy: ${labels[idx]}`);
+    }
+    popMenu();
+  };
+
+  const buildOfflineModeMenu = (): { items: MenuOption[]; footer: string[] } => {
+    const on = state.offlineMode;
+    return {
+      items: [
+        { label: "Off", description: "Normal — web_search/web_fetch and Codex housekeeping run as usual", marker: !on ? "✔" : undefined },
+        { label: "On", description: "No network calls except the model API itself — web_search/web_fetch disabled, Codex background checks skipped", marker: on ? "✔" : undefined },
+      ],
+      footer: ["Doesn't block the active model endpoint's own API calls, or an explicit /login."],
+    };
+  };
+
+  const handleOfflineModeSelect = (idx: number) => {
+    const next = idx === 1;
+    if (next !== state.offlineMode) {
+      send({ type: "update_offline_mode", enabled: next });
+      setOfflineMode(next);
+      addSystemEntry(`Offline mode: ${next ? "On" : "Off"}`);
     }
     popMenu();
   };
@@ -924,6 +953,16 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
   };
 
   const handleOpenAiReasoningSelect = (idx: number, ep: EndpointInfo) => {
+    if (idx === 2 && isXaiEndpoint(ep)) {
+      const enabled = !ep.xai_priority_tier;
+      updateXaiPriorityTier(ep.name, enabled);
+      addSystemEntry(
+        enabled
+          ? `Priority tier for ${ep.name}: on — requests now billed at 2x xAI's standard rate.`
+          : `Priority tier for ${ep.name}: off — back to standard pricing.`
+      );
+      return;
+    }
     const reasoning = structuredClone(ep.reasoning);
     if (idx === 0) {
       reasoning.open_ai_compatible.thinking = nextToggle(reasoning.open_ai_compatible.thinking);
@@ -1015,6 +1054,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
     state.pendingApproval !== null ||
     state.pendingPlan !== null ||
     state.pendingQuestion !== null ||
+    state.pendingProviderBusy !== null ||
     activeMenu !== null;
 
   const renderMenu = () => {
@@ -1039,6 +1079,7 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
       }
       case "reasoning_openai": {
         const liveEp = state.endpoints.find((candidate) => candidate.name === activeMenu.ep.name) ?? activeMenu.ep;
+        const isXai = isXaiEndpoint(liveEp);
         const items: MenuOption[] = [
           {
             label: "Thinking",
@@ -1048,13 +1089,24 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
             label: "Preserve thinking",
             description: toggleLabel(liveEp.reasoning.open_ai_compatible.preserve_thinking),
           },
+          // xAI-only: opt in to priority processing (service_tier: "priority")
+          // — 2x xAI's standard per-token price for higher scheduling priority
+          // during high demand. Off by default; this is a charge from xAI
+          // itself, not Forge, so the description says so up front.
+          ...(isXai ? [{
+            label: "Priority tier",
+            description: liveEp.xai_priority_tier ? "on — 2x cost" : "off (standard)",
+          }] : []),
         ];
         return <Menu
           title={`${liveEp.name} reasoning`}
           items={items}
           onSelect={(idx) => handleOpenAiReasoningSelect(idx, liveEp)}
           onCancel={popMenu}
-          footer={["OpenAI-compatible local endpoints use chat_template_kwargs. Select an item to cycle its value."]}
+          footer={isXai
+            ? ["OpenAI-compatible local endpoints use chat_template_kwargs. Select an item to cycle its value.",
+               "Priority tier requests higher scheduling priority from xAI during high demand, billed by xAI at 2x the standard per-token price."]
+            : ["OpenAI-compatible local endpoints use chat_template_kwargs. Select an item to cycle its value."]}
           nested
         />;
       }
@@ -1115,6 +1167,10 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
       case "settings_context": {
         const menu = buildContextStrategyMenu();
         return <Menu title="Context Strategy" items={menu.items} footer={menu.footer} onSelect={handleContextStrategySelect} onCancel={popMenu} nested />;
+      }
+      case "settings_offline": {
+        const menu = buildOfflineModeMenu();
+        return <Menu title="Offline Mode" items={menu.items} footer={menu.footer} onSelect={handleOfflineModeSelect} onCancel={popMenu} nested />;
       }
       case "subagent": {
         const { items, footer } = buildSubagentMenu();
@@ -1240,6 +1296,15 @@ export function App({ initialAgentArgs, initialCwd }: AppProps) {
           command={state.pendingBgPrompt.command}
           prompt={state.pendingBgPrompt.prompt}
           onSubmit={(text) => sendBgProcessInput(state.pendingBgPrompt!.bg_id, text)}
+        />
+      )}
+
+      {/* Provider-at-capacity notice — offers switching the endpoint to xAI's priority tier */}
+      {state.pendingProviderBusy && (
+        <ProviderBusyDialog
+          busy={state.pendingProviderBusy}
+          onSwitchToPriority={switchProviderBusyToPriority}
+          onDismiss={dismissProviderBusy}
         />
       )}
 

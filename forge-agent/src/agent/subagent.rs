@@ -63,6 +63,10 @@ pub struct SubagentRunner {
     approval_rx: Option<mpsc::UnboundedReceiver<UserAction>>,
     /// Slot ID for parallel subagent tracking. Nested subagents inherit the parent's slot_id.
     slot_id: String,
+    /// Snapshotted from the parent `Agent` at spawn time — not live-updated if the
+    /// user toggles auto-mode mid-run, same scope as the model/config snapshot.
+    dangerously_allow_all: bool,
+    auto_mode: bool,
 
     // Anti-thrash: detect identical errors repeated without progress
     last_error_sig: Option<u64>,
@@ -72,6 +76,7 @@ pub struct SubagentRunner {
 }
 
 impl SubagentRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_def: AgentDefinition,
         client: ApiClient,
@@ -87,6 +92,8 @@ impl SubagentRunner {
         parent_event_tx: mpsc::UnboundedSender<AgentEvent>,
         approval_rx: Option<mpsc::UnboundedReceiver<UserAction>>,
         slot_id: String,
+        dangerously_allow_all: bool,
+        auto_mode: bool,
     ) -> Self {
         Self {
             agent_def,
@@ -103,6 +110,8 @@ impl SubagentRunner {
             parent_event_tx,
             approval_rx,
             slot_id,
+            dangerously_allow_all,
+            auto_mode,
             last_error_sig: None,
             same_error_count: 0,
             analyze_mode: false,
@@ -346,27 +355,86 @@ impl SubagentRunner {
                         let kind = executor.classify_tool_name(tool_name);
                         let mut denied = false;
 
+                        // Sent for *every* kind, matching the top-level agent
+                        // (core.rs's own `handle_tool_call`) — previously only
+                        // sent for Write/Execute/Unknown, so a subagent's read
+                        // calls (read_file, search_code, ...) never produced a
+                        // ToolRequest/ToolResult at all; a client had no way to
+                        // show what a read-only subagent was actually doing
+                        // beyond the coarse `SubagentStatus` status line.
+                        let kind_event = match kind {
+                            ToolKind::Write => ToolKindEvent::Write,
+                            ToolKind::Execute => ToolKindEvent::Execute,
+                            _ => ToolKindEvent::Read,
+                        };
+                        // Mirror the top-level gate (core.rs) so a subagent doesn't
+                        // block forever on an approval the session's trust settings
+                        // already said it doesn't need — e.g. a nominally read-only
+                        // "explore" subagent nesting another delegate_task call
+                        // (Execute-kind) used to always block here regardless of
+                        // --dangerously-allow-all/auto-mode. Computed *before* the
+                        // ToolRequest send below so the event can tell a client
+                        // whether this call will actually wait — a client guessing
+                        // from `kind` alone has no way to see these trust settings.
+                        let needs_approval = if !matches!(
+                            kind,
+                            ToolKind::Write | ToolKind::Execute | ToolKind::Unknown
+                        ) {
+                            false
+                        } else if self.dangerously_allow_all {
+                            false
+                        } else {
+                            match kind {
+                                ToolKind::Write => {
+                                    !self.app_config.agent.auto_approve_writes
+                                        && !self.auto_mode
+                                }
+                                ToolKind::Execute => !self.auto_mode,
+                                ToolKind::Unknown => true,
+                                ToolKind::Read => false,
+                            }
+                        };
+                        let _ = self.parent_event_tx.send(AgentEvent::ToolRequest {
+                            tool_name: tool_name.clone(),
+                            tool_args: tc.function.arguments.clone(),
+                            tool_id: tc.id.clone(),
+                            kind: kind_event,
+                            subagent_id: Some(self.slot_id.clone()),
+                            needs_approval,
+                        });
+
                         if matches!(
                             kind,
                             ToolKind::Write | ToolKind::Execute | ToolKind::Unknown
                         ) {
-                            let kind_event = match kind {
-                                ToolKind::Write => ToolKindEvent::Write,
-                                ToolKind::Execute => ToolKindEvent::Execute,
-                                _ => ToolKindEvent::Read,
-                            };
-                            let _ = self.parent_event_tx.send(AgentEvent::ToolRequest {
-                                tool_name: tool_name.clone(),
-                                tool_args: tc.function.arguments.clone(),
-                                tool_id: tc.id.clone(),
-                                kind: kind_event,
-                            });
-
-                            // Block until user approves/denies
-                            match approval_rx.recv().await {
-                                Some(UserAction::ApproveAction(_)) => { /* proceed */ }
-                                _ => {
-                                    denied = true;
+                            // Block until user approves/denies, unless trust settings
+                            // already cover this call. The parent forwards every
+                            // approve/deny to *all* concurrently-running subagents'
+                            // channels (see core.rs's Phase 3 select loop) since it
+                            // has no cheaper way to know which one a click was meant
+                            // for — so a message not addressed to this specific
+                            // tool_id must be ignored and waited past, not treated as
+                            // an answer. Without this check, a click approving one
+                            // subagent's pending write would also silently wave
+                            // through every other subagent's *next* approval-gated
+                            // call, with no real wait and no genuine user decision
+                            // for it.
+                            if needs_approval {
+                                loop {
+                                    match approval_rx.recv().await {
+                                        Some(UserAction::ApproveAction(id)) if id == tc.id => break,
+                                        Some(UserAction::DenyAction { tool_id, .. })
+                                            if tool_id == tc.id =>
+                                        {
+                                            denied = true;
+                                            break;
+                                        }
+                                        None => {
+                                            denied = true;
+                                            break;
+                                        }
+                                        _ => continue,
+                                    }
                                 }
                             }
                         }
@@ -396,17 +464,24 @@ impl SubagentRunner {
                                 Err(e) => format!("Tool error: {}", e),
                             };
 
-                            // Emit ToolResult for write/exec tools so TUI shows scrollback
-                            if matches!(kind, ToolKind::Write | ToolKind::Execute) {
-                                let success = !exec_result.starts_with("Tool error:");
-                                let result_summary: String =
-                                    exec_result.chars().take(200).collect();
-                                let _ = self.parent_event_tx.send(AgentEvent::ToolResult {
-                                    tool_name: tool_name.clone(),
-                                    result: result_summary,
-                                    success,
-                                });
-                            }
+                            // Emitted for every kind now — see the matching
+                            // comment on the `ToolRequest` send above. Sends
+                            // the full result, not a truncated summary — this
+                            // is what a client actually renders in a
+                            // subagent's own tool-call card, and the
+                            // top-level agent's equivalent event has never
+                            // truncated it either. (`tool_observations`
+                            // below, used to build this subagent's own final
+                            // summary, intentionally keeps a short 200-char
+                            // version — that's internal bookkeeping, not
+                            // something a client displays.)
+                            let success = !exec_result.starts_with("Tool error:");
+                            let _ = self.parent_event_tx.send(AgentEvent::ToolResult {
+                                tool_name: tool_name.clone(),
+                                result: exec_result.clone(),
+                                success,
+                                subagent_id: Some(self.slot_id.clone()),
+                            });
 
                             exec_result
                         }
@@ -669,11 +744,21 @@ impl SubagentRunner {
             }
         };
 
-        // Emit SubagentStarted so the UI shows the nested subagent (same slot)
+        // Unique id for this nested call — parent slot + this specific tool call's
+        // id, not a reuse of `self.slot_id`. Reusing the parent's id meant a client
+        // tracking subagents by id (Forge IDE included) would see the *outer*
+        // subagent marked "finished" the moment this nested call completed, even
+        // though the outer subagent kept running afterward. If this nested runner
+        // itself nests another level, its `slot_id` (set below) is this id, so a
+        // third level naturally extends the same way.
+        let nested_id = format!("{}:{}", self.slot_id, tc.id);
+
+        // Emit SubagentStarted so the UI shows the nested subagent as its own entry
         let _ = self.parent_event_tx.send(AgentEvent::SubagentStarted {
-            id: self.slot_id.clone(),
+            id: nested_id.clone(),
             agent_type: agent_type.clone(),
             prompt: prompt.clone(),
+            parent_id: Some(self.slot_id.clone()),
         });
 
         // Pass the parent's status_tx so nested ToolRunning/ToolDone events
@@ -692,17 +777,19 @@ impl SubagentRunner {
             self.app_config.clone(),
             self.parent_event_tx.clone(), // same TUI channel
             None,                         // no owned rx — will borrow
-            self.slot_id.clone(),         // inherit parent's slot_id
+            nested_id.clone(),
+            self.dangerously_allow_all,
+            self.auto_mode,
         );
 
         // Run nested with borrowed approval_rx — no new channel, no forwarding
         let (result, _history, _turns) =
             Box::pin(nested_runner.run_inner(approval_rx, None)).await?;
 
-        // Emit SubagentFinished so the TUI closes the nested subagent panel
+        // Emit SubagentFinished so the TUI closes the nested subagent's own entry
         let summary: String = result.chars().take(200).collect();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentFinished {
-            id: self.slot_id.clone(),
+            id: nested_id,
             agent_type: agent_type,
             summary,
         });

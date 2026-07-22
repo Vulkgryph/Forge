@@ -554,7 +554,6 @@ impl ConversationLog {
 
         Ok(checkpoints)
     }
-
 }
 
 /// Entry types for TUI replay on resume.

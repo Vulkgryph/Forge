@@ -1436,3 +1436,61 @@ pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod ink_redraw_tests {
+    use super::{Grid, MAX_SCROLLBACK};
+
+    /// One ink-style repaint: move the cursor up over the previously drawn
+    /// block, erase to end of screen, then redraw it. This is how ink (and so
+    /// forge-tui, and Claude Code) animates a live region — no alternate
+    /// screen, everything inline.
+    fn repaint(g: &mut Grid, lines: usize, tick: usize) {
+        if tick > 0 {
+            g.process(&format!("\x1b[{lines}A"));  // cursor up over the block
+            g.process("\x1b[J");                    // erase to end of screen
+        }
+        for i in 0..lines {
+            g.process(&format!("status line {i} tick {tick}"));
+            if i + 1 < lines { g.process("\r\n"); }
+        }
+    }
+
+    /// Repainting a live region in place must not grow scrollback. If it does,
+    /// total content height climbs every frame and a bottom-pinned view is
+    /// re-pinned to a moving target — which reads as the terminal jittering.
+    #[test]
+    fn in_place_repaint_does_not_grow_scrollback() {
+        let mut g = Grid::with_size(24, 80);
+        let block = 6;
+
+        repaint(&mut g, block, 0);
+        let after_first = g.scrollback.len();
+
+        for tick in 1..200 {
+            repaint(&mut g, block, tick);
+        }
+
+        let grown = g.scrollback.len() - after_first;
+        assert_eq!(
+            grown, 0,
+            "199 in-place repaints added {grown} scrollback lines \
+             (before {after_first}, after {}); a live region redrawn in place \
+             should add none",
+            g.scrollback.len()
+        );
+        assert!(g.scrollback.len() < MAX_SCROLLBACK);
+    }
+
+    /// Sanity check the opposite case: genuinely new output *should* scroll.
+    #[test]
+    fn real_output_does_scroll_into_scrollback() {
+        let mut g = Grid::with_size(24, 80);
+        for i in 0..100 {
+            g.process(&format!("line {i}\r\n"));
+        }
+        assert!(g.scrollback.len() > 50,
+                "100 lines of real output on a 24-row screen should scroll, got {}",
+                g.scrollback.len());
+    }
+}

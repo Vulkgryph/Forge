@@ -14,3 +14,32 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the LICENSE file for the specific language governing permissions
 and limitations under the License.
+
+
+--------------------------------------------------------------------------
+THIRD-PARTY NOTICES
+--------------------------------------------------------------------------
+
+Forge distributes no third-party binaries. The macOS application bundle
+contains only Vulkgryph LLC's own executable and generated resources; GPU
+rendering goes through Apple's Metal framework, which is part of the
+operating system.
+
+Forge does link third-party Rust crates, predominantly under the MIT and
+Apache-2.0 licenses, along with libgit2 and OpenSSL compiled from source.
+These are declared in the Cargo.toml of each workspace member and pinned in
+Cargo.lock, which together are the authoritative dependency list.
+
+
+Trademarks
+----------
+
+Vulkan and the Vulkan logo are registered trademarks of The Khronos Group
+Inc. Forge's optional `vulkan-renderer` build uses the Vulkan API; it is not
+an implementation of the Vulkan specification, and it is neither produced by
+nor endorsed by The Khronos Group. Vulkgryph LLC and Forge are not
+affiliated with The Khronos Group Inc.
+
+Metal and macOS are trademarks of Apple Inc.
+
+All other trademarks are the property of their respective owners.

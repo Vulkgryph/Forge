@@ -3,6 +3,8 @@ use crate::buffer::Buffer;
 use crate::filetree::{FileTree, TreeAction};
 use crate::terminal::Terminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 const DIVIDER_H: f32 = 5.0;
@@ -14,33 +16,176 @@ const AGENT_HISTORY_RENDER_LIMIT: usize = 150;
 
 // ── Quick Open ────────────────────────────────────────────────────────────────
 
+/// Quick Open lists exactly one directory at a time and you descend into
+/// folders to reach a file, rather than indexing the tree up front. The cost
+/// of opening it is therefore one `read_dir` — a function of how crowded the
+/// current folder is, not of how large the tree below it is. That is what
+/// makes `Ctrl+P` in `$HOME` or `/` cheap instead of unbounded.
+///
+/// Cap on entries kept for a single directory. Only pathological folders
+/// (cache/maildir style, hundreds of thousands of siblings) reach it.
+const QUICK_OPEN_MAX_ENTRIES: usize = 20_000;
+
+/// How many rows the list shows. Must bound *every* path that assigns
+/// `filtered` — the ScrollArea builds one widget per entry per frame, so an
+/// unbounded list is its own freeze independent of how fast listing was.
+const QUICK_OPEN_MAX_RESULTS: usize = 50;
+
+struct QuickOpenEntry {
+    path:       PathBuf,
+    /// Bare file name, with a trailing `/` on directories so the list makes
+    /// clear which rows descend and which rows open.
+    name:       String,
+    /// `name` pre-lowercased, so filtering allocates nothing per keystroke.
+    name_lower: String,
+    is_dir:     bool,
+}
+
 struct QuickOpen {
+    /// Directory being listed. Starts at `root` and moves as you navigate.
+    dir:      PathBuf,
+    /// Project root. `..` stops here, so navigation can't wander off into the
+    /// filesystem above the open folder.
+    root:     PathBuf,
     query:    String,
-    all:      Vec<PathBuf>,
+    entries:  Vec<QuickOpenEntry>,
     filtered: Vec<usize>,
     cursor:   usize,
+    /// Set when this directory's listing stopped at `QUICK_OPEN_MAX_ENTRIES`.
+    truncated: bool,
+    /// `Some` while a directory listing is in flight.
+    rx:       Option<mpsc::Receiver<(PathBuf, Vec<QuickOpenEntry>, bool)>>,
+    /// Tells an in-flight listing its result is unwanted; tripped by `Drop`
+    /// and on every navigation, so a stalled network mount can't pile up.
+    cancel:   Arc<AtomicBool>,
+}
+
+impl Drop for QuickOpen {
+    fn drop(&mut self) { self.cancel.store(true, Ordering::Relaxed); }
 }
 
 impl QuickOpen {
     fn new(root: &Path) -> Self {
-        let all = collect_files(root);
-        let filtered: Vec<usize> = (0..all.len()).collect();
-        Self { query: String::new(), all, filtered, cursor: 0 }
+        let mut qo = Self {
+            dir: root.to_path_buf(), root: root.to_path_buf(),
+            query: String::new(), entries: Vec::new(), filtered: Vec::new(),
+            cursor: 0, truncated: false, rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        qo.load(root.to_path_buf());
+        qo
     }
 
-    fn update_filter(&mut self, root: &Path) {
-        let q = self.query.to_lowercase();
-        self.filtered = self.all.iter().enumerate()
-            .filter(|(_, p)| {
-                let name = p.strip_prefix(root).unwrap_or(p)
-                    .to_string_lossy().to_lowercase();
-                fuzzy_match(&name, &q)
-            })
-            .map(|(i, _)| i)
-            .take(50)
-            .collect();
-        self.cursor = 0;
+    /// Kick off a listing of `dir`. Off-thread even though it is a single
+    /// `read_dir`: on a stalled network mount that one call can block for
+    /// seconds, and blocking the render thread is what froze the window.
+    fn load(&mut self, dir: PathBuf) {
+        // Abandon any listing already running — its result is stale now.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&self.cancel);
+
+        self.dir       = dir.clone();
+        self.query.clear();
+        self.entries.clear();
+        self.filtered.clear();
+        self.cursor    = 0;
+        self.truncated = false;
+
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let (entries, truncated) = list_dir(&dir, &flag);
+            if !flag.load(Ordering::Relaxed) {
+                let _ = tx.send((dir, entries, truncated));
+            }
+        });
     }
+
+    fn listing(&self) -> bool { self.rx.is_some() }
+
+    /// Path of the listed directory relative to the root, for the header.
+    fn breadcrumb(&self) -> String {
+        match self.dir.strip_prefix(&self.root) {
+            Ok(rel) if rel.as_os_str().is_empty() => {
+                self.root.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.root.to_string_lossy().into_owned())
+            }
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_)  => self.dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn at_root(&self) -> bool { self.dir == self.root }
+
+    /// Descend into `dir`, listing it fresh.
+    fn enter(&mut self, dir: PathBuf) { self.load(dir); }
+
+    /// Go up one level, stopping at the project root.
+    fn go_up(&mut self) {
+        if self.at_root() { return; }
+        let Some(parent) = self.dir.parent().map(|p| p.to_path_buf()) else { return };
+        self.load(parent);
+    }
+
+    fn poll(&mut self) {
+        let Some(rx) = &self.rx else { return };
+        match rx.try_recv() {
+            Ok((dir, entries, truncated)) => {
+                self.rx = None;
+                // Guard against a listing that finished after we navigated on.
+                if dir != self.dir { return; }
+                self.entries   = entries;
+                self.truncated = truncated;
+                self.update_filter();
+            }
+            Err(mpsc::TryRecvError::Empty)        => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.rx = None,
+        }
+    }
+
+    fn update_filter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self.entries.iter().enumerate()
+            .filter(|(_, e)| fuzzy_match(&e.name_lower, &q))
+            .map(|(i, _)| i)
+            .take(QUICK_OPEN_MAX_RESULTS)
+            .collect();
+        // Highlight the first real entry rather than the `../` row that sits at
+        // slot 0 below the root: Enter in a folder you just opened should act on
+        // its contents, not bounce straight back out. Up-arrow still reaches
+        // `../`. With nothing to show, `../` is the only actionable row.
+        self.cursor = if self.at_root() || self.filtered.is_empty() { 0 } else { 1 };
+    }
+}
+
+/// One Quick Open row. Allocates the full available width so the whole row is
+/// a click target, not just the text glyphs.
+fn draw_quick_open_row(
+    ui:       &mut egui::Ui,
+    label:    &str,
+    selected: bool,
+    is_dir:   bool,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(0, 120, 212));
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(55));
+    }
+    let fg = if selected      { egui::Color32::WHITE }
+             else if is_dir   { egui::Color32::from_rgb(176, 200, 230) }
+             else             { egui::Color32::from_gray(200) };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        fg,
+    );
+    resp
 }
 
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
@@ -57,25 +202,45 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     true
 }
 
-fn collect_files(root: &Path) -> Vec<PathBuf> {
+/// List one directory — no recursion, so this is bounded by that directory's
+/// own entry count no matter how deep the tree below it goes. Returns the
+/// entries plus whether the cap truncated them.
+///
+/// Hidden entries and `node_modules` are skipped, matching what the file tree
+/// shows (see `filetree::FileTree::walk`) so the two views agree.
+fn list_dir(dir: &Path, cancel: &AtomicBool) -> (Vec<QuickOpenEntry>, bool) {
+    let Ok(iter) = std::fs::read_dir(dir) else { return (Vec::new(), false) };
     let mut out = Vec::new();
-    collect_recursive(root, root, &mut out);
-    out.sort();
-    out
-}
-
-fn collect_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(iter) = std::fs::read_dir(dir) else { return };
+    let mut truncated = false;
     for entry in iter.flatten() {
+        if cancel.load(Ordering::Relaxed) { return (out, truncated); }
+        if out.len() >= QUICK_OPEN_MAX_ENTRIES { truncated = true; break; }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') || name == "node_modules" { continue; }
+        // Resolve through symlinks so a linked directory is still navigable.
+        // Safe to follow here precisely because nothing recurses: a link cycle
+        // costs one extra `read_dir` when the user walks into it, not an
+        // unbounded descent.
         let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
-        if path.is_dir() {
-            collect_recursive(root, &path, out);
-        } else {
-            out.push(path);
-        }
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_symlink() => path.is_dir(),
+            Ok(ft)                    => ft.is_dir(),
+            Err(_)                    => continue,
+        };
+        let display = if is_dir { format!("{name}/") } else { name.to_string() };
+        out.push(QuickOpenEntry {
+            path,
+            name_lower: display.to_lowercase(),
+            name: display,
+            is_dir,
+        });
     }
+    // Directories first, then case-insensitive by name — the file tree's order.
+    out.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name_lower.cmp(&b.name_lower))
+    });
+    (out, truncated)
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -197,6 +362,13 @@ struct SearchState {
     rx:             Option<mpsc::Receiver<Vec<SearchHit>>>,
     request_focus:  bool,
     last_query:     String,
+    /// Tells the in-flight walk to stop. Tripped whenever a new search starts,
+    /// so retyping doesn't leave the previous walk churning through the tree.
+    cancel:         Arc<AtomicBool>,
+}
+
+impl Drop for SearchState {
+    fn drop(&mut self) { self.cancel.store(true, Ordering::Relaxed); }
 }
 
 impl SearchState {
@@ -205,11 +377,15 @@ impl SearchState {
             query: String::new(), case_sensitive: false,
             results: Vec::new(), searching: false, rx: None,
             request_focus: false, last_query: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn start(&mut self, root: PathBuf) {
         if self.query.is_empty() {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.rx = None;
+            self.searching = false;
             self.results.clear();
             self.last_query.clear();
             return;
@@ -218,14 +394,18 @@ impl SearchState {
         self.last_query = self.query.clone();
         self.results.clear();
         self.searching = true;
+        // Abandon whatever the previous keystroke started.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&self.cancel);
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let q  = self.query.clone();
         let cs = self.case_sensitive;
         std::thread::spawn(move || {
             let mut hits = Vec::new();
-            walk_search(&root, &q, cs, &mut hits, 2000);
-            let _ = tx.send(hits);
+            walk_search(&root, &q, cs, &mut hits, 2000, 0, &flag);
+            if !flag.load(Ordering::Relaxed) { let _ = tx.send(hits); }
         });
     }
 
@@ -240,19 +420,71 @@ impl SearchState {
     }
 }
 
-fn walk_search(dir: &Path, query: &str, case_sensitive: bool, hits: &mut Vec<SearchHit>, max: usize) {
-    if hits.len() >= max { return; }
+/// Lines retained by the Output panel. The panel carries task/git/SSH status,
+/// not full build output (that lives in the terminal), so this is generous —
+/// and every retained line is also a widget laid out each frame it's visible.
+const MAX_OUTPUT_LINES: usize = 2_000;
+
+/// Longest single Output line kept, in characters.
+const MAX_OUTPUT_LINE_CHARS: usize = 4_000;
+
+/// How long to let file-watch events settle before re-walking the file tree.
+/// Long enough to swallow a build's worth of churn, short enough that a file
+/// an agent just wrote shows up without feeling laggy.
+const TREE_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A finished external-formatter run, sent back from its worker thread.
+struct PendingFormat {
+    /// Buffer this was started for; `None` means an untitled buffer.
+    path:   Option<PathBuf>,
+    /// The text handed to the formatter. The result is only applied if the
+    /// buffer still matches, so edits typed while it ran aren't clobbered.
+    sent:   String,
+    result: Result<String, String>,
+}
+
+/// Depth cap for the project-wide search walk.
+const SEARCH_MAX_DEPTH: usize = 24;
+
+/// Largest file the search will read. Search is a background thread, so an
+/// unbounded read doesn't freeze the window — it just pins a core and can
+/// exhaust memory on a single huge file.
+const SEARCH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn walk_search(
+    dir:            &Path,
+    query:          &str,
+    case_sensitive: bool,
+    hits:           &mut Vec<SearchHit>,
+    max:            usize,
+    depth:          usize,
+    cancel:         &AtomicBool,
+) {
+    if hits.len() >= max || depth > SEARCH_MAX_DEPTH || cancel.load(Ordering::Relaxed) { return; }
     let Ok(iter) = std::fs::read_dir(dir) else { return };
     let q_lower = if case_sensitive { String::new() } else { query.to_lowercase() };
     for entry in iter.flatten() {
-        if hits.len() >= max { return; }
+        if hits.len() >= max || cancel.load(Ordering::Relaxed) { return; }
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with('.') { continue; }
         if matches!(name, "target" | "node_modules" | "dist" | "build" | "__pycache__") { continue; }
-        if path.is_dir() {
-            walk_search(&path, query, case_sensitive, hits, max);
-        } else if let Ok(content) = std::fs::read_to_string(&path) {
+        // `file_type()` does not resolve symlinks, unlike `Path::is_dir()`.
+        // Following them here meant a single cycle (`~/link -> ~`) recursed
+        // until the thread died — the same defect Quick Open's walker had.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_search(&path, query, case_sensitive, hits, max, depth + 1, cancel);
+        } else if ft.is_file() {
+            // Check the size before reading: `read_to_string` on a multi-GB
+            // file pulls all of it into memory before the binary sniff below
+            // ever gets to reject it.
+            match entry.metadata() {
+                Ok(m) if m.len() > SEARCH_MAX_FILE_BYTES => continue,
+                Ok(_)  => {}
+                Err(_) => continue,
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else { continue };
             // skip binary-looking files
             if content.bytes().take(4096).any(|b| b == 0) { continue; }
             for (line_idx, line) in content.lines().enumerate() {
@@ -268,7 +500,7 @@ fn walk_search(dir: &Path, query: &str, case_sensitive: bool, hits: &mut Vec<Sea
                         text: line.trim().chars().take(140).collect(),
                     });
                     if hits.len() >= max { return; }
-}
+                }
             }
         }
     }
@@ -2802,6 +3034,12 @@ pub struct IdeApp {
     /// Per-line blame for the active buffer (for hover tooltips).
     blame_lines:     Vec<crate::git::BlameLine>,
     blame_path:      Option<PathBuf>,
+    /// In-flight background blame; see `crate::git::spawn_blame`.
+    blame_rx:        Option<mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>>,
+    /// In-flight external formatter run.
+    fmt_rx:          Option<mpsc::Receiver<PendingFormat>>,
+    /// When a coalesced file-tree refresh is due; see the file-watch drain.
+    tree_refresh_due: Option<std::time::Instant>,
     /// In-flight fetch/pull/push result channel (None when idle).
     git_task:        Option<mpsc::Receiver<Result<String, String>>>,
     /// Language server (rust-analyzer) + latest diagnostics per file.
@@ -2948,6 +3186,9 @@ impl IdeApp {
             gutter_dirty:    true,
             blame_lines:     Vec::new(),
             blame_path:      None,
+            blame_rx:        None,
+            fmt_rx:          None,
+            tree_refresh_due: None,
             git_task:        None,
             ssh:             None,
             ssh_hosts:       crate::ssh::load_hosts(),
@@ -3310,7 +3551,15 @@ impl IdeApp {
                         BottomTab::Output => {
                             let bg = egui::Color32::from_rgb(14, 14, 14);
                             ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-                            let log = self.output_log.clone();
+                            // Move the log out for the duration of the render
+                            // instead of deep-copying it. This was a full
+                            // `clone()` — every retained line's `String`
+                            // reallocated on every repaint the panel is
+                            // visible, which with the 300ms baseline is
+                            // several times a second and up to 250/sec while
+                            // interacting. Restored below, keeping anything
+                            // appended while it was out.
+                            let log = std::mem::take(&mut self.output_log);
                             egui::ScrollArea::vertical()
                                 .id_salt("output_scroll")
                                 .stick_to_bottom(true)
@@ -3329,6 +3578,10 @@ impl IdeApp {
                                             .color(egui::Color32::from_gray(80)));
                     }
                                 });
+                            // Put it back, appending anything that arrived
+                            // while it was moved out so no line is dropped.
+                            let appended = std::mem::replace(&mut self.output_log, log);
+                            self.output_log.extend(appended);
         }
     }
                 });
@@ -3720,14 +3973,23 @@ impl IdeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(4));
         }
 
-        // A modest baseline keeps running always, independent of the checks
-        // below — catches anything not explicitly enumerated there (a
-        // file-watcher notification, an LSP response with no other
-        // trigger, etc.) without needing to hand-track every background
-        // source. 300ms is far under human perception for "did that async
-        // thing get picked up", while still ~1000x fewer wakeups than the
-        // old unconditional per-frame loop.
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        // There is deliberately no unconditional baseline repaint here.
+        //
+        // This used to be `request_repaint_after(300ms)`, always — a blanket
+        // 3.3 Hz poll so that anything arriving on any channel would be picked
+        // up without having to enumerate every background source. The cost was
+        // that the app never idled: ~4% of a core sitting still, each tick a
+        // full egui layout plus a GPU submit (~8.7ms measured).
+        //
+        // Producers now wake the loop themselves via `crate::wake::wake()` —
+        // the terminal PTY readers, the LSP reader, the file watcher, the git
+        // status/blame scans, and the pty-host client all call it after sending.
+        // Anything that pushes without user input therefore gets a frame
+        // promptly, and a genuinely idle window schedules nothing at all.
+        //
+        // The tiers below still apply: they cover work that is *in flight and
+        // polled* (where a steady tick is simpler than threading a waker
+        // through), and the interactive tier keeps gestures smooth.
         // While something is actively streaming/in-flight, poll fast enough
         // that it still feels live: agent tokens, terminal output, a
         // background git/SSH/task/dialog result, or the anvil cooldown
@@ -3756,6 +4018,10 @@ impl IdeApp {
             || self.ssh_connect_rx.is_some()
             || self.gh_check.is_some()
             || self.git_task.is_some()
+            || self.git.as_ref().is_some_and(|g| g.scanning())
+            || self.blame_rx.is_some()
+            || self.fmt_rx.is_some()
+            || self.tree_refresh_due.is_some()
             || self.folder_rx.is_some()
             || self.dap_running
             || self.search.searching
@@ -3766,6 +4032,28 @@ impl IdeApp {
 
         // Poll any in-flight git fetch/pull/push
         self.poll_git_task();
+
+        // Apply a finished background status scan. Decorations and the SC
+        // panel are empty until this lands, which is the tradeoff for not
+        // blocking window creation on a working-tree walk.
+        if let Some(g) = &mut self.git {
+            if g.poll() { self.gutter_dirty = true; }
+        }
+
+        // Fire a coalesced file-tree refresh once the event burst has settled.
+        if self.tree_refresh_due.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.tree_refresh_due = None;
+            self.file_tree.refresh();
+        }
+
+        // Apply a finished external-formatter run.
+        if let Some(rx) = &self.fmt_rx {
+            match rx.try_recv() {
+                Ok(pf) => { self.fmt_rx = None; self.apply_format(pf); }
+                Err(mpsc::TryRecvError::Empty)        => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.fmt_rx = None,
+            }
+        }
 
         // Drain external file-change events (git checkout, a pull, another
         // process, or an agent creating/editing files) and reload matching
@@ -3801,32 +4089,40 @@ impl IdeApp {
                     }
                 }
             }
+            // Coalesce instead of refreshing per batch of events. The watcher is
+            // recursive over the whole workspace, so one `cargo build` or `git
+            // checkout` produces a burst of events — and each refresh re-walks
+            // every expanded directory on this thread. Collapse a burst into a
+            // single refresh shortly after it goes quiet.
             if any_change {
-                self.file_tree.refresh();
+                self.tree_refresh_due =
+                    Some(std::time::Instant::now() + TREE_REFRESH_DEBOUNCE);
             }
             for (msg, level) in logs {
-                self.output_log.push((msg, level));
+                self.push_output(msg, level);
             }
         }
 
-        // Drain running-task output into the Output panel
+        // Drain running-task output into the Output panel. Collected first so
+        // the receiver borrow ends before `push_output` takes `&mut self`.
         if let Some(rx) = &self.task_rx {
+            let mut drained = Vec::new();
             let mut done = false;
             loop {
                 match rx.try_recv() {
-                    Ok(line) => self.output_log.push(line),
+                    Ok(line) => drained.push(line),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => { done = true; break; }
                 }
             }
             if done { self.task_rx = None; }
+            for (msg, level) in drained { self.push_output(msg, level); }
         }
 
         // Drain SSH connection log messages into the output panel
         if let Some(rx) = &self.ssh_log_rx {
-            while let Ok((msg, level)) = rx.try_recv() {
-                self.output_log.push((msg, level));
-            }
+            let drained: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            for (msg, level) in drained { self.push_output(msg, level); }
         }
 
         // Poll lazy PTY open result
@@ -4125,7 +4421,7 @@ impl IdeApp {
             if let Some(s) = new_stack  { self.dap_stack = s; }
             if let Some(v) = new_vars   { self.dap_vars = v; }
             for t in outputs {
-                self.output_log.push((t, OutputLevel::Info));
+                self.push_output(t, OutputLevel::Info);
             }
             if let Some((path, line)) = goto_frame {
                 if path.exists() {
@@ -6873,13 +7169,15 @@ impl IdeApp {
 
         // Snapshot per-side data so we don't hold a borrow of self.git across
         // mutating actions (stage / unstage / commit).
-        let (workdir, staged, unstaged, branch, has_origin) = {
+        let (workdir, staged, unstaged, branch, has_origin, scanning, truncated) = {
             let g = self.git.as_ref().unwrap();
             (g.workdir().to_path_buf(),
              g.staged.clone(),
              g.unstaged.clone(),
              g.branch.clone(),
-             g.has_origin)
+             g.has_origin,
+             g.scanning(),
+             g.truncated)
         };
 
         // ── Branch line ──
@@ -7083,11 +7381,25 @@ impl IdeApp {
             for (p, st) in &unstaged { items.push(ScItem::File(p, *st, false)); }
         }
 
+        if truncated {
+            // Say so rather than silently under-reporting: in a working tree
+            // this large the untracked side was collapsed to directories.
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(
+                    "Large working tree — untracked folders are collapsed and \
+                     the change list is capped.")
+                    .size(11.0).color(egui::Color32::from_gray(140)));
+            });
+        }
+
         if items.is_empty() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("No changes")
+                ui.label(egui::RichText::new(
+                    if scanning { "Scanning…" } else { "No changes" })
                     .size(11.5).color(egui::Color32::from_gray(140)));
             });
         } else {
@@ -8490,14 +8802,30 @@ impl IdeApp {
 
         // Take ownership so we can also borrow the rest of self freely
         let mut qo = self.quick_open.take().unwrap();
+        qo.poll();
+        // The listing arrives on a background thread, so keep repainting until
+        // it lands — otherwise rows only appear on the next input event.
+        if qo.listing() { ctx.request_repaint(); }
 
         let screen = ctx.screen_rect();
         let w = (screen.width() * 0.5).min(600.0);
         let h = 360.0;
-        let cwd = self.cwd.clone();
 
         let mut open_path: Option<PathBuf> = None;
         let mut dismissed = false;
+        // Navigation is deferred out of the row loop: descending mutates the
+        // entry list `qo.filtered` is indexing into.
+        let mut descend: Option<PathBuf> = None;
+        let mut ascend = false;
+
+        // Backspace or Left goes up a level, but only on an empty query — with
+        // text typed they belong to the filter box, where stealing them would
+        // make editing a query impossible.
+        if qo.query.is_empty() && ctx.input(|i| {
+            i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::ArrowLeft)
+        }) {
+            ascend = true;
+        }
 
         egui::Area::new(egui::Id::new("quick_open"))
             .fixed_pos(egui::pos2(screen.center().x - w * 0.5, screen.top() + 80.0))
@@ -8508,53 +8836,98 @@ impl IdeApp {
                     .rounding(4.0)
                     .show(ui, |ui| {
                         ui.set_width(w);
+
+                        // Where we are, so navigating several levels deep stays
+                        // legible when the query box only shows a filter.
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(qo.breadcrumb())
+                            .size(11.0).color(egui::Color32::from_gray(140)));
+
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut qo.query)
                                 .font(egui::FontId::proportional(14.0))
                                 .desired_width(w - 16.0)
-                                .hint_text("Search files…")
+                                .hint_text("Filter this folder…")
                                 .frame(false),
                         );
                         resp.request_focus();
-                        if resp.changed() { qo.update_filter(&cwd); }
+                        if resp.changed() { qo.update_filter(); }
 
+                        let rows = qo.filtered.len() + if qo.at_root() { 0 } else { 1 };
                         if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                            if qo.cursor + 1 < qo.filtered.len() { qo.cursor += 1; }
+                            if qo.cursor + 1 < rows { qo.cursor += 1; }
         }
                         if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                             qo.cursor = qo.cursor.saturating_sub(1);
         }
+                        // Enter acts on the highlighted row — folders descend,
+                        // files open. Right does too, but only on an empty
+                        // query, where it isn't text-cursor movement.
+                        let empty_query = qo.query.is_empty();
+                        let activate = ctx.input(|i| {
+                            i.key_pressed(egui::Key::Enter)
+                                || (empty_query && i.key_pressed(egui::Key::ArrowRight))
+                        });
 
                         ui.separator();
 
-                        egui::ScrollArea::vertical().max_height(h - 60.0).show(ui, |ui| {
-                            ui.style_mut().spacing.item_spacing.y = 0.0;
-                            for (di, &fi) in qo.filtered.iter().enumerate() {
-                                let path = &qo.all[fi];
-                                let rel  = path.strip_prefix(&cwd).unwrap_or(path);
-                                let name = rel.to_string_lossy().to_string();
-                                let sel  = di == qo.cursor;
-                                let bg   = if sel { egui::Color32::from_rgb(0, 120, 212) }
-                                           else   { egui::Color32::TRANSPARENT };
-                                egui::Frame::none().fill(bg)
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
-                                        let resp = ui.add(egui::Label::new(
-                                            egui::RichText::new(&name).size(13.0)
-                                                .color(if sel { egui::Color32::WHITE }
-                                                       else   { egui::Color32::from_gray(200) })
-                                        ).sense(egui::Sense::click()));
-                                        if resp.clicked()
-                                        || (sel && ctx.input(|i| i.key_pressed(egui::Key::Enter)))
-                                        {
-                                            open_path = Some(path.clone());
-                                            dismissed = true;
+                        if qo.listing() {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Reading folder…").size(13.0)
+                                .color(egui::Color32::from_gray(150)));
+                            ui.add_space(6.0);
                         }
-                                    });
+
+                        egui::ScrollArea::vertical().max_height(h - 80.0).show(ui, |ui| {
+                            ui.style_mut().spacing.item_spacing.y = 0.0;
+
+                            // `../` occupies cursor slot 0 whenever we're below
+                            // the root, so the row indices below are offset by it.
+                            let up_offset = if qo.at_root() { 0 } else { 1 };
+                            if up_offset == 1 {
+                                let sel = qo.cursor == 0;
+                                let r = draw_quick_open_row(ui, "../", sel, true);
+                                if r.clicked() || (sel && activate) { ascend = true; }
+                                if sel { r.scroll_to_me(None); }
+                            }
+
+                            for (di, &fi) in qo.filtered.iter().enumerate() {
+                                let entry = &qo.entries[fi];
+                                let sel   = di + up_offset == qo.cursor;
+                                let r = draw_quick_open_row(ui, &entry.name, sel, entry.is_dir);
+                                if r.clicked() || (sel && activate) {
+                                    if entry.is_dir {
+                                        descend = Some(entry.path.clone());
+                                    } else {
+                                        open_path = Some(entry.path.clone());
+                                        dismissed = true;
+                                    }
+                        }
+                                // Keep arrow-key navigation visible; without this
+                                // the cursor walks off the bottom of the viewport.
+                                if sel { r.scroll_to_me(None); }
             }
+
+                            if !qo.listing() && qo.filtered.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(
+                                    if qo.entries.is_empty() { "Empty folder" }
+                                    else                     { "No matches in this folder" }
+                                ).size(12.0).color(egui::Color32::from_gray(130)));
+                            }
+                            if qo.truncated {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(format!(
+                                    "Showing first {QUICK_OPEN_MAX_ENTRIES} entries of this folder"
+                                )).size(11.0).color(egui::Color32::from_gray(130)));
+                            }
                         });
                     });
             });
+
+        // Descend wins over ascend if a click and a key landed on the same frame.
+        if let Some(dir) = descend { qo.enter(dir); }
+        else if ascend          { qo.go_up(); }
 
         if !dismissed { self.quick_open = Some(qo); }
         if let Some(path) = open_path { self.open_file(path); }
@@ -8852,13 +9225,32 @@ impl IdeApp {
 
         // ── Recompute blame on file switch / after commit-pull (coarse: not
         //    per keystroke — blame only changes when history does). ──────────
+        //    Dispatched to a worker rather than computed inline: blame walks
+        //    the file's history, which measured ~240ms on this file alone in a
+        //    five-commit repo, and it ran on every tab switch.
         if self.blame_path != active_path {
-            let text = self.buffers.get(self.active).map(|b| b.text()).unwrap_or_default();
-            self.blame_lines = match (&self.git, &active_path) {
-                (Some(g), Some(p)) => g.blame(p, &text),
-                _ => Vec::new(),
+            self.blame_path  = active_path.clone();
+            self.blame_lines = Vec::new();
+            self.blame_rx    = match (&self.git, &active_path) {
+                (Some(g), Some(p)) => {
+                    let text = self.buffers.get(self.active)
+                        .map(|b| b.text()).unwrap_or_default();
+                    Some(crate::git::spawn_blame(
+                        g.workdir().to_path_buf(), p.clone(), text))
+                }
+                _ => None,
             };
-            self.blame_path = active_path.clone();
+        }
+        if let Some(rx) = &self.blame_rx {
+            match rx.try_recv() {
+                // Discard a result for a file we've since navigated away from.
+                Ok((path, lines)) => {
+                    if Some(&path) == active_path.as_ref() { self.blame_lines = lines; }
+                    self.blame_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty)        => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.blame_rx = None,
+            }
         }
         let blame = self.blame_lines.clone();
 
@@ -8951,22 +9343,24 @@ impl IdeApp {
                     self.fmt_req = lsp.formatting(&path);
                 }
             } else {
+                // Shell out on a worker thread. `fmt::format` blocks on
+                // `wait_with_output`, and prettier's cold start alone is a
+                // sizeable fraction of a second — inline, the window froze for
+                // the whole formatter run.
                 let name = buf.path.as_ref()
                     .and_then(|p| p.file_name()).and_then(|n| n.to_str())
                     .unwrap_or("untitled").to_string();
-                match crate::fmt::format(ext_now, &name, &buf.text()) {
-                    Ok(t)  => {
-                        buf.lines = if t.is_empty() { vec![String::new()] }
-                                    else { t.lines().map(String::from).collect() };
-                        buf.modified = true;
-                        self.gutter_dirty = true;
-                        let (r, c) = buf.cursor;
-                        let r = r.min(buf.lines.len() - 1);
-                        buf.cursor = (r, c.min(buf.lines[r].len()));
-                        self.status = "Formatted".into();
-                    }
-                    Err(e) => self.status = format!("Format: {e}"),
-                }
+                let sent = buf.text();
+                let path = buf.path.clone();
+                let ext  = ext_now.to_string();
+                let text = sent.clone();
+                let (tx, rx) = mpsc::channel();
+                self.fmt_rx = Some(rx);
+                self.status = "Formatting…".into();
+                std::thread::spawn(move || {
+                    let result = crate::fmt::format(&ext, &name, &text);
+                    let _ = tx.send(PendingFormat { path, sent, result });
+                });
             }
         }
         // Format on save (Ctrl+S already handled above — re-check just for format)
@@ -10188,6 +10582,35 @@ impl IdeApp {
         }
     }
 
+    /// Apply a finished external-formatter run to its buffer.
+    fn apply_format(&mut self, pf: PendingFormat) {
+        let formatted = match pf.result {
+            Ok(t)  => t,
+            Err(e) => { self.status = format!("Format: {e}"); return; }
+        };
+        let msg = {
+            let Some(buf) = self.buffers.iter_mut()
+                .find(|b| b.diff.is_none() && b.path == pf.path)
+            else {
+                // Tab was closed while the formatter ran.
+                return;
+            };
+            if buf.text() != pf.sent {
+                "Format: buffer changed while formatting — not applied".to_string()
+            } else {
+                buf.lines = if formatted.is_empty() { vec![String::new()] }
+                            else { formatted.lines().map(String::from).collect() };
+                buf.modified = true;
+                let (r, c) = buf.cursor;
+                let r = r.min(buf.lines.len() - 1);
+                buf.cursor = (r, c.min(buf.lines[r].len()));
+                "Formatted".to_string()
+            }
+        };
+        self.gutter_dirty = true;
+        self.status = msg;
+    }
+
     fn open_file(&mut self, path: PathBuf) {
         if let Some(i) = self.buffers.iter()
             .position(|b| b.diff.is_none() && b.path.as_ref() == Some(&path))
@@ -10455,8 +10878,30 @@ impl IdeApp {
     /// an SSH connect result) shouldn't rip focus away from a Terminal tab
     /// the user is actively looking at; it can just sit in Output for them
     /// to check whenever they switch over.
+    /// Append one line to the Output panel, bounding both the number of
+    /// retained lines and the length of any single line.
+    ///
+    /// This was an uncapped `Vec<(String, OutputLevel)>` that only ever grew:
+    /// task/git/SSH output streams in line by line, so a long session kept
+    /// every line forever. Measured at ~120 MB of resident heap growth over a
+    /// 15-hour session, and every line is also a widget in the Output panel.
+    fn push_output(&mut self, msg: String, level: OutputLevel) {
+        let msg = if msg.chars().count() > MAX_OUTPUT_LINE_CHARS {
+            // One pathological line (a task dumping a huge blob) shouldn't be
+            // held in full, or laid out in full, forever.
+            let mut t: String = msg.chars().take(MAX_OUTPUT_LINE_CHARS).collect();
+            t.push('…');
+            t
+        } else {
+            msg
+        };
+        self.output_log.push((msg, level));
+        let excess = self.output_log.len().saturating_sub(MAX_OUTPUT_LINES);
+        if excess > 0 { self.output_log.drain(..excess); }
+    }
+
     fn output_log(&mut self, msg: impl Into<String>, level: OutputLevel) {
-        self.output_log.push((msg.into(), level));
+        self.push_output(msg.into(), level);
         self.show_term = true;
     }
 
@@ -11031,10 +11476,23 @@ fn setup_fonts(ctx: &egui::Context) {
     // a "tofu" missing-glyph box. Inserted right after the main UI font
     // (position 1): ordinary text still prefers HelveticaNeue, only the
     // glyphs it's missing fall through to this.
+    //
+    // Ordered smallest-sufficient-first. `Arial Unicode.ttf` covers essentially
+    // everything, but it is a 22 MB file and `FontData::from_owned` keeps it
+    // resident: measured at **67 MB** of process footprint (551 MB -> 485 MB
+    // when swapped out), for a fallback whose job is arrows and checkmarks.
+    // Apple Symbols is 877 KB and covers the symbol ranges that actually
+    // triggered this. Arial Unicode stays as a later candidate so a machine
+    // without Apple Symbols still gets broad coverage.
+    //
+    // TRADEOFF: with Apple Symbols first, text outside its coverage — CJK
+    // especially — falls back to egui's built-in fonts and can render as tofu.
+    // To restore the old behavior, move the Arial Unicode line back to the top.
     let symbol_candidates = [
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", // macOS — very broad coverage
+        "/System/Library/Fonts/Apple Symbols.ttf",              // macOS — 877 KB, arrows/math/misc
         "C:/Windows/Fonts/seguisym.ttf",                        // Windows — Segoe UI Symbol
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      // Linux — already broad
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", // macOS — 22 MB, near-total coverage
     ];
     for path in symbol_candidates {
         if let Ok(data) = std::fs::read(path) {
@@ -11067,4 +11525,413 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+}
+
+
+#[cfg(test)]
+mod quick_open_tests {
+    use super::{QuickOpen, QuickOpenEntry, list_dir, fuzzy_match, QUICK_OPEN_MAX_ENTRIES};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    /// Unique scratch dir; no `tempfile` dependency in this crate.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-qo-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn list(dir: &Path) -> Vec<QuickOpenEntry> {
+        list_dir(dir, &AtomicBool::new(false)).0
+    }
+
+    fn names(entries: &[QuickOpenEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// The whole point of listing one level: what lives in subdirectories is
+    /// never touched, so cost tracks this folder's width, not the tree's size.
+    #[test]
+    fn lists_only_the_immediate_level() {
+        let root = scratch("one-level");
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("top.rs"), "").unwrap();
+        std::fs::write(root.join("sub/nested.rs"), "").unwrap();
+        std::fs::write(root.join("sub/deeper/buried.rs"), "").unwrap();
+
+        // Directories first, then case-insensitive by name.
+        assert_eq!(names(&list(&root)), vec!["sub/", "top.rs"]);
+        assert_eq!(names(&list(&root.join("sub"))), vec!["deeper/", "nested.rs"]);
+        assert_eq!(names(&list(&root.join("sub/deeper"))), vec!["buried.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink cycle used to hang the old recursive index. With no recursion
+    /// the link is just a navigable row, and listing it terminates trivially.
+    #[test]
+    #[cfg(unix)]
+    fn symlink_to_ancestor_is_listable_not_fatal() {
+        let root = scratch("cycle");
+        std::fs::write(root.join("real.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        let entries = list(&root);
+        // The link is presented as a directory, so it can be navigated…
+        let link = entries.iter().find(|e| e.name == "loop/").expect("link listed");
+        assert!(link.is_dir);
+        // …and stepping into it is one more bounded listing, not a descent.
+        assert_eq!(names(&list(&root.join("loop"))), vec!["loop/", "real.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn caps_a_pathologically_wide_folder() {
+        let root = scratch("wide");
+        for i in 0..(QUICK_OPEN_MAX_ENTRIES + 10) {
+            std::fs::write(root.join(format!("f{i}.txt")), "").unwrap();
+        }
+        let (entries, truncated) = list_dir(&root, &AtomicBool::new(false));
+        assert_eq!(entries.len(), QUICK_OPEN_MAX_ENTRIES);
+        assert!(truncated);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_flag_abandons_the_listing() {
+        let root = scratch("cancel");
+        for i in 0..50 { std::fs::write(root.join(format!("f{i}.txt")), "").unwrap(); }
+        let (entries, _) = list_dir(&root, &AtomicBool::new(true));
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Matches `filetree::FileTree::walk` so the two views agree on what exists.
+    #[test]
+    fn hides_dotfiles_and_node_modules_but_keeps_target() {
+        let root = scratch("skip");
+        for d in [".git", "node_modules", "target"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join(".hidden"), "").unwrap();
+        std::fs::write(root.join("keep.rs"), "").unwrap();
+
+        assert_eq!(names(&list(&root)), vec!["target/", "keep.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filters_within_the_current_folder_case_insensitively() {
+        let root = scratch("filter");
+        std::fs::write(root.join("MyFile.rs"), "").unwrap();
+        std::fs::write(root.join("other.rs"), "").unwrap();
+        std::fs::create_dir(root.join("Docs")).unwrap();
+
+        let entries = list(&root);
+        let dir_entry = entries.iter().find(|e| e.is_dir).unwrap();
+        assert_eq!(dir_entry.name, "Docs/");
+        assert_eq!(dir_entry.name_lower, "docs/");
+        let file = entries.iter().find(|e| e.name == "MyFile.rs").unwrap();
+        assert!(fuzzy_match(&file.name_lower, "myfile"));
+        assert!(!fuzzy_match(&file.name_lower, "zzz"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Navigation is confined to the opened folder: `..` stops at the root
+    /// rather than letting you wander up into the filesystem.
+    #[test]
+    fn go_up_stops_at_the_root() {
+        let root = scratch("bounds");
+        std::fs::create_dir(root.join("sub")).unwrap();
+
+        let mut qo = QuickOpen::new(&root);
+        assert!(qo.at_root());
+        qo.go_up();
+        assert_eq!(qo.dir, root, "must not escape above the project root");
+
+        qo.enter(root.join("sub"));
+        assert!(!qo.at_root());
+        assert_eq!(qo.breadcrumb(), "sub");
+
+        qo.go_up();
+        assert_eq!(qo.dir, root);
+        assert!(qo.at_root());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Navigating clears the filter and resets the cursor, so the previous
+    /// folder's query can't hide everything in the new one.
+    #[test]
+    fn navigating_resets_query_and_cursor() {
+        let root = scratch("reset");
+        std::fs::create_dir(root.join("sub")).unwrap();
+
+        let mut qo = QuickOpen::new(&root);
+        qo.query = "zzz".into();
+        qo.cursor = 7;
+        qo.enter(root.join("sub"));
+        assert!(qo.query.is_empty());
+        assert_eq!(qo.cursor, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Row 0 is `../` below the root, so the default highlight has to skip it —
+    /// otherwise Enter in a folder you just opened would bounce you back out.
+    #[test]
+    fn default_highlight_skips_the_up_row() {
+        let root = scratch("highlight");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/a.rs"), "").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+
+        // At the root there is no `../` row, so slot 0 is the first entry.
+        let mut qo = QuickOpen::new(&root);
+        qo.entries = list(&root);
+        qo.update_filter();
+        assert_eq!(qo.cursor, 0);
+
+        // One level down, slot 0 is `../` and the highlight starts past it.
+        qo.dir = root.join("sub");
+        qo.entries = list(&qo.dir.clone());
+        qo.update_filter();
+        assert_eq!(qo.cursor, 1);
+        assert_eq!(qo.entries[qo.filtered[qo.cursor - 1]].name, "a.rs");
+
+        // With nothing to list, `../` is the only actionable row.
+        qo.dir = root.join("empty");
+        qo.entries = list(&qo.dir.clone());
+        qo.update_filter();
+        assert!(qo.filtered.is_empty());
+        assert_eq!(qo.cursor, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A listing that lands after the user has already navigated on must be
+    /// discarded, or a slow mount would repopulate the wrong folder.
+    #[test]
+    fn stale_listing_is_discarded() {
+        let root = scratch("stale");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("root-file.rs"), "").unwrap();
+        std::fs::write(root.join("sub/sub-file.rs"), "").unwrap();
+
+        let mut qo = QuickOpen::new(&root);
+        // Navigate before polling, so the root listing is now stale.
+        qo.enter(root.join("sub"));
+        for _ in 0..200 {
+            qo.poll();
+            if !qo.listing() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!qo.entries.iter().any(|e| e.name == "root-file.rs"),
+                "stale root listing leaked into sub: {:?}", names(&qo.entries));
+        assert_eq!(names(&qo.entries), vec!["sub-file.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod walk_search_tests {
+    use super::{SearchHit, walk_search, SEARCH_MAX_FILE_BYTES, SEARCH_MAX_DEPTH};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-search-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn search(root: &PathBuf) -> Vec<SearchHit> {
+        let mut hits = Vec::new();
+        walk_search(root, "needle", false, &mut hits, 2000, 0, &AtomicBool::new(false));
+        hits
+    }
+
+    #[test]
+    fn finds_matches_in_nested_files() {
+        let root = scratch("basic");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "nothing\nNEEDLE here\n").unwrap();
+        std::fs::write(root.join("sub/b.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("c.txt"), "no match\n").unwrap();
+
+        let hits = search(&root);
+        assert_eq!(hits.len(), 2, "case-insensitive across nesting");
+        assert!(hits.iter().any(|h| h.file.ends_with("a.txt") && h.line == 1));
+        assert!(hits.iter().any(|h| h.file.ends_with("sub/b.txt") && h.line == 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink cycle used to recurse until the search thread died.
+    #[test]
+    #[cfg(unix)]
+    fn symlink_cycle_terminates() {
+        let root = scratch("cycle");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/hit.txt"), "needle\n").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("sub/loop")).unwrap();
+
+        // Terminating at all is the assertion; the link is not descended, so
+        // the single match is found exactly once.
+        assert_eq!(search(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Files over the cap are skipped without being read into memory.
+    #[test]
+    fn skips_files_over_the_size_cap() {
+        let root = scratch("bigfile");
+        std::fs::write(root.join("small.txt"), "needle\n").unwrap();
+        let big = root.join("big.txt");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(SEARCH_MAX_FILE_BYTES + 1).unwrap();
+        drop(f);
+
+        let hits = search(&root);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].file.ends_with("small.txt"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stops_at_the_depth_cap() {
+        let root = scratch("deep");
+        let mut deep = root.clone();
+        for i in 0..(SEARCH_MAX_DEPTH + 4) {
+            deep = deep.join(format!("d{i}"));
+            std::fs::create_dir(&deep).unwrap();
+            std::fs::write(deep.join("f.txt"), "needle\n").unwrap();
+        }
+        // One match per level within the cap, none below it.
+        assert_eq!(search(&root).len(), SEARCH_MAX_DEPTH);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn honors_the_hit_cap() {
+        let root = scratch("maxhits");
+        for i in 0..40 {
+            std::fs::write(root.join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let mut hits = Vec::new();
+        walk_search(&root, "needle", false, &mut hits, 10, 0, &AtomicBool::new(false));
+        assert_eq!(hits.len(), 10);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_flag_abandons_the_walk() {
+        let root = scratch("cancel");
+        for i in 0..20 {
+            std::fs::write(root.join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let mut hits = Vec::new();
+        walk_search(&root, "needle", false, &mut hits, 2000, 0, &AtomicBool::new(true));
+        assert!(hits.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn case_sensitive_mode_distinguishes() {
+        let root = scratch("case");
+        std::fs::write(root.join("a.txt"), "Needle\nneedle\n").unwrap();
+        let mut hits = Vec::new();
+        walk_search(&root, "needle", true, &mut hits, 2000, 0, &AtomicBool::new(false));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Measures the cost of laying out an entire file into one galley — the current
+/// editor behavior — against laying out only a screenful. Ignored by default:
+///   cargo test -p forge-ide layout_cost -- --ignored --nocapture
+#[cfg(test)]
+mod layout_cost_bench {
+    #[test]
+    #[ignore]
+    fn layout_cost() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/app.rs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        eprintln!("file: {} lines, {} KB", lines.len(), text.len() / 1024);
+        eprintln!("size_of::<epaint::text::Glyph>() = {}",
+                  std::mem::size_of::<egui::epaint::text::Glyph>());
+
+        let ctx = egui::Context::default();
+        // Force font initialization.
+        let _ = ctx.run(Default::default(), |_| {});
+        let pal = crate::theme::Palette::default();
+
+        let measure = |label: &str, src: &str| {
+            let t = std::time::Instant::now();
+            let mut job = super::syntax_highlight(src, "rs", &[], None, 13.0, &pal);
+            let hl = t.elapsed();
+            job.wrap.max_width = f32::INFINITY;
+            let t2 = std::time::Instant::now();
+            let galley = ctx.fonts(|f| f.layout_job(job));
+            let lay = t2.elapsed();
+            let glyphs: usize = galley.rows.iter().map(|r| r.glyphs.len()).sum();
+            let bytes = glyphs * std::mem::size_of::<egui::epaint::text::Glyph>();
+            eprintln!("{label}: highlight {hl:?} + layout {lay:?} = {:?} | \
+                       {} rows, {glyphs} glyphs, ~{:.1} MB of glyph data",
+                      hl + lay, galley.rows.len(), bytes as f64 / 1_048_576.0);
+        };
+
+        measure("WHOLE FILE (current)", &text);
+        // A generous screenful at a typical window height.
+        let visible: String = lines.iter().take(60).cloned().collect::<Vec<_>>().join("\n");
+        measure("60 VISIBLE LINES    ", &visible);
+    }
+}
+
+#[cfg(test)]
+mod output_log_tests {
+    use super::{IdeApp, OutputLevel, MAX_OUTPUT_LINES, MAX_OUTPUT_LINE_CHARS};
+
+    /// A real app rooted at an empty temp dir. `IdeApp` has no cheap
+    /// constructor, so this goes through the normal one.
+    fn app() -> IdeApp {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-outlog-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        IdeApp::new_with_spec(crate::app::NewWindowSpec {
+            cwd: Some(dir), ssh_host: None, is_reload: false,
+        })
+    }
+
+    /// The log used to grow without limit for the life of the process.
+    #[test]
+    fn retained_lines_are_capped() {
+        let mut a = app();
+        for i in 0..(MAX_OUTPUT_LINES + 500) {
+            a.push_output(format!("line {i}"), OutputLevel::Info);
+        }
+        assert_eq!(a.output_log.len(), MAX_OUTPUT_LINES);
+        // Oldest lines are the ones dropped; the newest is still present.
+        let last = &a.output_log.last().unwrap().0;
+        assert_eq!(last, &format!("line {}", MAX_OUTPUT_LINES + 499));
+        assert!(!a.output_log.iter().any(|(m, _)| m == "line 0"));
+    }
+
+    /// One pathological line must not be retained in full.
+    #[test]
+    fn a_single_huge_line_is_truncated() {
+        let mut a = app();
+        a.push_output("x".repeat(MAX_OUTPUT_LINE_CHARS * 3), OutputLevel::Warn);
+        let (msg, _) = &a.output_log[0];
+        assert_eq!(msg.chars().count(), MAX_OUTPUT_LINE_CHARS + 1, "cap + ellipsis");
+        assert!(msg.ends_with('…'));
+    }
+
+    #[test]
+    fn short_lines_are_untouched() {
+        let mut a = app();
+        a.push_output("hello".into(), OutputLevel::Info);
+        assert_eq!(a.output_log[0].0, "hello");
+    }
 }

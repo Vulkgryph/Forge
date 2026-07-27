@@ -4,10 +4,37 @@
 //! up the current branch name and ahead/behind counts against upstream.  No
 //! network, no commit/push/pull yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use git2::{BranchType, Repository, StatusOptions};
+
+/// Cap on retained status entries, and the budget for the probe walk that
+/// decides whether a fully-recursive untracked scan is affordable.
+///
+/// A repo whose working tree is enormous and mostly untracked — a `git init`
+/// in `$HOME` with no `.gitignore` is the case that motivated this — has over
+/// a million untracked files. Recursing them costs tens of seconds inside
+/// libgit2 plus a `PathBuf` per file and one per ancestor directory. None of
+/// that is useful to render, so it is bounded rather than merely deferred.
+const MAX_STATUS_ENTRIES: usize = 20_000;
+
+/// Depth cap for the probe walk. Anything below this is left uncounted and so
+/// assumed to fit — a tree both deeper than this and enormous would still get
+/// the recursive scan. That is survivable because the scan is off-thread and
+/// `MAX_STATUS_ENTRIES` still bounds what is retained; the property that keeps
+/// the probe itself terminating is not following symlinks, not this cap.
+const MAX_PROBE_DEPTH: usize = 24;
+
+/// Result of one background status scan, applied wholesale by `poll`.
+struct StatusScan {
+    statuses:   HashMap<PathBuf, FileStatus>,
+    dirty_dirs: HashSet<PathBuf>,
+    staged:     Vec<(PathBuf, FileStatus)>,
+    unstaged:   Vec<(PathBuf, FileStatus)>,
+    truncated:  bool,
+}
 
 /// What an individual file's state is, condensed into a single category for
 /// rendering. We intentionally collapse "staged + worktree" overlaps; the
@@ -92,6 +119,11 @@ pub struct GitState {
     /// path so opening + per-side actions are unambiguous.
     pub staged:     Vec<(PathBuf, FileStatus)>,
     pub unstaged:   Vec<(PathBuf, FileStatus)>,
+    /// `Some` while a background status scan is in flight.
+    scan_rx:        Option<mpsc::Receiver<StatusScan>>,
+    /// Set when the last scan collapsed untracked directories, or hit
+    /// `MAX_STATUS_ENTRIES`, instead of reporting every file.
+    pub truncated:  bool,
 }
 
 impl GitState {
@@ -107,17 +139,31 @@ impl GitState {
             behind:     0,
             has_origin: false,
             statuses:   HashMap::new(),
-            dirty_dirs: std::collections::HashSet::new(),
+            dirty_dirs: HashSet::new(),
             staged:     Vec::new(),
             unstaged:   Vec::new(),
+            scan_rx:    None,
+            truncated:  false,
         };
         me.refresh();
         Some(me)
     }
 
-    /// Re-read branch info and per-file status. Cheap enough to call after
-    /// every save; libgit2 walks only what's changed since the index mtime.
+    /// Re-read branch info, and kick off a per-file status scan in the
+    /// background.
+    ///
+    /// The status walk used to run inline here, which meant every caller —
+    /// including `open`, itself called during window creation on the event
+    /// loop thread — blocked on it. In a large working tree that is tens of
+    /// seconds with no frames rendered, i.e. an apparently hung window.
+    /// Everything below is metadata-only and cheap; the walk is now
+    /// `start_status_scan` plus `poll`.
     pub fn refresh(&mut self) {
+        self.refresh_meta();
+        self.start_status_scan();
+    }
+
+    fn refresh_meta(&mut self) {
         // ── Branch name ──
         self.branch = self.repo.head().ok()
             .and_then(|h| h.shorthand().map(String::from))
@@ -145,87 +191,44 @@ impl GitState {
             }
         }
 
-        // ── Per-file working tree status ──
-        self.statuses.clear();
-        self.dirty_dirs.clear();
-        self.staged.clear();
-        self.unstaged.clear();
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .renames_head_to_index(true)
-            .renames_index_to_workdir(true)
-            .exclude_submodules(true);
-        if let Ok(entries) = self.repo.statuses(Some(&mut opts)) {
-            for entry in entries.iter() {
-                let Some(rel) = entry.path() else { continue };
-                let abs = self.workdir.join(rel);
-                let s = entry.status();
+    }
 
-                // Per-side categorization for the SC panel.
-                let staged_fs = if s.is_conflicted() {
-                    None // conflicts show on the unstaged side
-                } else if s.is_index_renamed() {
-                    Some(FileStatus::Renamed)
-                } else if s.is_index_new() {
-                    Some(FileStatus::Added)
-                } else if s.is_index_deleted() {
-                    Some(FileStatus::Deleted)
-                } else if s.is_index_modified() || s.is_index_typechange() {
-                    Some(FileStatus::Modified)
-                } else { None };
-                let unstaged_fs = if s.is_conflicted() {
-                    Some(FileStatus::Conflicted)
-                } else if s.is_wt_renamed() {
-                    Some(FileStatus::Renamed)
-                } else if s.is_wt_new() {
-                    Some(FileStatus::Untracked)
-                } else if s.is_wt_deleted() {
-                    Some(FileStatus::Deleted)
-                } else if s.is_wt_modified() || s.is_wt_typechange() {
-                    Some(FileStatus::Modified)
-                } else { None };
-
-                if let Some(st) = staged_fs   { self.staged  .push((abs.clone(), st)); }
-                if let Some(st) = unstaged_fs { self.unstaged.push((abs.clone(), st)); }
-
-                // Collapsed view for the file tree (any non-clean state).
-                let fs = if s.is_conflicted() {
-                    FileStatus::Conflicted
-                } else if s.is_index_renamed() || s.is_wt_renamed() {
-                    FileStatus::Renamed
-                } else if s.is_index_new() {
-                    FileStatus::Added
-                } else if s.is_wt_new() {
-                    FileStatus::Untracked
-                } else if s.is_index_deleted() || s.is_wt_deleted() {
-                    FileStatus::Deleted
-                } else if s.is_index_modified() || s.is_wt_modified() || s.is_wt_typechange() {
-                    FileStatus::Modified
-                } else {
-                    continue;
-                };
-                self.statuses.insert(abs.clone(), fs);
-                // Propagate "dirty" up the directory chain so folders can show
-                // a hint that something inside them has changed.
-                let mut p = abs.parent();
-                while let Some(dir) = p {
-                    if dir == self.workdir.parent().unwrap_or(Path::new("/")) { break; }
-                    self.dirty_dirs.insert(dir.to_path_buf());
-                    if dir == self.workdir { break; }
-                    p = dir.parent();
-                }
+    /// Spawn the working-tree status walk. Any scan already running is
+    /// abandoned — its receiver is dropped, so its send fails harmlessly and
+    /// a stale result can never overwrite a newer one.
+    fn start_status_scan(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.scan_rx = Some(rx);
+        let workdir = self.workdir.clone();
+        std::thread::spawn(move || {
+            if let Some(scan) = scan_status(&workdir) {
+                let _ = tx.send(scan);
+                crate::wake::wake();
             }
-        }
+        });
+    }
 
-        // Sort both lists by full path, case-insensitively — matches VSCode's
-        // Source Control ordering (folder contents grouped, not git2's raw order).
-        let by_path = |a: &(PathBuf, FileStatus), b: &(PathBuf, FileStatus)| {
-            a.0.to_string_lossy().to_lowercase()
-                .cmp(&b.0.to_string_lossy().to_lowercase())
-        };
-        self.staged.sort_by(by_path);
-        self.unstaged.sort_by(by_path);
+    /// True while a scan is in flight, so the UI can keep repainting until
+    /// decorations arrive.
+    pub fn scanning(&self) -> bool { self.scan_rx.is_some() }
+
+    /// Apply a finished scan. Returns true when new data landed, so callers
+    /// can invalidate anything derived from the old statuses.
+    pub fn poll(&mut self) -> bool {
+        let Some(rx) = &self.scan_rx else { return false };
+        match rx.try_recv() {
+            Ok(scan) => {
+                self.statuses   = scan.statuses;
+                self.dirty_dirs = scan.dirty_dirs;
+                self.staged     = scan.staged;
+                self.unstaged   = scan.unstaged;
+                self.truncated  = scan.truncated;
+                self.scan_rx    = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty)        => false,
+            Err(mpsc::TryRecvError::Disconnected) => { self.scan_rx = None; false }
+        }
     }
 
     /// Workspace root (for displaying paths relative to it).
@@ -438,51 +441,239 @@ impl GitState {
         }
         marks
     }
+}
 
-    /// Per-line blame for a file, aligned to the *current* buffer text (so it
-    /// stays correct when the working copy has unsaved edits — those lines come
-    /// back as uncommitted).  Indexed 0-based by line.  Empty for untracked
-    /// files or on error.
-    pub fn blame(&self, abs_path: &Path, current: &str) -> Vec<BlameLine> {
-        let Ok(rel) = abs_path.strip_prefix(&self.workdir) else { return vec![] };
-        let mut opts = git2::BlameOptions::new();
-        let Ok(base) = self.repo.blame_file(rel, Some(&mut opts)) else { return vec![] };
-        // Map the committed blame onto the current buffer contents (falls back
-        // to the raw file blame if the buffer remap fails).
-        let buf_blame = base.blame_buffer(current.as_bytes());
-        let blame: &git2::Blame = buf_blame.as_ref().unwrap_or(&base);
+// ── Background status scanning ────────────────────────────────────────────────
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+fn base_status_opts() -> StatusOptions {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true)
+        .exclude_submodules(true);
+    opts
+}
 
-        let n = current.lines().count().max(1);
-        let mut out = Vec::with_capacity(n);
-        for i in 1..=n {
-            let line = match blame.get_line(i) {
-                Some(h) => {
-                    let oid = h.final_commit_id();
-                    if oid.is_zero() {
-                        BlameLine::uncommitted()
-                    } else if let Ok(commit) = self.repo.find_commit(oid) {
-                        BlameLine {
-                            short:     oid.to_string().chars().take(7).collect(),
-                            author:    commit.author().name().unwrap_or("?").to_string(),
-                            age:       relative_time(commit.time().seconds(), now),
-                            summary:   commit.summary().unwrap_or("").to_string(),
-                            committed: true,
-                        }
-                    } else {
-                        BlameLine::uncommitted()
-                    }
-                }
-                None => BlameLine::uncommitted(),
-            };
-            out.push(line);
+/// Walk the working tree and categorize every changed path.
+///
+/// Runs on a background thread, and opens its own `Repository` handle rather
+/// than sharing the UI's — which keeps `GitState` free of synchronization.
+fn scan_status(workdir: &Path) -> Option<StatusScan> {
+    let repo = Repository::open(workdir).ok()?;
+
+    // Pass 1 collapses untracked directories into one entry each, the way
+    // plain `git status` does. This is the only variant that is cheap
+    // unconditionally: in a `$HOME` repo with no `.gitignore` it is ~60ms,
+    // where the recursive form is ~30s.
+    let mut opts = base_status_opts();
+    opts.recurse_untracked_dirs(false);
+    let collapsed = repo.statuses(Some(&mut opts)).ok()?;
+
+    // Recursing is what the file tree wants — individual files inside a newly
+    // created folder get decorated — so do it whenever it is affordable.
+    // libgit2 exposes no way to abort a status walk part-way, so affordability
+    // has to be decided up front, by a probe walk that *can* stop early.
+    let untracked_dirs: Vec<PathBuf> = collapsed.iter()
+        .filter(|e| e.status().is_wt_new())
+        .filter_map(|e| e.path().map(|p| workdir.join(p)))
+        .filter(|p| p.is_dir())
+        .collect();
+
+    let mut truncated = false;
+    let recursive = if untracked_dirs.is_empty() {
+        None // nothing to expand; pass 1 is already exact
+    } else if untracked_fits(&untracked_dirs, MAX_STATUS_ENTRIES) {
+        opts.recurse_untracked_dirs(true);
+        repo.statuses(Some(&mut opts)).ok()
+    } else {
+        truncated = true;
+        None
+    };
+    let entries = recursive.as_ref().unwrap_or(&collapsed);
+
+    let mut scan = StatusScan {
+        statuses:   HashMap::new(),
+        dirty_dirs: HashSet::new(),
+        staged:     Vec::new(),
+        unstaged:   Vec::new(),
+        truncated,
+    };
+
+    for entry in entries.iter() {
+        if scan.statuses.len() >= MAX_STATUS_ENTRIES {
+            scan.truncated = true;
+            break;
         }
-        out
+        let Some(rel) = entry.path() else { continue };
+        let abs = workdir.join(rel);
+        let s = entry.status();
+
+        // Per-side categorization for the SC panel.
+        let staged_fs = if s.is_conflicted() {
+            None // conflicts show on the unstaged side
+        } else if s.is_index_renamed() {
+            Some(FileStatus::Renamed)
+        } else if s.is_index_new() {
+            Some(FileStatus::Added)
+        } else if s.is_index_deleted() {
+            Some(FileStatus::Deleted)
+        } else if s.is_index_modified() || s.is_index_typechange() {
+            Some(FileStatus::Modified)
+        } else { None };
+        let unstaged_fs = if s.is_conflicted() {
+            Some(FileStatus::Conflicted)
+        } else if s.is_wt_renamed() {
+            Some(FileStatus::Renamed)
+        } else if s.is_wt_new() {
+            Some(FileStatus::Untracked)
+        } else if s.is_wt_deleted() {
+            Some(FileStatus::Deleted)
+        } else if s.is_wt_modified() || s.is_wt_typechange() {
+            Some(FileStatus::Modified)
+        } else { None };
+
+        if let Some(st) = staged_fs   { scan.staged  .push((abs.clone(), st)); }
+        if let Some(st) = unstaged_fs { scan.unstaged.push((abs.clone(), st)); }
+
+        // Collapsed view for the file tree (any non-clean state).
+        let fs = if s.is_conflicted() {
+            FileStatus::Conflicted
+        } else if s.is_index_renamed() || s.is_wt_renamed() {
+            FileStatus::Renamed
+        } else if s.is_index_new() {
+            FileStatus::Added
+        } else if s.is_wt_new() {
+            FileStatus::Untracked
+        } else if s.is_index_deleted() || s.is_wt_deleted() {
+            FileStatus::Deleted
+        } else if s.is_index_modified() || s.is_wt_modified() || s.is_wt_typechange() {
+            FileStatus::Modified
+        } else {
+            continue;
+        };
+        scan.statuses.insert(abs.clone(), fs);
+        // Propagate "dirty" up the directory chain so folders can show a hint
+        // that something inside them has changed.
+        let mut p = abs.parent();
+        while let Some(dir) = p {
+            if dir == workdir.parent().unwrap_or(Path::new("/")) { break; }
+            scan.dirty_dirs.insert(dir.to_path_buf());
+            if dir == workdir { break; }
+            p = dir.parent();
+        }
     }
+
+    // Sort both lists by full path, case-insensitively — matches VSCode's
+    // Source Control ordering (folder contents grouped, not git2's raw order).
+    let by_path = |a: &(PathBuf, FileStatus), b: &(PathBuf, FileStatus)| {
+        a.0.to_string_lossy().to_lowercase()
+            .cmp(&b.0.to_string_lossy().to_lowercase())
+    };
+    scan.staged.sort_by(by_path);
+    scan.unstaged.sort_by(by_path);
+    Some(scan)
+}
+
+/// Probe: would recursing these untracked directories stay within `budget`
+/// files? Stops the moment the budget is blown, which is the whole point —
+/// this is the abortable stand-in for a status walk that can't be aborted.
+///
+/// Counts every file, including ones a nested `.gitignore` would exclude. That
+/// only ever over-counts, so the answer errs toward the cheap collapsed scan.
+fn untracked_fits(dirs: &[PathBuf], budget: usize) -> bool {
+    let mut seen = 0usize;
+    for dir in dirs {
+        if !probe_walk(dir, 0, budget, &mut seen) { return false; }
+    }
+    true
+}
+
+/// Returns false as soon as `*seen` exceeds `budget`. Never follows symlinks —
+/// `entry.file_type()` does not resolve them, so a link cycle cannot make this
+/// recurse forever.
+fn probe_walk(dir: &Path, depth: usize, budget: usize, seen: &mut usize) -> bool {
+    if depth > MAX_PROBE_DEPTH { return true; }
+    let Ok(iter) = std::fs::read_dir(dir) else { return true };
+    for entry in iter.flatten() {
+        if *seen > budget { return false; }
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if !probe_walk(&entry.path(), depth + 1, budget, seen) { return false; }
+        } else if ft.is_file() {
+            *seen += 1;
+        }
+    }
+    *seen <= budget
+}
+
+// ── Blame ───────────────────────────────────────────────────────────────
+
+/// Per-line blame for a file, aligned to the *current* buffer text (so it stays
+/// correct when the working copy has unsaved edits — those lines come back as
+/// uncommitted). Indexed 0-based by line. Empty for untracked files or on error.
+///
+/// Only reachable through `spawn_blame`, deliberately: this walks the file's
+/// history, which measured ~240ms on an 11k-line file in a five-commit repo and
+/// scales with history depth. It used to run inline on every tab switch.
+fn blame_with(repo: &Repository, workdir: &Path, abs_path: &Path, current: &str)
+-> Vec<BlameLine>
+{
+    let Ok(rel) = abs_path.strip_prefix(&workdir) else { return vec![] };
+    let mut opts = git2::BlameOptions::new();
+    let Ok(base) = repo.blame_file(rel, Some(&mut opts)) else { return vec![] };
+    // Map the committed blame onto the current buffer contents (falls back
+    // to the raw file blame if the buffer remap fails).
+    let buf_blame = base.blame_buffer(current.as_bytes());
+    let blame: &git2::Blame = buf_blame.as_ref().unwrap_or(&base);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let n = current.lines().count().max(1);
+    let mut out = Vec::with_capacity(n);
+    for i in 1..=n {
+        let line = match blame.get_line(i) {
+            Some(h) => {
+                let oid = h.final_commit_id();
+                if oid.is_zero() {
+                    BlameLine::uncommitted()
+                } else if let Ok(commit) = repo.find_commit(oid) {
+                    BlameLine {
+                        short:     oid.to_string().chars().take(7).collect(),
+                        author:    commit.author().name().unwrap_or("?").to_string(),
+                        age:       relative_time(commit.time().seconds(), now),
+                        summary:   commit.summary().unwrap_or("").to_string(),
+                        committed: true,
+                    }
+                } else {
+                    BlameLine::uncommitted()
+                }
+            }
+            None => BlameLine::uncommitted(),
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// Run a blame on a background thread. Opens its own `Repository` handle, so
+/// nothing is shared with the UI's `GitState`. The path is echoed back so a
+/// result that arrives after the user switched files can be discarded.
+pub fn spawn_blame(workdir: PathBuf, abs_path: PathBuf, current: String)
+    -> mpsc::Receiver<(PathBuf, Vec<BlameLine>)>
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let lines = match Repository::open(&workdir) {
+            Ok(repo) => blame_with(&repo, &workdir, &abs_path, &current),
+            Err(_)   => Vec::new(),
+        };
+        let _ = tx.send((abs_path, lines));
+        crate::wake::wake();
+    });
+    rx
 }
 
 /// Blame info for a single line, ready to render in a hover tooltip.
@@ -651,4 +842,156 @@ fn push_current_branch(repo: &Repository) -> Result<String, String> {
     po.remote_callbacks(auth_callbacks());
     remote.push(&[refspec.as_str()], Some(&mut po)).map_err(|e| e.to_string())?;
     Ok("Pushed to origin".into())
+}
+
+#[cfg(test)]
+mod status_scan_tests {
+    use super::{FileStatus, MAX_STATUS_ENTRIES, scan_status, untracked_fits};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-git-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `git init` with a committed baseline, so status has something to
+    /// compare against.
+    fn init_repo(dir: &PathBuf) -> git2::Repository {
+        let repo = git2::Repository::init(dir).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        {
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig  = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        }
+        repo
+    }
+
+    /// The probe is the abortable stand-in for libgit2's un-abortable status
+    /// walk, so its only real job is bailing once the budget is blown.
+    #[test]
+    fn probe_rejects_a_tree_over_budget() {
+        let root = scratch("probe-big");
+        for i in 0..50 { std::fs::write(root.join(format!("f{i}")), "").unwrap(); }
+        assert!(!untracked_fits(&[root.clone()], 10));
+        assert!(untracked_fits(&[root.clone()], 500));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_counts_across_nested_directories() {
+        let root = scratch("probe-nested");
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        for p in ["a/1", "a/b/2", "a/b/c/3"] {
+            std::fs::write(root.join(p), "").unwrap();
+        }
+        assert!(untracked_fits(&[root.clone()], 3));
+        assert!(!untracked_fits(&[root.clone()], 2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink cycle must not make the probe recurse forever — the same
+    /// hazard the Quick Open walker had.
+    #[test]
+    #[cfg(unix)]
+    fn probe_does_not_follow_symlinks() {
+        let root = scratch("probe-cycle");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/real"), "").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("sub/loop")).unwrap();
+        // Terminating at all is the assertion.
+        assert!(untracked_fits(&[root.clone()], MAX_STATUS_ENTRIES));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A normal-sized repo takes the recursive path, so files inside a new
+    /// untracked folder still get individual statuses for the file tree.
+    #[test]
+    fn small_repo_reports_files_inside_untracked_dirs() {
+        let root = scratch("small");
+        let _repo = init_repo(&root);
+        std::fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap(); // modified
+        std::fs::write(root.join("loose.txt"), "").unwrap();            // untracked file
+        std::fs::create_dir(root.join("newdir")).unwrap();
+        std::fs::write(root.join("newdir/inner.txt"), "").unwrap();     // inside untracked dir
+
+        let scan = scan_status(&root).expect("scan");
+        assert!(!scan.truncated);
+        assert_eq!(scan.statuses.get(&root.join("tracked.txt")), Some(&FileStatus::Modified));
+        assert_eq!(scan.statuses.get(&root.join("loose.txt")), Some(&FileStatus::Untracked));
+        assert_eq!(scan.statuses.get(&root.join("newdir/inner.txt")),
+                   Some(&FileStatus::Untracked),
+                   "recursive pass should expand untracked directories");
+        // Ancestors are marked dirty so the tree can hint at nested changes.
+        assert!(scan.dirty_dirs.contains(&root.join("newdir")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no untracked directories there is nothing to expand, so pass 1 is
+    /// already exact and the second libgit2 walk is skipped entirely.
+    #[test]
+    fn repo_without_untracked_dirs_is_exact() {
+        let root = scratch("exact");
+        let _repo = init_repo(&root);
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+
+        let scan = scan_status(&root).expect("scan");
+        assert!(!scan.truncated);
+        assert_eq!(scan.statuses.len(), 1);
+        assert_eq!(scan.unstaged.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Staged and worktree sides stay separated, as the SC panel renders them.
+    #[test]
+    fn staged_and_unstaged_sides_are_distinguished() {
+        let root = scratch("sides");
+        let repo = init_repo(&root);
+        std::fs::write(root.join("staged.txt"), "new\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+        std::fs::write(root.join("tracked.txt"), "edited\n").unwrap();
+
+        let scan = scan_status(&root).expect("scan");
+        assert_eq!(scan.staged, vec![(root.join("staged.txt"), FileStatus::Added)]);
+        assert_eq!(scan.unstaged, vec![(root.join("tracked.txt"), FileStatus::Modified)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Timing harness for the real `$HOME` repo — the case that froze window
+/// creation. Ignored by default (machine-specific); run with:
+///   cargo test -p forge-ide home_repo_scan_is_fast -- --ignored --nocapture
+#[cfg(test)]
+mod home_repo_bench {
+    #[test]
+    #[ignore]
+    fn home_repo_scan_is_fast() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+        if git2::Repository::open(&home).is_err() {
+            eprintln!("$HOME is not a git repo; nothing to measure");
+            return;
+        }
+        let t = std::time::Instant::now();
+        let scan = super::scan_status(&home).expect("scan");
+        let elapsed = t.elapsed();
+        eprintln!("scan_status($HOME): {:?}, {} entries, truncated={}",
+                  elapsed, scan.statuses.len(), scan.truncated);
+        assert!(elapsed < std::time::Duration::from_secs(5),
+                "scan took {elapsed:?} — the bound is not holding");
+        assert!(scan.statuses.len() <= super::MAX_STATUS_ENTRIES);
+    }
 }

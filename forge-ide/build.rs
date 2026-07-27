@@ -1,15 +1,14 @@
 use std::fs;
-use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=shaders/egui.vert");
-    println!("cargo:rerun-if-changed=shaders/egui.frag");
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
-    compile("shaders/egui.vert", shaderc::ShaderKind::Vertex,   out_dir.join("egui.vert.spv"));
-    compile("shaders/egui.frag", shaderc::ShaderKind::Fragment, out_dir.join("egui.frag.spv"));
-
+    // Always needed, regardless of renderer.
     emit_forge_server_version();
+
+    // SPIR-V is only consumed by the optional Vulkan renderer (`egui_pass.rs`).
+    // The default wgpu backend carries its own WGSL, so shaderc — a heavy build
+    // dependency that compiles glslang — is skipped entirely by default.
+    #[cfg(feature = "vulkan-renderer")]
+    compile_vulkan_shaders();
 }
 
 /// `ssh.rs` needs forge-server's version to know whether the copy already on
@@ -30,14 +29,26 @@ fn emit_forge_server_version() {
     println!("cargo:rustc-env=FORGE_SERVER_VERSION={version}");
 }
 
-fn compile(src: &str, kind: shaderc::ShaderKind, out: PathBuf) {
-    let source   = fs::read_to_string(src).expect("failed to read shader");
-    let compiler = shaderc::Compiler::new().expect("shaderc unavailable");
-    let mut opts = shaderc::CompileOptions::new().expect("compile options");
-    opts.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
-    opts.set_optimization_level(shaderc::OptimizationLevel::Performance);
-    let artifact = compiler
-        .compile_into_spirv(&source, kind, src, "main", Some(&opts))
-        .unwrap_or_else(|e| panic!("compile {src}: {e}"));
-    fs::write(out, artifact.as_binary_u8()).expect("write SPIR-V");
+#[cfg(feature = "vulkan-renderer")]
+fn compile_vulkan_shaders() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-changed=shaders/egui.vert");
+    println!("cargo:rerun-if-changed=shaders/egui.frag");
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+    compile("shaders/egui.vert", shaderc::ShaderKind::Vertex,   out_dir.join("egui.vert.spv"));
+    compile("shaders/egui.frag", shaderc::ShaderKind::Fragment, out_dir.join("egui.frag.spv"));
+
+    fn compile(src: &str, kind: shaderc::ShaderKind, out: PathBuf) {
+        let source   = fs::read_to_string(src).expect("failed to read shader");
+        let compiler = shaderc::Compiler::new().expect("shaderc unavailable");
+        let mut opts = shaderc::CompileOptions::new().expect("compile options");
+        opts.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
+        opts.set_optimization_level(shaderc::OptimizationLevel::Performance);
+        let artifact = compiler
+            .compile_into_spirv(&source, kind, src, "main", Some(&opts))
+            .unwrap_or_else(|e| panic!("compile {src}: {e}"));
+        fs::write(out, artifact.as_binary_u8()).expect("write SPIR-V");
+    }
 }

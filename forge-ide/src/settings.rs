@@ -116,7 +116,7 @@ impl Default for Settings {
             minimap:            true,
             terminal_font_size: 14.0,
             theme:              "Dark+".into(),
-            restore_session:    false,
+            restore_session:    true,
             check_for_updates:  false,
             update_check_prompted: false,
             onboarding_skipped: false,

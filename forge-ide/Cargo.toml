@@ -10,10 +10,27 @@ repository  = "https://github.com/Vulkgryph/Forge"
 name = "forge-ide"
 path = "src/main.rs"
 
+[features]
+# Default renderer is wgpu (gfx_wgpu.rs): native Metal on macOS, D3D12 on
+# Windows, Vulkan on Linux. Chosen over the hand-written Vulkan backend because
+# Vulkan does not exist on macOS — that path needs MoltenVK, a 10 MB
+# third-party dylib redistributed inside the .app. Metal ships with the OS, so
+# the default build now bundles no third-party runtime at all.
+default = []
+
+# Opt-in: the original hand-written Vulkan renderer (gfx.rs + egui_pass.rs).
+# Kept while wgpu proves itself in real use. Requires MoltenVK to be present at
+# runtime on macOS — it is no longer bundled — and pulls in shaderc at build
+# time to compile the SPIR-V shaders.
+vulkan-renderer = ["dep:ash", "dep:ash-window", "dep:shaderc"]
+
 [dependencies]
 forge-proto       = { path = "forge-proto" }
-ash               = "0.38"
-ash-window        = "0.13"
+egui-wgpu         = { version = "0.29", default-features = false }
+wgpu              = "22"
+pollster          = "0.3"
+ash               = { version = "0.38", optional = true }
+ash-window        = { version = "0.13", optional = true }
 winit             = "0.30"
 egui              = "0.29.1"
 egui-winit        = "0.29.1"
@@ -38,7 +55,7 @@ notify = "6"
 ureq              = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [build-dependencies]
-shaderc = "0.10"
+shaderc = { version = "0.10", optional = true }
 toml    = "0.8"
 
 # winit patch (vendor/winit-0.30.13) is declared in the workspace root

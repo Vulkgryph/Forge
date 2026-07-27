@@ -638,3 +638,90 @@ fn load_entry() -> Result<ash::Entry, String> {
         unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan not found: {e}"))
     }
 }
+
+/// Bisects where the process's graphics memory is actually allocated: before
+/// Vulkan, after instance creation, and after device creation. Answers whether
+/// the large fixed "owned unmapped (graphics)" block is MoltenVK's or ours.
+///   cargo test -p forge-ide vulkan_memory_bisect -- --ignored --nocapture
+#[cfg(test)]
+mod vulkan_memory_bisect {
+    use ash::vk;
+
+    fn footprint(label: &str) {
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-p", &pid]).output();
+        let Ok(out) = out else { eprintln!("{label}: footprint unavailable"); return };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let total = text.lines().find(|l| l.contains("Footprint:"))
+            .and_then(|l| l.split("Footprint:").nth(1)).unwrap_or("?").trim().to_string();
+        let gfx: Vec<&str> = text.lines()
+            .filter(|l| l.contains("(graphics)") || l.contains("IOSurface"))
+            .collect();
+        eprintln!("── {label}\n   total: {total}");
+        for g in gfx { eprintln!("   {}", g.trim()); }
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_memory_bisect() {
+        footprint("BEFORE any Vulkan");
+
+        let entry = super::load_entry().expect("entry");
+        footprint("after load_entry (MoltenVK dylib loaded)");
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"bisect").api_version(vk::API_VERSION_1_3);
+        // Only request what this MoltenVK build actually advertises.
+        let avail = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .unwrap_or_default();
+        let has = |n: &std::ffi::CStr| avail.iter().any(|e| {
+            let got = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
+            got == n
+        });
+        let mut exts: Vec<*const std::ffi::c_char> = Vec::new();
+        let mut flags = vk::InstanceCreateFlags::empty();
+        if has(ash::khr::portability_enumeration::NAME) {
+            exts.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+        if has(ash::khr::get_physical_device_properties2::NAME) {
+            exts.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+        }
+        let instance = unsafe {
+            entry.create_instance(&vk::InstanceCreateInfo::default()
+                .application_info(&app_info)
+                .enabled_extension_names(&exts)
+                .flags(flags), None)
+        }.expect("instance");
+        footprint("after create_instance");
+
+        let physicals = unsafe { instance.enumerate_physical_devices() }.expect("physicals");
+        let physical = physicals[0];
+        footprint("after enumerate_physical_devices");
+
+        let qfams = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let qi = qfams.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .expect("graphics queue") as u32;
+        let prios = [1.0f32];
+        let qci = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(qi).queue_priorities(&prios)];
+        let dev_avail = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .unwrap_or_default();
+        let mut dev_exts: Vec<*const std::ffi::c_char> = Vec::new();
+        if dev_avail.iter().any(|e| {
+            let got = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
+            got == ash::khr::portability_subset::NAME
+        }) {
+            dev_exts.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+        let device = unsafe {
+            instance.create_device(physical, &vk::DeviceCreateInfo::default()
+                .queue_create_infos(&qci)
+                .enabled_extension_names(&dev_exts), None)
+        }.expect("device");
+        footprint("after create_device  <-- the answer");
+
+        unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+    }
+}

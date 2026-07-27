@@ -41,6 +41,7 @@ impl FileWatcher {
                     for path in event.paths {
                         if !is_ignored(&path) {
                             let _ = tx.send(WatchEvent::Removed(path));
+                            crate::wake::wake();
                         }
                     }
                 }
@@ -48,6 +49,7 @@ impl FileWatcher {
                     for path in event.paths {
                         if !is_ignored(&path) {
                             let _ = tx.send(WatchEvent::Changed(path));
+                            crate::wake::wake();
                         }
                     }
                 }

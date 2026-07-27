@@ -7,6 +7,21 @@ const VERTEX_BUFFER_SIZE: vk::DeviceSize = 8 * 1024 * 1024;
 const INDEX_BUFFER_SIZE:  vk::DeviceSize = 4 * 1024 * 1024;
 const FRAMES: usize = 2;
 
+/// One reusable host-visible upload buffer, shared by every texture upload and
+/// atlas patch.
+///
+/// Each upload used to create and destroy its own staging buffer. Besides the
+/// per-call churn — `patch_image` runs whenever egui rasterizes new glyphs — the
+/// allocations themselves were expensive: instrumenting `upload_rgba` showed a
+/// single 6 MB staging allocation expanding MoltenVK's internal Metal pool by
+/// ~172 MB. Allocating once and growing monotonically keeps that to one.
+#[derive(Default)]
+struct Staging {
+    buf:  vk::Buffer,
+    mem:  vk::DeviceMemory,
+    size: vk::DeviceSize,
+}
+
 struct GpuTex {
     image:      vk::Image,
     memory:     vk::DeviceMemory,
@@ -65,6 +80,8 @@ pub struct EguiPass {
     idx_bufs:        [vk::Buffer;       FRAMES],
     idx_mems:        [vk::DeviceMemory; FRAMES],
     textures:        HashMap<egui::TextureId, GpuTex>,
+    /// Reusable upload buffer — see `Staging`.
+    stage:           Staging,
     pub ctx:         egui::Context,
     pub winit:       egui_winit::State,
 }
@@ -101,7 +118,7 @@ impl EguiPass {
         Ok(Self {
             shared: shared.clone(), desc_pool,
             vert_bufs, vert_mems, idx_bufs, idx_mems,
-            textures: HashMap::new(), ctx, winit,
+            textures: HashMap::new(), stage: Staging::default(), ctx, winit,
         })
     }
 
@@ -135,7 +152,9 @@ impl EguiPass {
                     // trusting the offset/size blindly or corrupting the
                     // existing (still valid) texture with a wrong-sized one.
                     if px + w <= existing.width && py + h <= existing.height {
-                        patch_image(device, &mem_props, queue, command_pool,
+                        ensure_staging(device, &mem_props, &mut self.stage,
+                                       rgba.len() as vk::DeviceSize)?;
+                        patch_image(device, &self.stage, queue, command_pool,
                                     existing.image, w, h, px, py, &rgba)?;
                     } else {
                         eprintln!(
@@ -147,7 +166,9 @@ impl EguiPass {
                 }
             }
             if let Some(old) = self.textures.remove(&id) { destroy_tex(device, old); }
-            let t = upload_tex(device, &mem_props, queue, command_pool,
+            ensure_staging(device, &mem_props, &mut self.stage,
+                           rgba.len() as vk::DeviceSize)?;
+            let t = upload_tex(device, &mem_props, &self.stage, queue, command_pool,
                                self.desc_pool, self.shared.0.set_layout, w, h, &rgba)?;
             self.textures.insert(id, t);
         }
@@ -247,6 +268,10 @@ impl EguiPass {
                 device.free_memory(self.vert_mems[i],     None);
                 device.destroy_buffer(self.idx_bufs[i],   None);
                 device.free_memory(self.idx_mems[i],      None);
+            }
+            if self.stage.size > 0 {
+                device.destroy_buffer(self.stage.buf, None);
+                device.free_memory(self.stage.mem, None);
             }
             device.destroy_descriptor_pool(self.desc_pool, None);
         }
@@ -370,6 +395,7 @@ fn shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule, S
 fn upload_tex(
     device:     &ash::Device,
     mem_props:  &vk::PhysicalDeviceMemoryProperties,
+    stage:      &Staging,
     queue:      vk::Queue,
     pool:       vk::CommandPool,
     desc_pool:  vk::DescriptorPool,
@@ -396,7 +422,7 @@ fn upload_tex(
     )}.map_err(|e| format!("image mem: {e:?}"))?;
     unsafe { device.bind_image_memory(image, memory, 0) }.map_err(|e| format!("bind: {e:?}"))?;
 
-    upload_rgba(device, mem_props, queue, pool, image, w, h, rgba)?;
+    upload_rgba(device, stage, queue, pool, image, w, h, rgba)?;
 
     let view = unsafe { device.create_image_view(&vk::ImageViewCreateInfo::default()
         .image(image).view_type(vk::ImageViewType::TYPE_2D)
@@ -431,28 +457,18 @@ fn upload_tex(
 }
 
 fn upload_rgba(
-    device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties,
+    device: &ash::Device, stage: &Staging,
     queue: vk::Queue, pool: vk::CommandPool,
     image: vk::Image, w: u32, h: u32, rgba: &[u8],
 ) -> Result<(), String> {
     let size = rgba.len() as vk::DeviceSize;
-    let staging = unsafe { device.create_buffer(&vk::BufferCreateInfo::default()
-        .size(size).usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }
-        .map_err(|e| format!("staging: {e:?}"))?;
-    let req = unsafe { device.get_buffer_memory_requirements(staging) };
-    let mt  = find_memory_type(mem_props, req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-        .ok_or("no host-visible memory")?;
-    let smem = unsafe { device.allocate_memory(
-        &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None,
-    )}.map_err(|e| format!("staging mem: {e:?}"))?;
+    debug_assert!(stage.size >= size, "staging buffer too small — call ensure_staging first");
+    let staging = stage.buf;
     unsafe {
-        device.bind_buffer_memory(staging, smem, 0).map_err(|e| format!("{e:?}"))?;
-        let ptr = device.map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
+        let ptr = device.map_memory(stage.mem, 0, size, vk::MemoryMapFlags::empty())
             .map_err(|e| format!("{e:?}"))?;
         std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr.cast::<u8>(), rgba.len());
-        device.unmap_memory(smem);
+        device.unmap_memory(stage.mem);
     }
     let cmd = one_shot_begin(device, pool)?;
     unsafe {
@@ -483,36 +499,22 @@ fn upload_rgba(
         ]);
     }
     one_shot_end(device, pool, queue, cmd)?;
-    unsafe {
-        device.destroy_buffer(staging, None);
-        device.free_memory(smem, None);
-    }
     Ok(())
 }
 
 fn patch_image(
-    device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties,
+    device: &ash::Device, stage: &Staging,
     queue: vk::Queue, pool: vk::CommandPool,
     image: vk::Image, w: u32, h: u32, px: u32, py: u32, rgba: &[u8],
 ) -> Result<(), String> {
     let size = rgba.len() as vk::DeviceSize;
-    let staging = unsafe { device.create_buffer(&vk::BufferCreateInfo::default()
-        .size(size).usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }
-        .map_err(|e| format!("{e:?}"))?;
-    let req = unsafe { device.get_buffer_memory_requirements(staging) };
-    let mt  = find_memory_type(mem_props, req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-        .ok_or("no host-visible memory")?;
-    let smem = unsafe { device.allocate_memory(
-        &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None,
-    )}.map_err(|e| format!("{e:?}"))?;
+    debug_assert!(stage.size >= size, "staging buffer too small — call ensure_staging first");
+    let staging = stage.buf;
     unsafe {
-        device.bind_buffer_memory(staging, smem, 0).map_err(|e| format!("{e:?}"))?;
-        let ptr = device.map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
+        let ptr = device.map_memory(stage.mem, 0, size, vk::MemoryMapFlags::empty())
             .map_err(|e| format!("{e:?}"))?;
         std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr.cast::<u8>(), rgba.len());
-        device.unmap_memory(smem);
+        device.unmap_memory(stage.mem);
     }
     let cmd = one_shot_begin(device, pool)?;
     unsafe {
@@ -546,10 +548,6 @@ fn patch_image(
         ]);
     }
     one_shot_end(device, pool, queue, cmd)?;
-    unsafe {
-        device.destroy_buffer(staging, None);
-        device.free_memory(smem, None);
-    }
     Ok(())
 }
 
@@ -560,6 +558,29 @@ fn destroy_tex(device: &ash::Device, t: GpuTex) {
         device.free_memory(t.memory, None);
         device.destroy_sampler(t.sampler, None);
     }
+}
+
+/// Grow `stage` to hold at least `need` bytes. Never shrinks, so a session
+/// settles on one allocation sized to the largest upload it has seen.
+fn ensure_staging(
+    device:    &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    stage:     &mut Staging,
+    need:      vk::DeviceSize,
+) -> Result<(), String> {
+    if stage.size >= need && stage.size > 0 { return Ok(()); }
+    // Round up to a power of two (min 1 MiB) so a slowly-growing atlas doesn't
+    // reallocate on every patch.
+    let cap = need.max(1024 * 1024).next_power_of_two();
+    if stage.size > 0 {
+        unsafe {
+            device.destroy_buffer(stage.buf, None);
+            device.free_memory(stage.mem, None);
+        }
+    }
+    let (buf, mem) = host_buffer(device, mem_props, cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
+    *stage = Staging { buf, mem, size: cap };
+    Ok(())
 }
 
 fn host_buffer(

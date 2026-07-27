@@ -125,6 +125,11 @@ const DEFAULT_ROWS:    usize = 24;
 const DEFAULT_COLS:    usize = 80;
 const MAX_SCROLLBACK:  usize = 5000;
 
+/// How many scrollback lines a persisted `GridSnapshot` keeps. Far smaller than
+/// `MAX_SCROLLBACK`: this is only restored for visual continuity on reattach,
+/// and it is what `session.json` pays for on every save/load.
+const SNAPSHOT_SCROLLBACK: usize = 200;
+
 #[derive(PartialEq, Clone, Copy)]
 enum PState { Ground, Esc, Csi, Osc, Charset }
 
@@ -218,6 +223,13 @@ impl Grid {
     pub fn cursor_visible(&self) -> bool { self.cursor_visible }
 
     pub fn snapshot(&self) -> GridSnapshot {
+        // Only the tail of the scrollback is persisted. Snapshots exist purely
+        // so a reattached terminal shows recent context instead of sitting
+        // blank, and every cell serializes as a JSON object — a full
+        // `MAX_SCROLLBACK` history produced a 132 MB `session.json` for a
+        // single terminal, which then had to be written and re-parsed
+        // synchronously on the event-loop thread at every save and restore.
+        let keep = self.scrollback.len().saturating_sub(SNAPSHOT_SCROLLBACK);
         GridSnapshot {
             rows: self.rows,
             cols: self.cols,
@@ -227,7 +239,7 @@ impl Grid {
             cells: self.viewport.iter()
                 .map(|row| row.iter().map(CellSnap::from).collect())
                 .collect(),
-            scrollback: self.scrollback.iter()
+            scrollback: self.scrollback.iter().skip(keep)
                 .map(|row| row.iter().map(CellSnap::from).collect())
                 .collect(),
         }
@@ -650,6 +662,10 @@ fn feed_grid(
         if let Ok(mut g) = grid.lock() { g.process(&s); }
         leftover.drain(..valid_len);
         *last_output.lock().unwrap() = Some(std::time::Instant::now());
+        // Shell output arrives with no user input behind it; the event loop is
+        // asleep and has to be told. Both PTY reader threads funnel through
+        // here, so this is the single place that needs it.
+        crate::wake::wake();
     }
     // A valid UTF-8 sequence is at most 4 bytes; anything longer than that
     // left over is genuinely invalid, not just incomplete — drop it so a

@@ -135,6 +135,8 @@ impl LspClient {
                     continue;
                 }
                 if tx.send(msg).is_err() { break; }
+                // Diagnostics arrive unprompted while the server indexes.
+                crate::wake::wake();
             }
         });
 

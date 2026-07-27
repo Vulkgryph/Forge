@@ -52,8 +52,19 @@ fn session_path(root: &Path) -> PathBuf {
 }
 
 pub fn load(root: &Path) -> Option<SessionState> {
-    let text = std::fs::read_to_string(session_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = session_path(root);
+    // A missing file is the normal "no session yet" case and stays quiet. A
+    // file that exists but won't parse is a real failure — a truncated write, a
+    // schema change — and used to be swallowed by `.ok()?`, so a whole restored
+    // session silently became "nothing to restore" with no way to tell why.
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            eprintln!("session: ignoring unreadable {} ({e})", path.display());
+            None
+        }
+    }
 }
 
 pub fn save(root: &Path, state: &SessionState) {
@@ -61,7 +72,86 @@ pub fn save(root: &Path, state: &SessionState) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(path, text);
+    // Compact, not pretty: nothing reads this by hand, and pretty-printing the
+    // terminal cell arrays roughly tripled an already-oversized file.
+    let Ok(text) = serde_json::to_string(state) else { return };
+    // Write to a sibling temp file and rename, so an interrupted or partial
+    // write can't replace a good session with a truncated one — the failure
+    // mode that loses everything, since a corrupt file restores nothing.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("forge-sess-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A saved session with a busy terminal must stay small. This file used to
+    /// reach 132 MB for one terminal, which made every save and restore a
+    /// multi-second synchronous stall and risked truncation.
+    #[test]
+    fn saved_session_with_a_busy_terminal_stays_small() {
+        let root = scratch("size");
+        let mut grid = crate::terminal::Grid::with_size(50, 220);
+        // Well past the snapshot cap, so trimming is what bounds the file.
+        let mut feed = String::new();
+        for i in 0..4000 {
+            feed.push_str(&format!("line {i} ...........................\r\n"));
+        }
+        grid.process(&feed);
+        let state = SessionState {
+            open_files: vec![root.join("a.rs")],
+            terminals: vec![TerminalState {
+                pty_id: Some(1), cwd: root.clone(), viewport: Some(grid.snapshot()),
+            }],
+            ..Default::default()
+        };
+        save(&root, &state);
+        let bytes = std::fs::metadata(session_path(&root)).unwrap().len();
+        eprintln!("session.json for a 4000-line terminal: {} KB", bytes / 1024);
+        assert!(bytes < 8 * 1024 * 1024,
+                "session.json is {bytes} bytes — the scrollback cap regressed");
+        // And it still round-trips.
+        let back = load(&root).expect("should load");
+        assert_eq!(back.open_files, state.open_files);
+        assert_eq!(back.terminals.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A corrupt file must be reported and ignored, not panic.
+    #[test]
+    fn corrupt_session_is_ignored() {
+        let root = scratch("corrupt");
+        std::fs::create_dir_all(root.join(".forge")).unwrap();
+        std::fs::write(session_path(&root), "{ truncated").unwrap();
+        assert!(load(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_session_is_none() {
+        let root = scratch("missing");
+        assert!(load(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The temp-file dance must not leave debris behind.
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let root = scratch("tmp");
+        save(&root, &SessionState::default());
+        assert!(session_path(&root).exists());
+        assert!(!session_path(&root).with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2,10 +2,14 @@ mod agent_panel;
 mod app;
 mod buffer;
 mod dap;
+#[cfg(feature = "vulkan-renderer")]
 mod egui_pass;
 mod filetree;
 mod filewatch;
+#[cfg(feature = "vulkan-renderer")]
 mod gfx;
+#[cfg(not(feature = "vulkan-renderer"))]
+mod gfx_wgpu;
 mod git;
 mod icons;
 mod lsp;
@@ -19,12 +23,17 @@ mod ssh;
 mod tasks;
 mod theme;
 mod update_check;
+mod wake;
 pub use app::OutputLevel;
 mod markdown;
 mod terminal;
 
+use std::sync::Arc;
+
 use app::{IdeApp, NewWindowSpec};
+#[cfg(feature = "vulkan-renderer")]
 use egui_pass::{EguiPass, SharedEguiPass};
+#[cfg(feature = "vulkan-renderer")]
 use gfx::{GfxContext, SharedGfx};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -33,13 +42,23 @@ use winit::window::{Window, WindowId};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
+/// Whatever the active backend needs to share process-wide across windows.
+#[cfg(feature = "vulkan-renderer")]
+type SharedRenderer = (SharedGfx, SharedEguiPass);
+#[cfg(not(feature = "vulkan-renderer"))]
+type SharedRenderer = Arc<gfx_wgpu::SharedWgpu>;
+
 // ── Per-window state ──────────────────────────────────────────────────────────
 
 struct IdeWindow {
     id:     WindowId,
-    window: Window,
+    window: Arc<Window>,
+    #[cfg(feature = "vulkan-renderer")]
     gfx:    GfxContext,
+    #[cfg(feature = "vulkan-renderer")]
     egui:   EguiPass,
+    #[cfg(not(feature = "vulkan-renderer"))]
+    egui:   gfx_wgpu::WgpuPass,
     app:    IdeApp,
     /// Closed by the user but not yet removed from the vec.
     closing: bool,
@@ -62,7 +81,7 @@ impl IdeWindow {
     fn create(
         event_loop: &ActiveEventLoop,
         spec: NewWindowSpec,
-        shared: &mut Option<(SharedGfx, SharedEguiPass)>,
+        shared: &mut Option<SharedRenderer>,
     ) -> Option<Self> {
         let window = event_loop.create_window(
             Window::default_attributes()
@@ -71,7 +90,9 @@ impl IdeWindow {
                 .with_inner_size(winit::dpi::LogicalSize::new(1400u32, 900u32)),
         ).ok()?;
         window.focus_window();
+        let window = Arc::new(window);
 
+        #[cfg(feature = "vulkan-renderer")]
         let (gfx, egui) = match shared {
             Some((shared_gfx, shared_egui)) => {
                 let gfx = match GfxContext::new_shared(shared_gfx, &window) {
@@ -105,6 +126,13 @@ impl IdeWindow {
                 (gfx, egui)
             }
         };
+
+        #[cfg(not(feature = "vulkan-renderer"))]
+        let egui = match gfx_wgpu::WgpuPass::new(shared, Arc::clone(&window)) {
+            Ok(p)  => p,
+            Err(e) => { eprintln!("wgpu init: {e}"); return None; }
+        };
+
         let id  = window.id();
         let app = IdeApp::new_with_spec(spec);
 
@@ -122,7 +150,10 @@ impl IdeWindow {
             });
         }
 
-        Some(IdeWindow { id, window, gfx, egui, app, closing: false, next_repaint })
+        #[cfg(feature = "vulkan-renderer")]
+        return Some(IdeWindow { id, window, gfx, egui, app, closing: false, next_repaint });
+        #[cfg(not(feature = "vulkan-renderer"))]
+        return Some(IdeWindow { id, window, egui, app, closing: false, next_repaint });
     }
 
     /// Renders one frame and returns the earliest time (if any) this frame's
@@ -130,28 +161,43 @@ impl IdeWindow {
     fn render(&mut self) -> Option<std::time::Instant> {
         *self.next_repaint.lock().unwrap() = None;
 
-        if self.gfx.is_dirty() { self.gfx.rebuild(&self.window); }
+        #[cfg(feature = "vulkan-renderer")]
+        {
+            if self.gfx.is_dirty() { self.gfx.rebuild(&self.window); }
 
-        let raw_input   = self.egui.winit.take_egui_input(&self.window);
-        let full_output  = self.egui.ctx.run(raw_input, |ctx| self.app.draw(ctx));
-        self.egui.winit.handle_platform_output(&self.window, full_output.platform_output.clone());
+            let raw_input   = self.egui.winit.take_egui_input(&self.window);
+            let full_output = self.egui.ctx.run(raw_input, |ctx| self.app.draw(ctx));
+            self.egui.winit.handle_platform_output(
+                &self.window, full_output.platform_output.clone());
 
-        if !full_output.textures_delta.is_empty() {
-            let _ = self.egui.update_textures(
-                self.gfx.instance(), self.gfx.physical(), self.gfx.device(),
-                self.gfx.queue(), self.gfx.command_pool,
-                full_output.textures_delta,
-            );
+            if !full_output.textures_delta.is_empty() {
+                let _ = self.egui.update_textures(
+                    self.gfx.instance(), self.gfx.physical(), self.gfx.device(),
+                    self.gfx.queue(), self.gfx.command_pool,
+                    full_output.textures_delta,
+                );
+            }
+
+            let primitives = self.egui.ctx.tessellate(
+                full_output.shapes, full_output.pixels_per_point);
+
+            if let Some((cmd, img_idx, fi)) = self.gfx.begin_frame() {
+                self.egui.record(
+                    self.gfx.device(), cmd, fi, self.gfx.extent,
+                    &primitives, full_output.pixels_per_point);
+                self.gfx.end_frame(cmd, img_idx);
+            }
         }
 
-        let primitives = self.egui.ctx.tessellate(
-            full_output.shapes, full_output.pixels_per_point);
-
-        if let Some((cmd, img_idx, fi)) = self.gfx.begin_frame() {
-            self.egui.record(
-                self.gfx.device(), cmd, fi, self.gfx.extent,
-                &primitives, full_output.pixels_per_point);
-            self.gfx.end_frame(cmd, img_idx);
+        #[cfg(not(feature = "vulkan-renderer"))]
+        {
+            let raw_input   = self.egui.winit.take_egui_input(&self.window);
+            let full_output = self.egui.ctx.run(raw_input, |ctx| self.app.draw(ctx));
+            self.egui.winit.handle_platform_output(
+                &self.window, full_output.platform_output.clone());
+            let ppp = full_output.pixels_per_point;
+            let window = Arc::clone(&self.window);
+            self.egui.present(&window, full_output, ppp);
         }
 
         self.next_repaint.lock().unwrap().take()
@@ -174,7 +220,7 @@ struct Ide {
     initial_specs: Vec<NewWindowSpec>,
     /// The process-wide Vulkan instance/device + egui pipeline, populated by
     /// the first window created and reused by every window after it.
-    shared: Option<(SharedGfx, SharedEguiPass)>,
+    shared: Option<SharedRenderer>,
     /// Set whenever a real window event arrives (`window_event`) or a new
     /// window is queued — cleared once that's actually been rendered.
     /// `about_to_wait` only does the expensive egui-layout-plus-Vulkan-submit
@@ -231,7 +277,7 @@ impl ApplicationHandler for Ide {
         let Some(win) = self.find_mut(id) else { return };
 
         // Forward to egui first
-        let resp = win.egui.winit.on_window_event(&win.window, &event);
+        let resp = win.egui.winit.on_window_event(&*win.window, &event);
         if resp.consumed { return; }
 
         match event {
@@ -244,11 +290,17 @@ impl ApplicationHandler for Ide {
                 // process) stay open would leak its Vulkan resources for
                 // as long as the process keeps running, since the device
                 // itself stays alive via the other windows' `Arc` refs.
+                #[cfg(feature = "vulkan-renderer")]
                 win.egui.destroy(win.gfx.device());
                 win.closing = true;
             }
             WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 { win.gfx.mark_dirty(); }
+                if size.width > 0 && size.height > 0 {
+                    #[cfg(feature = "vulkan-renderer")]
+                    win.gfx.mark_dirty();
+                    #[cfg(not(feature = "vulkan-renderer"))]
+                    win.egui.mark_dirty();
+                }
             }
             // A window can relocate to a different screen (different backing/color space,
             // e.g. moving onto a CGVirtualDisplay-backed screen) without any Resized event
@@ -257,7 +309,10 @@ impl ApplicationHandler for Ide {
             // ERROR_OUT_OF_DATE/SUBOPTIMAL for it either — so the surface can keep presenting
             // stale content indefinitely. Treat both as swapchain-dirty too.
             WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                #[cfg(feature = "vulkan-renderer")]
                 win.gfx.mark_dirty();
+                #[cfg(not(feature = "vulkan-renderer"))]
+                win.egui.mark_dirty();
             }
             _ => {}
         }
@@ -310,7 +365,15 @@ impl ApplicationHandler for Ide {
         // could possibly have changed. Only do that work when a real window
         // event happened since the last render (`dirty`) or our own
         // previously-requested deadline has actually passed.
-        let deadline_due = self.next_deadline.map_or(true, |t| std::time::Instant::now() >= t);
+        //
+        // `None` means nothing asked to be repainted, so nothing is due — this
+        // must not be `map_or(true, ..)`. That inverted default was harmless
+        // only while a baseline repaint guaranteed a deadline every frame; once
+        // a genuinely idle window schedules nothing, it turned every spurious
+        // wakeup into a rendered frame (measured: 10% of a core, worse than the
+        // polling it replaced).
+        let deadline_due = self.next_deadline
+            .is_some_and(|t| std::time::Instant::now() >= t);
         if !self.dirty && !deadline_due {
             event_loop.set_control_flow(match self.next_deadline {
                 Some(t) => ControlFlow::WaitUntil(t),
@@ -399,10 +462,35 @@ impl ApplicationHandler for Ide {
             None    => ControlFlow::Wait,
         });
     }
+
+    /// A background thread called `wake::wake()`. Nothing to inspect — the
+    /// point is simply that the loop is awake now; marking dirty makes
+    /// `about_to_wait` render one frame, which polls every channel as usual.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        self.dirty = true;
+    }
+
+    /// Last chance to persist state before the process goes away.
+    ///
+    /// `WindowEvent::CloseRequested` only fires from AppKit's
+    /// `windowShouldClose:` — i.e. the window's own close button. Quitting the
+    /// application (⌘Q, the Dock menu, "Quit Forge IDE") goes through
+    /// `applicationWillTerminate:` instead, which never touches that path, so
+    /// every session was silently dropped on the most common way to quit.
+    /// winit surfaces that as `LoopExiting`, which is this hook.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        for win in &mut self.windows {
+            win.app.save_session();
+        }
+    }
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
+    // Only the optional Vulkan renderer needs MoltenVK, and it is no longer
+    // bundled — the host must provide it (Homebrew's molten-vk, or the Vulkan
+    // SDK). The default wgpu build talks to Metal directly and needs none of
+    // this.
+    #[cfg(all(target_os = "macos", feature = "vulkan-renderer"))]
     {
         use std::ffi::OsStr;
         if std::env::var_os("DYLD_LIBRARY_PATH").is_none() {
@@ -444,5 +532,13 @@ fn main() {
         .with_activation_policy(ActivationPolicy::Regular)
         .with_activate_ignoring_other_apps(true);
     let event_loop = builder.build().expect("event loop");
+
+    // Let background threads wake the loop. Without this, the loop sleeping in
+    // `ControlFlow::Wait` would never notice an `mpsc` send, which is why the
+    // app used to poll unconditionally at 300ms — see `wake` and
+    // `IdeApp::draw`'s repaint tiers.
+    let proxy = event_loop.create_proxy();
+    wake::set_waker(move || { let _ = proxy.send_event(()); });
+
     event_loop.run_app(&mut Ide::new(initial_specs)).expect("run");
 }

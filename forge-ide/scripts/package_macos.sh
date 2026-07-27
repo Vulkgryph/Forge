@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds a release .app bundle for Forge IDE: Contents/MacOS binary,
-# bundled MoltenVK (Contents/Frameworks), generated .icns, and Info.plist.
+# generated .icns and Info.plist. No third-party runtime is bundled.
 # Does not sign or notarize - see the .dmg release checklist for those steps.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,12 +23,14 @@ cargo build --release -p forge-agent
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BUILD_DIR/forge-ide" "$APP/Contents/MacOS/forge-ide"
 cp "$BUILD_DIR/forge-agent" "$APP/Contents/MacOS/forge-agent"
-cp runtime/macos/libMoltenVK.dylib "$APP/Contents/Frameworks/libMoltenVK.dylib"
-cp runtime/macos/MoltenVK_icd.json "$APP/Contents/Resources/MoltenVK_icd.json"
+# No third-party runtime is bundled. The default renderer uses wgpu, which
+# targets Apple's own Metal framework — already present on every Mac. The
+# optional `vulkan-renderer` build needs MoltenVK installed on the host
+# instead; it is deliberately not redistributed here.
 
 echo "==> Generating icon"
 ICONSET="$OUT_DIR/AppIcon.iconset"

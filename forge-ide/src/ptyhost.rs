@@ -103,11 +103,13 @@ impl PtyHostClient {
                             None    => Ok(msg.result.unwrap_or(serde_json::Value::Null)),
                         };
                         let _ = tx.send(result);
+                        crate::wake::wake();
                     }
                 } else if msg.method.as_deref() == Some("pty/data") {
                     if let Ok(p) = serde_json::from_value::<PtyDataPush>(msg.params.unwrap_or_default()) {
                         if let Some(tx) = pushes2.lock().unwrap().get(&p.id) {
                             let _ = tx.send(p.data);
+                            crate::wake::wake();
                         }
                     }
                 }

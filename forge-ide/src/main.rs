@@ -2,6 +2,8 @@ mod agent_panel;
 mod app;
 mod buffer;
 mod dap;
+#[cfg(target_os = "macos")]
+mod dock_menu;
 #[cfg(feature = "vulkan-renderer")]
 mod egui_pass;
 mod filetree;
@@ -249,6 +251,18 @@ impl Ide {
 
 impl ApplicationHandler for Ide {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Right-click-the-Dock-icon menu. Installed here rather than in `main`
+        // because it needs a live event loop (and, underneath, a main-thread
+        // marker) — see `dock_menu`.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::ActiveEventLoopExtMacOS;
+            use objc2_foundation::MainThreadMarker;
+            if let Some(mtm) = MainThreadMarker::new() {
+                event_loop.set_dock_menu(dock_menu::build(mtm));
+            }
+        }
+
         if !self.windows.is_empty() { return; }
         // `about_to_wait` recomputes this every iteration based on what the
         // just-rendered frame actually asked for (see its doc comment) —
@@ -346,6 +360,22 @@ impl ApplicationHandler for Ide {
     /// already alongside their own animations), captured here through
     /// `IdeWindow::next_repaint`.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Dock-menu clicks land on a queue rather than calling in directly: the
+        // click arrives on the main thread inside AppKit, which has no handle on
+        // the state that owns the window list. Drained here, just before the
+        // pending-window pass below picks it up.
+        #[cfg(target_os = "macos")]
+        for req in dock_menu::take_requests() {
+            match req {
+                // Same as "New Window" inside the app — `cwd: None` inherits the
+                // process working directory, matching Cmd+N / the menu item.
+                dock_menu::DockRequest::NewWindow => {
+                    self.pending.push(NewWindowSpec::default());
+                    self.dirty = true;
+                }
+            }
+        }
+
         // Create any windows queued by app code
         let specs: Vec<NewWindowSpec> = std::mem::take(&mut self.pending);
         if !specs.is_empty() { self.dirty = true; }

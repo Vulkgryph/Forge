@@ -6,7 +6,8 @@ use std::time::Instant;
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu,
+    NSRunningApplication,
 };
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
 
@@ -44,6 +45,26 @@ pub(super) struct AppState {
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
 
+// Menu returned from `applicationDockMenu:` — i.e. what appears when the user
+// right-clicks (or long-presses) the app's Dock icon.
+//
+// LOCAL PATCH (see the [patch] note in the workspace Cargo.toml). AppKit only
+// consults the *application delegate* for this menu, and winit owns the
+// delegate, so an application built on winit has no way to supply one. This
+// hook lets it: set the menu with `EventLoopExtMacOS::set_dock_menu` and the
+// delegate hands it back whenever AppKit asks.
+//
+// Main-thread only, like everything else here: the Dock menu is requested on
+// the main thread and only ever set from it.
+thread_local! {
+    static DOCK_MENU: std::cell::RefCell<Option<Retained<NSMenu>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_dock_menu(_mtm: MainThreadMarker, menu: Retained<NSMenu>) {
+    DOCK_MENU.with(|m| *m.borrow_mut() = Some(menu));
+}
+
 declare_class!(
     #[derive(Debug)]
     pub(super) struct ApplicationDelegate;
@@ -69,6 +90,12 @@ declare_class!(
         #[method(applicationWillTerminate:)]
         fn app_will_terminate(&self, notification: &NSNotification) {
             self.will_terminate(notification)
+        }
+
+        // LOCAL PATCH — see `DOCK_MENU`.
+        #[method_id(applicationDockMenu:)]
+        fn app_dock_menu(&self, _sender: &NSApplication) -> Option<Retained<NSMenu>> {
+            DOCK_MENU.with(|m| m.borrow().clone())
         }
     }
 );

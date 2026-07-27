@@ -2,7 +2,7 @@
 mod util;
 
 mod app;
-mod app_state;
+pub(crate) mod app_state;
 mod cursor;
 mod event;
 mod event_handler;

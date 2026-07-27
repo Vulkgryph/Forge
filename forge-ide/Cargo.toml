@@ -54,6 +54,20 @@ notify = "6"
 # reintroduce the dynamic-OpenSSL distribution problem git2 had.
 ureq              = { version = "2", default-features = false, features = ["json", "tls"] }
 
+# macOS Dock-icon context menu (src/dock_menu.rs). Versions pinned to match the
+# vendored winit so there is one objc2 in the graph, not two.
+[target.'cfg(target_os = "macos")'.dependencies.objc2]
+version = "0.5.2"
+features = ["relax-sign-encoding"]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
+version = "0.2.2"
+features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder"]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.2.2"
+features = ["NSString", "NSThread"]
+
 [build-dependencies]
 shaderc = { version = "0.10", optional = true }
 toml    = "0.8"

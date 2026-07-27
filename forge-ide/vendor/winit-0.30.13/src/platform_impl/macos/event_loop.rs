@@ -68,7 +68,7 @@ impl PanicInfo {
 #[derive(Debug)]
 pub struct ActiveEventLoop {
     delegate: Retained<ApplicationDelegate>,
-    pub(super) mtm: MainThreadMarker,
+    pub(crate) mtm: MainThreadMarker,
 }
 
 impl ActiveEventLoop {
@@ -147,6 +147,11 @@ impl ActiveEventLoop {
 
     pub(crate) fn owned_display_handle(&self) -> OwnedDisplayHandle {
         OwnedDisplayHandle
+    }
+
+    /// LOCAL PATCH: see `app_state::set_dock_menu`.
+    pub(crate) fn set_dock_menu(&self, menu: Retained<objc2_app_kit::NSMenu>) {
+        super::app_state::set_dock_menu(self.mtm, menu);
     }
 
     pub(crate) fn hide_application(&self) {

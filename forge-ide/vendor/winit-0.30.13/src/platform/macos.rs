@@ -490,6 +490,17 @@ pub trait ActiveEventLoopExtMacOS {
     fn set_allows_automatic_window_tabbing(&self, enabled: bool);
     /// Returns whether the system can automatically organize windows into tabs.
     fn allows_automatic_window_tabbing(&self) -> bool;
+    /// LOCAL PATCH: set the menu shown when the user right-clicks the app's
+    /// Dock icon.
+    ///
+    /// AppKit only asks the *application delegate* for this menu
+    /// (`applicationDockMenu:`), and winit owns the delegate, so upstream winit
+    /// gives an application no way to provide one. Call this once the event loop
+    /// is running (e.g. from `ApplicationHandler::resumed`).
+    ///
+    /// The menu and its items are yours: set each item's target/action to
+    /// whatever should handle the click.
+    fn set_dock_menu(&self, menu: objc2::rc::Retained<objc2_app_kit::NSMenu>);
 }
 
 impl ActiveEventLoopExtMacOS for ActiveEventLoop {
@@ -507,6 +518,10 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
 
     fn allows_automatic_window_tabbing(&self) -> bool {
         self.p.allows_automatic_window_tabbing()
+    }
+
+    fn set_dock_menu(&self, menu: objc2::rc::Retained<objc2_app_kit::NSMenu>) {
+        self.p.set_dock_menu(menu);
     }
 }
 

@@ -2883,7 +2883,20 @@ pub struct IdeApp {
     bottom_tab:      BottomTab,
     output_log:      Vec<(String, OutputLevel)>,  // (message, level)
     status:          String,
+    /// The directory terminals, the agent, DAP, LSP and tasks are rooted in.
+    /// Always a real path, even with no workspace open (`$HOME` in that case),
+    /// because those subsystems all need *somewhere* to run.
     cwd:             PathBuf,
+    /// Whether a workspace folder is actually open.
+    ///
+    /// A window created with no folder — "New Window", including from the Dock
+    /// menu — starts `false`: the Explorer shows an empty state rather than
+    /// rendering `cwd`, and nothing scans it. This matches VS Code, where a new
+    /// window has no folder but its terminal still opens somewhere sensible.
+    /// Flipped by "Open Folder", which is the only thing that establishes a
+    /// workspace. Guard anything workspace-shaped (tree, git, watcher, Quick
+    /// Open, search, session, tasks) on this rather than on `cwd`.
+    has_folder:      bool,
     file_watcher:    Option<crate::filewatch::FileWatcher>,
     terminal_height: f32,
     pub settings:    crate::settings::Settings,
@@ -3101,8 +3114,14 @@ pub struct IdeApp {
 impl IdeApp {
     pub fn new_with_spec(spec: NewWindowSpec) -> Self {
         let is_reload = spec.is_reload;
-        let cwd  = spec.cwd
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // `None` means "no workspace", not "inherit the process working
+        // directory". That old behavior meant a window opened from the Dock —
+        // where the process cwd is `/` — rendered the entire filesystem as the
+        // workspace root.
+        let has_folder = spec.cwd.is_some();
+        let cwd = spec.cwd.unwrap_or_else(|| {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+        });
         // Resolves a relative arg (`forge-ide .`) or symlink to a stable
         // absolute path — best-effort, since this is now also used as a
         // per-workspace identity key (conversation history scoping; see
@@ -3111,9 +3130,16 @@ impl IdeApp {
         // the raw path if canonicalization fails (doesn't exist yet, no
         // permission, etc.) rather than erroring out.
         let cwd = cwd.canonicalize().unwrap_or(cwd);
+        // With no workspace open there is nothing to walk, watch or diff. The
+        // tree is still constructed (rooted at `cwd`) so "Open Folder" has an
+        // object to retarget, but `has_folder` keeps it from being drawn.
         let tree = FileTree::new(cwd.clone());
-        let git  = crate::git::GitState::open(&cwd);
-        let file_watcher = crate::filewatch::FileWatcher::new(&cwd);
+        let git  = if has_folder { crate::git::GitState::open(&cwd) } else { None };
+        let file_watcher = if has_folder {
+            crate::filewatch::FileWatcher::new(&cwd)
+        } else {
+            None
+        };
         let pending_ssh = spec.ssh_host;
         let agent_saved = crate::agent_panel::load_conversations(&cwd);
         let mut app = Self {
@@ -3128,6 +3154,7 @@ impl IdeApp {
             output_log:      Vec::new(),
             status:          String::new(),
             cwd,
+            has_folder,
             file_watcher,
             terminal_height: 260.0,
             settings:        crate::settings::load(),
@@ -3268,7 +3295,10 @@ impl IdeApp {
         // matching VS Code's Reload Window regardless of that setting.
         // Either way, skip it if we're opening a remote (SSH) workspace
         // instead.
-        if (app.settings.restore_session || is_reload) && app.pending_ssh_connect.is_none() {
+        if has_folder
+            && (app.settings.restore_session || is_reload)
+            && app.pending_ssh_connect.is_none()
+        {
             if let Some(state) = crate::session::load(&app.cwd) {
                 let restored: Vec<Buffer> = state.open_files.iter()
                     .filter_map(|p| Buffer::from_file(p.clone()).ok())
@@ -3374,6 +3404,8 @@ impl IdeApp {
         if !self.settings.restore_session || self.pending_ssh_connect.is_some() {
             return;
         }
+        // Sessions are keyed by workspace folder; a folderless window has none.
+        if !self.has_folder { return; }
         let state = self.build_session_state();
         crate::session::save(&self.cwd, &state);
     }
@@ -3415,7 +3447,7 @@ impl IdeApp {
     /// reload ever got its conversation/open-files state saved, and every
     /// other open window came back empty on the other end.
     pub fn save_session_for_reload(&self) {
-        if self.pending_ssh_connect.is_none() {
+        if self.has_folder && self.pending_ssh_connect.is_none() {
             let state = self.build_session_state();
             crate::session::save(&self.cwd, &state);
         }
@@ -3862,6 +3894,22 @@ impl IdeApp {
                             if self.ssh.is_some() {
                                 // Remote workspace: show the SSH file tree in Explorer
                                 self.draw_remote_explorer(ui);
+                            } else if !self.has_folder {
+                                // No workspace open. Don't render `cwd` as if it
+                                // were one — offer to pick a folder instead.
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.label(egui::RichText::new("No folder opened")
+                                        .size(12.0).color(egui::Color32::from_gray(150)));
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    if ui.button("Open Folder…").clicked() {
+                                        self.open_folder_dialog();
+                                    }
+                                });
                             } else {
                                 match self.file_tree.draw(ui, self.git.as_ref()) {
                                     Some(TreeAction::Open(path))          => self.open_file(path),
@@ -4465,6 +4513,8 @@ impl IdeApp {
                         self.file_tree.add_root(path);
                     }
                 } else if let Some(path) = result {
+                    // This is the only thing that establishes a workspace.
+                    self.has_folder = true;
                     self.cwd = path.clone();
                     self.file_tree.set_root(path.clone());
                     self.git = crate::git::GitState::open(&path);
@@ -4508,7 +4558,9 @@ impl IdeApp {
         if !terminal_focused {
         if ctrl && !shift && ctx.input(|i| i.key_pressed(egui::Key::P)) {
             self.cmd_palette = None;
-            if self.quick_open.is_none() {
+            if !self.has_folder {
+                self.status = "Open a folder first".into();
+            } else if self.quick_open.is_none() {
                 self.quick_open = Some(QuickOpen::new(&self.cwd));
             } else {
                 self.quick_open = None;
@@ -5416,7 +5468,7 @@ impl IdeApp {
     // ── Task picker overlay (Ctrl+Shift+B) ─────────────────────────────
     fn draw_task_picker(&mut self, ctx: &egui::Context) {
         let Some(mut sel) = self.task_picker else { return };
-        let tasks = crate::tasks::load(&self.cwd);
+        let tasks = if self.has_folder { crate::tasks::load(&self.cwd) } else { Vec::new() };
         let mut close = false;
         let mut chosen: Option<usize> = None;
         if !tasks.is_empty() {
@@ -8652,6 +8704,21 @@ impl IdeApp {
     }
 
     fn draw_search_panel(&mut self, ui: &mut egui::Ui) {
+        // Project-wide search has no project without a workspace folder.
+        if !self.has_folder {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Open a folder to search across files")
+                    .size(12.0).color(egui::Color32::from_gray(150)));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                if ui.button("Open Folder…").clicked() { self.open_folder_dialog(); }
+            });
+            return;
+        }
         self.search.poll();
 
         // ── Query input row ──
@@ -9017,7 +9084,11 @@ impl IdeApp {
             Cmd::NewWindow     => { self.pending_new_window = Some(NewWindowSpec::default()); }
             Cmd::ToggleTerminal  => self.show_term  = !self.show_term,
             Cmd::ToggleFileTree  => self.show_tree  = !self.show_tree,
-            Cmd::QuickOpen       => self.quick_open = Some(QuickOpen::new(&self.cwd)),
+            Cmd::QuickOpen       => if self.has_folder {
+                self.quick_open = Some(QuickOpen::new(&self.cwd));
+            } else {
+                self.status = "Open a folder first".into();
+            },
             Cmd::Plugin(i)       => {
                 if let Some(cmd) = self.plugins.commands.get(i) {
                     if let Some(buf) = self.buffers.get_mut(self.active) {
@@ -9085,7 +9156,11 @@ impl IdeApp {
                 });
                 ui.menu_button("Go", |ui| {
                     if ui.button("Go to File…         Ctrl+P").clicked() {
-                        self.quick_open = Some(QuickOpen::new(&self.cwd));
+                        if self.has_folder {
+                            self.quick_open = Some(QuickOpen::new(&self.cwd));
+                        } else {
+                            self.status = "Open a folder first".into();
+                        }
                         ui.close_menu();
     }
                     if ui.button("Command Palette… Ctrl+Shift+P").clicked() {
@@ -11933,5 +12008,48 @@ mod output_log_tests {
         let mut a = app();
         a.push_output("hello".into(), OutputLevel::Info);
         assert_eq!(a.output_log[0].0, "hello");
+    }
+}
+
+#[cfg(test)]
+mod folderless_window_tests {
+    use super::{IdeApp, NewWindowSpec};
+
+    fn spec(cwd: Option<std::path::PathBuf>) -> NewWindowSpec {
+        NewWindowSpec { cwd, ssh_host: None, is_reload: false }
+    }
+
+    /// "New Window" — including from the Dock menu — opens no workspace.
+    ///
+    /// `cwd: None` used to fall back to `std::env::current_dir()`, so a window
+    /// launched from the Dock (process cwd `/`) rendered the whole filesystem as
+    /// its workspace root.
+    #[test]
+    fn no_folder_means_no_workspace() {
+        let app = IdeApp::new_with_spec(spec(None));
+        assert!(!app.has_folder, "a folderless window must not claim a workspace");
+        // Terminals/agent/LSP still need somewhere to run: a real absolute
+        // directory, and specifically not the filesystem root. Deliberately not
+        // compared against `dirs::home_dir()` — other tests in this binary
+        // mutate `HOME`, so that value is not stable across a test run.
+        assert!(app.cwd.is_absolute(), "cwd must be absolute, got {:?}", app.cwd);
+        assert!(app.cwd.is_dir(), "cwd must exist, got {:?}", app.cwd);
+        assert_ne!(app.cwd, std::path::Path::new("/"),
+                   "a folderless window must not root at the filesystem root");
+        // Nothing workspace-shaped was started.
+        assert!(app.git.is_none(), "no repo should be opened without a workspace");
+        assert!(app.file_watcher.is_none(), "nothing to watch without a workspace");
+    }
+
+    /// An explicit folder is a real workspace.
+    #[test]
+    fn explicit_folder_opens_a_workspace() {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = IdeApp::new_with_spec(spec(Some(dir.clone())));
+        assert!(app.has_folder);
+        assert_eq!(app.cwd, dir.canonicalize().unwrap_or(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

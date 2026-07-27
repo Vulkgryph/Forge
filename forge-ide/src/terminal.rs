@@ -738,6 +738,18 @@ pub struct Terminal {
     /// for a moment after typing, so it's easy to keep track of while
     /// actively typing, then resumes its normal blink rhythm once idle.
     last_input_at: Option<std::time::Instant>,
+    /// Whether the view should follow new output. See the `stick_to_bottom`
+    /// call in `draw_sized` for why this isn't left to egui.
+    stick_bottom: bool,
+    /// True while the primary button is held after being pressed inside the
+    /// terminal viewport — i.e. a text-selection drag is in progress.
+    ///
+    /// Needed because egui's label text selection does not scroll its container:
+    /// dragging past the top or bottom edge just stops extending the selection.
+    /// Tracking the gesture ourselves lets `draw_sized` scroll while it runs.
+    /// Gated on "press began inside" so a drag that started elsewhere (a panel
+    /// splitter, say) doesn't move the terminal.
+    selecting: bool,
     /// When the feeder thread(s) last actually decoded new PTY output —
     /// `None` if none yet. Read by the app to decide whether this terminal
     /// is worth polling at a fast cadence right now (a live command
@@ -827,6 +839,8 @@ impl Terminal {
             pending_size:  None,
             pending_input: Vec::new(),
             last_input_at: None,
+            stick_bottom: true,
+            selecting: false,
             last_output:   Arc::new(Mutex::new(None)),
             cached_galley: None,
             cached_scrollback_galley: None,
@@ -888,6 +902,8 @@ impl Terminal {
             pending_size:  None,
             pending_input: Vec::new(),
             last_input_at: None,
+            stick_bottom: true,
+            selecting: false,
             last_output,
             cached_galley: None,
             cached_scrollback_galley: None,
@@ -1093,7 +1109,15 @@ impl Terminal {
         let scroll_resp = egui::ScrollArea::vertical()
             .id_salt("term_scroll")
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
+            // Stickiness is tracked here rather than left to egui's own
+            // `scroll_stuck_to_end`, because that flag is private and is only
+            // cleared by egui's *own* interaction paths. Programmatic scrolling
+            // — which is how drag-select auto-scroll works below — would be
+            // snapped straight back to the bottom every frame. Recomputed after
+            // the scroll area from the real offset, so it behaves like every
+            // other terminal: follow new output while you are at the bottom,
+            // stay put once you have scrolled away.
+            .stick_to_bottom(self.stick_bottom)
             // egui's default `drag_to_scroll(true)` is a touch-screen-style
             // pan gesture that claims a click-drag on its contents *before*
             // the selectable text inside gets a chance to interpret the same
@@ -1117,6 +1141,69 @@ impl Terminal {
                         .sense(egui::Sense::click()),
                 )
             });
+
+        // Follow new output only while parked at the bottom — the rule every
+        // terminal uses. A couple of pixels of slack absorbs rounding.
+        {
+            let max_off = (scroll_resp.content_size.y - scroll_resp.inner_rect.height()).max(0.0);
+            self.stick_bottom = scroll_resp.state.offset.y >= max_off - 2.0;
+        }
+
+        // ── auto-scroll while drag-selecting past an edge ─────────────────────
+        // egui's label text selection doesn't scroll its container: drag to the
+        // top or bottom edge and the selection simply stops growing, so anything
+        // off-screen is unselectable. Track the gesture and scroll for it.
+        {
+            let view = scroll_resp.inner_rect;
+            let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+            let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+
+            if !primary_down {
+                self.selecting = false;
+            } else if !self.selecting {
+                // Only adopt drags that began in the viewport, so dragging a
+                // panel splitter or a scrollbar doesn't move the terminal.
+                if ui.ctx().input(|i| i.pointer.primary_pressed())
+                    && pointer.is_some_and(|p| view.contains(p))
+                {
+                    self.selecting = true;
+                }
+            }
+
+            if self.selecting {
+                if let Some(p) = pointer {
+                    // Speed ramps with how far past the edge the pointer is, so
+                    // a small overshoot creeps and a big one moves quickly —
+                    // capped so it stays controllable. Per-frame, not per-second:
+                    // the repaint request below keeps the cadence steady.
+                    const MAX_STEP: f32 = 40.0;
+                    let over = if p.y < view.top() {
+                        p.y - view.top()          // negative → scroll up
+                    } else if p.y > view.bottom() {
+                        p.y - view.bottom()       // positive → scroll down
+                    } else {
+                        0.0
+                    };
+                    if over != 0.0 {
+                        let step = (over / 4.0).clamp(-MAX_STEP, MAX_STEP);
+                        let max_off = (scroll_resp.content_size.y - view.height()).max(0.0);
+                        let mut st = scroll_resp.state.clone();
+                        let target = (st.offset.y + step).clamp(0.0, max_off);
+                        if target != st.offset.y {
+                            st.offset.y = target;
+                            st.store(ui.ctx(), scroll_resp.id);
+                        }
+                        // Release stickiness as soon as we scroll up, or the
+                        // stored offset above is overridden on the next frame
+                        // and the view never leaves the bottom.
+                        if step < 0.0 { self.stick_bottom = false; }
+                        // Keep frames coming while the pointer sits outside —
+                        // the loop is otherwise idle and would stop scrolling.
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
 
         // ── block cursor ──────────────────────────────────────────────────────
         {

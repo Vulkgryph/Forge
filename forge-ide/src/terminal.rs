@@ -1171,12 +1171,20 @@ impl Terminal {
             }
 
             if self.selecting {
+                // Unconditional while the gesture runs: egui updates the
+                // selection from pointer position, so it needs frames even when
+                // the pointer is parked outside the viewport and not scrolling.
+                ui.ctx().request_repaint();
                 if let Some(p) = pointer {
-                    // Speed ramps with how far past the edge the pointer is, so
-                    // a small overshoot creeps and a big one moves quickly —
-                    // capped so it stays controllable. Per-frame, not per-second:
-                    // the repaint request below keeps the cadence steady.
-                    const MAX_STEP: f32 = 40.0;
+                    // Rate is per *second*, scaled by frame time — not a fixed
+                    // per-frame step. A per-frame step is a rate multiplied by
+                    // however fast the machine happens to render: at the ~120fps
+                    // the repaint request below produces, 40px/frame is nearly
+                    // 5000px/s, which reaches the end of the scrollback before
+                    // you can react and so selects everything below the anchor
+                    // no matter where you meant to stop.
+                    const MAX_RATE: f32 = 450.0; // px/s at full deflection
+                    let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.001, 0.1);
                     let over = if p.y < view.top() {
                         p.y - view.top()          // negative → scroll up
                     } else if p.y > view.bottom() {
@@ -1185,7 +1193,9 @@ impl Terminal {
                         0.0
                     };
                     if over != 0.0 {
-                        let step = (over / 4.0).clamp(-MAX_STEP, MAX_STEP);
+                        // Ramp over the first ~60px past the edge, then hold.
+                        let deflection = (over / 60.0).clamp(-1.0, 1.0);
+                        let step = deflection * MAX_RATE * dt;
                         let max_off = (scroll_resp.content_size.y - view.height()).max(0.0);
                         let mut st = scroll_resp.state.clone();
                         let target = (st.offset.y + step).clamp(0.0, max_off);

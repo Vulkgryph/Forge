@@ -4033,8 +4033,16 @@ impl IdeApp {
         // after the last bit of input closes that gap. 200ms of "still
         // interacting" covers pauses mid-gesture (e.g. a scroll that
         // briefly stops) without keeping this tier alive indefinitely.
+        // `any_down` matters as much as events or velocity here. A button held
+        // still — mid drag-select, mid scrollbar drag — generates no events and
+        // has zero velocity, so on those two alone the loop went to sleep and
+        // the gesture froze until the pointer moved again. That was invisible
+        // while an unconditional 300ms repaint existed to paper over it; now
+        // that idle really is idle, a held button has to count as interaction.
         let had_input_this_frame = ctx.input(|i| {
-            !i.events.is_empty() || i.pointer.velocity() != egui::Vec2::ZERO
+            !i.events.is_empty()
+                || i.pointer.velocity() != egui::Vec2::ZERO
+                || i.pointer.any_down()
         });
         if had_input_this_frame {
             self.last_interaction_at = Some(std::time::Instant::now());

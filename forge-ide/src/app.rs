@@ -3048,6 +3048,11 @@ pub struct IdeApp {
     ssh_nav_rx:      Option<mpsc::Receiver<Result<(String, Vec<crate::ssh::RemoteEntry>), String>>>,
     /// In-flight remote file read.
     ssh_open_rx:     Option<mpsc::Receiver<Result<(String, String), String>>>, // (path, text)
+    /// In-flight remote uploads (dropped files); one result per file.
+    ssh_upload_rx:   Option<mpsc::Receiver<Result<String, String>>>,
+    /// Directory those uploads are landing in, so the view can be refreshed
+    /// once they finish.
+    ssh_upload_dir:  Option<String>,
     /// Whether the SSH quick-pick overlay is open.
     ssh_overlay:       bool,
     ssh_overlay_query: String,
@@ -3254,6 +3259,8 @@ impl IdeApp {
             ssh_log_rx:       None,
             ssh_nav_rx:      None,
             ssh_open_rx:     None,
+            ssh_upload_rx:   None,
+            ssh_upload_dir:  None,
             ssh_overlay:       false,
             ssh_overlay_query: String::new(),
             ssh_overlay_frame: 0,
@@ -4082,6 +4089,7 @@ impl IdeApp {
             || self.ssh_log_rx.is_some()
             || self.ssh_pty_rx.is_some()
             || self.ssh_open_rx.is_some()
+            || self.ssh_upload_rx.is_some()
             || self.ssh_nav_rx.is_some()
             || self.ssh_connect_rx.is_some()
             || self.gh_check.is_some()
@@ -4191,6 +4199,33 @@ impl IdeApp {
         if let Some(rx) = &self.ssh_log_rx {
             let drained: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
             for (msg, level) in drained { self.push_output(msg, level); }
+        }
+
+        // Drain remote upload results.
+        if let Some(rx) = &self.ssh_upload_rx {
+            let mut done = false;
+            let mut msgs: Vec<(String, OutputLevel)> = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(path))  => msgs.push((format!("Uploaded {path}"), OutputLevel::Success)),
+                    Ok(Err(e))    => msgs.push((format!("Upload failed: {e}"), OutputLevel::Error)),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    // Sender dropped = every file has been reported.
+                    Err(mpsc::TryRecvError::Disconnected) => { done = true; break; }
+                }
+            }
+            for (m, l) in msgs { self.output_log(m, l); }
+            if done {
+                self.ssh_upload_rx = None;
+                self.status = "Upload complete".into();
+                // Show what landed.
+                if let Some(dir) = self.ssh_upload_dir.take() {
+                    if self.ssh_tree.last().map(|(p, _)| p.as_str()) == Some(dir.as_str()) {
+                        self.ssh_tree.pop();
+                        self.ssh_navigate(dir);
+                    }
+                }
+            }
         }
 
         // Poll lazy PTY open result
@@ -8394,6 +8429,10 @@ impl IdeApp {
         let mut open_path: Option<String> = None;
         let mut push_dir:  Option<String> = None;
         let mut pop = false;
+        // Remote row geometry, so a dropped file can be attributed to the
+        // directory it landed on (see the drop handling after the scroll area).
+        let panel_rect = ui.max_rect();
+        let mut row_dirs: Vec<(egui::Rect, String)> = Vec::new();
 
         egui::ScrollArea::vertical()
             .id_salt("remote_explorer_scroll")
@@ -8429,6 +8468,9 @@ impl IdeApp {
                         let avail_w = ui.available_width();
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(avail_w, 22.0), egui::Sense::click());
+                        // Directory rows are drop targets; files are not (their
+                        // parent is the browsed directory, which is the fallback).
+                        if entry.is_dir { row_dirs.push((rect, entry.path.clone())); }
                         if resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             ui.painter().rect_filled(rect, 0.0,
@@ -8469,9 +8511,55 @@ impl IdeApp {
 }
             });
 
+        // ── Dropped files upload to the remote ────────────────────────────
+        // Local drops copy into a local folder; on a remote workspace the
+        // equivalent is an upload. Target is the row under the cursor when it is
+        // a directory, otherwise the directory currently being browsed.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if !dropped.is_empty() {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                if panel_rect.contains(pos) {
+                    let target = row_dirs.iter()
+                        .find(|(rect, _)| rect.contains(pos))
+                        .map(|(_, p)| p.clone())
+                        .or_else(|| self.ssh_tree.last().map(|(p, _)| p.clone()));
+                    if let Some(dir) = target {
+                        self.ssh_upload_files(dropped, dir);
+                    }
+                }
+            }
+        }
+
         if pop { self.ssh_tree.pop(); }
         if let Some(dir) = push_dir  { self.ssh_navigate(dir); }
         if let Some(path) = open_path { self.ssh_open_file(path); }
+    }
+
+    /// Send dropped local files to a remote directory, then refresh the view.
+    ///
+    /// Non-blocking: `SshConnection::fs_upload` spawns the transfer onto the
+    /// connection's runtime and hands back a receiver, drained in `draw`.
+    fn ssh_upload_files(&mut self, files: Vec<PathBuf>, remote_dir: String) {
+        let files: Vec<PathBuf> = files.into_iter().filter(|p| {
+            if p.is_dir() {
+                self.output_log(
+                    format!("Skipped {}: uploading folders isn't supported yet",
+                            p.file_name().unwrap_or_default().to_string_lossy()),
+                    OutputLevel::Warn);
+                false
+            } else {
+                true
+            }
+        }).collect();
+        if files.is_empty() { return; }
+
+        let Some(conn) = self.ssh.as_ref() else { return };
+        let n = files.len();
+        self.ssh_upload_rx  = Some(conn.fs_upload(files, &remote_dir));
+        self.ssh_upload_dir = Some(remote_dir);
+        self.status = format!("Uploading {n} file(s)…");
     }
 
     // ── Outline / symbol-tree sidebar panel ─────────────────────────────────

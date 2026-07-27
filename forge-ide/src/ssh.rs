@@ -93,7 +93,15 @@ pub struct SshConnection {
     /// PTY push callbacks keyed by pty id
     pub pty_pushes: Arc<Mutex<HashMap<u32, mpsc::SyncSender<Vec<u8>>>>>,
     /// Session dropped FIRST (closes SSH channel, unblocks reader tasks).
-    _session:    Option<russh::client::Handle<ClientHandler>>,
+    ///
+    /// `Arc` because uploads run as spawned tasks that need `&Handle` to open
+    /// their own SFTP channel (`Handle` is not `Clone` — it owns a receiver and
+    /// a join handle). Dropping our reference below still closes the session
+    /// promptly in the common case; if an upload is in flight, the session
+    /// outlives us until `shutdown_background` drops that task, which is the
+    /// behaviour you want anyway — yanking the channel mid-transfer would
+    /// corrupt the file.
+    _session:    Option<Arc<russh::client::Handle<ClientHandler>>>,
     /// Runtime dropped LAST via shutdown_background() — non-blocking.
     _rt:         Option<tokio::runtime::Runtime>,
 }
@@ -203,7 +211,7 @@ impl SshConnection {
             pending,
             stdin:    Arc::new(Mutex::new(Box::new(writer) as Box<dyn Write + Send>)),
             pty_pushes,
-            _session: Some(session),
+            _session: Some(Arc::new(session)),
             _rt:      Some(rt),
         })
     }
@@ -223,6 +231,69 @@ impl SshConnection {
     pub fn fs_write(&self, path: &str, text: &str) -> Result<(), String> {
         self.call("fs/write", serde_json::json!({ "path": path, "text": text }))?;
         Ok(())
+    }
+
+    /// Upload local files into a remote directory, off the UI thread.
+    ///
+    /// Returns a receiver yielding one result per file, in order. Uploads run as
+    /// tasks on the connection's own tokio runtime rather than a std thread, so
+    /// nothing here has to own or share the runtime — `spawn` only needs `&self`,
+    /// and the task keeps the session alive through the `Arc` for exactly as
+    /// long as the transfer takes.
+    ///
+    /// SFTP rather than the `fs/write` RPC: that call carries a `&str`, and a
+    /// dropped file is as likely to be a screenshot as it is text. Base64 over
+    /// JSON would mean a forge-server change and therefore a forced re-upload of
+    /// the server binary on every host. SFTP is already how forge-server itself
+    /// gets deployed here.
+    pub fn fs_upload(&self, files: Vec<PathBuf>, remote_dir: &str)
+        -> mpsc::Receiver<Result<String, String>>
+    {
+        let (tx, rx) = mpsc::channel();
+        let (Some(session), Some(rt)) = (self._session.as_ref(), self._rt.as_ref()) else {
+            let _ = tx.send(Err("ssh session closed".into()));
+            return rx;
+        };
+        let session = Arc::clone(session);
+        let dir = remote_dir.trim_end_matches('/').to_string();
+
+        rt.spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            for local in files {
+                let res = async {
+                    let name = local.file_name().and_then(|n| n.to_str())
+                        .ok_or_else(|| "file has no usable name".to_string())?;
+                    let remote_path = format!("{dir}/{name}");
+                    // Read off the async worker: this runtime also drives the
+                    // SSH reader task, and a blocking read of a large file would
+                    // stall it. (`tokio::fs` isn't in this crate's feature set,
+                    // hence spawn_blocking rather than an async read.)
+                    let path_for_read = local.clone();
+                    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path_for_read))
+                        .await
+                        .map_err(|e| format!("read task: {e}"))?
+                        .map_err(|e| format!("read {}: {e}", local.display()))?;
+
+                    let ch = session.channel_open_session().await
+                        .map_err(|e| format!("open channel: {e}"))?;
+                    ch.request_subsystem(true, "sftp").await
+                        .map_err(|e| format!("sftp subsystem: {e}"))?;
+                    let sftp = SftpSession::new(ch.into_stream()).await
+                        .map_err(|e| format!("sftp session: {e}"))?;
+                    let mut f = sftp.create(&remote_path).await
+                        .map_err(|e| format!("create {remote_path}: {e}"))?;
+                    f.write_all(&bytes).await.map_err(|e| format!("write: {e}"))?;
+                    f.flush().await.map_err(|e| format!("flush: {e}"))?;
+                    drop(f);
+                    drop(sftp);
+                    Ok::<String, String>(remote_path)
+                }.await;
+                // Receiver gone means the window closed; stop rather than
+                // finishing a transfer nobody is waiting for.
+                if tx.send(res).is_err() { break; }
+            }
+        });
+        rx
     }
 
     // ── RPC internals ─────────────────────────────────────────────────────────
@@ -713,5 +784,73 @@ mod tests {
         let value: toml::Value = cargo_toml.parse().unwrap();
         let version = value["package"]["version"].as_str().unwrap();
         assert_eq!(SERVER_VERSION, format!("forge-server-{version}"));
+    }
+}
+
+/// Live SFTP upload check against a real host. Ignored by default — needs a
+/// reachable machine and writes to its `~/.forge-dnd-test/`.
+///   FORGE_TEST_SSH_HOST=user@192.0.2.10 \
+///     cargo test -p forge-ide fs_upload_roundtrip -- --ignored --nocapture
+#[cfg(test)]
+mod upload_tests {
+    #[test]
+    #[ignore]
+    fn fs_upload_roundtrip() {
+        let Some(target) = std::env::var_os("FORGE_TEST_SSH_HOST")
+            .map(|s| s.to_string_lossy().into_owned()) else {
+            eprintln!("FORGE_TEST_SSH_HOST not set; skipping");
+            return;
+        };
+        let (user, host) = target.split_once('@').expect("want user@host");
+
+        // Two files: one binary-ish with NUL bytes, one with a space in the name,
+        // since those are the cases text-based transfer and naive quoting break.
+        let dir = std::env::temp_dir().join(format!("forge-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("shot.png");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(40_000).collect();
+        std::fs::write(&bin, &payload).unwrap();
+        let spaced = dir.join("my notes.txt");
+        std::fs::write(&spaced, b"hello from forge\n").unwrap();
+
+        let hosts = super::load_hosts();
+        let cfg = hosts.iter().find(|h| h.host == host && h.user == user)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut h = super::SshHost::default();
+                h.name = host.to_string();
+                h.host = host.to_string();
+                h.user = user.to_string();
+                h.port = 22;
+                h
+            });
+
+        let conn = super::SshConnection::connect(
+            &cfg, None, &|m, _| eprintln!("  ssh: {m}"),
+        ).expect("connect");
+
+        let remote_dir = format!("/home/{user}/.forge-dnd-test");
+        let rx = conn.fs_upload(vec![bin.clone(), spaced.clone()], &remote_dir);
+
+        let mut uploaded: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(Ok(p))  => { eprintln!("  uploaded -> {p}"); uploaded.push(p); }
+                Ok(Err(e)) => panic!("upload failed: {e}"),
+                Err(e)     => panic!("no result: {e}"),
+            }
+        }
+        assert_eq!(uploaded.len(), 2);
+        assert!(uploaded[1].ends_with("my notes.txt"), "space in name survived: {:?}", uploaded[1]);
+
+        // Verify byte-for-byte on the far side via the server's own fs API.
+        let listing = conn.fs_list(&remote_dir).expect("fs_list");
+        let png = listing.iter().find(|e| e.name == "shot.png").expect("shot.png present");
+        assert_eq!(png.size as usize, payload.len(),
+                   "binary upload truncated: {} vs {}", png.size, payload.len());
+        assert!(listing.iter().any(|e| e.name == "my notes.txt"));
+
+        eprintln!("  verified {} bytes for shot.png", png.size);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

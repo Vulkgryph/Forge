@@ -21,12 +21,22 @@ cargo build --release
 echo "==> Building forge-agent (bundled so the agent panel works standalone)"
 cargo build --release -p forge-agent
 
+# forge-server doubles as the *local* pty-host daemon: `ptyhost.rs` looks for it
+# next to the forge-ide binary and spawns it as `forge-server --listen <socket>`.
+# Without it in the bundle that lookup fails and every terminal silently falls
+# back to a directly-owned PTY, which dies with the process — so terminals do not
+# survive Reload Window. (Same binary, cross-compiled to musl, is what gets
+# uploaded to remote hosts for SSH workspaces.)
+echo "==> Building forge-server (local pty-host daemon; also the SSH remote agent)"
+cargo build --release -p forge-server
+
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BUILD_DIR/forge-ide" "$APP/Contents/MacOS/forge-ide"
 cp "$BUILD_DIR/forge-agent" "$APP/Contents/MacOS/forge-agent"
+cp "$BUILD_DIR/forge-server" "$APP/Contents/MacOS/forge-server"
 # No third-party runtime is bundled. The default renderer uses wgpu, which
 # targets Apple's own Metal framework — already present on every Mac. The
 # optional `vulkan-renderer` build needs MoltenVK installed on the host

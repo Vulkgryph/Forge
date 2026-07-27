@@ -188,6 +188,23 @@ fn draw_quick_open_row(
     resp
 }
 
+/// `dir/name`, or `dir/name (2)`, `(3)`… if that already exists. Never returns
+/// a path that exists, so an import cannot clobber.
+fn unique_dest(dir: &Path, name: &Path) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() { return first; }
+    let stem = name.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext  = name.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 2..1000 {
+        let candidate = match &ext {
+            Some(e) => dir.join(format!("{stem} ({n}).{e}")),
+            None    => dir.join(format!("{stem} ({n})")),
+        };
+        if !candidate.exists() { return candidate; }
+    }
+    first
+}
+
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() { return true; }
     let mut hi = haystack.chars();
@@ -3924,6 +3941,9 @@ impl IdeApp {
                                         self.folder_add_root = true;
                                         self.open_folder_dialog();
                                     }
+                                    Some(TreeAction::DropFiles { dir, paths }) => {
+                                        self.import_dropped_files(&dir, &paths);
+                                    }
                                     None => {}
                 }
             }
@@ -6445,6 +6465,9 @@ impl IdeApp {
             .exact_height(input_h)
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(30,30,30)))
             .show_inside(ui, |ui| {
+                // Whole composer panel is the drop target, not just the text
+                // box — see the drop handler below.
+                let drop_zone = ui.max_rect();
                 ui.add_space(8.0);
                 let panel_w = ui.available_width();
                 let outer_pad = 6.0;
@@ -6561,6 +6584,45 @@ impl IdeApp {
                                             .desired_rows(3));
                                     if std::mem::take(&mut tab.session.request_input_focus) {
                                         resp.request_focus();
+                                    }
+
+                                    // Dragging a file in appends its path to the
+                                    // prompt, which is how you point the agent at
+                                    // something — a screenshot to look at, a file
+                                    // to read. Same reasoning as the terminal
+                                    // (see `Terminal::draw_sized`): the useful
+                                    // thing to hand over is the path, not the
+                                    // bytes.
+                                    //
+                                    // Scoped to a drop that lands on this panel:
+                                    // `dropped_files` is global for the frame, so
+                                    // without the rect check a drop onto the
+                                    // terminal or editor would also land here.
+                                    let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+                                    if !dropped.is_empty() {
+                                        let over_panel = ui.ctx().input(|i| i.pointer.interact_pos())
+                                            .is_some_and(|p| drop_zone.contains(p));
+                                        if over_panel {
+                                            let paths: Vec<String> = dropped.iter()
+                                                .filter_map(|f| f.path.as_ref())
+                                                .map(|p| {
+                                                    // Quote only when needed — an
+                                                    // unquoted path with spaces
+                                                    // reads as several arguments.
+                                                    let s = p.to_string_lossy();
+                                                    if s.contains(' ') { format!("\"{s}\"") } else { s.into_owned() }
+                                                })
+                                                .collect();
+                                            if !paths.is_empty() {
+                                                let text = &mut tab.session.input;
+                                                if !text.is_empty() && !text.ends_with(' ') {
+                                                    text.push(' ');
+                                                }
+                                                text.push_str(&paths.join(" "));
+                                                text.push(' ');
+                                                tab.session.request_input_focus = true;
+                                            }
+                                        }
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         let active = !tab.session.input.trim().is_empty();
@@ -9175,6 +9237,38 @@ impl IdeApp {
     fn draw_editor(&mut self, ui: &mut egui::Ui) {
         // ── Context menu — detected first so it works on the welcome screen too
         let editor_rect = ui.max_rect();
+
+        // ── Dropped files open as tabs ─────────────────────────────────────
+        // Scoped to the editor area: `dropped_files` is global for the frame,
+        // and the terminal, agent composer and file tree each claim their own
+        // rect for a different meaning (paste the path / attach it / import the
+        // file). Here the obvious meaning is "open it".
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if !dropped.is_empty()
+            && ui.ctx().input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| editor_rect.contains(p))
+        {
+            for path in dropped {
+                // Folders aren't buffers — treat one as "open this workspace",
+                // which is what dragging a folder onto an editor means anywhere
+                // else, rather than failing silently.
+                if path.is_dir() {
+                    self.has_folder = true;
+                    self.cwd = path.clone();
+                    self.file_tree.set_root(path.clone());
+                    self.git = crate::git::GitState::open(&path);
+                    self.file_watcher = crate::filewatch::FileWatcher::new(&path);
+                    for tab in &mut self.terminal_tabs {
+                        tab.terminal.restart_in(&path);
+                    }
+                    self.status = format!("Opened folder {}", path.display());
+                } else {
+                    self.open_file(path);
+                }
+            }
+        }
         let menu_id     = ui.id().with("editor_ctx_menu");
         if ui.ctx().input(|i| {
             i.pointer.secondary_clicked()
@@ -10684,6 +10778,47 @@ impl IdeApp {
         };
         self.gutter_dirty = true;
         self.status = msg;
+    }
+
+    /// Bring files dropped from outside the app into `dir`.
+    ///
+    /// Copy, never move: these come from `dropped_files`, which only carries
+    /// OS-level drops (Finder and friends). Dragging a row *within* the tree is
+    /// a different egui mechanism entirely and isn't wired up, so there is no
+    /// case here where the source is ours to remove.
+    ///
+    /// Name collisions get a ` (2)`-style suffix rather than overwriting —
+    /// silently replacing a file because a drop landed a few pixels off is not
+    /// recoverable.
+    fn import_dropped_files(&mut self, dir: &Path, paths: &[PathBuf]) {
+        let mut copied = 0usize;
+        for src in paths {
+            let Some(name) = src.file_name() else { continue };
+            // Directories would need a recursive walk with all the symlink and
+            // depth bounding that implies; not worth it for a drop target.
+            if src.is_dir() {
+                self.output_log(
+                    format!("Skipped {}: dropping folders isn't supported yet",
+                            name.to_string_lossy()),
+                    OutputLevel::Warn);
+                continue;
+            }
+            let dest = unique_dest(dir, Path::new(name));
+            match std::fs::copy(src, &dest) {
+                Ok(_) => {
+                    copied += 1;
+                    let shown = dest.strip_prefix(&self.cwd).unwrap_or(&dest);
+                    self.output_log(format!("Copied {}", shown.display()), OutputLevel::Success);
+                }
+                Err(e) => self.output_log(
+                    format!("Copy {} failed: {e}", name.to_string_lossy()),
+                    OutputLevel::Error),
+            }
+        }
+        if copied > 0 {
+            self.file_tree.refresh();
+            self.status = format!("Copied {copied} file(s)");
+        }
     }
 
     fn open_file(&mut self, path: PathBuf) {

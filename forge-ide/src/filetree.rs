@@ -13,6 +13,11 @@ pub enum TreeAction {
     OpenInTerminal(PathBuf),
     OpenFolderDialog,
     AddFolderDialog,
+    /// Files dropped from outside the app (Finder, another editor) onto a row.
+    /// `dir` is where they should land: the hovered folder, or the hovered
+    /// file's parent. The caller decides what "land" means — a local workspace
+    /// copies, an SSH one uploads.
+    DropFiles { dir: PathBuf, paths: Vec<PathBuf> },
 }
 
 // ── Inline creation state ─────────────────────────────────────────────────────
@@ -190,6 +195,9 @@ impl FileTree {
         let mut action: Option<TreeAction> = None;
         let mut toggle: Option<PathBuf>    = None;
         let mut refresh                    = false;
+        // Row geometry, kept so an external file drop can be attributed to the
+        // row it landed on (see the drop handling at the end of this function).
+        let mut row_rects: Vec<(egui::Rect, PathBuf)> = Vec::new();
 
         // Capture full panel rect BEFORE the header is drawn so the context
         // menu covers the entire sidebar including the "Forge-IDE" title row.
@@ -294,6 +302,7 @@ impl FileTree {
                     let (row_rect, resp) = ui.allocate_exact_size(
                         egui::vec2(avail_w, row_h), egui::Sense::click(),
                     );
+                    row_rects.push((row_rect, path.clone()));
 
                     // Hover / selection highlight across the full row
                     if selected {
@@ -491,6 +500,28 @@ impl FileTree {
                     }
                 }
             });
+
+        // ── External file drop ────────────────────────────────────────────
+        // Only OS-level drops arrive as `dropped_files` (Finder and friends);
+        // dragging a row *within* the tree is a separate egui mechanism and is
+        // not handled here. So this is always an import, never a move.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if !dropped.is_empty() {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                if full_rect.contains(pos) {
+                    // Land in the row under the cursor: that folder, or the
+                    // parent of that file. Falling back to the root means a drop
+                    // on empty space below the rows still does the obvious thing.
+                    let target = row_rects.iter()
+                        .find(|(rect, _)| rect.contains(pos))
+                        .map(|(_, path)| Self::parent_dir(path))
+                        .unwrap_or_else(|| self.root.clone());
+                    action = Some(TreeAction::DropFiles { dir: target, paths: dropped });
+                }
+            }
+        }
 
         if let Some(dir) = toggle {
             if self.expanded.contains(&dir) { self.expanded.remove(&dir); }

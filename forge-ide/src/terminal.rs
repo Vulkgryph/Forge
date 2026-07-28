@@ -1735,4 +1735,41 @@ mod private_mode_tests {
         assert!(g.sync_update.is_some(), "and so was the synchronized update");
         g.process("\x1b[?2026l");
     }
+
+    /// The exact bytes forge-tui's frame writer emits, captured from a real pty.
+    ///
+    /// This is the jitter the user reported: ink erases scrollback (`3J`) and
+    /// reprints the transcript, and the scrollbar jumps as history shrinks and
+    /// regrows. Wrapped in a synchronized update, the wipe and the reprint must
+    /// present as a single frame — exactly one version bump for the whole
+    /// sequence, so the renderer never shows the emptied intermediate state.
+    #[test]
+    fn forge_tui_repaint_presents_as_one_frame() {
+        let mut g = Grid::with_size(10, 40);
+        filled(&mut g, 30, "transcript");
+        let before = g.version();
+
+        g.process("\x1b[?2026h\x1b[2J\x1b[3J\x1b[HREPAINT\x1b[?2026l");
+
+        assert_eq!(g.version(), before + 1,
+                   "the wipe and reprint must present once, not twice");
+        assert!(g.sync_update.is_none(), "update closed");
+    }
+
+    /// The same frame split across pty reads — the common case, since a repaint
+    /// of a long transcript exceeds a single chunk. Nothing may present until
+    /// the closing `2026l` arrives.
+    #[test]
+    fn a_split_repaint_withholds_until_complete() {
+        let mut g = Grid::with_size(10, 40);
+        filled(&mut g, 30, "transcript");
+        let before = g.version();
+
+        g.process("\x1b[?2026h\x1b[2J\x1b[3J\x1b[H");
+        assert_eq!(g.version(), before, "nothing may present mid-frame");
+        g.process("first half ");
+        assert_eq!(g.version(), before, "still nothing");
+        g.process("second half\x1b[?2026l");
+        assert_eq!(g.version(), before + 1, "one frame once complete");
+    }
 }

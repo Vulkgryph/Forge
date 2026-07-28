@@ -16,7 +16,9 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.tsx",
-    "build": "bun build src/index.tsx --outfile dist/forge.js --target bun"
+    "build": "bun build src/index.tsx --outfile dist/forge.js --target bun",
+    "test": "bun test src/",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "chalk": "^5.6.2",

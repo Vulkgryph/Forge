@@ -4,6 +4,7 @@ import React from "react";
 import { render } from "ink";
 import { App } from "./components/App.js";
 import { findAgentBinary } from "./agent-bridge.js";
+import { createFrameWriter } from "./frame-writer.js";
 
 const VERSION = "0.1.0";
 
@@ -250,6 +251,14 @@ if (
   }
 }
 
+// Group ink's writes into one synchronized-update frame per tick, so a
+// full-transcript repaint can't be presented half-finished. See frame-writer.ts
+// for why ink needs this. Registered for exit *before* the cursor-restore
+// handler below, so a pending frame lands before the cursor goes back to the
+// shell.
+const { stdout: tuiStdout, flush: flushFrame } = createFrameWriter(process.stdout);
+process.on("exit", flushFrame);
+
 // Hide the OS-level terminal cursor while the TUI is rendering. Ink writes
 // new content as the agent streams, and the terminal cursor parks itself
 // wherever the last write landed — which means it shows up in the middle of
@@ -269,4 +278,6 @@ process.on("exit", restoreCursor);
 process.on("SIGINT", () => { restoreCursor(); process.exit(130); });
 process.on("SIGTERM", () => { restoreCursor(); process.exit(143); });
 
-render(<App initialAgentArgs={cli.agentArgs} initialCwd={cli.cwd} />);
+render(<App initialAgentArgs={cli.agentArgs} initialCwd={cli.cwd} />, {
+  stdout: tuiStdout,
+});

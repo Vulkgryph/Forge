@@ -130,6 +130,19 @@ const MAX_SCROLLBACK:  usize = 5000;
 /// and it is what `session.json` pays for on every save/load.
 const SNAPSHOT_SCROLLBACK: usize = 200;
 
+/// Main-screen state parked while the alternate screen is active.
+struct AltSaved {
+    viewport: Vec<Vec<Cell>>,
+    cur_row:  usize,
+    cur_col:  usize,
+}
+
+/// How long a synchronized update may withhold presentation before we give up
+/// and draw anyway. An application that sets `?2026h` and then dies — or simply
+/// forgets the matching `l` — must not freeze the terminal; real emulators use a
+/// comparable bail-out.
+const SYNC_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
 #[derive(PartialEq, Clone, Copy)]
 enum PState { Ground, Esc, Csi, Osc, Charset }
 
@@ -165,6 +178,22 @@ pub struct Grid {
     dim:          bool,
     parse_st:     PState,
     parse_params: String,
+    /// Main-screen contents saved while the alternate screen (`ESC[?1049h`) is
+    /// active. `Some` means we are on the alternate screen.
+    ///
+    /// Full-screen programs — vim, htop, less, and any TUI that takes over the
+    /// display — switch to this buffer precisely so their repaints do not end up
+    /// in the scrollback. Without it their frames scrolled into history as if
+    /// they were output, so leaving one left thousands of junk lines behind.
+    alt_screen:   Option<AltSaved>,
+    /// Set between `ESC[?2026h` and `ESC[?2026l` — synchronized update.
+    ///
+    /// The contract is "do not present anything until I say I am done", which
+    /// lets an application emit a whole frame without the user seeing it drawn
+    /// piecewise. Implemented by withholding `version` bumps: the renderer keys
+    /// its cached galley on `version`, so an unchanged version means it keeps
+    /// presenting the last *complete* frame while this one is assembled.
+    sync_update:  Option<std::time::Instant>,
     /// Bumped on every content-affecting mutation (`process`, `resize`,
     /// `restore_snapshot`). Lets `Terminal::draw_sized` cache its rendered
     /// viewport `Galley` and skip rebuilding + re-shaping it on every single
@@ -204,6 +233,7 @@ impl Grid {
             current_bg: None,
             dim: false,
             parse_st: PState::Ground, parse_params: String::new(),
+            alt_screen: None, sync_update: None,
             version: 0,
             scrollback_version: 0,
         }
@@ -333,15 +363,65 @@ impl Grid {
         if self.scrollback.len() != before { self.scrollback_version += 1; }
     }
 
+    /// Switch to the alternate screen: park the main viewport, hand the
+    /// application a cleared one. `save_cursor` distinguishes `1049` (which also
+    /// saves the cursor) from the older `47`/`1047`.
+    ///
+    /// Re-entering while already on the alternate screen is a no-op rather than
+    /// stacking saves — otherwise a program that sets the mode twice would lose
+    /// the real main screen behind an alternate one.
+    fn enter_alt_screen(&mut self, save_cursor: bool) {
+        if self.alt_screen.is_some() { return; }
+        self.alt_screen = Some(AltSaved {
+            viewport: std::mem::replace(
+                &mut self.viewport,
+                vec![vec![Cell::blank(); self.cols]; self.rows],
+            ),
+            cur_row: if save_cursor { self.cur_row } else { 0 },
+            cur_col: if save_cursor { self.cur_col } else { 0 },
+        });
+        self.cur_row = 0;
+        self.cur_col = 0;
+        self.version += 1;
+    }
+
+    /// Return to the main screen, restoring what was parked. Anything the
+    /// application drew on the alternate screen is discarded, which is the whole
+    /// point: it never belonged in the scrollback.
+    fn leave_alt_screen(&mut self, restore_cursor: bool) {
+        let Some(saved) = self.alt_screen.take() else { return };
+        self.viewport = saved.viewport;
+        // A resize while on the alternate screen can leave the parked copy the
+        // wrong shape; normalise rather than trust it.
+        self.viewport.truncate(self.rows);
+        while self.viewport.len() < self.rows {
+            self.viewport.push(vec![Cell::blank(); self.cols]);
+        }
+        for row in &mut self.viewport {
+            row.truncate(self.cols);
+            while row.len() < self.cols { row.push(Cell::blank()); }
+        }
+        if restore_cursor {
+            self.cur_row = saved.cur_row.min(self.rows.saturating_sub(1));
+            self.cur_col = saved.cur_col.min(self.cols.saturating_sub(1));
+        }
+        self.version += 1;
+    }
+
     /// Shift the viewport up by one line, pushing the departing top line
     /// into scrollback. Does not move the cursor (matches real terminals'
     /// "scroll" primitive, used both by line-feed-at-bottom and ESC[S).
+    ///
+    /// On the alternate screen the departing line is dropped instead: that
+    /// buffer has no scrollback, which is why full-screen programs use it.
     fn scroll_up_one(&mut self) {
         let top = self.viewport.remove(0);
-        self.scrollback.push_back(top);
-        self.scrollback_version += 1;
+        if self.alt_screen.is_none() {
+            self.scrollback.push_back(top);
+            self.scrollback_version += 1;
+            self.trim_scrollback();
+        }
         self.viewport.push(vec![Cell::blank(); self.cols]);
-        self.trim_scrollback();
     }
 
     fn line_feed(&mut self) {
@@ -464,10 +544,26 @@ impl Grid {
             // (e.g. `?1004;25h` — bracketed paste + cursor visibility at
             // once), so this has to check membership across all
             // semicolon-separated values, not require an exact "25" match.
-            if rest.split(';').any(|p| p == "25") {
-                match cmd {
-                    'h' => self.cursor_visible = true,
-                    'l' => self.cursor_visible = false,
+            let set = cmd == 'h';
+            for mode in rest.split(';') {
+                match mode {
+                    "25" => self.cursor_visible = set,
+                    // Alternate screen. 1049 also saves/restores the cursor;
+                    // 47 and 1047 are the older variants without that.
+                    "1049" | "1047" | "47" => {
+                        if set { self.enter_alt_screen(mode == "1049"); }
+                        else   { self.leave_alt_screen(mode == "1049"); }
+                    }
+                    // Synchronized update — see `sync_update`.
+                    "2026" => {
+                        if set {
+                            self.sync_update = Some(std::time::Instant::now());
+                        } else {
+                            // Cleared here; the single atomic bump for the whole
+                            // frame happens at the end of `process`.
+                            self.sync_update = None;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -503,7 +599,6 @@ impl Grid {
     }
 
     pub fn process(&mut self, data: &str) {
-        self.version += 1;
         for c in data.chars() {
             match self.parse_st {
                 PState::Ground => match c {
@@ -556,6 +651,21 @@ impl Grid {
                     _ => {}
                 },
             }
+        }
+
+        // Present at most once per chunk, and only when no synchronized update is
+        // open — the renderer keys its cached galley on `version`, so leaving it
+        // unchanged keeps the last *complete* frame on screen while this one is
+        // still being written. Decided here, after parsing, so the chunk that
+        // *opens* the update doesn't present, and the one that closes it presents
+        // exactly once.
+        //
+        // The deadline is a safety valve: an application that opens a
+        // synchronized update and then dies must not freeze the display.
+        match self.sync_update {
+            Some(started) if started.elapsed() < SYNC_UPDATE_TIMEOUT => {}
+            Some(_) => { self.sync_update = None; self.version += 1; }
+            None    => self.version += 1,
         }
     }
 
@@ -1502,5 +1612,127 @@ mod ink_redraw_tests {
         assert!(g.scrollback.len() > 50,
                 "100 lines of real output on a 24-row screen should scroll, got {}",
                 g.scrollback.len());
+    }
+}
+
+#[cfg(test)]
+mod private_mode_tests {
+    use super::{Grid, SYNC_UPDATE_TIMEOUT};
+
+    fn filled(g: &mut Grid, lines: usize, tag: &str) {
+        let mut s = String::new();
+        for i in 0..lines { s.push_str(&format!("{tag} {i}\r\n")); }
+        g.process(&s);
+    }
+
+    /// The point of the alternate screen: a full-screen program's repaints must
+    /// not end up in the scrollback. Without this, leaving vim/htop left
+    /// thousands of junk lines behind.
+    #[test]
+    fn alt_screen_scrolling_does_not_touch_scrollback() {
+        let mut g = Grid::with_size(10, 40);
+        filled(&mut g, 30, "history");
+        let before = g.scrollback.len();
+        assert!(before > 0, "precondition: real output scrolled into history");
+
+        g.process("\x1b[?1049h");
+        filled(&mut g, 200, "tui frame");
+        assert_eq!(g.scrollback.len(), before,
+                   "alternate screen must not add scrollback");
+
+        g.process("\x1b[?1049l");
+        assert_eq!(g.scrollback.len(), before, "leaving must not add any either");
+    }
+
+    /// Leaving restores exactly what the main screen had.
+    #[test]
+    fn alt_screen_restores_the_main_viewport() {
+        let mut g = Grid::with_size(6, 40);
+        g.process("main content here");
+        let main_before = g.all_text();
+
+        g.process("\x1b[?1049h");
+        g.process("totally different full-screen thing");
+        assert_ne!(g.all_text(), main_before, "alt screen shows its own content");
+
+        g.process("\x1b[?1049l");
+        assert_eq!(g.all_text(), main_before, "main screen came back intact");
+    }
+
+    /// Entering twice must not park the alternate screen as if it were the main
+    /// one — that would lose the real main screen permanently.
+    #[test]
+    fn re_entering_alt_screen_is_idempotent() {
+        let mut g = Grid::with_size(6, 40);
+        g.process("the real main screen");
+        let main = g.all_text();
+        g.process("\x1b[?1049h");
+        g.process("alt one");
+        g.process("\x1b[?1049h");   // again — must be a no-op
+        g.process("alt two");
+        g.process("\x1b[?1049l");
+        assert_eq!(g.all_text(), main);
+    }
+
+    /// 1049 saves and restores the cursor; 47 does not.
+    #[test]
+    fn cursor_save_differs_between_1049_and_47() {
+        let mut g = Grid::with_size(8, 40);
+        g.process("\x1b[5;10H");                 // row 5, col 10 (1-based)
+        let pos = g.cursor();
+        g.process("\x1b[?1049h");
+        assert_eq!(g.cursor(), (0, 0), "alt screen starts at home");
+        g.process("\x1b[?1049l");
+        assert_eq!(g.cursor(), pos, "1049 restores the cursor");
+
+        g.process("\x1b[3;7H");
+        g.process("\x1b[?47h");
+        g.process("\x1b[?47l");
+        assert_eq!(g.cursor(), (0, 0), "47 does not restore it");
+    }
+
+    /// Synchronized update withholds presentation: `version` drives the renderer's
+    /// galley cache, so an unchanged version means the last complete frame stays
+    /// on screen while this one is written.
+    #[test]
+    fn synchronized_update_defers_presentation() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("settled");
+        let v = g.version();
+
+        g.process("\x1b[?2026h");
+        for i in 0..20 { g.process(&format!("frame piece {i}\r\n")); }
+        assert_eq!(g.version(), v, "nothing should be presented mid-frame");
+
+        g.process("\x1b[?2026l");
+        assert_eq!(g.version(), v + 1, "exactly one atomic bump for the frame");
+    }
+
+    /// An application that opens a synchronized update and never closes it must
+    /// not freeze the display.
+    #[test]
+    fn synchronized_update_times_out() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("\x1b[?2026h");
+        g.process("held back");
+        let held = g.version();
+
+        // Backdate the open so the next write is past the deadline.
+        g.sync_update = Some(std::time::Instant::now() - SYNC_UPDATE_TIMEOUT * 2);
+        g.process("this must get through");
+        assert!(g.version() > held, "presentation resumed after the timeout");
+        assert!(g.sync_update.is_none(), "and the stuck state was cleared");
+    }
+
+    /// Batched private modes must all apply — `?2026;25h` sets both.
+    #[test]
+    fn batched_private_modes_all_apply() {
+        let mut g = Grid::with_size(6, 40);
+        g.process("\x1b[?25l");
+        assert!(!g.cursor_visible());
+        g.process("\x1b[?2026;25h");
+        assert!(g.cursor_visible(), "cursor visibility applied from a batch");
+        assert!(g.sync_update.is_some(), "and so was the synchronized update");
+        g.process("\x1b[?2026l");
     }
 }

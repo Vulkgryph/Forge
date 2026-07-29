@@ -1,0 +1,21 @@
+[package]
+name    = "forge-tui-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Terminal UI for the Forge agent, rendered from scratch."
+
+# Deliberately short. crossterm exists for one reason: raw mode and key decoding
+# differ enough on Windows (console API, not termios) that hand-rolling it buys
+# risk, not independence. Everything above the byte layer — layout, diffing,
+# styling, markdown — is ours.
+[dependencies]
+crossterm            = "0.28"
+unicode-segmentation = "1.12"
+unicode-width        = "0.2"
+
+# Only for restoring the terminal from a SIGTERM/SIGHUP handler, where Drop
+# never runs. crossterm already pulls this in on unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -609,9 +609,13 @@ fn load_entry() -> Result<ash::Entry, String> {
         // for that case (it's always this same checkout), meaningless for
         // an actually-shipped build, which is why it's a fallback and not
         // the primary lookup.
+        //
+        // Nothing is checked in at this path: MoltenVK is third-party and the
+        // repository ships no third-party binaries. It stays in the list as a
+        // place a developer can drop their own copy, which is what the error
+        // below suggests.
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         candidates.push(manifest.join("runtime/macos/libMoltenVK.dylib"));
-        candidates.push(manifest.join("../Game Engine/launchers/desktop/runtime/macos/libMoltenVK.dylib"));
 
         // Last resort: whatever happens to already be installed system-wide.
         candidates.push(std::path::PathBuf::from("/opt/homebrew/lib/libMoltenVK.dylib"));

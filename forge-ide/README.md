@@ -41,7 +41,7 @@ Forge IDE is a Cargo workspace with three crates:
 ### Requirements
 
 - **Rust** (stable, 2024 edition)
-- **Vulkan** — on macOS this means [MoltenVK](https://github.com/KhronosGroup/MoltenVK); a copy is bundled under `runtime/macos/` and picked up automatically. Linux and Windows use their native Vulkan drivers.
+- **Vulkan** — only for the optional `vulkan-renderer` build; the default renderer is wgpu and needs none of this. On macOS Vulkan means [MoltenVK](https://github.com/KhronosGroup/MoltenVK), which is **not bundled** — this repository ships no third-party binaries. Install it with `brew install molten-vk`, or drop your own `libMoltenVK.dylib` at `runtime/macos/`. Linux and Windows use their native Vulkan drivers.
 - **A GLSL compiler toolchain** for `shaderc` (used at build time to compile the egui shaders) — this typically means `cmake` and a C++ compiler are available.
 
 ### Build the IDE

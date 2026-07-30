@@ -24,10 +24,17 @@ if [ ! -d "$APP" ]; then
   exit 1
 fi
 
-echo "==> Signing embedded libraries"
-codesign --force --options runtime --timestamp \
-  --sign "$SIGN_ID" \
-  "$APP/Contents/Frameworks/libMoltenVK.dylib"
+# No third-party library is bundled: the default renderer is wgpu, which goes
+# through Apple's own Metal framework. The optional `vulkan-renderer` build
+# needs MoltenVK installed on the host, and a packager who chooses to embed
+# their own copy still needs it signed — hence the existence check rather than
+# an unconditional sign, which failed outright once the bundled copy was gone.
+if [ -f "$APP/Contents/Frameworks/libMoltenVK.dylib" ]; then
+  echo "==> Signing embedded libraries"
+  codesign --force --options runtime --timestamp \
+    --sign "$SIGN_ID" \
+    "$APP/Contents/Frameworks/libMoltenVK.dylib"
+fi
 
 echo "==> Signing bundled forge-agent"
 codesign --force --options runtime --timestamp \

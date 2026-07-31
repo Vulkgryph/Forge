@@ -8,9 +8,11 @@
 
 use forge_agent_proto::ClientMessage;
 
+use crate::dialog::{Decision, Dialog};
 use crate::markdown::{self, Line, Span};
 use crate::screen::{Screen, Style};
 use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
+use crate::widgets::Rect;
 
 /// What the event loop should do after an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub struct App {
     /// Cached wrap of the transcript: the width it was built for, how many
     /// entries it covered, and the lines themselves.
     cache:   Option<(usize, usize, Vec<Line>)>,
+    /// The modal prompt, mirroring `session.pending`.
+    dialog:  Option<Dialog>,
 }
 
 impl Default for App {
@@ -68,7 +72,32 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self { session: Session::new(), input: String::new(), scroll: 0, cache: None }
+        Self {
+            session: Session::new(),
+            input: String::new(),
+            scroll: 0,
+            cache: None,
+            dialog: None,
+        }
+    }
+
+    /// Keep the dialog in step with what the agent is waiting on.
+    ///
+    /// Rebuilding only on a transition preserves the user's cursor and any text
+    /// they have typed; rebuilding every frame would reset both under them.
+    fn sync_dialog(&mut self) {
+        match (self.session.pending.is_some(), self.dialog.is_some()) {
+            (true, false) => {
+                self.dialog = self.session.pending.as_ref().map(Dialog::for_pending);
+            }
+            (false, true) => self.dialog = None,
+            _ => {}
+        }
+    }
+
+    /// The open modal prompt, if any.
+    pub fn dialog(&self) -> Option<&Dialog> {
+        self.dialog.as_ref()
     }
 
     pub fn session(&self) -> &Session {
@@ -98,7 +127,34 @@ impl App {
     }
 
     pub fn update(&mut self, input: Input, screen: &Screen) -> (Outcome, Vec<Effect>) {
+        self.sync_dialog();
         let page = self.viewport_rows(screen).max(1);
+
+        // Quitting and interrupting are never captured by a prompt: a modal that
+        // could not be escaped would be a trap.
+        match input {
+            Input::Quit => return (Outcome::Quit, Vec::new()),
+            Input::Interrupt if self.dialog.is_some() => {
+                // Interrupting while blocked denies the prompt as a side effect,
+                // since the turn it belongs to is being abandoned.
+                let effects = self.decide(Decision::Deny);
+                return (Outcome::Continue, effects);
+            }
+            Input::Resize(..) => {
+                self.cache = None;
+                return (Outcome::Continue, Vec::new());
+            }
+            _ => {}
+        }
+
+        // A prompt is modal: everything else goes to it.
+        if self.dialog.is_some() {
+            let decision = self.dialog.as_mut().and_then(|d| d.handle(input));
+            return match decision {
+                Some(decision) => (Outcome::Continue, self.decide(decision)),
+                None => (Outcome::Continue, Vec::new()),
+            };
+        }
 
         match input {
             Input::Quit => return (Outcome::Quit, Vec::new()),
@@ -113,12 +169,6 @@ impl App {
             }
 
             Input::Char(c) => {
-                // While the agent is waiting on a yes/no decision, those keys
-                // are the answer rather than text — otherwise the only way to
-                // approve would be to type into a prompt that is not listening.
-                if let Some(effects) = self.answer_with_key(c) {
-                    return (Outcome::Continue, effects);
-                }
                 self.input.push(c);
                 self.follow_tail();
             }
@@ -146,20 +196,6 @@ impl App {
                 if text.is_empty() {
                     return (Outcome::Continue, Vec::new());
                 }
-
-                // A prompt taking free text consumes the line.
-                if self.session.pending.is_some() {
-                    // Cloned because a prompt that does *not* take text leaves
-                    // the line to be sent as an ordinary message below.
-                    let effects = self.session.reply(text.clone());
-                    if !effects.is_empty() {
-                        self.follow_tail();
-                        return (Outcome::Continue, effects);
-                    }
-                    // Nothing consumed it (an approval, say) — fall through and
-                    // treat the text as a message rather than swallowing it.
-                }
-
                 self.session_mut().push_user(&text);
                 self.follow_tail();
                 return (
@@ -180,38 +216,49 @@ impl App {
         (Outcome::Continue, Vec::new())
     }
 
-    /// Route a single keypress to a pending yes/no decision, if there is one.
-    ///
-    /// Only while the input line is empty. Otherwise the letters y, n and a
-    /// could not be typed at all with a prompt open — "wait" would trigger
-    /// "always approve" on its second keystroke. Starting to type is taken as
-    /// choosing to write a reply instead of picking an option.
-    ///
-    /// Returns `None` when the key is just text.
-    fn answer_with_key(&mut self, c: char) -> Option<Vec<Effect>> {
-        if !self.input.is_empty() {
-            return None;
-        }
-        match self.session.pending {
-            Some(Pending::Approval { .. }) => match c.to_ascii_lowercase() {
-                'y' => Some(self.session.approve(false)),
-                'a' => Some(self.session.approve(true)),
-                'n' => Some(self.session.deny("denied by the user")),
-                _ => None,
-            },
-            Some(Pending::Plan { .. }) => match c.to_ascii_lowercase() {
-                'y' => Some(self.session.approve_plan(false)),
-                'c' => Some(self.session.approve_plan(true)),
-                _ => None,
-            },
-            _ => None,
-        }
+    /// Turn a dialog decision into session calls.
+    fn decide(&mut self, decision: Decision) -> Vec<Effect> {
+        let is_rewind = matches!(self.session.pending, Some(Pending::Rewind { .. }));
+        let effects = match decision {
+            // A rewind answers with a checkpoint id, not a tool id.
+            Decision::Approve { .. } if is_rewind => self.session.confirm_rewind(),
+            Decision::Approve { remember } => self.session.approve(remember),
+            Decision::Deny if is_rewind => {
+                self.session.cancel_pending();
+                Vec::new()
+            }
+            Decision::Deny => self.session.deny("denied by the user"),
+            Decision::Answer(text) => self.session.reply(text),
+            Decision::ApprovePlan { clear_context } => self.session.approve_plan(clear_context),
+            Decision::Cancel => {
+                self.session.cancel_pending();
+                Vec::new()
+            }
+        };
+        self.dialog = None;
+        self.cache = None;
+        self.follow_tail();
+        effects
     }
 
     /// Rows available to the transcript: everything but the status line, the
-    /// rule, and the input line.
+    /// rule, the input line, and whatever the open prompt occupies.
     fn viewport_rows(&self, screen: &Screen) -> usize {
-        screen.rows().saturating_sub(3)
+        let chrome = 3 + self.dialog_rows(screen);
+        screen.rows().saturating_sub(chrome)
+    }
+
+    /// How many rows the open prompt wants, bounded so the transcript never
+    /// disappears entirely behind it.
+    fn dialog_rows(&self, screen: &Screen) -> usize {
+        match &self.dialog {
+            None => 0,
+            Some(d) => {
+                let wanted = d.height(screen.cols());
+                let ceiling = screen.rows().saturating_sub(4).max(1);
+                wanted.min(ceiling)
+            }
+        }
     }
 
     fn scroll_by(&mut self, delta: isize, screen: &Screen) {
@@ -299,6 +346,7 @@ impl App {
     }
 
     pub fn view(&mut self, screen: &mut Screen) {
+        self.sync_dialog();
         screen.begin_frame();
         let (cols, rows) = (screen.cols(), screen.rows());
         if cols == 0 || rows == 0 {
@@ -325,6 +373,20 @@ impl App {
             }
         }
 
+        // The prompt sits above the chrome, over the transcript's lowest rows.
+        let dialog_rows = self.dialog_rows(screen);
+        if dialog_rows > 0 {
+            let area = Rect::new(
+                rows.saturating_sub(3 + dialog_rows),
+                0,
+                dialog_rows,
+                cols,
+            );
+            if let Some(dialog) = &self.dialog {
+                dialog.draw(screen, area, palette::PROMPT);
+            }
+        }
+
         if rows >= 3 {
             self.draw_status(screen, rows - 3, cols);
         }
@@ -345,11 +407,38 @@ impl App {
             col = screen.put(row, col, "○ connecting", Style::fg(palette::SYSTEM).dim());
         }
 
-        // Context use, when the agent has reported any.
+        // Context use as a bar plus a figure — the bar is readable at a glance,
+        // the number is what you quote when it matters.
         if self.session.usage.is_some() {
-            let pct = (self.session.context_fraction() * 100.0).round() as u32;
-            col = screen.put(row, col + 2, &format!("ctx {pct}%"),
+            let fraction = self.session.context_fraction();
+            let pct = (fraction * 100.0).round() as u32;
+            // Amber past three quarters: the point where compaction is near.
+            let style = if fraction > 0.75 {
+                Style::fg(palette::ERROR)
+            } else {
+                Style::fg(palette::TOOL)
+            };
+            crate::widgets::gauge(screen, row, col + 2, 8, fraction, style);
+            col = screen.put(row, col + 11, &format!("{pct}%"),
                              Style::fg(palette::SYSTEM).dim());
+        }
+
+        // Running subagents, named so a long delegation is not a mystery.
+        if !self.session.subagents.is_empty() {
+            let text = match self.session.subagents.len() {
+                1 => {
+                    let sub = &self.session.subagents[0];
+                    if sub.detail.is_empty() {
+                        format!("▸ {}", sub.agent_type)
+                    } else {
+                        format!("▸ {}: {}", sub.agent_type, sub.detail)
+                    }
+                }
+                n => format!("▸ {n} subagents"),
+            };
+            let room = cols.saturating_sub(col + 4);
+            col = screen.put(row, col + 2, &crate::widgets::clip(&text, room),
+                             Style::fg(palette::SUBAGENT));
         }
 
         if self.session.permission_mode == PermissionMode::AllowAll {
@@ -381,26 +470,14 @@ impl App {
     }
 
     fn draw_input(&self, screen: &mut Screen, row: usize, cols: usize) {
-        // A pending decision replaces the prompt with what it is asking, so the
-        // available keys are never a guess.
-        let prompt = match &self.session.pending {
-            Some(Pending::Approval { tool_name, .. }) => {
-                format!("approve {tool_name}? [y]es [n]o [a]lways ")
-            }
-            Some(Pending::Plan { .. }) => "plan ready: [y]es [c]lear+yes, or type feedback ".into(),
-            Some(Pending::Question { question, .. }) => format!("{question} "),
-            Some(Pending::ProcessInput { prompt }) => format!("{prompt} "),
-            Some(Pending::BackgroundInput { prompt, .. }) => format!("{prompt} "),
-            Some(Pending::Rewind { summary, .. }) => format!("rewind: {summary} [y/n] "),
-            None => "› ".to_string(),
-        };
-        let style = if self.session.pending.is_some() {
-            Style::fg(palette::ERROR).bold()
-        } else {
-            Style::fg(palette::PROMPT).bold()
-        };
+        // With a prompt open, the dialog owns both the keyboard and the cursor;
+        // showing a live input line as well would suggest typing goes there.
+        if self.dialog.is_some() {
+            screen.put(row, 0, "  (answer above)", Style::fg(palette::SYSTEM).dim());
+            return;
+        }
 
-        let col = screen.put(row, 0, &prompt, style);
+        let col = screen.put(row, 0, "› ", Style::fg(palette::PROMPT).bold());
         let visible = self.visible_input(cols.saturating_sub(col));
         let end = screen.put(row, col, &visible, Style::default());
         screen.set_cursor(row, end.min(cols.saturating_sub(1)));
@@ -569,60 +646,43 @@ mod tests {
     }
 
     #[test]
-    fn a_denies_and_n_refuses_with_the_right_message() {
+    fn n_refuses_with_a_reason() {
         let (mut app, screen) = app_with(0);
-
         app.session_mut().apply(tool_request("shell_exec", "t1"));
         let (_, effects) = app.update(Input::Char('n'), &screen);
         assert!(matches!(
             effects.first(),
             Some(Effect::Send(ClientMessage::DenyAction { .. })),
         ));
+    }
+
+    /// Selecting "Yes, always" grants the tool standing approval, so later calls
+    /// of it stop asking. Reachable only by selection, never a bare keystroke.
+    #[test]
+    fn selecting_always_allow_remembers_the_tool() {
+        let (mut app, screen) = app_with(0);
 
         app.session_mut().apply(tool_request("shell_exec", "t2"));
-        let (_, effects) = app.update(Input::Char('a'), &screen);
+        app.update(Input::Down, &screen);              // onto "Yes, always"
+        let (_, effects) = app.update(Input::Enter, &screen);
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t2".into() })],
         );
-        // "always" remembered it, so the next call goes straight through.
+
+        // The next call of that tool goes straight through.
         let effects = app.session_mut().apply(tool_request("shell_exec", "t3"));
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t3".into() })],
         );
+
+        // A different tool still asks.
+        app.session_mut().apply(tool_request("write_file", "t4"));
+        assert!(app.session().pending.is_some());
     }
 
-    /// A key that is not one of the answers must still be typed, so a user can
-    /// write feedback where feedback is accepted.
-    #[test]
-    fn other_keys_still_type_while_a_prompt_is_open() {
-        let (mut app, screen) = app_with(0);
-        app.session_mut().apply(tool_request("shell_exec", "t1"));
-        app.update(Input::Char('z'), &screen);
-        assert_eq!(app.input(), "z");
-    }
 
-    /// Once the user has started typing, the answer keys are letters again —
-    /// otherwise a word like "wait" would fire "always approve" on its second
-    /// keystroke, silently granting a permission nobody chose.
-    #[test]
-    fn answer_keys_are_ordinary_letters_once_typing_has_started() {
-        let (mut app, screen) = app_with(0);
-        app.session_mut().apply(tool_request("shell_exec", "t1"));
-
-        let mut effects_seen = Vec::new();
-        for c in "wait a moment".chars() {
-            let (_, effects) = app.update(Input::Char(c), &screen);
-            effects_seen.extend(effects);
-        }
-        assert!(
-            effects_seen.is_empty(),
-            "typing must not approve anything: {effects_seen:?}",
-        );
-        assert_eq!(app.input(), "wait a moment");
-        assert!(app.session().pending.is_some(), "still waiting on the user");
-    }
 
     /// The first keystroke on an empty line is still the shortcut.
     #[test]
@@ -634,6 +694,76 @@ mod tests {
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t1".into() })],
         );
+    }
+
+    /// A prompt is modal: keystrokes belong to it, not the input line. This is
+    /// what removes the earlier hazard where typing "wait" fired "always
+    /// approve" — there is no longer any ambiguity to resolve.
+    #[test]
+    fn a_prompt_captures_typing_instead_of_the_input_line() {
+        let (mut app, screen) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+
+        let mut effects_seen = Vec::new();
+        for c in "wait".chars() {
+            let (_, effects) = app.update(Input::Char(c), &screen);
+            effects_seen.extend(effects);
+        }
+        assert!(
+            effects_seen.is_empty(),
+            "typing approved nothing: {effects_seen:?}",
+        );
+        assert_eq!(app.input(), "", "the input line was not touched");
+        assert!(app.session().pending.is_some(), "still waiting");
+    }
+
+    /// A modal must not be a trap: quitting has to work regardless.
+    #[test]
+    fn quit_works_with_a_prompt_open() {
+        let (mut app, screen) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        assert_eq!(app.update(Input::Quit, &screen).0, Outcome::Quit);
+    }
+
+    /// Interrupting abandons the turn, so the prompt it belongs to is denied
+    /// rather than left on screen waiting for an answer that will not come.
+    #[test]
+    fn interrupt_denies_an_open_prompt() {
+        let (mut app, screen) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        let (_, effects) = app.update(Input::Interrupt, &screen);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Send(ClientMessage::DenyAction { .. })),
+        ), "got {effects:?}");
+        assert!(app.dialog().is_none(), "and the prompt closes");
+    }
+
+    /// The dialog must actually appear, with the options and the keys.
+    #[test]
+    fn a_pending_approval_draws_a_dialog() {
+        let (mut app, mut screen) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("shell_exec"), "names the tool: {grid:?}");
+        assert!(grid.contains("Yes"), "and offers the options");
+        assert!(grid.contains("answer above"), "input line points at the prompt");
+    }
+
+    /// The transcript must not be drawn underneath the prompt.
+    #[test]
+    fn an_open_prompt_shrinks_the_transcript_viewport() {
+        let (mut app, screen) = app_with(30);
+        let before = app.viewport_rows(&screen);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        app.sync_dialog();
+        let after = app.viewport_rows(&screen);
+        assert!(after < before, "{after} should be fewer rows than {before}");
+        assert!(after >= 1, "the transcript never vanishes entirely");
     }
 
     #[test]
@@ -663,22 +793,6 @@ mod tests {
         );
     }
 
-    /// If the pending prompt does not take text, the typed line must not be
-    /// silently swallowed.
-    #[test]
-    fn text_typed_during_an_approval_is_sent_as_a_message() {
-        let (mut app, screen) = app_with(0);
-        app.session_mut().apply(tool_request("shell_exec", "t1"));
-        for c in "wait".chars() {
-            app.update(Input::Char(c), &screen);
-        }
-        let (_, effects) = app.update(Input::Enter, &screen);
-        assert_eq!(
-            effects,
-            vec![Effect::Send(ClientMessage::SendMessage { content: "wait".into() })],
-            "the line was not lost",
-        );
-    }
 
     // ── Scrolling ─────────────────────────────────────────────────────────
 
@@ -737,6 +851,46 @@ mod tests {
         assert!(!text.contains("\x1b[3J"));
     }
 
+    /// The context bar has to reflect real usage, since it is what tells you a
+    /// compaction is coming.
+    #[test]
+    fn the_status_line_shows_context_use() {
+        use forge_agent_proto::UsageSnapshot;
+        let (mut app, mut screen) = app_with(0);
+        app.session_mut().apply(AgentMessage::UsageUpdate {
+            snapshot: UsageSnapshot {
+                last_prompt_tokens: 500,
+                last_completion_tokens: 0,
+                max_context_tokens: 1000,
+                ..Default::default()
+            },
+        });
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("50%"), "the figure is shown: {grid:?}");
+        assert!(grid.contains('█'), "and the bar");
+    }
+
+    #[test]
+    fn the_status_line_names_a_running_subagent() {
+        let (mut app, mut screen) = app_with(0);
+        app.session_mut().apply(AgentMessage::SubagentStarted {
+            id: "s1".into(),
+            agent_type: "Explore".into(),
+            prompt: "look".into(),
+            parent_id: None,
+        });
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("Explore"), "got {grid:?}");
+    }
+
     #[test]
     fn the_status_line_shows_what_the_agent_is_doing() {
         let (mut app, mut screen) = app_with(0);
@@ -755,18 +909,6 @@ mod tests {
         assert!(text.contains("running shell_exec"), "status names the tool");
     }
 
-    /// The prompt must state the available keys, or approving is guesswork.
-    #[test]
-    fn a_pending_approval_replaces_the_prompt_with_its_options() {
-        let (mut app, mut screen) = app_with(0);
-        app.session_mut().apply(tool_request("shell_exec", "t1"));
-        app.view(&mut screen);
-        let mut sink = Vec::new();
-        screen.flush(&mut sink).unwrap();
-        let text = String::from_utf8_lossy(&sink);
-        assert!(text.contains("approve shell_exec?"), "names the tool");
-        assert!(text.contains("[y]es"), "and the keys");
-    }
 
     /// Tool output is preformatted; reflowing a diff or a stack trace would
     /// corrupt it.

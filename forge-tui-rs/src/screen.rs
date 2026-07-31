@@ -245,9 +245,13 @@ impl Screen {
         out.flush()
     }
 
-    /// Row contents as a string, for tests and debugging.
-    #[cfg(test)]
-    fn row_text(&self, row: usize) -> String {
+    /// Row contents as a string.
+    ///
+    /// Public because the diffing renderer emits only *changed* cells, so the
+    /// bytes on the wire are not the screen: a run broken by an unchanged blank
+    /// arrives as two positioned writes. Anything asserting on what the user
+    /// sees has to read the grid, not the output.
+    pub fn row_text(&self, row: usize) -> String {
         (0..self.cols)
             .filter_map(|c| self.idx(row, c))
             .map(|i| self.back[i].text.as_ref())

@@ -26,9 +26,11 @@
 
 pub mod app;
 pub mod bridge;
+pub mod dialog;
 pub mod input;
 pub mod markdown;
 pub mod screen;
 pub mod session;
 pub mod term;
+pub mod widgets;
 pub mod width;

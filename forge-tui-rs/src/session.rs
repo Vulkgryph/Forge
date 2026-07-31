@@ -699,6 +699,33 @@ impl Session {
         }
     }
 
+    /// Confirm a pending rewind.
+    ///
+    /// Separate from [`Session::approve`] because a rewind is not a tool call:
+    /// it answers with the checkpoint id rather than a tool id, and approving
+    /// the wrong one would rewind to the wrong place.
+    pub fn confirm_rewind(&mut self) -> Vec<Effect> {
+        match self.pending.take() {
+            Some(Pending::Rewind { checkpoint_id, .. }) => {
+                vec![Effect::Send(ClientMessage::Rewind {
+                    checkpoint_id: Some(checkpoint_id),
+                })]
+            }
+            other => {
+                self.pending = other;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Dismiss whatever is pending without answering.
+    ///
+    /// Only correct where the agent is not blocked on the reply; the dialog
+    /// layer decides which prompts may be cancelled at all.
+    pub fn cancel_pending(&mut self) {
+        self.pending = None;
+    }
+
     /// Flip between asking and approving everything.
     pub fn toggle_permission_mode(&mut self) -> Vec<Effect> {
         self.permission_mode = match self.permission_mode {

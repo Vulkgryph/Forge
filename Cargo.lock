@@ -1801,6 +1801,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-agent-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "forge-ide"
 version = "0.1.0"
 dependencies = [
@@ -1858,7 +1866,9 @@ name = "forge-tui-rs"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "forge-agent-proto",
  "libc",
+ "serde_json",
  "unicode-segmentation",
  "unicode-width 0.2.2",
 ]

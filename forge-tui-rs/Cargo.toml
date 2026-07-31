@@ -11,7 +11,9 @@ description = "Terminal UI for the Forge agent, rendered from scratch."
 # risk, not independence. Everything above the byte layer — layout, diffing,
 # styling, markdown — is ours.
 [dependencies]
+forge-agent-proto    = { path = "../forge-agent-proto" }
 crossterm            = "0.28"
+serde_json           = "1"
 unicode-segmentation = "1.12"
 unicode-width        = "0.2"
 

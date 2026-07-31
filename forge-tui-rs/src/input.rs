@@ -52,8 +52,13 @@ fn decode_key(key: KeyEvent) -> Option<Input> {
 
 /// The few control keys worth binding. Anything else is dropped rather than
 /// inserted as a control character into the input.
+///
+/// Interrupt is Ctrl-X rather than the customary Ctrl-C: raw mode delivers
+/// Ctrl-C as an ordinary key, and a user pressing it expects to leave, not to
+/// cancel a turn and stay. Binding it to cancel would make quitting impossible.
 fn ctrl_key(c: char) -> Option<Input> {
     Some(match c {
+        'x' => Input::Interrupt,
         'u' => Input::PageUp,
         'd' => Input::PageDown,
         'g' => Input::Home,
@@ -133,5 +138,18 @@ mod tests {
         assert_eq!(decode(ctrl('u')), Some(Input::PageUp));
         assert_eq!(decode(ctrl('d')), Some(Input::Quit)); // quit wins over scroll
         assert_eq!(decode(ctrl('g')), Some(Input::Home));
+    }
+
+    /// The help text advertises Ctrl-X for interrupt, so it has to produce one.
+    #[test]
+    fn ctrl_x_interrupts() {
+        assert_eq!(decode(ctrl('x')), Some(Input::Interrupt));
+    }
+
+    /// Ctrl-C must remain quit. Binding it to cancel-the-turn would leave no way
+    /// out of the program.
+    #[test]
+    fn ctrl_c_remains_quit_not_interrupt() {
+        assert_eq!(decode(ctrl('c')), Some(Input::Quit));
     }
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["forge-agent", "forge-ide", "forge-ide/forge-proto", "forge-ide/forge-server", "forge-tui-rs"]
+members = ["forge-agent", "forge-agent-proto", "forge-ide", "forge-ide/forge-proto", "forge-ide/forge-server", "forge-tui-rs"]
 # Without this, a plain `cargo build`/`cargo test` run from the workspace
 # root builds every member by default — including forge-ide, which pulls in
 # Vulkan/shaderc and needs a GPU-capable toolchain that a server, CI runner,

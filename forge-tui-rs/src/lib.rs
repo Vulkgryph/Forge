@@ -25,8 +25,10 @@
 //! terminal, and [`input`] is the only module that knows crossterm exists.
 
 pub mod app;
+pub mod bridge;
 pub mod input;
 pub mod markdown;
 pub mod screen;
+pub mod session;
 pub mod term;
 pub mod width;

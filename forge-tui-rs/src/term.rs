@@ -46,10 +46,13 @@ pub fn take_resize() -> bool {
     RESIZED.swap(false, Ordering::SeqCst)
 }
 
-/// Enter/leave sequences, written directly rather than through crossterm's
-/// command queue so the exact bytes are visible and testable.
-const ENTER_ALT: &str = "\x1b[?1049h";
-const LEAVE_ALT: &str = "\x1b[?1049l";
+/// Setup and teardown sequences, written directly so the exact bytes are
+/// visible and testable.
+///
+/// **No alternate screen.** The transcript is printed into the terminal's own
+/// scrollback so it can be scrolled back to, selected and copied, and so it
+/// survives the program exiting. The alternate screen would hide all of that
+/// behind a window that vanishes on exit.
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 /// Report key presses as unambiguous sequences where the terminal supports it.
@@ -92,7 +95,7 @@ impl Guard {
         // during startup is already delimited.
         write!(
             out,
-            "{ENABLE_BRACKETED_PASTE}{ENTER_ALT}{DISABLE_AUTOWRAP}{HIDE_CURSOR}{PUSH_KEYBOARD}",
+            "{ENABLE_BRACKETED_PASTE}{DISABLE_AUTOWRAP}{HIDE_CURSOR}{PUSH_KEYBOARD}",
         )?;
         out.flush()?;
 
@@ -125,7 +128,7 @@ pub fn restore() {
     // ours to erase.
     let _ = write!(
         out,
-        "{POP_KEYBOARD}{SHOW_CURSOR}{ENABLE_AUTOWRAP}{LEAVE_ALT}{DISABLE_BRACKETED_PASTE}",
+        "{POP_KEYBOARD}{SHOW_CURSOR}{ENABLE_AUTOWRAP}{DISABLE_BRACKETED_PASTE}",
     );
     let _ = out.flush();
 
@@ -189,13 +192,16 @@ pub fn size() -> (usize, usize) {
 mod tests {
     use super::*;
 
-    /// The sequences we emit are part of the contract with forge-ide's emulator,
-    /// which has matching tests. Pin them so a refactor cannot quietly change
-    /// what the emulator has to understand.
+    /// The transcript belongs in the terminal's scrollback, so the alternate
+    /// screen must not be entered — it would hide the history behind a window
+    /// that disappears on exit.
     #[test]
-    fn uses_1049_for_the_alternate_screen() {
-        assert_eq!(ENTER_ALT, "\x1b[?1049h");
-        assert_eq!(LEAVE_ALT, "\x1b[?1049l");
+    fn the_alternate_screen_is_not_used() {
+        for seq in [HIDE_CURSOR, SHOW_CURSOR, PUSH_KEYBOARD, POP_KEYBOARD,
+                    ENABLE_BRACKETED_PASTE, DISABLE_BRACKETED_PASTE,
+                    DISABLE_AUTOWRAP, ENABLE_AUTOWRAP] {
+            assert!(!seq.contains("1049"), "{seq:?} must not switch screens");
+        }
     }
 
     /// The specific sequence that caused the original jitter. It must appear
@@ -203,7 +209,7 @@ mod tests {
     #[test]
     fn no_setup_or_teardown_sequence_erases_scrollback() {
         for seq in [
-            ENTER_ALT, LEAVE_ALT, HIDE_CURSOR, SHOW_CURSOR,
+            HIDE_CURSOR, SHOW_CURSOR,
             PUSH_KEYBOARD, POP_KEYBOARD,
             ENABLE_BRACKETED_PASTE, DISABLE_BRACKETED_PASTE,
             DISABLE_AUTOWRAP, ENABLE_AUTOWRAP,

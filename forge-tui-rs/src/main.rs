@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use forge_tui_rs::app::{App, Input, Outcome};
 use forge_tui_rs::bridge::{AgentBridge, BridgeEvent};
+use forge_tui_rs::inline::Inline;
 use forge_tui_rs::keys::{Decoder, ESCAPE_TIMEOUT};
-use forge_tui_rs::screen::Screen;
 use forge_tui_rs::session::Effect;
 use forge_tui_rs::sys::{self, Ready};
 use forge_tui_rs::{input, term};
@@ -80,14 +80,13 @@ fn main() -> io::Result<()> {
     let _guard = term::Guard::new()?;
 
     let (cols, rows) = term::size();
-    let mut screen = Screen::new(cols, rows);
+    let mut inline = Inline::new(cols, rows);
     let mut app = App::new();
     let mut out = io::BufWriter::new(io::stdout());
 
     let events = merge_sources(&mut bridge);
 
-    app.view(&mut screen);
-    screen.flush(&mut out)?;
+    app.render(&mut inline, &mut out)?;
 
     'session: loop {
         // Blocks. An idle session costs nothing here.
@@ -107,12 +106,12 @@ fn main() -> io::Result<()> {
 
                 Event::Resized => {
                     let (cols, rows) = term::size();
-                    screen.resize(cols, rows);
-                    app.update(Input::Resize(cols, rows), &screen);
+                    inline.resized(cols, rows);
+                    app.update(Input::Resize(cols, rows), inline.rows());
                 }
 
                 Event::Key(decoded) => {
-                    let (outcome, effects) = app.update(decoded, &screen);
+                    let (outcome, effects) = app.update(decoded, inline.rows());
                     if outcome == Outcome::Quit || !dispatch(&mut bridge, effects) {
                         break 'session;
                     }
@@ -150,17 +149,19 @@ fn main() -> io::Result<()> {
                         Some(c) => format!("the agent exited ({c})"),
                         None => "the agent exited".to_string(),
                     });
-                    app.view(&mut screen);
-                    screen.flush(&mut out)?;
+                    app.render(&mut inline, &mut out)?;
                     break 'session;
                 }
             }
         }
 
-        app.view(&mut screen);
-        screen.flush(&mut out)?;
+        app.render(&mut inline, &mut out)?;
     }
 
+    // Commit whatever the last turn left live, so the finished conversation is
+    // all in the scrollback rather than half of it being erased on exit.
+    app.commit_all(&mut inline, &mut out)?;
+    inline.finish(&mut out)?;
     out.flush()?;
     bridge.shutdown(SHUTDOWN_GRACE);
     Ok(())

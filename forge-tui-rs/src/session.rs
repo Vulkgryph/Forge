@@ -277,6 +277,15 @@ impl Session {
         &self.entries
     }
 
+    /// Where the current turn's output begins, if a turn is in progress.
+    ///
+    /// The inline renderer needs it to decide what is settled: everything before
+    /// this can be printed permanently, because only the current turn can still
+    /// be rewritten or discarded.
+    pub fn turn_start(&self) -> Option<usize> {
+        self.turn_start
+    }
+
     /// Record what the user sent, so it appears before the reply.
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.entries.push(Entry::new(EntryKind::User, text));

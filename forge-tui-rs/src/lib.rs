@@ -27,6 +27,7 @@
 pub mod app;
 pub mod bridge;
 pub mod dialog;
+pub mod inline;
 pub mod input;
 pub mod keys;
 pub mod markdown;

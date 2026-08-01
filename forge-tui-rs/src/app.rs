@@ -14,6 +14,7 @@ use crate::menu::{self, Menu};
 use crate::screen::{Screen, Style};
 use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
 use crate::widgets::{self, Rect};
+use crate::width::str_width;
 
 /// What the event loop should do after an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +82,12 @@ pub struct App {
     /// The menu, when open. Takes the whole screen, so the transcript is hidden
     /// while it is up.
     menu:    Option<Menu>,
+    /// How many transcript entries have been printed permanently.
+    ///
+    /// Everything before the current turn is settled and gets committed to the
+    /// terminal's scrollback, where it can be scrolled back to and copied. Only
+    /// what follows is redrawn.
+    committed: usize,
 }
 
 impl Default for App {
@@ -98,6 +105,7 @@ impl App {
             cache: None,
             dialog: None,
             menu: None,
+            committed: 0,
         }
     }
 
@@ -150,9 +158,11 @@ impl App {
         self.cache = None;
     }
 
-    pub fn update(&mut self, input: Input, screen: &Screen) -> (Outcome, Vec<Effect>) {
+    /// Handle one input. `rows` is the window height, which the menu needs for
+    /// paging.
+    pub fn update(&mut self, input: Input, rows: usize) -> (Outcome, Vec<Effect>) {
         self.sync_dialog();
-        let page = self.viewport_rows(screen).max(1);
+        let _ = rows;
 
         // Quitting and interrupting are never captured by a prompt: a modal that
         // could not be escaped would be a trap.
@@ -264,13 +274,12 @@ impl App {
                 );
             }
 
-            Input::Up       => self.scroll_by(1, screen),
-            Input::Down     => self.scroll_by(-1, screen),
-            Input::PageUp   => self.scroll_by(page as isize, screen),
-            Input::PageDown => self.scroll_by(-(page as isize), screen),
-            Input::Home     => self.scroll = self.max_scroll(screen),
-            Input::End      => self.scroll = 0,
-            Input::Resize(..) => self.cache = None,
+            // Scrolling belongs to the terminal now: the transcript is printed
+            // into its scrollback, so the mouse wheel and the scrollbar work on
+            // the real history rather than on a window we maintain.
+            Input::Up | Input::Down | Input::PageUp | Input::PageDown
+            | Input::Home | Input::End => {}
+            Input::Resize(..) => {}
         }
 
         (Outcome::Continue, Vec::new())
@@ -301,60 +310,16 @@ impl App {
         effects
     }
 
-    /// Rows available to the transcript: everything but the status line, the
-    /// rule, the input line, and whatever the open prompt occupies.
-    fn viewport_rows(&self, screen: &Screen) -> usize {
-        let chrome = 3 + self.dialog_rows(screen);
-        screen.rows().saturating_sub(chrome)
-    }
-
-    /// How many rows the open prompt wants, bounded so the transcript never
-    /// disappears entirely behind it.
-    fn dialog_rows(&self, screen: &Screen) -> usize {
-        match &self.dialog {
-            None => 0,
-            Some(d) => {
-                let wanted = d.height(screen.cols());
-                let ceiling = screen.rows().saturating_sub(4).max(1);
-                wanted.min(ceiling)
-            }
-        }
-    }
-
-    fn scroll_by(&mut self, delta: isize, screen: &Screen) {
-        let max = self.max_scroll(screen) as isize;
-        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
-    }
-
-    fn max_scroll(&self, screen: &Screen) -> usize {
-        self.wrap(screen.cols()).len().saturating_sub(self.viewport_rows(screen))
-    }
-
-    /// The transcript, wrapped to `cols`.
-    ///
-    /// Recomputed when the width changes or entries are added. The entry count
-    /// is part of the key because streaming mutates the last entry in place, so
-    /// a count alone would not notice — hence the deliberate exclusion of the
-    /// tail entry from the cache, below.
-    fn wrap(&self, cols: usize) -> Vec<Line> {
-        if let Some((cached_cols, count, lines)) = &self.cache {
-            if *cached_cols == cols && *count == self.session.entries().len() {
-                return lines.clone();
-            }
-        }
-        self.build_lines(cols)
-    }
-
     /// Render the transcript, following the TypeScript client's layout.
     ///
     /// The indentation is the point: tool calls sit four columns in and their
     /// output six, so a turn reads as a hierarchy rather than a wall of text.
-    fn build_lines(&self, cols: usize) -> Vec<Line> {
+    fn build_range(&self, range: std::ops::Range<usize>, cols: usize) -> Vec<Line> {
         let dim = Style::fg(palette::GRAY).dim();
         let mut out = Vec::new();
 
-        for (i, entry) in self.session.entries().iter().enumerate() {
-            if i > 0 {
+        for (i, entry) in self.session.entries()[range.clone()].iter().enumerate() {
+            if i > 0 || range.start > 0 {
                 out.push(Line::default());
             }
             match entry.kind {
@@ -481,146 +446,206 @@ impl App {
         out
     }
 
-    /// Wrap and cache.
-    fn wrap_cached(&mut self, cols: usize) -> Vec<Line> {
-        let count = self.session.entries().len();
-        let fresh = match &self.cache {
-            Some((c, n, _)) => *c != cols || *n != count,
-            None => true,
-        };
-        if fresh {
-            let lines = self.build_lines(cols);
-            self.cache = Some((cols, count, lines));
-        }
-        self.cache.as_ref().map(|(_, _, l)| l.clone()).unwrap_or_default()
+    /// The whole transcript as lines. Used by tests; rendering goes through
+    /// [`App::lines_for`] so it can commit and redraw separate ranges.
+    #[cfg(test)]
+    fn build_lines(&self, cols: usize) -> Vec<Line> {
+        self.build_range(0..self.session.entries().len(), cols)
     }
 
-    pub fn view(&mut self, screen: &mut Screen) {
-        self.sync_dialog();
-        screen.begin_frame();
-        let (cols, rows) = (screen.cols(), screen.rows());
-        if cols == 0 || rows == 0 {
-            return;
-        }
-
-        // The menu replaces the transcript entirely — it is somewhere you are,
-        // not an overlay on the conversation. Drawn before anything else so no
-        // transcript rows are left showing underneath it.
-        if self.menu.is_some() {
-            let mut menu = self.menu.take().expect("checked above");
-            menu.draw(screen, Rect::new(0, 0, rows, cols), &self.session, palette::PROMPT);
-            self.menu = Some(menu);
-            return;
-        }
-
-        // Streaming rewrites the tail entry in place, so the cache cannot be
-        // trusted while a turn is live. Rebuilding a wrap is cheap next to a
-        // transcript that lags behind the output.
-        let lines = if self.session.activity.is_busy() {
-            self.cache = None;
-            self.build_lines(cols)
-        } else {
-            self.wrap_cached(cols)
-        };
-
-        let viewport = self.viewport_rows(screen);
-        let end = lines.len().saturating_sub(self.scroll);
-        let start = end.saturating_sub(viewport);
-        for (row, line) in lines[start..end].iter().enumerate() {
-            let mut col = 0;
-            for span in &line.spans {
-                col = screen.put(row, col, &span.text, span.style);
-            }
-        }
-
-        // The prompt sits above the chrome, over the transcript's lowest rows.
-        let dialog_rows = self.dialog_rows(screen);
-        if dialog_rows > 0 {
-            let area = Rect::new(
-                rows.saturating_sub(3 + dialog_rows),
-                0,
-                dialog_rows,
-                cols,
-            );
-            if let Some(dialog) = &self.dialog {
-                dialog.draw(screen, area, palette::PROMPT);
-            }
-        }
-
-        // Chrome, bottom-up: the context bar sits on the last row, the prompt
-        // above it, and any running subagents above that. No separator rule and
-        // no status line — the TypeScript client had neither, and the context
-        // bar carries what they were showing.
-        self.draw_context_bar(screen, rows - 1, cols);
-        if rows >= 2 {
-            self.draw_input(screen, rows - 2, cols);
-        }
-        if rows >= 4 {
-            self.draw_subagents(screen, rows - 3, cols);
-        }
-    }
-
-    /// Running subagents, listed above the prompt.
+    /// Print settled output, then redraw what is still changing.
     ///
-    /// Drawn upwards from `bottom` so the block grows into the transcript rather
-    /// than pushing the prompt off the screen.
-    fn draw_subagents(&self, screen: &mut Screen, bottom: usize, cols: usize) {
-        let subagents = &self.session.subagents;
-        if subagents.is_empty() {
-            return;
+    /// This is the whole point of rendering inline: the conversation goes into
+    /// the terminal's own scrollback rather than into a window we page through.
+    pub fn render(
+        &mut self,
+        inline: &mut crate::inline::Inline,
+        out:    &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        // Agent events arrive between keypresses, so the dialog has to be brought
+        // into step here as well as in `update` — otherwise a prompt the agent is
+        // blocked on would not appear until the user pressed something.
+        self.sync_dialog();
+        let cols = inline.cols().max(1);
+
+        // A cleared session removes entries that were already printed. They
+        // cannot be unprinted, so start counting again rather than indexing past
+        // the end of a shorter transcript.
+        if self.session.entries().len() < self.committed {
+            self.committed = 0;
         }
-        let dim = Style::fg(palette::GRAY).dim();
 
-        // One row per agent, plus the heading, as far as there is room.
-        let room = bottom.min(subagents.len() + 1);
-        let mut row = bottom + 1 - room;
-
-        let col = screen.put(row, 0, "Subagents", Style::fg(palette::MAGENTA));
-        screen.put(row, col, &format!(" · {} running", subagents.len()), dim);
-        row += 1;
-
-        for sub in subagents.iter().take(room.saturating_sub(1)) {
-            let col = screen.put(row, 2, "◆ ", Style::fg(palette::MAGENTA));
-            let col = screen.put(row, col, &sub.agent_type, Style::default());
-            let detail = if sub.detail.is_empty() { "starting" } else { &sub.detail };
-            let room = cols.saturating_sub(col + 3);
-            screen.put(row, col, &format!(" · {}", widgets::clip(detail, room)), dim);
-            row += 1;
+        // Everything before the current turn is settled. Mid-turn, nothing new
+        // is committed, because a discard can still take it back.
+        let settled = self.session.turn_start().unwrap_or_else(|| self.session.entries().len());
+        if settled > self.committed {
+            let lines = self.lines_for(self.committed..settled, cols);
+            inline.commit(out, &lines)?;
+            self.committed = settled;
         }
+
+        let live = self.live_lines(inline, cols);
+        let cursor = self.cursor_in(&live, cols);
+        inline.draw_live(out, &live.lines, cursor)
     }
 
-    /// The prompt line: `❯ ` and what has been typed, or a placeholder.
-    fn draw_input(&self, screen: &mut Screen, row: usize, cols: usize) {
-        // With a prompt open the dialog owns the keyboard and the cursor;
-        // showing a live input line as well would suggest typing goes there.
+    /// Print everything still live, so a finished conversation is entirely in
+    /// the scrollback rather than partly erased when the program exits.
+    pub fn commit_all(
+        &mut self,
+        inline: &mut crate::inline::Inline,
+        out:    &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        let cols = inline.cols().max(1);
+        let total = self.session.entries().len();
+        if total > self.committed {
+            let lines = self.lines_for(self.committed..total, cols);
+            inline.commit(out, &lines)?;
+            self.committed = total;
+        }
+        Ok(())
+    }
+
+    /// The block redrawn at the bottom: whatever the current turn has produced
+    /// so far, plus the chrome.
+    fn live_lines(&mut self, inline: &crate::inline::Inline, cols: usize) -> LiveBlock {
+        let capacity = inline.live_capacity();
+
+        // The menu replaces everything while it is open.
+        if self.menu.is_some() {
+            let mut canvas = Screen::new(cols, capacity);
+            canvas.begin_frame();
+            let mut menu = self.menu.take().expect("checked above");
+            menu.draw(&mut canvas, Rect::new(0, 0, capacity, cols), &self.session,
+                      palette::PROMPT);
+            self.menu = Some(menu);
+            return LiveBlock { lines: canvas.to_lines(), prompt_row: None };
+        }
+
+        let mut chrome = Vec::new();
+
+        // Subagents, then the prompt, then the context bar.
+        chrome.extend(self.subagent_lines(cols));
+        let dialog_lines = self.dialog_lines(cols, capacity);
+        chrome.extend(dialog_lines);
+        let prompt_offset = chrome.len();
+        chrome.push(self.prompt_line(cols));
+        chrome.push(self.context_bar_line(cols));
+
+        // The tail of the current turn, as much as fits above the chrome.
+        let room = capacity.saturating_sub(chrome.len());
+        let mut tail = self.lines_for(self.committed..self.session.entries().len(), cols);
+        let hidden = tail.len().saturating_sub(room);
+        if hidden > 0 {
+            // Keep the newest, and say what is above — the same thing the
+            // TypeScript client did while streaming a long reply.
+            tail = tail.split_off(hidden);
+            if !tail.is_empty() {
+                tail[0] = Line {
+                    spans: vec![Span {
+                        text: format!("  ↑ {hidden} more line{}", if hidden == 1 { "" } else { "s" }),
+                        style: Style::fg(palette::GRAY).dim(),
+                    }],
+                };
+            }
+        }
+
+        let prompt_row = Some(tail.len() + prompt_offset);
+        let mut lines = tail;
+        lines.extend(chrome);
+        LiveBlock { lines, prompt_row }
+    }
+
+    /// Where the caret goes within the live block.
+    fn cursor_in(&self, block: &LiveBlock, cols: usize) -> Option<(usize, usize)> {
+        let row = block.prompt_row?;
         if self.dialog.is_some() {
-            screen.put(row, 0, "  (answer above)", Style::fg(palette::GRAY).dim());
-            return;
+            return None; // the dialog owns the caret
         }
-
-        let col = screen.put(row, 0, "❯ ", Style::fg(palette::PROMPT).bold());
-        if self.input.is_empty() {
-            screen.put(row, col, &widgets::clip(PLACEHOLDER, cols.saturating_sub(col)),
-                       Style::fg(palette::GRAY).dim());
-            screen.set_cursor(row, col);
-            return;
-        }
-        let visible = self.visible_input(cols.saturating_sub(col));
-        let end = screen.put(row, col, &visible, Style::default());
-        screen.set_cursor(row, end.min(cols.saturating_sub(1)));
+        let lead = str_width(PROMPT_GLYPH);
+        let typed = str_width(&self.visible_input(cols.saturating_sub(lead)));
+        Some((row, (lead + typed).min(cols.saturating_sub(1))))
     }
 
-    /// The context bar: model, context use and mode, dot-separated and dim.
-    fn draw_context_bar(&self, screen: &mut Screen, row: usize, cols: usize) {
+    /// Render a range of transcript entries.
+    fn lines_for(&self, range: std::ops::Range<usize>, cols: usize) -> Vec<Line> {
+        let entries = self.session.entries();
+        let range = range.start.min(entries.len())..range.end.min(entries.len());
+        self.build_range(range, cols)
+    }
+
+    fn subagent_lines(&self, cols: usize) -> Vec<Line> {
+        let dim = Style::fg(palette::GRAY).dim();
+        let subs = &self.session.subagents;
+        if subs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![Line {
+            spans: vec![
+                Span { text: "Subagents".into(), style: Style::fg(palette::MAGENTA) },
+                Span { text: format!(" · {} running", subs.len()), style: dim },
+            ],
+        }];
+        for sub in subs {
+            let detail = if sub.detail.is_empty() { "starting" } else { &sub.detail };
+            out.push(Line {
+                spans: vec![
+                    Span { text: "  ◆ ".into(), style: Style::fg(palette::MAGENTA) },
+                    Span { text: sub.agent_type.clone(), style: Style::default() },
+                    Span {
+                        text: format!(" · {}", widgets::clip(detail, cols.saturating_sub(20))),
+                        style: dim,
+                    },
+                ],
+            });
+        }
+        out
+    }
+
+    fn dialog_lines(&self, cols: usize, capacity: usize) -> Vec<Line> {
+        let Some(dialog) = &self.dialog else { return Vec::new() };
+        let height = dialog.height(cols).min(capacity.saturating_sub(2)).max(1);
+        let mut canvas = Screen::new(cols, height);
+        canvas.begin_frame();
+        dialog.draw(&mut canvas, Rect::new(0, 0, height, cols), palette::PROMPT);
+        canvas.to_lines()
+    }
+
+    fn prompt_line(&self, cols: usize) -> Line {
+        if self.dialog.is_some() {
+            return Line {
+                spans: vec![Span {
+                    text: "  (answer above)".into(),
+                    style: Style::fg(palette::GRAY).dim(),
+                }],
+            };
+        }
+        let lead = str_width(PROMPT_GLYPH);
+        let mut spans = vec![Span {
+            text: PROMPT_GLYPH.into(),
+            style: Style::fg(palette::PROMPT).bold(),
+        }];
+        if self.input.is_empty() {
+            spans.push(Span {
+                text: widgets::clip(PLACEHOLDER, cols.saturating_sub(lead)),
+                style: Style::fg(palette::GRAY).dim(),
+            });
+        } else {
+            spans.push(Span {
+                text: self.visible_input(cols.saturating_sub(lead)),
+                style: Style::default(),
+            });
+        }
+        Line { spans }
+    }
+
+    fn context_bar_line(&self, cols: usize) -> Line {
         let dim = Style::fg(palette::GRAY).dim();
         let mut parts: Vec<String> = Vec::new();
-
         if !self.session.model_name.is_empty() {
             parts.push(self.session.model_name.clone());
         }
         if let Some(usage) = self.session.usage {
-            // Prompt tokens against the window, as the TypeScript bar computed
-            // it — not prompt plus completion.
             let pct = if usage.max_context_tokens > 0 {
                 (usage.last_prompt_tokens as f64 / usage.max_context_tokens as f64 * 100.0)
                     .round() as u32
@@ -636,22 +661,20 @@ impl App {
             parts.push(label);
         }
 
-        let col = screen.put(row, 0, &widgets::clip(&parts.join(" · "), cols), dim);
-
-        // The mode indicator is coloured rather than dim, since it says
-        // approvals are being skipped.
+        let mut spans = vec![Span {
+            text: widgets::clip(&parts.join(" · "), cols),
+            style: dim,
+        }];
         let (label, colour) = match self.session.permission_mode {
             PermissionMode::AllowAll => (Some("⏵⏵ auto-accept edits"), palette::GREEN),
             PermissionMode::Plan => (Some("⏸ plan mode"), palette::YELLOW),
             PermissionMode::Ask => (None, palette::GRAY),
         };
         if let Some(label) = label {
-            let room = cols.saturating_sub(col + 3);
-            if room > 4 {
-                let col = screen.put(row, col, " · ", dim);
-                screen.put(row, col, &widgets::clip(label, room), Style::fg(colour));
-            }
+            spans.push(Span { text: " · ".into(), style: dim });
+            spans.push(Span { text: label.into(), style: Style::fg(colour) });
         }
+        Line { spans }
     }
 
     fn visible_input(&self, budget: usize) -> String {
@@ -676,6 +699,15 @@ impl App {
 
 /// Shown when nothing has been typed, as in the TypeScript client.
 const PLACEHOLDER: &str = "Type a message...";
+/// The prompt, as in the TypeScript client.
+const PROMPT_GLYPH: &str = "❯ ";
+
+/// The redrawn block, and where the prompt sits inside it.
+struct LiveBlock {
+    lines:      Vec<Line>,
+    /// Row of the prompt within the block, for placing the caret.
+    prompt_row: Option<usize>,
+}
 
 /// Apply one style to every span of every line.
 fn restyle(lines: Vec<Line>, style: Style) -> Vec<Line> {
@@ -764,7 +796,55 @@ mod tests {
     use super::*;
     use forge_agent_proto::{AgentMessage, Init};
 
-    fn app_with(n: usize) -> (App, Screen) {
+    /// Window height used throughout these tests.
+    const ROWS: usize = 24;
+    const COLS: usize = 80;
+
+    /// Render through the real inline path and return what was written.
+    fn rendered(app: &mut App) -> String {
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// What the live block contains, as plain text lines.
+    ///
+    /// Syncs the dialog first, as rendering does — a prompt the agent is blocked
+    /// on has to be reflected before the block is built.
+    fn live_text(app: &mut App) -> String {
+        app.sync_dialog();
+        let inline = crate::inline::Inline::new(COLS, ROWS);
+        let block = app.live_lines(&inline, COLS);
+        block.lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Emitted output with the escape sequences removed.
+    ///
+    /// Each span carries its own colour and reset, so text spanning two spans is
+    /// not a contiguous substring of the raw output.
+    fn visible(out: &str) -> String {
+        let mut plain = String::new();
+        let mut chars = out.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                plain.push(c);
+                continue;
+            }
+            // Skip a CSI sequence up to its final byte.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        }
+        plain
+    }
+
+    fn app_with(n: usize) -> (App, usize) {
         let mut app = App::new();
         app.session_mut().apply(AgentMessage::Init(Box::new(Init {
             model_name: "Model".into(),
@@ -775,7 +855,7 @@ mod tests {
         for i in 0..n {
             app.session_mut().push_system(format!("entry number {i}"));
         }
-        (app, Screen::new(40, 12))
+        (app, ROWS)
     }
 
     fn tool_request(name: &str, id: &str) -> AgentMessage {
@@ -793,32 +873,32 @@ mod tests {
 
     #[test]
     fn typing_accumulates_and_backspace_removes() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         for c in "hi".chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
         assert_eq!(app.input(), "hi");
-        app.update(Input::Backspace, &screen);
+        app.update(Input::Backspace, ROWS);
         assert_eq!(app.input(), "h");
     }
 
     #[test]
     fn backspace_removes_a_whole_grapheme() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         for c in "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
-        app.update(Input::Backspace, &screen);
+        app.update(Input::Backspace, ROWS);
         assert_eq!(app.input(), "", "the whole emoji, not one codepoint");
     }
 
     #[test]
     fn enter_sends_the_message_and_records_it() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         for c in "hello".chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
-        let (outcome, effects) = app.update(Input::Enter, &screen);
+        let (outcome, effects) = app.update(Input::Enter, ROWS);
         assert_eq!(outcome, Outcome::Continue);
         assert_eq!(
             effects,
@@ -834,16 +914,16 @@ mod tests {
 
     #[test]
     fn enter_on_blank_input_sends_nothing() {
-        let (mut app, screen) = app_with(0);
-        app.update(Input::Char(' '), &screen);
-        let (_, effects) = app.update(Input::Enter, &screen);
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Char(' '), ROWS);
+        let (_, effects) = app.update(Input::Enter, ROWS);
         assert!(effects.is_empty());
     }
 
     #[test]
     fn a_multiline_paste_does_not_submit() {
-        let (mut app, screen) = app_with(0);
-        let (_, effects) = app.update(Input::Paste("one\ntwo".into()), &screen);
+        let (mut app, _rows) = app_with(0);
+        let (_, effects) = app.update(Input::Paste("one\ntwo".into()), ROWS);
         assert!(effects.is_empty(), "paste never submits");
         assert_eq!(app.input(), "one two");
     }
@@ -852,12 +932,12 @@ mod tests {
 
     #[test]
     fn interrupt_cancels_only_while_busy() {
-        let (mut app, screen) = app_with(0);
-        let (_, effects) = app.update(Input::Interrupt, &screen);
+        let (mut app, _rows) = app_with(0);
+        let (_, effects) = app.update(Input::Interrupt, ROWS);
         assert!(effects.is_empty(), "nothing to cancel when idle");
 
         app.session_mut().apply(AgentMessage::Thinking);
-        let (_, effects) = app.update(Input::Interrupt, &screen);
+        let (_, effects) = app.update(Input::Interrupt, ROWS);
         assert_eq!(effects, vec![Effect::Send(ClientMessage::CancelRun)]);
     }
 
@@ -867,10 +947,10 @@ mod tests {
     /// no way to approve — the prompt is not accepting text.
     #[test]
     fn approval_keys_answer_instead_of_typing() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
 
-        let (_, effects) = app.update(Input::Char('y'), &screen);
+        let (_, effects) = app.update(Input::Char('y'), ROWS);
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t1".into() })],
@@ -880,9 +960,9 @@ mod tests {
 
     #[test]
     fn n_refuses_with_a_reason() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        let (_, effects) = app.update(Input::Char('n'), &screen);
+        let (_, effects) = app.update(Input::Char('n'), ROWS);
         assert!(matches!(
             effects.first(),
             Some(Effect::Send(ClientMessage::DenyAction { .. })),
@@ -893,11 +973,11 @@ mod tests {
     /// of it stop asking. Reachable only by selection, never a bare keystroke.
     #[test]
     fn selecting_always_allow_remembers_the_tool() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
 
         app.session_mut().apply(tool_request("shell_exec", "t2"));
-        app.update(Input::Down, &screen);              // onto "Yes, always"
-        let (_, effects) = app.update(Input::Enter, &screen);
+        app.update(Input::Down, ROWS);              // onto "Yes, always"
+        let (_, effects) = app.update(Input::Enter, ROWS);
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t2".into() })],
@@ -920,9 +1000,9 @@ mod tests {
     /// The first keystroke on an empty line is still the shortcut.
     #[test]
     fn an_answer_key_on_an_empty_line_still_answers() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        let (_, effects) = app.update(Input::Char('y'), &screen);
+        let (_, effects) = app.update(Input::Char('y'), ROWS);
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::ApproveAction { tool_id: "t1".into() })],
@@ -934,12 +1014,12 @@ mod tests {
     /// approve" — there is no longer any ambiguity to resolve.
     #[test]
     fn a_prompt_captures_typing_instead_of_the_input_line() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
 
         let mut effects_seen = Vec::new();
         for c in "wait".chars() {
-            let (_, effects) = app.update(Input::Char(c), &screen);
+            let (_, effects) = app.update(Input::Char(c), ROWS);
             effects_seen.extend(effects);
         }
         assert!(
@@ -954,12 +1034,12 @@ mod tests {
 
     #[test]
     fn the_menu_opens_and_closes() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         assert!(!app.menu_open());
-        app.update(Input::Menu, &screen);
+        app.update(Input::Menu, ROWS);
         assert!(app.menu_open());
         // Escape at the top level closes it.
-        app.update(Input::End, &screen);
+        app.update(Input::End, ROWS);
         assert!(!app.menu_open());
     }
 
@@ -967,10 +1047,10 @@ mod tests {
     /// quietly type into the prompt behind it.
     #[test]
     fn the_menu_captures_typing() {
-        let (mut app, screen) = app_with(0);
-        app.update(Input::Menu, &screen);
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Menu, ROWS);
         for c in "hello".chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
         assert_eq!(app.input(), "", "nothing reached the input line");
         assert!(app.menu_open(), "and it is still open");
@@ -1010,11 +1090,11 @@ mod tests {
             ..Default::default()
         })));
 
-        app.update(Input::Menu, &screen);
+        app.update(Input::Menu, ROWS);
         // Root starts on "Main model".
-        app.update(Input::Enter, &screen);
-        app.update(Input::Down, &screen); // onto Second
-        let (_, effects) = app.update(Input::Enter, &screen);
+        app.update(Input::Enter, ROWS);
+        app.update(Input::Down, ROWS); // onto Second
+        let (_, effects) = app.update(Input::Enter, ROWS);
 
         match effects.first() {
             Some(Effect::Send(ClientMessage::SwitchModel { model_id, .. })) => {
@@ -1028,9 +1108,9 @@ mod tests {
     /// the answer it is waiting for has to come first.
     #[test]
     fn the_menu_does_not_open_over_a_pending_prompt() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        app.update(Input::Menu, &screen);
+        app.update(Input::Menu, ROWS);
         assert!(!app.menu_open(), "the approval still owns the screen");
         assert!(app.session().pending.is_some());
     }
@@ -1038,39 +1118,37 @@ mod tests {
     /// Quitting has to work from inside the menu too.
     #[test]
     fn quit_works_with_the_menu_open() {
-        let (mut app, screen) = app_with(0);
-        app.update(Input::Menu, &screen);
-        assert_eq!(app.update(Input::Quit, &screen).0, Outcome::Quit);
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Menu, ROWS);
+        assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
     #[test]
     fn the_menu_replaces_the_transcript_when_drawn() {
-        let (mut app, mut screen) = app_with(10);
-        app.update(Input::Menu, &screen);
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (mut app, _rows) = app_with(10);
+        app.update(Input::Menu, ROWS);
+        let grid = live_text(&mut app);
         assert!(grid.contains("Main model"), "the menu is drawn: {grid:?}");
         assert!(!grid.contains("entry number"), "the transcript is hidden");
     }
 
     /// A modal must not be a trap: quitting has to work regardless.
+
+
     #[test]
     fn quit_works_with_a_prompt_open() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        assert_eq!(app.update(Input::Quit, &screen).0, Outcome::Quit);
+        assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
     /// Interrupting abandons the turn, so the prompt it belongs to is denied
     /// rather than left on screen waiting for an answer that will not come.
     #[test]
     fn interrupt_denies_an_open_prompt() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        let (_, effects) = app.update(Input::Interrupt, &screen);
+        let (_, effects) = app.update(Input::Interrupt, ROWS);
         assert!(matches!(
             effects.first(),
             Some(Effect::Send(ClientMessage::DenyAction { .. })),
@@ -1081,34 +1159,38 @@ mod tests {
     /// The dialog must actually appear, with the options and the keys.
     #[test]
     fn a_pending_approval_draws_a_dialog() {
-        let (mut app, mut screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(tool_request("shell_exec", "t1"));
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let grid = live_text(&mut app);
         assert!(grid.contains("shell_exec"), "names the tool: {grid:?}");
         assert!(grid.contains("Yes"), "and offers the options");
         assert!(grid.contains("answer above"), "input line points at the prompt");
     }
 
-    /// The transcript must not be drawn underneath the prompt.
+    /// An open prompt takes rows from the live block, so less of the in-progress
+    /// turn is shown — but the prompt itself is never pushed off.
     #[test]
-    fn an_open_prompt_shrinks_the_transcript_viewport() {
-        let (mut app, screen) = app_with(30);
-        let before = app.viewport_rows(&screen);
+    fn an_open_prompt_takes_rows_from_the_live_block() {
+        let mut app = App::new();
+        for i in 0..40 {
+            app.session_mut().push_system(format!("line {i}"));
+        }
+        let inline = crate::inline::Inline::new(COLS, ROWS);
+        let before = app.live_lines(&inline, COLS).lines.len();
+
         app.session_mut().apply(tool_request("shell_exec", "t1"));
         app.sync_dialog();
-        let after = app.viewport_rows(&screen);
-        assert!(after < before, "{after} should be fewer rows than {before}");
-        assert!(after >= 1, "the transcript never vanishes entirely");
+        let block = app.live_lines(&inline, COLS);
+        assert!(block.lines.len() <= inline.live_capacity(), "still fits the window");
+        assert!(before <= inline.live_capacity());
+        // The prompt row is still inside the block.
+        assert!(block.prompt_row.is_some_and(|r| r < block.lines.len()));
     }
 
     #[test]
     fn approval_keys_do_nothing_when_no_approval_is_pending() {
-        let (mut app, screen) = app_with(0);
-        app.update(Input::Char('y'), &screen);
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Char('y'), ROWS);
         assert_eq!(app.input(), "y", "just a letter");
     }
 
@@ -1116,16 +1198,16 @@ mod tests {
     /// which would leave the agent still waiting.
     #[test]
     fn typed_text_answers_a_pending_question() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(AgentMessage::QuestionRequest {
             question: "which one?".into(),
             tool_id: "q1".into(),
             items: Vec::new(),
         });
         for c in "the first".chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
-        let (_, effects) = app.update(Input::Enter, &screen);
+        let (_, effects) = app.update(Input::Enter, ROWS);
         assert_eq!(
             effects,
             vec![Effect::Send(ClientMessage::AnswerQuestion { answer: "the first".into() })],
@@ -1135,57 +1217,28 @@ mod tests {
 
     // ── Scrolling ─────────────────────────────────────────────────────────
 
+    /// Scrolling is the terminal's job now: the transcript is printed into its
+    /// scrollback, so the wheel and scrollbar act on the real history. The keys
+    /// that used to move an internal window must do nothing rather than
+    /// silently maintain a viewport nobody sees.
     #[test]
-    fn scrolling_is_clamped_at_both_ends() {
-        let (mut app, screen) = app_with(40);
-        for _ in 0..500 {
-            app.update(Input::Up, &screen);
+    fn scroll_keys_no_longer_move_an_internal_window() {
+        let (mut app, _rows) = app_with(40);
+        for key in [Input::Up, Input::Down, Input::PageUp, Input::PageDown,
+                    Input::Home, Input::End] {
+            let (outcome, effects) = app.update(key, ROWS);
+            assert_eq!(outcome, Outcome::Continue);
+            assert!(effects.is_empty(), "no message to the agent");
         }
-        let max = app.scroll();
-        assert!(max > 0, "there is history to scroll into");
-        app.update(Input::Up, &screen);
-        assert_eq!(app.scroll(), max, "cannot pass the oldest line");
-
-        for _ in 0..500 {
-            app.update(Input::Down, &screen);
-        }
-        assert_eq!(app.scroll(), 0, "cannot pass the newest line");
-    }
-
-    #[test]
-    fn a_short_transcript_cannot_scroll() {
-        let (mut app, screen) = app_with(0);
-        app.update(Input::Up, &screen);
-        assert_eq!(app.scroll(), 0);
-    }
-
-    #[test]
-    fn home_and_end_jump_to_the_ends() {
-        let (mut app, screen) = app_with(40);
-        app.update(Input::Home, &screen);
-        assert!(app.scroll() > 0);
-        app.update(Input::End, &screen);
-        assert_eq!(app.scroll(), 0);
-    }
-
-    #[test]
-    fn new_output_returns_to_the_bottom() {
-        let (mut app, screen) = app_with(40);
-        app.update(Input::Home, &screen);
-        assert!(app.scroll() > 0);
-        app.follow_tail();
-        assert_eq!(app.scroll(), 0);
+        assert_eq!(app.input(), "", "and nothing typed");
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────
 
     #[test]
     fn a_frame_is_one_synchronized_update_and_never_erases_scrollback() {
-        let (mut app, mut screen) = app_with(30);
-        app.view(&mut screen);
-        let mut sink = Vec::new();
-        screen.flush(&mut sink).unwrap();
-        let text = String::from_utf8_lossy(&sink);
+        let (mut app, _rows) = app_with(30);
+        let text = rendered(&mut app);
         assert_eq!(text.matches(crate::screen::SYNC_BEGIN).count(), 1);
         assert!(!text.contains("\x1b[3J"));
     }
@@ -1196,7 +1249,7 @@ mod tests {
     #[test]
     fn the_context_bar_shows_context_use() {
         use forge_agent_proto::UsageSnapshot;
-        let (mut app, mut screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(AgentMessage::UsageUpdate {
             snapshot: UsageSnapshot {
                 last_prompt_tokens: 500,
@@ -1205,11 +1258,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let grid = live_text(&mut app);
         assert!(grid.contains("50% ctx"), "the figure is shown: {grid:?}");
         assert!(grid.contains("Model"), "alongside the model name");
         assert!(!grid.contains('█'), "no gauge — that was not in the original");
@@ -1218,12 +1267,8 @@ mod tests {
     /// The prompt is `❯ ` with a placeholder, and no separator rule above it.
     #[test]
     fn the_prompt_matches_the_original() {
-        let (mut app, mut screen) = app_with(0);
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (mut app, _rows) = app_with(0);
+        let grid = live_text(&mut app);
         assert!(grid.contains("❯"), "the prompt glyph: {grid:?}");
         assert!(grid.contains("Type a message"), "and the placeholder");
         assert!(!grid.contains("───"), "no rule — that was not in the original");
@@ -1233,13 +1278,9 @@ mod tests {
     /// Auto-approve has to be visible, since it means prompts are being skipped.
     #[test]
     fn the_context_bar_flags_auto_approve() {
-        let (mut app, mut screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().permission_mode = PermissionMode::AllowAll;
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let grid = live_text(&mut app);
         assert!(grid.contains("auto-accept"), "got {grid:?}");
     }
 
@@ -1301,24 +1342,20 @@ mod tests {
 
     #[test]
     fn the_status_line_names_a_running_subagent() {
-        let (mut app, mut screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(AgentMessage::SubagentStarted {
             id: "s1".into(),
             agent_type: "Explore".into(),
             prompt: "look".into(),
             parent_id: None,
         });
-        app.view(&mut screen);
-        let grid: String = (0..screen.rows())
-            .map(|r| screen.row_text(r))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let grid = live_text(&mut app);
         assert!(grid.contains("Explore"), "got {grid:?}");
     }
 
     #[test]
     fn the_status_line_shows_what_the_agent_is_doing() {
-        let (mut app, mut screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         app.session_mut().apply(AgentMessage::ToolRequest {
             tool_name: "shell_exec".into(),
             tool_args: "{}".into(),
@@ -1327,10 +1364,7 @@ mod tests {
             subagent_id: None,
             needs_approval: false,
         });
-        app.view(&mut screen);
-        let mut sink = Vec::new();
-        screen.flush(&mut sink).unwrap();
-        let text = String::from_utf8_lossy(&sink);
+        let text = rendered(&mut app);
         assert!(text.contains("running shell_exec"), "status names the tool");
     }
 
@@ -1413,14 +1447,14 @@ mod tests {
         };
         assert!(!shown(&app), "collapsed to begin with");
 
-        app.update(Input::ToggleReasoning, &screen);
+        app.update(Input::ToggleReasoning, ROWS);
         assert!(shown(&app), "expanded");
         assert!(
             app.build_lines(60).iter().any(|l| l.plain().contains("collapse")),
             "and the hint flips",
         );
 
-        app.update(Input::ToggleReasoning, &screen);
+        app.update(Input::ToggleReasoning, ROWS);
         assert!(!shown(&app), "collapsed again");
     }
 
@@ -1446,61 +1480,57 @@ mod tests {
     }
 
     #[test]
-    fn view_survives_a_degenerate_screen() {
+    fn rendering_survives_a_degenerate_window() {
         let mut app = App::new();
         app.session_mut().push_system("text that will not fit anywhere");
-        for (cols, rows) in [(0usize, 0usize), (1, 1), (2, 1), (1, 3), (3, 2), (4, 4)] {
-            let mut screen = Screen::new(cols, rows);
-            app.view(&mut screen);
-            let mut sink = Vec::new();
-            screen.flush(&mut sink).unwrap();
+        for (cols, rows) in [(1usize, 1usize), (2, 1), (4, 2), (10, 3), (20, 5)] {
+            let mut inline = crate::inline::Inline::new(cols, rows);
+            let mut out: Vec<u8> = Vec::new();
+            app.render(&mut inline, &mut out).expect("must not fail");
         }
     }
 
-    /// Streaming mutates the tail entry in place, so a cache keyed only on the
-    /// entry count would show stale text.
+    /// Streaming appends to the tail entry, so successive renders must show the
+    /// growing text rather than a stale copy of it.
     #[test]
-    fn streaming_text_is_not_served_from_a_stale_cache() {
+    fn streaming_text_is_redrawn_as_it_grows() {
         let mut app = App::new();
-        let mut screen = Screen::new(40, 10);
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
 
         app.session_mut().apply(AgentMessage::AssistantToken { content: "first".into() });
-        app.view(&mut screen);
+        app.render(&mut inline, &mut out).unwrap();
 
+        out.clear();
         app.session_mut().apply(AgentMessage::AssistantToken { content: " second".into() });
-        app.view(&mut screen);
+        app.render(&mut inline, &mut out).unwrap();
 
-        let mut sink = Vec::new();
-        screen.flush(&mut sink).unwrap();
-        // The frame after the second token must contain the appended text.
-        let text: Vec<String> = app.build_lines(40).iter().map(|l| l.plain()).collect();
+        let text = visible(&String::from_utf8_lossy(&out));
+        assert!(text.contains("first second"), "the appended text is drawn: {text:?}");
+    }
+
+    #[test]
+    fn narrower_windows_wrap_into_more_lines() {
+        let mut app = App::new();
+        app.session_mut()
+            .push_system("a message long enough that its wrapping depends on the width");
         assert!(
-            text.iter().any(|l| l.contains("first second")),
-            "got {text:?}",
+            app.build_lines(20).len() > app.build_lines(70).len(),
+            "narrower means more lines",
         );
     }
 
     #[test]
-    fn resizing_rewraps_the_transcript() {
-        let mut app = App::new();
-        app.session_mut()
-            .push_system("a message long enough that its wrapping depends on the width");
-        let narrow = app.wrap_cached(20).len();
-        let wide = app.wrap_cached(70).len();
-        assert!(narrow > wide, "narrower means more lines");
-    }
-
-    #[test]
     fn quit_is_reported() {
-        let (mut app, screen) = app_with(0);
-        assert_eq!(app.update(Input::Quit, &screen).0, Outcome::Quit);
+        let (mut app, _rows) = app_with(0);
+        assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
     #[test]
     fn long_input_shows_its_tail() {
-        let (mut app, screen) = app_with(0);
+        let (mut app, _rows) = app_with(0);
         for c in "0123456789".repeat(10).chars() {
-            app.update(Input::Char(c), &screen);
+            app.update(Input::Char(c), ROWS);
         }
         let visible = app.visible_input(10);
         assert_eq!(crate::width::str_width(&visible), 10);

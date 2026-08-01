@@ -51,6 +51,14 @@ impl Style {
     ///
     /// Always resets first. Turning attributes *off* individually needs more
     /// codes than starting clean does, and a reset is one sequence.
+    /// The escape sequence for this style, unconditionally.
+    ///
+    /// Public because the inline renderer emits whole lines rather than diffing
+    /// cells, and needs the same encoding.
+    pub fn ansi(&self) -> String {
+        self.sgr(None)
+    }
+
     fn sgr(&self, from: Option<&Style>) -> String {
         if from == Some(self) {
             return String::new();
@@ -269,6 +277,47 @@ impl Screen {
         out.flush()
     }
 
+    /// The frame under construction, as styled lines.
+    ///
+    /// Lets the cell-grid drawing code — the menu, the dialogs, the widgets — be
+    /// reused by the inline renderer, which prints lines rather than addressing
+    /// cells. Runs of equal style are merged so the output is not one span per
+    /// cell, and trailing blanks are dropped so a mostly-empty row does not print
+    /// a screenful of spaces into the scrollback.
+    pub fn to_lines(&self) -> Vec<crate::markdown::Line> {
+        use crate::markdown::{Line, Span};
+
+        (0..self.rows)
+            .map(|row| {
+                let mut spans: Vec<Span> = Vec::new();
+                for col in 0..self.cols {
+                    let cell = &self.back[row * self.cols + col];
+                    if cell.text.is_empty() {
+                        continue; // the reserved half of a wide cluster
+                    }
+                    match spans.last_mut() {
+                        Some(last) if last.style == cell.style => {
+                            last.text.push_str(&cell.text);
+                        }
+                        _ => spans.push(Span {
+                            text: cell.text.to_string(),
+                            style: cell.style,
+                        }),
+                    }
+                }
+                // Drop trailing whitespace-only spans.
+                while spans.last().is_some_and(|s| s.text.trim().is_empty()) {
+                    spans.pop();
+                }
+                if let Some(last) = spans.last_mut() {
+                    let trimmed = last.text.trim_end().to_string();
+                    last.text = trimmed;
+                }
+                Line { spans }
+            })
+            .collect()
+    }
+
     /// Row contents as a string.
     ///
     /// Public because the diffing renderer emits only *changed* cells, so the
@@ -365,6 +414,43 @@ mod tests {
         s.begin_frame();
         s.put(0, 0, "hi", Style::default());
         assert_eq!(render(&mut s).0.len(), 0, "steady state stays free");
+    }
+
+    /// The grid has to be convertible to lines, or the menu and dialogs could
+    /// not be drawn by the inline renderer.
+    #[test]
+    fn the_frame_can_be_exported_as_lines() {
+        let mut s = Screen::new(20, 3);
+        s.begin_frame();
+        s.put(0, 0, "hello", Style::fg(9));
+        s.put(2, 2, "world", Style::default());
+
+        let lines = s.to_lines();
+        assert_eq!(lines.len(), 3, "one line per row");
+        assert_eq!(lines[0].plain(), "hello");
+        assert!(lines[1].plain().is_empty(), "an untouched row is empty");
+        assert_eq!(lines[2].plain(), "  world", "leading blanks are kept");
+        assert_eq!(lines[0].spans[0].style.fg, Some(9), "style survives");
+    }
+
+    /// Runs of one style must merge, or a row becomes one span per cell.
+    #[test]
+    fn exported_spans_merge_runs_of_equal_style() {
+        let mut s = Screen::new(20, 1);
+        s.begin_frame();
+        s.put(0, 0, "aaaa", Style::fg(2));
+        s.put(0, 4, "bbbb", Style::fg(3));
+        let line = &s.to_lines()[0];
+        assert_eq!(line.spans.len(), 2, "two runs, not eight: {:?}", line.spans);
+    }
+
+    /// A wide cluster's reserved half must not be exported as an empty span.
+    #[test]
+    fn exported_lines_skip_wide_cluster_continuations() {
+        let mut s = Screen::new(10, 1);
+        s.begin_frame();
+        s.put(0, 0, "日本", Style::default());
+        assert_eq!(s.to_lines()[0].plain(), "日本");
     }
 
     #[test]

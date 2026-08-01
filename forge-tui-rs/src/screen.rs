@@ -88,6 +88,16 @@ impl Cell {
     pub fn continuation() -> Self {
         Self { text: "".into(), style: Style::default() }
     }
+
+    /// A cell whose contents are unknown, used to mean "the terminal may be
+    /// showing anything here".
+    ///
+    /// A NUL can never be produced by drawing — [`Screen::put`] skips
+    /// zero-width clusters — so this compares unequal to every real cell and
+    /// forces a repaint of the position.
+    pub fn unknown() -> Self {
+        Self { text: "\u{0}".into(), style: Style::default() }
+    }
     fn is_continuation(&self) -> bool {
         self.text.is_empty()
     }
@@ -110,8 +120,17 @@ impl Screen {
         Self {
             cols,
             rows,
-            front:  vec![Cell::blank(); n],
             back:   vec![Cell::blank(); n],
+            // Not blanks. The front buffer records what the terminal is showing,
+            // and at startup that is whatever was there before — an old frame, a
+            // shell prompt, a previous session. Initialising it to blanks claims
+            // the screen is already empty, so the first frame diffs
+            // blank-against-blank and emits nothing for every cell the UI does
+            // not happen to draw on, leaving the old content visible underneath.
+            //
+            // A sentinel that no real cell can equal forces the first frame to
+            // paint every position, which is what actually clears the screen.
+            front:  vec![Cell::unknown(); n],
             cursor: None,
         }
     }
@@ -130,7 +149,7 @@ impl Screen {
         self.rows = rows;
         let n = cols * rows;
         self.back  = vec![Cell::blank(); n];
-        self.front = vec![Cell { text: "\u{0}".into(), style: Style::default() }; n];
+        self.front = vec![Cell::unknown(); n];
         self.cursor = None;
     }
 
@@ -312,6 +331,42 @@ mod tests {
         sink
     }
 
+    /// The first frame has to paint the whole screen, not just what the UI
+    /// draws. Anything else leaves whatever the terminal was already showing —
+    /// an old frame, a shell prompt — visible in the gaps.
+    #[test]
+    fn the_first_frame_paints_every_cell() {
+        let mut s = Screen::new(10, 3);
+        s.begin_frame();
+        s.put(0, 0, "hi", Style::default());
+        let out = render(&mut s);
+        let text = out.text();
+
+        // Every row must be addressed, including the two the UI never touched.
+        for row in 1..=3 {
+            assert!(
+                text.contains(&format!("\x1b[{row};1H")),
+                "row {row} was not painted: {text:?}",
+            );
+        }
+        // And enough blanks written to cover the untouched area.
+        assert!(text.matches(' ').count() >= 20, "the screen is wiped: {text:?}");
+    }
+
+    /// Only the first frame. Once the screen is known, diffing takes over — an
+    /// unchanged frame must still cost nothing.
+    #[test]
+    fn later_identical_frames_still_emit_nothing() {
+        let mut s = Screen::new(10, 3);
+        s.begin_frame();
+        s.put(0, 0, "hi", Style::default());
+        render(&mut s); // the full initial paint
+
+        s.begin_frame();
+        s.put(0, 0, "hi", Style::default());
+        assert_eq!(render(&mut s).0.len(), 0, "steady state stays free");
+    }
+
     #[test]
     fn a_frame_is_wrapped_in_one_synchronized_update() {
         let mut s = Screen::new(20, 3);
@@ -362,6 +417,10 @@ mod tests {
     #[test]
     fn writes_are_absolutely_positioned() {
         let mut s = Screen::new(20, 4);
+        // Settle the initial full paint first, so what follows is a real diff.
+        s.begin_frame();
+        render(&mut s);
+
         s.begin_frame();
         s.put(2, 3, "here", Style::default());
         let out = render(&mut s);
@@ -543,6 +602,9 @@ mod tests {
     #[test]
     fn drawing_out_of_bounds_is_ignored() {
         let mut s = Screen::new(5, 2);
+        s.begin_frame();
+        render(&mut s); // settle the initial paint
+
         s.begin_frame();
         s.put(99, 0, "nope", Style::default());
         s.put(0, 99, "nope", Style::default());

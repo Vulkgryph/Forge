@@ -305,6 +305,10 @@ mod tests {
     #[test]
     fn a_title_is_skipped_when_there_is_no_border_room() {
         let mut screen = Screen::new(5, 3);
+        // Settle the initial full paint, so the next flush is a true diff.
+        screen.begin_frame();
+        rendered(&mut screen);
+
         screen.begin_frame();
         title(&mut screen, Rect::new(0, 0, 3, 5), "hello", Style::default());
         assert_eq!(rendered(&mut screen).len(), 0, "nothing drawn");

@@ -24,12 +24,27 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-use crossterm::terminal;
+use crate::sys::{self, Termios};
 
 /// Set once the terminal has been modified, so restoration is idempotent and
 /// safe to attempt from a signal handler that may race with `Drop`.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The terminal settings from before we took over, to be put back exactly.
+///
+/// Kept rather than reconstructed: the user's shell may have set anything, and
+/// guessing at a "normal" configuration would silently change their setup.
+static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);
+
+/// Set by the `SIGWINCH` handler; the input thread turns it into a resize.
+static RESIZED: AtomicBool = AtomicBool::new(false);
+
+/// Take and clear the pending-resize flag.
+pub fn take_resize() -> bool {
+    RESIZED.swap(false, Ordering::SeqCst)
+}
 
 /// Enter/leave sequences, written directly rather than through crossterm's
 /// command queue so the exact bytes are visible and testable.
@@ -63,7 +78,14 @@ impl Guard {
     /// Installs the panic hook and signal handlers as a side effect; both are
     /// process-global and safe to install more than once.
     pub fn new() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
+        let original = sys::enable_raw_mode(sys::STDIN).ok_or_else(|| {
+            io::Error::other(
+                "could not put the terminal into raw mode — is this a terminal?",
+            )
+        })?;
+        if let Ok(mut slot) = ORIGINAL.lock() {
+            *slot = Some(original);
+        }
 
         let mut out = io::stdout();
         // Bracketed paste before the alternate screen, so a paste arriving
@@ -106,7 +128,12 @@ pub fn restore() {
         "{POP_KEYBOARD}{SHOW_CURSOR}{ENABLE_AUTOWRAP}{LEAVE_ALT}{DISABLE_BRACKETED_PASTE}",
     );
     let _ = out.flush();
-    let _ = terminal::disable_raw_mode();
+
+    // Put back exactly what was there, rather than an approximation of it.
+    let original = ORIGINAL.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(settings) = original {
+        sys::set_attributes(sys::STDIN, &settings);
+    }
 }
 
 /// Restore before the default hook prints, so the backtrace lands on the main
@@ -126,46 +153,36 @@ fn install_panic_hook() {
 /// `SIGTERM` and `SIGHUP` terminate the process without unwinding, so `Drop`
 /// never runs and the terminal would be left raw. Restore, then re-raise with
 /// the handler cleared so the default disposition and exit status apply.
-#[cfg(unix)]
 fn install_signal_handlers() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // SAFETY: `restore` writes to stdout and touches only an atomic. That
-        // is more than a strictly async-signal-safe handler should do, but the
-        // alternative — a terminal left unusable — is worse, and the process is
-        // about to die either way.
-        unsafe {
-            for sig in [libc::SIGTERM, libc::SIGHUP] {
-                libc::signal(sig, handle_fatal as *const () as libc::sighandler_t);
-            }
-        }
+        sys::on_signal(sys::SIGTERM, handle_fatal);
+        sys::on_signal(sys::SIGHUP, handle_fatal);
+        sys::on_signal(sys::SIGWINCH, handle_winch);
     });
 }
 
-#[cfg(unix)]
-extern "C" fn handle_fatal(sig: libc::c_int) {
+/// `SIGTERM`/`SIGHUP`: restore, then die the way the caller expects.
+///
+/// `restore` writes to stdout, which is more than a strictly async-signal-safe
+/// handler should do. The alternative is a terminal left raw and invisible, and
+/// the process is ending either way.
+extern "C" fn handle_fatal(sig: std::os::raw::c_int) {
     restore();
-    // SAFETY: restoring the default disposition and re-raising gives the caller
-    // the exit status they expect from a signal death.
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
+    sys::reraise_default(sig);
 }
 
-#[cfg(not(unix))]
-fn install_signal_handlers() {
-    // Windows delivers console close events rather than these signals; the
-    // panic hook and Drop cover the paths that matter for the spike.
+/// `SIGWINCH`: note it and return. Only an atomic store, which *is* safe here —
+/// the actual re-layout happens on the input thread.
+extern "C" fn handle_winch(_sig: std::os::raw::c_int) {
+    RESIZED.store(true, Ordering::SeqCst);
 }
 
-/// Current terminal size, falling back to a usable default when the size is
-/// unknown (a pipe, or a terminal that will not answer).
+/// Current terminal size, falling back to a usable default when it is unknown
+/// (a pipe, or a terminal that will not answer).
 pub fn size() -> (usize, usize) {
-    terminal::size()
-        .map(|(c, r)| (c as usize, r as usize))
-        .unwrap_or((80, 24))
+    sys::window_size(sys::STDIN).unwrap_or((80, 24))
 }
 
 #[cfg(test)]

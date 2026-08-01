@@ -825,9 +825,9 @@ fn first_line(s: &str) -> String {
 /// The full arguments are JSON and often large; the transcript shows the
 /// interesting field per tool, mirroring what the TypeScript client displayed.
 fn summarize_tool(name: &str, args_json: &str) -> String {
-    let args: serde_json::Value =
-        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
-    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let args = forge_agent_proto::json::parse(args_json)
+        .unwrap_or(forge_agent_proto::json::Json::Null);
+    let field = |k: &str| args.str_or_empty(k);
 
     let detail = match name {
         "read_file" | "write_file" | "edit_file" | "apply_patch" => field("path"),

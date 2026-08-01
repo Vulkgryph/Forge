@@ -21,6 +21,8 @@
 //! it and carry on. The zod schemas threw instead, which turned a new event into
 //! a dead session.
 
+pub mod json;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

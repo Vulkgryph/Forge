@@ -1,68 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Turning terminal events into [`Input`].
+//! Binding keys to actions.
 //!
-//! Kept separate from the app so the mapping is one small, readable table and
-//! the app never sees a crossterm type. That also means the app's state machine
-//! can be driven from tests without synthesising terminal events.
-
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+//! Kept apart from both the decoder and the app: [`crate::keys`] decides what
+//! key was pressed, this decides what it means, and [`crate::app`] carries it
+//! out. One small table, and the app never sees a keycode.
 
 use crate::app::Input;
+use crate::keys::Key;
 
-/// Map a terminal event to an [`Input`], or `None` for events we ignore.
-pub fn decode(event: Event) -> Option<Input> {
-    match event {
-        Event::Key(key) => decode_key(key),
-        Event::Paste(text) => Some(Input::Paste(text)),
-        Event::Resize(cols, rows) => Some(Input::Resize(cols as usize, rows as usize)),
-        _ => None,
-    }
-}
+/// Map a key to an action, or `None` for keys we do not bind.
+pub fn bind(key: Key) -> Option<Input> {
+    Some(match key {
+        // Raw mode turns off signal generation, so Ctrl-C arrives here as an
+        // ordinary key and leaving is this program's decision rather than the
+        // kernel's.
+        Key::Ctrl('c') | Key::Ctrl('d') => Input::Quit,
 
-fn decode_key(key: KeyEvent) -> Option<Input> {
-    // With the keyboard enhancement flags pushed, terminals report releases and
-    // repeats too. Acting on a release would double every keystroke.
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
+        // Interrupt is Ctrl-X, not Ctrl-C: a user pressing Ctrl-C expects to
+        // leave, and binding it to cancel-the-turn would make quitting
+        // impossible.
+        Key::Ctrl('x') => Input::Interrupt,
 
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        Key::Ctrl('u') => Input::PageUp,
+        Key::Ctrl('g') => Input::Home,
 
-    // Raw mode disables ISIG, so Ctrl-C is an ordinary key and quitting is our
-    // decision rather than the kernel's.
-    if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
-        return Some(Input::Quit);
-    }
+        Key::Char(c) => Input::Char(c),
+        Key::Paste(text) => Input::Paste(text),
+        Key::Enter => Input::Enter,
+        Key::Backspace => Input::Backspace,
 
-    Some(match key.code {
-        KeyCode::Char(c) if ctrl => return ctrl_key(c),
-        KeyCode::Char(c)  => Input::Char(c),
-        KeyCode::Enter    => Input::Enter,
-        KeyCode::Backspace => Input::Backspace,
-        KeyCode::Up       => Input::Up,
-        KeyCode::Down     => Input::Down,
-        KeyCode::PageUp   => Input::PageUp,
-        KeyCode::PageDown => Input::PageDown,
-        KeyCode::Home     => Input::Home,
-        KeyCode::End      => Input::End,
-        KeyCode::Esc      => Input::End,
-        _ => return None,
-    })
-}
+        Key::Up => Input::Up,
+        Key::Down => Input::Down,
+        Key::PageUp => Input::PageUp,
+        Key::PageDown => Input::PageDown,
+        Key::Home => Input::Home,
 
-/// The few control keys worth binding. Anything else is dropped rather than
-/// inserted as a control character into the input.
-///
-/// Interrupt is Ctrl-X rather than the customary Ctrl-C: raw mode delivers
-/// Ctrl-C as an ordinary key, and a user pressing it expects to leave, not to
-/// cancel a turn and stay. Binding it to cancel would make quitting impossible.
-fn ctrl_key(c: char) -> Option<Input> {
-    Some(match c {
-        'x' => Input::Interrupt,
-        'u' => Input::PageUp,
-        'd' => Input::PageDown,
-        'g' => Input::Home,
-        _   => return None,
+        // Escape and End both mean "stop scrolling and follow the newest
+        // output", which is also how a dialog reads a dismissal.
+        Key::Escape | Key::End => Input::End,
+
+        // Unbound: Tab, arrows we do not use for navigation, and any control
+        // chord not listed above. Dropped rather than inserted as a stray
+        // control character into the input line.
+        Key::Tab | Key::Left | Key::Right | Key::Delete | Key::Ctrl(_) => return None,
     })
 }
 
@@ -70,86 +50,87 @@ fn ctrl_key(c: char) -> Option<Input> {
 mod tests {
     use super::*;
 
-    fn key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
-    }
-    fn ctrl(c: char) -> Event {
-        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-    }
-
     #[test]
     fn ordinary_characters_pass_through() {
-        assert_eq!(decode(key(KeyCode::Char('a'))), Some(Input::Char('a')));
+        assert_eq!(bind(Key::Char('a')), Some(Input::Char('a')));
+        assert_eq!(bind(Key::Char('日')), Some(Input::Char('日')));
     }
 
     #[test]
     fn ctrl_c_and_ctrl_d_quit() {
-        assert_eq!(decode(ctrl('c')), Some(Input::Quit));
-        assert_eq!(decode(ctrl('d')), Some(Input::Quit));
+        assert_eq!(bind(Key::Ctrl('c')), Some(Input::Quit));
+        assert_eq!(bind(Key::Ctrl('d')), Some(Input::Quit));
     }
 
-    /// Terminals with keyboard enhancements report key releases. Treating one as
-    /// a press would insert every character twice.
+    /// The help text advertises Ctrl-X, so it has to produce an interrupt.
     #[test]
-    fn key_releases_are_ignored() {
-        let mut ev = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
-        ev.kind = KeyEventKind::Release;
-        assert_eq!(decode(Event::Key(ev)), None);
+    fn ctrl_x_interrupts() {
+        assert_eq!(bind(Key::Ctrl('x')), Some(Input::Interrupt));
+    }
+
+    /// Ctrl-C must remain quit. Binding it to cancel-the-turn would leave no way
+    /// out of the program, since raw mode means the kernel will not do it for us.
+    #[test]
+    fn ctrl_c_is_not_an_interrupt() {
+        assert_ne!(bind(Key::Ctrl('c')), Some(Input::Interrupt));
     }
 
     #[test]
     fn navigation_keys_map_over() {
-        for (code, expected) in [
-            (KeyCode::Up, Input::Up),
-            (KeyCode::Down, Input::Down),
-            (KeyCode::PageUp, Input::PageUp),
-            (KeyCode::PageDown, Input::PageDown),
-            (KeyCode::Home, Input::Home),
-            (KeyCode::End, Input::End),
-            (KeyCode::Enter, Input::Enter),
-            (KeyCode::Backspace, Input::Backspace),
+        for (key, expected) in [
+            (Key::Up, Input::Up),
+            (Key::Down, Input::Down),
+            (Key::PageUp, Input::PageUp),
+            (Key::PageDown, Input::PageDown),
+            (Key::Home, Input::Home),
+            (Key::End, Input::End),
+            (Key::Enter, Input::Enter),
+            (Key::Backspace, Input::Backspace),
         ] {
-            assert_eq!(decode(key(code)), Some(expected));
+            assert_eq!(bind(key.clone()), Some(expected), "{key:?}");
         }
+    }
+
+    #[test]
+    fn escape_follows_the_newest_output() {
+        assert_eq!(bind(Key::Escape), Some(Input::End));
     }
 
     #[test]
     fn paste_arrives_whole() {
         assert_eq!(
-            decode(Event::Paste("two words".into())),
+            bind(Key::Paste("two words".into())),
             Some(Input::Paste("two words".into())),
         );
     }
 
+    /// An unbound control chord must be dropped, not inserted as a literal
+    /// control character into the input line.
     #[test]
-    fn resize_is_forwarded() {
-        assert_eq!(decode(Event::Resize(100, 40)), Some(Input::Resize(100, 40)));
-    }
-
-    /// An unbound control key must be dropped, not inserted as a literal.
-    #[test]
-    fn unbound_control_keys_are_dropped() {
-        assert_eq!(decode(ctrl('q')), None);
-        assert_eq!(decode(ctrl('z')), None);
+    fn unbound_keys_are_dropped() {
+        for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Tab, Key::Delete] {
+            assert_eq!(bind(key.clone()), None, "{key:?} should be unbound");
+        }
     }
 
     #[test]
     fn bound_control_keys_scroll() {
-        assert_eq!(decode(ctrl('u')), Some(Input::PageUp));
-        assert_eq!(decode(ctrl('d')), Some(Input::Quit)); // quit wins over scroll
-        assert_eq!(decode(ctrl('g')), Some(Input::Home));
+        assert_eq!(bind(Key::Ctrl('u')), Some(Input::PageUp));
+        assert_eq!(bind(Key::Ctrl('g')), Some(Input::Home));
     }
 
-    /// The help text advertises Ctrl-X for interrupt, so it has to produce one.
+    /// Every key variant must be handled — a new one added to the decoder
+    /// without a binding here should be a deliberate `None`, never a panic.
     #[test]
-    fn ctrl_x_interrupts() {
-        assert_eq!(decode(ctrl('x')), Some(Input::Interrupt));
-    }
-
-    /// Ctrl-C must remain quit. Binding it to cancel-the-turn would leave no way
-    /// out of the program.
-    #[test]
-    fn ctrl_c_remains_quit_not_interrupt() {
-        assert_eq!(decode(ctrl('c')), Some(Input::Quit));
+    fn no_key_panics() {
+        let all = [
+            Key::Char('x'), Key::Enter, Key::Backspace, Key::Tab, Key::Escape,
+            Key::Up, Key::Down, Key::Right, Key::Left, Key::Home, Key::End,
+            Key::PageUp, Key::PageDown, Key::Delete, Key::Ctrl('a'),
+            Key::Paste(String::new()),
+        ];
+        for key in all {
+            let _ = bind(key);
+        }
     }
 }

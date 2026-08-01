@@ -435,18 +435,20 @@ impl Dialog {
 
 /// Tool arguments on one line, short enough to read.
 fn compact_args(json: &str) -> String {
-    let parsed: serde_json::Value = match serde_json::from_str(json) {
+    use forge_agent_proto::json::{self, Json};
+
+    let parsed = match json::parse(json) {
         Ok(v) => v,
         // Not JSON: show it as-is rather than hiding what is being approved.
         Err(_) => return first_line(json),
     };
-    let Some(map) = parsed.as_object() else {
+    let Json::Obj(map) = &parsed else {
         return first_line(json);
     };
     map.iter()
         .map(|(k, v)| {
             let value = match v {
-                serde_json::Value::String(s) => first_line(s),
+                Json::Str(s) => first_line(s),
                 other => other.to_string(),
             };
             format!("{k}: {value}")

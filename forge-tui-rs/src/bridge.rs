@@ -564,9 +564,9 @@ mod tests {
             }
         }
         let echoed = echoed.expect("child received the line");
-        let parsed: serde_json::Value = serde_json::from_str(&echoed).expect("valid JSON");
-        assert_eq!(parsed["type"], "send_message");
-        assert_eq!(parsed["content"], "ping");
+        let parsed = forge_agent_proto::json::parse(&echoed).expect("valid JSON");
+        assert_eq!(parsed.str_or_empty("type"), "send_message");
+        assert_eq!(parsed.str_or_empty("content"), "ping");
     }
 
     /// Shutdown must terminate a process that ignores `quit`, rather than

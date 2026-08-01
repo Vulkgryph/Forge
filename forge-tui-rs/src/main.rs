@@ -23,8 +23,10 @@ use std::time::Duration;
 
 use forge_tui_rs::app::{App, Input, Outcome};
 use forge_tui_rs::bridge::{AgentBridge, BridgeEvent};
+use forge_tui_rs::keys::{Decoder, ESCAPE_TIMEOUT};
 use forge_tui_rs::screen::Screen;
 use forge_tui_rs::session::Effect;
+use forge_tui_rs::sys::{self, Ready};
 use forge_tui_rs::{input, term};
 
 /// How long the agent gets to exit on its own before it is killed.
@@ -36,7 +38,10 @@ const MAX_BATCH: usize = 512;
 
 /// One thing that happened, from either source.
 enum Event {
-    Terminal(crossterm::event::Event),
+    Key(Input),
+    /// The window changed size; the new size is read when this is handled, since
+    /// several resizes can arrive faster than they are processed.
+    Resized,
     Agent(BridgeEvent),
     /// The terminal reader stopped — stdin is gone, so the session is over.
     InputClosed,
@@ -100,17 +105,16 @@ fn main() -> io::Result<()> {
             match event {
                 Event::InputClosed => break 'session,
 
-                Event::Terminal(crossterm::event::Event::Resize(c, r)) => {
-                    screen.resize(c as usize, r as usize);
-                    app.update(Input::Resize(c as usize, r as usize), &screen);
+                Event::Resized => {
+                    let (cols, rows) = term::size();
+                    screen.resize(cols, rows);
+                    app.update(Input::Resize(cols, rows), &screen);
                 }
 
-                Event::Terminal(ev) => {
-                    if let Some(decoded) = input::decode(ev) {
-                        let (outcome, effects) = app.update(decoded, &screen);
-                        if outcome == Outcome::Quit || !dispatch(&mut bridge, effects) {
-                            break 'session;
-                        }
+                Event::Key(decoded) => {
+                    let (outcome, effects) = app.update(decoded, &screen);
+                    if outcome == Outcome::Quit || !dispatch(&mut bridge, effects) {
+                        break 'session;
                     }
                 }
 
@@ -187,19 +191,7 @@ fn merge_sources(bridge: &mut AgentBridge) -> mpsc::Receiver<Event> {
     let term_tx = tx.clone();
     std::thread::Builder::new()
         .name("terminal-input".into())
-        .spawn(move || loop {
-            match crossterm::event::read() {
-                Ok(ev) => {
-                    if term_tx.send(Event::Terminal(ev)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = term_tx.send(Event::InputClosed);
-                    break;
-                }
-            }
-        })
+        .spawn(move || read_terminal(term_tx))
         .expect("spawn terminal reader");
 
     let agent_rx = bridge.take_events();
@@ -215,6 +207,70 @@ fn merge_sources(bridge: &mut AgentBridge) -> mpsc::Receiver<Event> {
         .expect("spawn agent forwarder");
 
     rx
+}
+
+/// Read stdin, decode it, and post keys onto the loop's channel.
+///
+/// Waits with a timeout only while the decoder is holding a partial sequence.
+/// Otherwise it blocks indefinitely, which is what keeps an idle session at no
+/// CPU — polling on a timer would wake many times a second to find nothing.
+///
+/// The timeout exists for one specific ambiguity: a lone `ESC` is both the
+/// Escape key and the first byte of every other sequence. Waiting briefly and
+/// then resolving it as Escape is how terminals have always settled this.
+fn read_terminal(tx: mpsc::Sender<Event>) {
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 1024];
+
+    loop {
+        // A resize can arrive between iterations; report it before blocking
+        // again, or the new size would not be picked up until the next keypress.
+        if term::take_resize() && tx.send(Event::Resized).is_err() {
+            return;
+        }
+
+        let timeout = decoder.has_pending().then_some(ESCAPE_TIMEOUT);
+        match sys::wait_readable(sys::STDIN, timeout) {
+            Ready::Readable => {}
+            Ready::TimedOut => {
+                // Nothing more is coming, so a held ESC really was Escape.
+                if let Some(key) = decoder.flush_pending_escape() {
+                    if let Some(action) = input::bind(key) {
+                        if tx.send(Event::Key(action)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+            // A signal — a resize, most likely. Loop round and report it.
+            Ready::Interrupted => continue,
+            Ready::Failed => {
+                let _ = tx.send(Event::InputClosed);
+                return;
+            }
+        }
+
+        match sys::read_bytes(sys::STDIN, &mut buf) {
+            // Zero bytes after `poll` said readable means end of input, except
+            // when a signal interrupted the read, which `read_bytes` also
+            // reports as zero. Re-polling distinguishes them without guessing.
+            Some(0) => continue,
+            Some(n) => {
+                for key in decoder.feed(&buf[..n]) {
+                    if let Some(action) = input::bind(key) {
+                        if tx.send(Event::Key(action)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {
+                let _ = tx.send(Event::InputClosed);
+                return;
+            }
+        }
+    }
 }
 
 fn parse_args() -> Result<Option<Options>, String> {

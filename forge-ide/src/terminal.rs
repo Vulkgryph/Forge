@@ -194,6 +194,16 @@ pub struct Grid {
     /// its cached galley on `version`, so an unchanged version means it keeps
     /// presenting the last *complete* frame while this one is assembled.
     sync_update:  Option<std::time::Instant>,
+    /// Autowrap (DECAWM, `ESC[?7h`/`l`). On by default, as a real terminal is.
+    ///
+    /// Full-screen programs turn it off because they position every cell
+    /// themselves and cannot have the terminal moving their output: with it on,
+    /// writing the bottom-right cell wraps, which line-feeds, which at the
+    /// bottom of the screen scrolls everything up a row. Ignoring the request
+    /// meant any such program — vim, htop, our own TUI — could have the frame it
+    /// had just drawn shifted out from under it while writing the next one,
+    /// leaving two frames on screen at once.
+    autowrap:     bool,
     /// Bumped on every content-affecting mutation (`process`, `resize`,
     /// `restore_snapshot`). Lets `Terminal::draw_sized` cache its rendered
     /// viewport `Galley` and skip rebuilding + re-shaping it on every single
@@ -234,6 +244,7 @@ impl Grid {
             dim: false,
             parse_st: PState::Ground, parse_params: String::new(),
             alt_screen: None, sync_update: None,
+            autowrap: true,
             version: 0,
             scrollback_version: 0,
         }
@@ -434,8 +445,15 @@ impl Grid {
 
     fn put_char(&mut self, c: char) {
         if self.cur_col >= self.cols {
-            self.cur_col = 0;
-            self.line_feed();
+            if self.autowrap {
+                self.cur_col = 0;
+                self.line_feed();
+            } else {
+                // DECAWM off: the cursor stays put at the last column and
+                // further characters overwrite it. Crucially it does not
+                // line-feed, so nothing scrolls.
+                self.cur_col = self.cols.saturating_sub(1);
+            }
         }
         let fg = if self.dim { dim_color(self.current_fg) } else { self.current_fg };
         self.viewport[self.cur_row][self.cur_col] = Cell { ch: c, fg, bg: self.current_bg };
@@ -554,6 +572,8 @@ impl Grid {
                         if set { self.enter_alt_screen(mode == "1049"); }
                         else   { self.leave_alt_screen(mode == "1049"); }
                     }
+                    // Autowrap — see `autowrap`.
+                    "7" => self.autowrap = set,
                     // Synchronized update — see `sync_update`.
                     "2026" => {
                         if set {
@@ -1734,6 +1754,56 @@ mod private_mode_tests {
         assert!(g.cursor_visible(), "cursor visibility applied from a batch");
         assert!(g.sync_update.is_some(), "and so was the synchronized update");
         g.process("\x1b[?2026l");
+    }
+
+    /// With autowrap off, filling the last row must not scroll.
+    ///
+    /// This is the bug behind two frames appearing on screen at once: a
+    /// full-screen renderer writes the bottom-right cell, the terminal wraps and
+    /// line-feeds, everything shifts up a row, and the next frame lands at
+    /// absolute positions over the top of the displaced one.
+    #[test]
+    fn with_autowrap_off_filling_the_last_cell_does_not_scroll() {
+        let mut g = Grid::with_size(4, 10);
+        filled(&mut g, 20, "history");
+        let scrollback_before = g.scrollback.len();
+
+        g.process("\x1b[?7l");
+        // Park on the last row and write exactly enough to fill it.
+        g.process("\x1b[4;1H");
+        g.process(&"x".repeat(10));
+
+        assert_eq!(
+            g.scrollback.len(), scrollback_before,
+            "filling the last row must not scroll with autowrap off",
+        );
+        // One more character overwrites the last cell rather than wrapping.
+        g.process("y");
+        assert_eq!(
+            g.scrollback.len(), scrollback_before,
+            "and neither does writing past it",
+        );
+    }
+
+    /// With autowrap on — the default — wrapping still works, or ordinary
+    /// shell output would stop flowing.
+    #[test]
+    fn autowrap_on_by_default_still_wraps() {
+        let mut g = Grid::with_size(4, 10);
+        g.process("\x1b[1;1H");
+        g.process(&"x".repeat(15));
+        // 15 characters into a 10-column row must have moved to a second row.
+        assert!(g.cursor().0 > 0, "wrapped onto the next row");
+    }
+
+    #[test]
+    fn autowrap_can_be_turned_back_on() {
+        let mut g = Grid::with_size(4, 10);
+        g.process("\x1b[?7l");
+        g.process("\x1b[?7h");
+        g.process("\x1b[1;1H");
+        g.process(&"x".repeat(15));
+        assert!(g.cursor().0 > 0, "wrapping restored");
     }
 
     /// The exact bytes forge-tui's frame writer emits, captured from a real pty.

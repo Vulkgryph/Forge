@@ -303,8 +303,10 @@ impl App {
                     .map(|l| Line { spans: vec![Span { text: l.to_string(), style }] })
                     .collect(),
                 EntryKind::Thought => {
-                    let secs = entry.duration.map(|d| d.as_secs()).unwrap_or(0);
-                    let head = format!("thought for {secs}s");
+                    let head = match entry.duration {
+                        Some(d) => format!("thought for {}", format_duration(d)),
+                        None => "thought".to_string(),
+                    };
                     let mut lines = vec![Line {
                         spans: vec![Span { text: head, style }],
                     }];
@@ -502,6 +504,30 @@ impl App {
         }
         kept.reverse();
         kept.concat()
+    }
+}
+
+/// A duration at a readable precision.
+///
+/// Truncating to whole seconds reported "thought for 0s" for anything under a
+/// second, which is both wrong-looking and useless — most reasoning blocks are
+/// fast, so that was the common case rather than an edge one.
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let secs = d.as_secs();
+    if secs < 60 {
+        // One decimal below a minute: the difference between 2s and 2.7s is
+        // worth seeing when you are waiting for it.
+        return format!("{:.1}s", d.as_secs_f64());
+    }
+    let (minutes, rest) = (secs / 60, secs % 60);
+    if rest == 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{minutes}m {rest}s")
     }
 }
 
@@ -925,6 +951,30 @@ mod tests {
             text.iter().any(|l| l.contains("    indented")),
             "indentation preserved: {text:?}",
         );
+    }
+
+    /// Whole-second truncation showed "thought for 0s" for anything under a
+    /// second, which is most reasoning blocks.
+    #[test]
+    fn short_durations_are_not_reported_as_zero() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(1)), "1ms");
+        assert_eq!(format_duration(Duration::from_millis(420)), "420ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
+        for d in [1u64, 250, 999] {
+            let out = format_duration(Duration::from_millis(d));
+            assert!(!out.starts_with('0'), "{d}ms rendered as {out:?}");
+        }
+    }
+
+    #[test]
+    fn longer_durations_read_naturally() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(1_000)), "1.0s");
+        assert_eq!(format_duration(Duration::from_millis(2_700)), "2.7s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59.0s");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
     }
 
     #[test]

@@ -42,6 +42,15 @@ const PUSH_KEYBOARD: &str = "\x1b[>1u";
 const POP_KEYBOARD: &str = "\x1b[<u";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
+/// Autowrap (DECAWM). Off while we own the screen.
+///
+/// With it on, writing the bottom-right cell wraps and scrolls: the frame just
+/// drawn shifts up a row while the next one is written at absolute positions,
+/// leaving two frames on screen at once. A full-screen renderer that addresses
+/// cells directly never wants the terminal moving them, so this is switched off
+/// for the duration and restored on the way out.
+const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
+const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
 
 /// Holds the terminal in TUI state and gives it back when dropped.
 pub struct Guard {
@@ -59,7 +68,10 @@ impl Guard {
         let mut out = io::stdout();
         // Bracketed paste before the alternate screen, so a paste arriving
         // during startup is already delimited.
-        write!(out, "{ENABLE_BRACKETED_PASTE}{ENTER_ALT}{HIDE_CURSOR}{PUSH_KEYBOARD}")?;
+        write!(
+            out,
+            "{ENABLE_BRACKETED_PASTE}{ENTER_ALT}{DISABLE_AUTOWRAP}{HIDE_CURSOR}{PUSH_KEYBOARD}",
+        )?;
         out.flush()?;
 
         ACTIVE.store(true, Ordering::SeqCst);
@@ -91,7 +103,7 @@ pub fn restore() {
     // ours to erase.
     let _ = write!(
         out,
-        "{POP_KEYBOARD}{SHOW_CURSOR}{LEAVE_ALT}{DISABLE_BRACKETED_PASTE}",
+        "{POP_KEYBOARD}{SHOW_CURSOR}{ENABLE_AUTOWRAP}{LEAVE_ALT}{DISABLE_BRACKETED_PASTE}",
     );
     let _ = out.flush();
     let _ = terminal::disable_raw_mode();
@@ -177,6 +189,7 @@ mod tests {
             ENTER_ALT, LEAVE_ALT, HIDE_CURSOR, SHOW_CURSOR,
             PUSH_KEYBOARD, POP_KEYBOARD,
             ENABLE_BRACKETED_PASTE, DISABLE_BRACKETED_PASTE,
+            DISABLE_AUTOWRAP, ENABLE_AUTOWRAP,
         ] {
             assert!(!seq.contains("3J"), "{seq:?} must not erase scrollback");
             assert!(!seq.contains("2J"), "{seq:?} must not clear the screen");
@@ -184,6 +197,16 @@ mod tests {
     }
 
     /// Restoration must be idempotent: `Drop` and a signal handler can both run.
+    /// Autowrap must be off while we own the screen and back on afterwards.
+    /// Leaving it on lets a write in the last cell scroll the display, which
+    /// puts two frames on screen at once; leaving it off afterwards would break
+    /// the user's shell.
+    #[test]
+    fn autowrap_is_disabled_during_and_restored_after() {
+        assert_eq!(DISABLE_AUTOWRAP, "\x1b[?7l");
+        assert_eq!(ENABLE_AUTOWRAP, "\x1b[?7h");
+    }
+
     #[test]
     fn restore_is_idempotent_when_inactive() {
         ACTIVE.store(false, Ordering::SeqCst);

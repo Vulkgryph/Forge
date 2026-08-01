@@ -326,11 +326,13 @@ Options:
       --login-chatgpt        Log in to ChatGPT Codex via OAuth
 
 Keys:
-  Enter          send                 Ctrl-C   quit
-  Up/Down        scroll               Esc      follow the newest output
-  PgUp/PgDn      scroll a page        Ctrl-X   interrupt the current turn
+  Enter          send                 Ctrl-T   menu (model, tools, settings)
+  Up/Down        scroll               Ctrl-X   interrupt the current turn
+  PgUp/PgDn      scroll a page        Ctrl-C   quit
+  Esc            follow newest output
 
-With a prompt open, y/n/a answer it when nothing has been typed yet.
+In the menu: Up/Down or j/k to move, Enter to choose, Esc to go back.
+At a prompt: y approves, n denies; always-allow must be selected.
 "
     .to_string()
 }

@@ -21,6 +21,7 @@ pub fn bind(key: Key) -> Option<Input> {
         // impossible.
         Key::Ctrl('x') => Input::Interrupt,
 
+        Key::Ctrl('t') => Input::Menu,
         Key::Ctrl('u') => Input::PageUp,
         Key::Ctrl('g') => Input::Home,
 
@@ -111,6 +112,12 @@ mod tests {
         for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Tab, Key::Delete] {
             assert_eq!(bind(key.clone()), None, "{key:?} should be unbound");
         }
+    }
+
+    /// The menu needs a key, or model switching is unreachable.
+    #[test]
+    fn ctrl_t_opens_the_menu() {
+        assert_eq!(bind(Key::Ctrl('t')), Some(Input::Menu));
     }
 
     #[test]

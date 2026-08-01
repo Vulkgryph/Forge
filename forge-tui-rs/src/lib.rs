@@ -30,6 +30,7 @@ pub mod dialog;
 pub mod input;
 pub mod keys;
 pub mod markdown;
+pub mod menu;
 pub mod screen;
 pub mod session;
 pub mod sys;

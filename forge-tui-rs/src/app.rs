@@ -10,6 +10,7 @@ use forge_agent_proto::ClientMessage;
 
 use crate::dialog::{Decision, Dialog};
 use crate::markdown::{self, Line, Span};
+use crate::menu::{self, Menu};
 use crate::screen::{Screen, Style};
 use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
 use crate::widgets::Rect;
@@ -36,6 +37,8 @@ pub enum Input {
     End,
     /// Ask the agent to stop the current turn.
     Interrupt,
+    /// Open the menu.
+    Menu,
     Quit,
     Resize(usize, usize),
 }
@@ -62,6 +65,9 @@ pub struct App {
     cache:   Option<(usize, usize, Vec<Line>)>,
     /// The modal prompt, mirroring `session.pending`.
     dialog:  Option<Dialog>,
+    /// The menu, when open. Takes the whole screen, so the transcript is hidden
+    /// while it is up.
+    menu:    Option<Menu>,
 }
 
 impl Default for App {
@@ -78,6 +84,7 @@ impl App {
             scroll: 0,
             cache: None,
             dialog: None,
+            menu: None,
         }
     }
 
@@ -98,6 +105,10 @@ impl App {
     /// The open modal prompt, if any.
     pub fn dialog(&self) -> Option<&Dialog> {
         self.dialog.as_ref()
+    }
+
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
     }
 
     pub fn session(&self) -> &Session {
@@ -147,6 +158,29 @@ impl App {
             _ => {}
         }
 
+        // The menu owns the screen while it is open.
+        if self.menu.is_some() {
+            let outcome = self
+                .menu
+                .as_mut()
+                .map(|m| m.handle(input, &self.session))
+                .unwrap_or(menu::Outcome::Stay);
+            return match outcome {
+                menu::Outcome::Stay => (Outcome::Continue, Vec::new()),
+                menu::Outcome::Close => {
+                    self.menu = None;
+                    self.cache = None;
+                    (Outcome::Continue, Vec::new())
+                }
+                menu::Outcome::Act(effects) => {
+                    // Settings pages stay open so several can be changed in one
+                    // visit; anything that ends the session's state closes.
+                    self.cache = None;
+                    (Outcome::Continue, effects)
+                }
+            };
+        }
+
         // A prompt is modal: everything else goes to it.
         if self.dialog.is_some() {
             let decision = self.dialog.as_mut().and_then(|d| d.handle(input));
@@ -165,6 +199,14 @@ impl App {
                         Outcome::Continue,
                         vec![Effect::Send(ClientMessage::CancelRun)],
                     );
+                }
+            }
+
+            Input::Menu => {
+                // Not while the agent is blocked on a prompt: the answer it is
+                // waiting for has to come first.
+                if self.dialog.is_none() {
+                    self.menu = Some(Menu::new());
                 }
             }
 
@@ -352,6 +394,16 @@ impl App {
         screen.begin_frame();
         let (cols, rows) = (screen.cols(), screen.rows());
         if cols == 0 || rows == 0 {
+            return;
+        }
+
+        // The menu replaces the transcript entirely — it is somewhere you are,
+        // not an overlay on the conversation. Drawn before anything else so no
+        // transcript rows are left showing underneath it.
+        if self.menu.is_some() {
+            let mut menu = self.menu.take().expect("checked above");
+            menu.draw(screen, Rect::new(0, 0, rows, cols), &self.session, palette::PROMPT);
+            self.menu = Some(menu);
             return;
         }
 
@@ -741,6 +793,112 @@ mod tests {
         );
         assert_eq!(app.input(), "", "the input line was not touched");
         assert!(app.session().pending.is_some(), "still waiting");
+    }
+
+    // ── Menu ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_menu_opens_and_closes() {
+        let (mut app, screen) = app_with(0);
+        assert!(!app.menu_open());
+        app.update(Input::Menu, &screen);
+        assert!(app.menu_open());
+        // Escape at the top level closes it.
+        app.update(Input::End, &screen);
+        assert!(!app.menu_open());
+    }
+
+    /// Keystrokes must go to the menu, not the input line, or opening it would
+    /// quietly type into the prompt behind it.
+    #[test]
+    fn the_menu_captures_typing() {
+        let (mut app, screen) = app_with(0);
+        app.update(Input::Menu, &screen);
+        for c in "hello".chars() {
+            app.update(Input::Char(c), &screen);
+        }
+        assert_eq!(app.input(), "", "nothing reached the input line");
+        assert!(app.menu_open(), "and it is still open");
+    }
+
+    /// The reason the menu exists: switching model has to reach the agent.
+    #[test]
+    fn switching_model_from_the_menu_sends_the_message() {
+        use forge_agent_proto::{EndpointInfo, EndpointReasoningConfig};
+        let mut app = App::new();
+        let screen = Screen::new(80, 24);
+        app.session_mut().apply(AgentMessage::Init(Box::new(Init {
+            model_name: "First".into(),
+            model_id: "first-1".into(),
+            endpoints: vec![
+                EndpointInfo {
+                    name: "First".into(),
+                    base_url: "https://example.invalid".into(),
+                    model_id: "first-1".into(),
+                    max_context_tokens: 1000,
+                    max_output_tokens: 100,
+                    endpoint_type: "anthropic".into(),
+                    reasoning: EndpointReasoningConfig::default(),
+                    xai_priority_tier: false,
+                },
+                EndpointInfo {
+                    name: "Second".into(),
+                    base_url: "https://example.invalid".into(),
+                    model_id: "second-1".into(),
+                    max_context_tokens: 2000,
+                    max_output_tokens: 200,
+                    endpoint_type: "open_ai".into(),
+                    reasoning: EndpointReasoningConfig::default(),
+                    xai_priority_tier: false,
+                },
+            ],
+            ..Default::default()
+        })));
+
+        app.update(Input::Menu, &screen);
+        // Root starts on "Main model".
+        app.update(Input::Enter, &screen);
+        app.update(Input::Down, &screen); // onto Second
+        let (_, effects) = app.update(Input::Enter, &screen);
+
+        match effects.first() {
+            Some(Effect::Send(ClientMessage::SwitchModel { model_id, .. })) => {
+                assert_eq!(model_id, "second-1");
+            }
+            other => panic!("expected a model switch, got {other:?}"),
+        }
+    }
+
+    /// The menu must not be reachable while the agent is blocked on a prompt —
+    /// the answer it is waiting for has to come first.
+    #[test]
+    fn the_menu_does_not_open_over_a_pending_prompt() {
+        let (mut app, screen) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        app.update(Input::Menu, &screen);
+        assert!(!app.menu_open(), "the approval still owns the screen");
+        assert!(app.session().pending.is_some());
+    }
+
+    /// Quitting has to work from inside the menu too.
+    #[test]
+    fn quit_works_with_the_menu_open() {
+        let (mut app, screen) = app_with(0);
+        app.update(Input::Menu, &screen);
+        assert_eq!(app.update(Input::Quit, &screen).0, Outcome::Quit);
+    }
+
+    #[test]
+    fn the_menu_replaces_the_transcript_when_drawn() {
+        let (mut app, mut screen) = app_with(10);
+        app.update(Input::Menu, &screen);
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("Main model"), "the menu is drawn: {grid:?}");
+        assert!(!grid.contains("entry number"), "the transcript is hidden");
     }
 
     /// A modal must not be a trap: quitting has to work regardless.

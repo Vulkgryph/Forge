@@ -21,7 +21,12 @@ pub fn bind(key: Key) -> Option<Input> {
         // impossible.
         Key::Ctrl('x') => Input::Interrupt,
 
-        Key::Ctrl('t') => Input::Menu,
+        // Ctrl-T expands and collapses reasoning. The TypeScript UI prints
+        // "(ctrl+t to expand)" in its own transcript, so the binding is part of
+        // the design rather than a free choice.
+        Key::Ctrl('t') => Input::ToggleReasoning,
+        // The menu takes Ctrl-O, since Ctrl-T is spoken for.
+        Key::Ctrl('o') => Input::Menu,
         Key::Ctrl('u') => Input::PageUp,
         Key::Ctrl('g') => Input::Home,
 
@@ -114,10 +119,17 @@ mod tests {
         }
     }
 
-    /// The menu needs a key, or model switching is unreachable.
+    /// Ctrl-T is expand/collapse reasoning, because the TypeScript UI says so in
+    /// its own transcript text. Taking it for the menu broke that muscle memory.
     #[test]
-    fn ctrl_t_opens_the_menu() {
-        assert_eq!(bind(Key::Ctrl('t')), Some(Input::Menu));
+    fn ctrl_t_toggles_reasoning_not_the_menu() {
+        assert_eq!(bind(Key::Ctrl('t')), Some(Input::ToggleReasoning));
+    }
+
+    /// The menu still needs a key, or model switching is unreachable.
+    #[test]
+    fn ctrl_o_opens_the_menu() {
+        assert_eq!(bind(Key::Ctrl('o')), Some(Input::Menu));
     }
 
     #[test]

@@ -30,16 +30,20 @@ pub const SYNC_BEGIN: &str = "\x1b[?2026h";
 /// End synchronized update: present.
 pub const SYNC_END: &str = "\x1b[?2026l";
 
-/// A 256-colour foreground index, or the terminal default.
+/// 256-colour foreground and background indices, or the terminal default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
     pub fg:   Option<u8>,
+    /// Background. Needed for diff highlighting, where the whole row is tinted
+    /// rather than just the text coloured.
+    pub bg:   Option<u8>,
     pub bold: bool,
     pub dim:  bool,
 }
 
 impl Style {
     pub fn fg(idx: u8) -> Self { Self { fg: Some(idx), ..Self::default() } }
+    pub fn bg(mut self, idx: u8) -> Self { self.bg = Some(idx); self }
     pub fn bold(mut self) -> Self { self.bold = true; self }
     pub fn dim(mut self) -> Self { self.dim = true; self }
 
@@ -58,6 +62,7 @@ impl Style {
         if self.bold { s.push_str(";1"); }
         if self.dim  { s.push_str(";2"); }
         if let Some(fg) = self.fg { let _ = write!(s, ";38;5;{fg}"); }
+        if let Some(bg) = self.bg { let _ = write!(s, ";48;5;{bg}"); }
         s.push('m');
         s
     }
@@ -417,6 +422,32 @@ mod tests {
             out.text().matches("38;5;42").count(), 1,
             "one SGR for a run of identically styled cells",
         );
+    }
+
+    /// A background has to reach the wire, or diff rows cannot be tinted.
+    #[test]
+    fn a_background_colour_is_emitted() {
+        let mut s = Screen::new(10, 1);
+        s.begin_frame();
+        s.put(0, 0, "x", Style::fg(2).bg(22));
+        let out = render(&mut s).text();
+        assert!(out.contains("38;5;2"), "foreground: {out:?}");
+        assert!(out.contains("48;5;22"), "background: {out:?}");
+    }
+
+    /// A row tinted only by its background still differs from a blank one, or
+    /// the diff would skip it and the tint would never appear.
+    #[test]
+    fn a_background_only_change_is_still_a_change() {
+        let mut s = Screen::new(6, 1);
+        s.begin_frame();
+        s.put(0, 0, "     ", Style::default());
+        render(&mut s);
+
+        s.begin_frame();
+        s.put(0, 0, "     ", Style::default().bg(52));
+        let out = render(&mut s).text();
+        assert!(out.contains("48;5;52"), "the tint is drawn: {out:?}");
     }
 
     #[test]

@@ -226,6 +226,12 @@ pub struct Session {
 
     /// Tools the user approved for the rest of the session, by name.
     approved_tools: HashSet<String>,
+    /// Whether finished reasoning blocks show their full text.
+    ///
+    /// Collapsed by default, matching the TypeScript client: a transcript that
+    /// prints every thought in full is mostly grey text, and the summary line is
+    /// enough unless you want to read it.
+    pub reasoning_expanded: bool,
 }
 
 impl Default for Session {
@@ -263,6 +269,7 @@ impl Session {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approved_tools: HashSet::new(),
+            reasoning_expanded: false,
         }
     }
 
@@ -716,6 +723,11 @@ impl Session {
                 Vec::new()
             }
         }
+    }
+
+    /// Show or hide the full text of finished reasoning blocks.
+    pub fn toggle_reasoning(&mut self) {
+        self.reasoning_expanded = !self.reasoning_expanded;
     }
 
     /// Dismiss whatever is pending without answering.

@@ -13,7 +13,7 @@ use crate::markdown::{self, Line, Span};
 use crate::menu::{self, Menu};
 use crate::screen::{Screen, Style};
 use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
-use crate::widgets::Rect;
+use crate::widgets::{self, Rect};
 
 /// What the event loop should do after an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,20 +39,33 @@ pub enum Input {
     Interrupt,
     /// Open the menu.
     Menu,
+    /// Show or hide the full text of reasoning blocks.
+    ToggleReasoning,
     Quit,
     Resize(usize, usize),
 }
 
-/// Palette, in one place.
+/// Palette, matched to the TypeScript client's ink colours.
+///
+/// ink names map onto the terminal's first sixteen: blue is 12, magenta 13,
+/// yellow 11, red 9, green 10, gray 8. Using the same indices means the TUI
+/// picks up the user's terminal theme exactly as the old one did, rather than
+/// imposing colours of its own.
 mod palette {
-    pub const USER:     u8 = 75;
-    pub const TOOL:     u8 = 108;
-    pub const ERROR:    u8 = 174;
-    pub const SYSTEM:   u8 = 245;
-    pub const THOUGHT:  u8 = 240;
-    pub const SUBAGENT: u8 = 141;
-    pub const RULE:     u8 = 238;
-    pub const PROMPT:   u8 = 75;
+    /// User messages: bold blue.
+    pub const USER:     u8 = 12;
+    /// Reasoning, subagents, plan content: magenta.
+    pub const MAGENTA:  u8 = 13;
+    /// Plan status and the pause indicator: yellow.
+    pub const YELLOW:   u8 = 11;
+    pub const RED:      u8 = 9;
+    pub const GREEN:    u8 = 10;
+    /// Dim text throughout.
+    pub const GRAY:     u8 = 8;
+    /// Diff line tints, as close as 256 colours get to ink's #002800/#280000.
+    pub const DIFF_ADD_BG: u8 = 22;
+    pub const DIFF_DEL_BG: u8 = 52;
+    pub const PROMPT:   u8 = 12;
 }
 
 pub struct App {
@@ -210,6 +223,11 @@ impl App {
                 }
             }
 
+            Input::ToggleReasoning => {
+                self.session.toggle_reasoning();
+                self.cache = None;
+            }
+
             Input::Char(c) => {
                 self.input.push(c);
                 self.follow_tail();
@@ -327,49 +345,137 @@ impl App {
         self.build_lines(cols)
     }
 
+    /// Render the transcript, following the TypeScript client's layout.
+    ///
+    /// The indentation is the point: tool calls sit four columns in and their
+    /// output six, so a turn reads as a hierarchy rather than a wall of text.
     fn build_lines(&self, cols: usize) -> Vec<Line> {
+        let dim = Style::fg(palette::GRAY).dim();
         let mut out = Vec::new();
+
         for (i, entry) in self.session.entries().iter().enumerate() {
             if i > 0 {
                 out.push(Line::default());
             }
-            let (prefix, style) = decorate(entry.kind, entry.success);
-            let body_cols = cols.saturating_sub(prefix.chars().count());
+            match entry.kind {
+                // Bold blue, no prefix glyph.
+                EntryKind::User => {
+                    let style = Style::fg(palette::USER).bold();
+                    out.extend(restyle(markdown::render(&entry.content, cols), style));
+                }
 
-            // Tool output and results are preformatted; running them through
-            // the markdown parser would reflow a diff or a stack trace.
-            let rendered = match entry.kind {
-                EntryKind::ToolOutput | EntryKind::ToolResult => entry
-                    .content
-                    .lines()
-                    .map(|l| Line { spans: vec![Span { text: l.to_string(), style }] })
-                    .collect(),
-                EntryKind::Thought => {
-                    let head = match entry.duration {
-                        Some(d) => format!("thought for {}", format_duration(d)),
-                        None => "thought".to_string(),
+                EntryKind::Assistant | EntryKind::PlanContent => {
+                    out.extend(markdown::render(&entry.content, cols));
+                }
+
+                // Collapsed to one line unless expanded: "✻ Thinking… (2.1s)".
+                EntryKind::Thought | EntryKind::Reasoning => {
+                    let stat = entry.duration.map(format_duration).unwrap_or_default();
+                    let head = if stat.is_empty() {
+                        "Thinking…".to_string()
+                    } else {
+                        format!("Thinking… ({stat})")
                     };
-                    let mut lines = vec![Line {
-                        spans: vec![Span { text: head, style }],
-                    }];
-                    lines.extend(markdown::render(&entry.content, body_cols));
-                    lines
+                    let hint = if self.session.reasoning_expanded {
+                        "  (ctrl+t to collapse)"
+                    } else {
+                        "  (ctrl+t to expand)"
+                    };
+                    out.push(Line {
+                        spans: vec![
+                            Span { text: "✻ ".into(), style: Style::fg(palette::MAGENTA) },
+                            Span { text: head, style: Style::fg(palette::MAGENTA).dim() },
+                            Span { text: hint.into(), style: dim },
+                        ],
+                    });
+                    if self.session.reasoning_expanded {
+                        out.extend(indent(
+                            restyle(markdown::render(&entry.content, cols.saturating_sub(2)), dim),
+                            2,
+                            dim,
+                        ));
+                    }
                 }
-                _ => markdown::render(&entry.content, body_cols),
-            };
 
-            for (j, line) in rendered.into_iter().enumerate() {
-                let lead = if j == 0 {
-                    prefix.to_string()
-                } else {
-                    " ".repeat(prefix.chars().count())
-                };
-                let mut spans = Vec::new();
-                if !lead.is_empty() {
-                    spans.push(Span { text: lead, style });
+                // Four columns in, with a status glyph.
+                EntryKind::ToolCall => {
+                    let mut spans = vec![
+                        Span { text: "    ".into(), style: dim },
+                        Span { text: "⏺ ".into(), style: Style::fg(palette::MAGENTA) },
+                    ];
+                    spans.push(Span { text: entry.content.clone(), style: dim });
+                    out.push(Line { spans });
                 }
-                spans.extend(line.spans);
-                out.push(Line { spans });
+
+                // Results and output are preformatted — running a diff or a
+                // stack trace through the markdown wrapper would corrupt it.
+                EntryKind::ToolResult => {
+                    let glyph_style = match entry.success {
+                        Some(false) => Style::fg(palette::RED),
+                        _ => Style::fg(palette::GREEN),
+                    };
+                    let mut lines = entry.content.lines();
+                    if let Some(first) = lines.next() {
+                        out.push(Line {
+                            spans: vec![
+                                Span { text: "    ".into(), style: dim },
+                                Span {
+                                    text: if entry.success == Some(false) { "✗ " } else { "⎿ " }
+                                        .into(),
+                                    style: glyph_style,
+                                },
+                                Span { text: clip_line(first, cols, 6), style: dim },
+                            ],
+                        });
+                    }
+                    for line in lines {
+                        out.push(diff_line(line, cols, dim));
+                    }
+                }
+
+                EntryKind::ToolOutput => {
+                    for line in entry.content.lines() {
+                        out.push(diff_line(line, cols, dim));
+                    }
+                }
+
+                EntryKind::System => {
+                    out.extend(restyle(markdown::render(&entry.content, cols), dim));
+                }
+
+                EntryKind::Error => {
+                    let red = Style::fg(palette::RED);
+                    for (j, line) in entry.content.lines().enumerate() {
+                        let style = if j == 0 { red.bold() } else { red };
+                        out.push(Line {
+                            spans: vec![Span { text: line.to_string(), style }],
+                        });
+                    }
+                }
+
+                EntryKind::PlanStatus => {
+                    out.push(Line {
+                        spans: vec![
+                            Span { text: "◆ ".into(), style: Style::fg(palette::YELLOW) },
+                            Span {
+                                text: entry.content.clone(),
+                                style: Style::fg(palette::YELLOW),
+                            },
+                        ],
+                    });
+                }
+
+                EntryKind::SubagentHeader => {
+                    out.push(Line {
+                        spans: vec![
+                            Span { text: "  ⎿ ".into(), style: dim },
+                            Span {
+                                text: entry.content.clone(),
+                                style: Style::fg(palette::MAGENTA),
+                            },
+                        ],
+                    });
+                }
             }
         }
         out
@@ -441,104 +547,113 @@ impl App {
             }
         }
 
-        if rows >= 3 {
-            self.draw_status(screen, rows - 3, cols);
-        }
+        // Chrome, bottom-up: the context bar sits on the last row, the prompt
+        // above it, and any running subagents above that. No separator rule and
+        // no status line — the TypeScript client had neither, and the context
+        // bar carries what they were showing.
+        self.draw_context_bar(screen, rows - 1, cols);
         if rows >= 2 {
-            self.draw_rule(screen, rows - 2, cols);
+            self.draw_input(screen, rows - 2, cols);
         }
-        self.draw_input(screen, rows - 1, cols);
-    }
-
-    fn draw_status(&self, screen: &mut Screen, row: usize, cols: usize) {
-        let mut col = 0;
-
-        if let Some(label) = self.session.activity.label() {
-            col = screen.put(row, col, &format!("● {label}"), Style::fg(palette::USER));
-        } else if self.session.connected {
-            col = screen.put(row, col, "● ready", Style::fg(palette::SYSTEM).dim());
-        } else {
-            col = screen.put(row, col, "○ connecting", Style::fg(palette::SYSTEM).dim());
-        }
-
-        // Context use as a bar plus a figure — the bar is readable at a glance,
-        // the number is what you quote when it matters.
-        if self.session.usage.is_some() {
-            let fraction = self.session.context_fraction();
-            let pct = (fraction * 100.0).round() as u32;
-            // Amber past three quarters: the point where compaction is near.
-            let style = if fraction > 0.75 {
-                Style::fg(palette::ERROR)
-            } else {
-                Style::fg(palette::TOOL)
-            };
-            crate::widgets::gauge(screen, row, col + 2, 8, fraction, style);
-            col = screen.put(row, col + 11, &format!("{pct}%"),
-                             Style::fg(palette::SYSTEM).dim());
-        }
-
-        // Running subagents, named so a long delegation is not a mystery.
-        if !self.session.subagents.is_empty() {
-            let text = match self.session.subagents.len() {
-                1 => {
-                    let sub = &self.session.subagents[0];
-                    if sub.detail.is_empty() {
-                        format!("▸ {}", sub.agent_type)
-                    } else {
-                        format!("▸ {}: {}", sub.agent_type, sub.detail)
-                    }
-                }
-                n => format!("▸ {n} subagents"),
-            };
-            let room = cols.saturating_sub(col + 4);
-            col = screen.put(row, col + 2, &crate::widgets::clip(&text, room),
-                             Style::fg(palette::SUBAGENT));
-        }
-
-        if self.session.permission_mode == PermissionMode::AllowAll {
-            col = screen.put(row, col + 2, "auto-approve", Style::fg(palette::ERROR));
-        }
-        if self.session.plan_mode {
-            col = screen.put(row, col + 2, "plan", Style::fg(palette::SUBAGENT));
-        }
-
-        // Right-aligned model name, when there is room for it.
-        let model = &self.session.model_name;
-        if !model.is_empty() {
-            let w = crate::width::str_width(model);
-            if cols > col + w + 2 {
-                screen.put(row, cols - w, model, Style::fg(palette::SYSTEM).dim());
-            }
+        if rows >= 4 {
+            self.draw_subagents(screen, rows - 3, cols);
         }
     }
 
-    fn draw_rule(&self, screen: &mut Screen, row: usize, cols: usize) {
-        let hint = if self.scroll > 0 {
-            format!(" {} lines below — End to follow ", self.scroll)
-        } else {
-            String::new()
-        };
-        let fill = cols.saturating_sub(hint.chars().count());
-        let filled = screen.put(row, 0, &"─".repeat(fill), Style::fg(palette::RULE));
-        screen.put(row, filled, &hint, Style::fg(palette::SYSTEM).dim());
+    /// Running subagents, listed above the prompt.
+    ///
+    /// Drawn upwards from `bottom` so the block grows into the transcript rather
+    /// than pushing the prompt off the screen.
+    fn draw_subagents(&self, screen: &mut Screen, bottom: usize, cols: usize) {
+        let subagents = &self.session.subagents;
+        if subagents.is_empty() {
+            return;
+        }
+        let dim = Style::fg(palette::GRAY).dim();
+
+        // One row per agent, plus the heading, as far as there is room.
+        let room = bottom.min(subagents.len() + 1);
+        let mut row = bottom + 1 - room;
+
+        let col = screen.put(row, 0, "Subagents", Style::fg(palette::MAGENTA));
+        screen.put(row, col, &format!(" · {} running", subagents.len()), dim);
+        row += 1;
+
+        for sub in subagents.iter().take(room.saturating_sub(1)) {
+            let col = screen.put(row, 2, "◆ ", Style::fg(palette::MAGENTA));
+            let col = screen.put(row, col, &sub.agent_type, Style::default());
+            let detail = if sub.detail.is_empty() { "starting" } else { &sub.detail };
+            let room = cols.saturating_sub(col + 3);
+            screen.put(row, col, &format!(" · {}", widgets::clip(detail, room)), dim);
+            row += 1;
+        }
     }
 
+    /// The prompt line: `❯ ` and what has been typed, or a placeholder.
     fn draw_input(&self, screen: &mut Screen, row: usize, cols: usize) {
-        // With a prompt open, the dialog owns both the keyboard and the cursor;
+        // With a prompt open the dialog owns the keyboard and the cursor;
         // showing a live input line as well would suggest typing goes there.
         if self.dialog.is_some() {
-            screen.put(row, 0, "  (answer above)", Style::fg(palette::SYSTEM).dim());
+            screen.put(row, 0, "  (answer above)", Style::fg(palette::GRAY).dim());
             return;
         }
 
-        let col = screen.put(row, 0, "› ", Style::fg(palette::PROMPT).bold());
+        let col = screen.put(row, 0, "❯ ", Style::fg(palette::PROMPT).bold());
+        if self.input.is_empty() {
+            screen.put(row, col, &widgets::clip(PLACEHOLDER, cols.saturating_sub(col)),
+                       Style::fg(palette::GRAY).dim());
+            screen.set_cursor(row, col);
+            return;
+        }
         let visible = self.visible_input(cols.saturating_sub(col));
         let end = screen.put(row, col, &visible, Style::default());
         screen.set_cursor(row, end.min(cols.saturating_sub(1)));
     }
 
-    /// The tail of the input that fits, so a long line scrolls horizontally
-    /// rather than being cut off where the user is typing.
+    /// The context bar: model, context use and mode, dot-separated and dim.
+    fn draw_context_bar(&self, screen: &mut Screen, row: usize, cols: usize) {
+        let dim = Style::fg(palette::GRAY).dim();
+        let mut parts: Vec<String> = Vec::new();
+
+        if !self.session.model_name.is_empty() {
+            parts.push(self.session.model_name.clone());
+        }
+        if let Some(usage) = self.session.usage {
+            // Prompt tokens against the window, as the TypeScript bar computed
+            // it — not prompt plus completion.
+            let pct = if usage.max_context_tokens > 0 {
+                (usage.last_prompt_tokens as f64 / usage.max_context_tokens as f64 * 100.0)
+                    .round() as u32
+            } else {
+                0
+            };
+            parts.push(format!("{pct}% ctx"));
+        }
+        if self.session.plan_mode {
+            parts.push("PLAN".into());
+        }
+        if let Some(label) = self.session.activity.label() {
+            parts.push(label);
+        }
+
+        let col = screen.put(row, 0, &widgets::clip(&parts.join(" · "), cols), dim);
+
+        // The mode indicator is coloured rather than dim, since it says
+        // approvals are being skipped.
+        let (label, colour) = match self.session.permission_mode {
+            PermissionMode::AllowAll => (Some("⏵⏵ auto-accept edits"), palette::GREEN),
+            PermissionMode::Plan => (Some("⏸ plan mode"), palette::YELLOW),
+            PermissionMode::Ask => (None, palette::GRAY),
+        };
+        if let Some(label) = label {
+            let room = cols.saturating_sub(col + 3);
+            if room > 4 {
+                let col = screen.put(row, col, " · ", dim);
+                screen.put(row, col, &widgets::clip(label, room), Style::fg(colour));
+            }
+        }
+    }
+
     fn visible_input(&self, budget: usize) -> String {
         use unicode_segmentation::UnicodeSegmentation;
         if crate::width::str_width(&self.input) <= budget {
@@ -556,6 +671,67 @@ impl App {
         }
         kept.reverse();
         kept.concat()
+    }
+}
+
+/// Shown when nothing has been typed, as in the TypeScript client.
+const PLACEHOLDER: &str = "Type a message...";
+
+/// Apply one style to every span of every line.
+fn restyle(lines: Vec<Line>, style: Style) -> Vec<Line> {
+    lines
+        .into_iter()
+        .map(|line| Line {
+            spans: line
+                .spans
+                .into_iter()
+                .map(|mut span| {
+                    // Keep the markdown's own emphasis, take the colour.
+                    span.style = Style { bold: span.style.bold, ..style };
+                    span
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Shift lines right by `by` columns.
+fn indent(lines: Vec<Line>, by: usize, style: Style) -> Vec<Line> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span { text: " ".repeat(by), style }];
+            spans.extend(line.spans);
+            Line { spans }
+        })
+        .collect()
+}
+
+/// Truncate a preformatted line to the space left after `used` columns.
+fn clip_line(line: &str, cols: usize, used: usize) -> String {
+    crate::widgets::clip(line, cols.saturating_sub(used))
+}
+
+/// One line of tool output, tinted when it is a diff.
+///
+/// Added and removed lines get a background rather than only coloured text, so a
+/// diff reads as blocks at a glance — the same treatment the TypeScript client
+/// gave them. This is why [`Style`] needed a background at all.
+fn diff_line(line: &str, cols: usize, dim: Style) -> Line {
+    let style = match line.trim_start().chars().next() {
+        Some('+') if !line.trim_start().starts_with("+++") => {
+            Style::fg(palette::GREEN).bg(palette::DIFF_ADD_BG)
+        }
+        Some('-') if !line.trim_start().starts_with("---") => {
+            Style::fg(palette::RED).bg(palette::DIFF_DEL_BG)
+        }
+        _ => dim,
+    };
+    Line {
+        spans: vec![
+            Span { text: "      ".into(), style: dim },
+            Span { text: clip_line(line, cols, 6), style },
+        ],
     }
 }
 
@@ -580,27 +756,6 @@ fn format_duration(d: std::time::Duration) -> String {
         format!("{minutes}m")
     } else {
         format!("{minutes}m {rest}s")
-    }
-}
-
-/// The prefix and style for an entry kind.
-fn decorate(kind: EntryKind, success: Option<bool>) -> (&'static str, Style) {
-    match kind {
-        EntryKind::User      => ("› ", Style::fg(palette::USER).bold()),
-        EntryKind::Assistant => ("  ", Style::default()),
-        EntryKind::Reasoning => ("  ", Style::fg(palette::THOUGHT).dim()),
-        EntryKind::Thought   => ("  ", Style::fg(palette::THOUGHT).dim()),
-        EntryKind::ToolCall  => ("⏵ ", Style::fg(palette::TOOL)),
-        EntryKind::ToolResult => match success {
-            Some(false) => ("  ", Style::fg(palette::ERROR)),
-            _ => ("  ", Style::fg(palette::SYSTEM).dim()),
-        },
-        EntryKind::ToolOutput => ("  ", Style::fg(palette::SYSTEM).dim()),
-        EntryKind::System     => ("  ", Style::fg(palette::SYSTEM).dim()),
-        EntryKind::Error      => ("✗ ", Style::fg(palette::ERROR)),
-        EntryKind::PlanContent => ("  ", Style::default()),
-        EntryKind::PlanStatus  => ("◆ ", Style::fg(palette::SUBAGENT)),
-        EntryKind::SubagentHeader => ("  ", Style::fg(palette::SUBAGENT)),
     }
 }
 
@@ -1036,9 +1191,10 @@ mod tests {
     }
 
     /// The context bar has to reflect real usage, since it is what tells you a
-    /// compaction is coming.
+    /// compaction is coming. Text and dot-separated, as the TypeScript bar was —
+    /// no gauge, which was my invention.
     #[test]
-    fn the_status_line_shows_context_use() {
+    fn the_context_bar_shows_context_use() {
         use forge_agent_proto::UsageSnapshot;
         let (mut app, mut screen) = app_with(0);
         app.session_mut().apply(AgentMessage::UsageUpdate {
@@ -1054,8 +1210,93 @@ mod tests {
             .map(|r| screen.row_text(r))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(grid.contains("50%"), "the figure is shown: {grid:?}");
-        assert!(grid.contains('█'), "and the bar");
+        assert!(grid.contains("50% ctx"), "the figure is shown: {grid:?}");
+        assert!(grid.contains("Model"), "alongside the model name");
+        assert!(!grid.contains('█'), "no gauge — that was not in the original");
+    }
+
+    /// The prompt is `❯ ` with a placeholder, and no separator rule above it.
+    #[test]
+    fn the_prompt_matches_the_original() {
+        let (mut app, mut screen) = app_with(0);
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("❯"), "the prompt glyph: {grid:?}");
+        assert!(grid.contains("Type a message"), "and the placeholder");
+        assert!(!grid.contains("───"), "no rule — that was not in the original");
+        assert!(!grid.contains("● ready"), "and no status line");
+    }
+
+    /// Auto-approve has to be visible, since it means prompts are being skipped.
+    #[test]
+    fn the_context_bar_flags_auto_approve() {
+        let (mut app, mut screen) = app_with(0);
+        app.session_mut().permission_mode = PermissionMode::AllowAll;
+        app.view(&mut screen);
+        let grid: String = (0..screen.rows())
+            .map(|r| screen.row_text(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains("auto-accept"), "got {grid:?}");
+    }
+
+    /// Tool calls indent four columns and their output six, so a turn reads as a
+    /// hierarchy rather than a flat wall of text.
+    #[test]
+    fn tool_calls_and_output_are_indented() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolRequest {
+            tool_name: "read_file".into(),
+            tool_args: r#"{"path":"src/main.rs"}"#.into(),
+            tool_id: "t1".into(),
+            kind: "read".into(),
+            subagent_id: None,
+            needs_approval: false,
+        });
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "read_file".into(),
+            content: "the file contents".into(),
+        });
+
+        let lines: Vec<String> = app.build_lines(60).iter().map(|l| l.plain()).collect();
+        let call = lines.iter().find(|l| l.contains("read_file(")).expect("the call");
+        assert!(call.starts_with("    "), "call indented four: {call:?}");
+        let output = lines.iter().find(|l| l.contains("file contents")).expect("the output");
+        assert!(output.starts_with("      "), "output indented six: {output:?}");
+    }
+
+    /// Diff lines are tinted, not just coloured — the reason Style needed a
+    /// background at all.
+    #[test]
+    fn diff_lines_in_tool_output_are_tinted() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "apply_patch".into(),
+            content: "--- a/x\n+++ b/x\n-removed line\n+added line\n unchanged".into(),
+        });
+
+        let lines = app.build_lines(60);
+        let find = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.plain().contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}"))
+                .spans
+                .iter()
+                .find(|s| s.text.contains(needle))
+                .map(|s| s.style)
+                .expect("a span")
+        };
+
+        assert_eq!(find("added line").bg, Some(palette::DIFF_ADD_BG), "additions tinted");
+        assert_eq!(find("removed line").bg, Some(palette::DIFF_DEL_BG), "removals tinted");
+        // The file headers are not changes and must not be tinted.
+        assert_eq!(find("+++ b/x").bg, None, "the +++ header is not an addition");
+        assert_eq!(find("--- a/x").bg, None, "nor is --- a removal");
+        assert_eq!(find("unchanged").bg, None);
     }
 
     #[test]
@@ -1135,17 +1376,52 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
     }
 
+    /// Reasoning collapses to one line, as in the TypeScript client: a
+    /// transcript that prints every thought in full is mostly grey text.
     #[test]
-    fn a_thought_is_summarised_with_its_duration() {
+    fn reasoning_collapses_to_a_single_line() {
         let mut app = App::new();
         app.session_mut().apply(AgentMessage::Reasoning);
-        app.session_mut().apply(AgentMessage::ReasoningToken { content: "hmm".into() });
+        app.session_mut().apply(AgentMessage::ReasoningToken {
+            content: "a long internal monologue".into(),
+        });
         app.session_mut().apply(AgentMessage::Done);
+
         let text: Vec<String> = app.build_lines(60).iter().map(|l| l.plain()).collect();
+        assert!(text.iter().any(|l| l.contains("✻")), "the glyph: {text:?}");
+        assert!(text.iter().any(|l| l.contains("Thinking…")), "the label");
+        assert!(text.iter().any(|l| l.contains("ctrl+t to expand")), "and how to open it");
         assert!(
-            text.iter().any(|l| l.contains("thought for")),
-            "got {text:?}",
+            !text.iter().any(|l| l.contains("long internal monologue")),
+            "the body stays hidden: {text:?}",
         );
+    }
+
+    /// Ctrl-T reveals it, and again hides it.
+    #[test]
+    fn ctrl_t_expands_and_collapses_reasoning() {
+        let mut app = App::new();
+        let screen = Screen::new(60, 20);
+        app.session_mut().apply(AgentMessage::Reasoning);
+        app.session_mut().apply(AgentMessage::ReasoningToken {
+            content: "the hidden thought".into(),
+        });
+        app.session_mut().apply(AgentMessage::Done);
+
+        let shown = |app: &App| {
+            app.build_lines(60).iter().any(|l| l.plain().contains("hidden thought"))
+        };
+        assert!(!shown(&app), "collapsed to begin with");
+
+        app.update(Input::ToggleReasoning, &screen);
+        assert!(shown(&app), "expanded");
+        assert!(
+            app.build_lines(60).iter().any(|l| l.plain().contains("collapse")),
+            "and the hint flips",
+        );
+
+        app.update(Input::ToggleReasoning, &screen);
+        assert!(!shown(&app), "collapsed again");
     }
 
     /// Every drawn line must respect the measured width, or layout and renderer

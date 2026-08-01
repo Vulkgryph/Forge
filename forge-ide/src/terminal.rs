@@ -1537,6 +1537,21 @@ pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
     // ink, which Claude Code is built on) respond to. Previously
     // unhandled: Enter always sent plain `\r` regardless of modifiers, so
     // Option+Enter behaved identically to plain Enter.
+    /// The control code for Ctrl+<letter>, or `None` for anything else.
+    fn ctrl_code(key: egui::Key) -> Option<u8> {
+        use egui::Key::*;
+        let letter = match key {
+            A => b'a', B => b'b', C => b'c', D => b'd', E => b'e', F => b'f',
+            G => b'g', H => b'h', I => b'i', J => b'j', K => b'k', L => b'l',
+            M => b'm', N => b'n', O => b'o', P => b'p', Q => b'q', R => b'r',
+            S => b's', T => b't', U => b'u', V => b'v', W => b'w', X => b'x',
+            Y => b'y', Z => b'z',
+            _ => return None,
+        };
+        // 'a' is 0x61; masking off 0x60 leaves 0x01.
+        Some(letter - 0x60)
+    }
+
     if m.alt && key == egui::Key::Enter {
         return Some(b"\x1b\r".to_vec());
     }
@@ -1548,14 +1563,26 @@ pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
     // see the `Paste` event handling below), breaking the two most basic
     // macOS clipboard shortcuts in the terminal entirely.
     if m.ctrl {
+        // Every letter, computed rather than listed. Ctrl+<letter> is the
+        // letter's position in the alphabet as a control code: Ctrl+A is 0x01
+        // through Ctrl+Z at 0x1A.
+        //
+        // This used to be a hand-written whitelist of thirteen letters, which
+        // silently dropped the rest — Ctrl+X, Ctrl+G, Ctrl+F, Ctrl+O and the
+        // others simply never reached the program. That is not an edge case:
+        // emacs is built on Ctrl+X, vim scrolls with Ctrl+F and Ctrl+B, and
+        // any full-screen application is free to bind any of them. A letter
+        // missing from the list was indistinguishable from a key that did
+        // nothing.
+        if let Some(code) = ctrl_code(key) {
+            return Some(vec![code]);
+        }
         return match key {
-            egui::Key::A => Some(b"\x01".to_vec()), egui::Key::B => Some(b"\x02".to_vec()),
-            egui::Key::C => Some(b"\x03".to_vec()), egui::Key::D => Some(b"\x04".to_vec()),
-            egui::Key::E => Some(b"\x05".to_vec()), egui::Key::K => Some(b"\x0b".to_vec()),
-            egui::Key::L => Some(b"\x0c".to_vec()), egui::Key::N => Some(b"\x0e".to_vec()),
-            egui::Key::P => Some(b"\x10".to_vec()), egui::Key::R => Some(b"\x12".to_vec()),
-            egui::Key::U => Some(b"\x15".to_vec()), egui::Key::W => Some(b"\x17".to_vec()),
-            egui::Key::Z => Some(b"\x1a".to_vec()),
+            // The handful of non-letter control codes worth carrying.
+            egui::Key::Space           => Some(b"\x00".to_vec()), // NUL
+            egui::Key::OpenBracket     => Some(b"\x1b".to_vec()), // Ctrl+[ is ESC
+            egui::Key::Backslash       => Some(b"\x1c".to_vec()),
+            egui::Key::CloseBracket    => Some(b"\x1d".to_vec()),
             _ => None,
         };
     }
@@ -1754,6 +1781,56 @@ mod private_mode_tests {
         assert!(g.cursor_visible(), "cursor visibility applied from a batch");
         assert!(g.sync_update.is_some(), "and so was the synchronized update");
         g.process("\x1b[?2026l");
+    }
+
+    /// Every Ctrl+letter has to reach the program.
+    ///
+    /// This was a whitelist of thirteen letters, and the rest were silently
+    /// dropped — indistinguishable, from inside the program, from a key that did
+    /// nothing. Ctrl+X alone breaks emacs; Ctrl+F and Ctrl+B break scrolling in
+    /// vim; Ctrl+T meant forge's own TUI could not open its menu.
+    #[test]
+    fn every_ctrl_letter_maps_to_its_control_code() {
+        use egui::Key::*;
+        let letters = [
+            (A, 0x01), (B, 0x02), (C, 0x03), (D, 0x04), (E, 0x05), (F, 0x06),
+            (G, 0x07), (H, 0x08), (I, 0x09), (J, 0x0a), (K, 0x0b), (L, 0x0c),
+            (M, 0x0d), (N, 0x0e), (O, 0x0f), (P, 0x10), (Q, 0x11), (R, 0x12),
+            (S, 0x13), (T, 0x14), (U, 0x15), (V, 0x16), (W, 0x17), (X, 0x18),
+            (Y, 0x19), (Z, 0x1a),
+        ];
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        for (key, expected) in letters {
+            assert_eq!(
+                super::key_to_pty(key, ctrl),
+                Some(vec![expected]),
+                "Ctrl+{key:?} must send {expected:#04x}",
+            );
+        }
+    }
+
+    /// The three that were missing and mattered most.
+    #[test]
+    fn the_previously_dropped_chords_now_reach_the_program() {
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(super::key_to_pty(egui::Key::T, ctrl), Some(vec![0x14]), "menu");
+        assert_eq!(super::key_to_pty(egui::Key::X, ctrl), Some(vec![0x18]), "interrupt");
+        assert_eq!(super::key_to_pty(egui::Key::G, ctrl), Some(vec![0x07]));
+    }
+
+    /// Ctrl+C must still be SIGINT, and Cmd must still not be treated as Ctrl —
+    /// that regression broke copy and paste once already.
+    #[test]
+    fn ctrl_c_is_still_sigint_and_cmd_is_not_ctrl() {
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(super::key_to_pty(egui::Key::C, ctrl), Some(vec![0x03]));
+
+        let cmd = egui::Modifiers { mac_cmd: true, command: true, ..Default::default() };
+        assert_ne!(
+            super::key_to_pty(egui::Key::C, cmd),
+            Some(vec![0x03]),
+            "Cmd+C copies; it must not send SIGINT",
+        );
     }
 
     /// With autowrap off, filling the last row must not scroll.

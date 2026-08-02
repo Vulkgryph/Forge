@@ -326,6 +326,18 @@ fn read_terminal(tx: mpsc::Sender<Event>) {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 1024];
 
+    // Polled alongside stdin so a SIGWINCH can wake this thread. Without it the
+    // handler sets a flag nobody reads until the next keystroke, because
+    // `signal` installs handlers with SA_RESTART and the blocked `poll` simply
+    // resumes.
+    let wake = term::wake_fd();
+    let watched: Vec<std::os::raw::c_int> = match wake {
+        Some(fd) => vec![sys::STDIN, fd],
+        None => vec![sys::STDIN],
+    };
+    const STDIN_BIT: u32 = 0b1;
+    const WAKE_BIT: u32 = 0b10;
+
     loop {
         // A resize can arrive between iterations; report it before blocking
         // again, or the new size would not be picked up until the next keypress.
@@ -334,8 +346,18 @@ fn read_terminal(tx: mpsc::Sender<Event>) {
         }
 
         let timeout = decoder.has_pending().then_some(ESCAPE_TIMEOUT);
-        match sys::wait_readable(sys::STDIN, timeout) {
-            Ready::Readable => {}
+        match sys::wait_readable_many(&watched, timeout) {
+            Ready::Readable(mask) => {
+                if mask & WAKE_BIT != 0 {
+                    // A signal woke us. Empty the pipe and loop, so the resize is
+                    // reported at the top rather than mistaken for input.
+                    term::drain_wake();
+                    continue;
+                }
+                if mask & STDIN_BIT == 0 {
+                    continue;
+                }
+            }
             Ready::TimedOut => {
                 // Nothing more is coming, so a held ESC really was Escape.
                 if let Some(key) = decoder.flush_pending_escape() {

@@ -494,6 +494,10 @@ impl App {
                     };
                     let mut lines = entry.content.lines();
                     if let Some(first) = lines.next() {
+                        // The glyph occupies the first row; the text wraps under
+                        // it rather than being cut off.
+                        let mut rows = wrap_at(first, cols, 6);
+                        let head = rows.remove(0);
                         out.push(Line {
                             spans: vec![
                                 Span { text: "    ".into(), style: dim },
@@ -502,18 +506,26 @@ impl App {
                                         .into(),
                                     style: glyph_style,
                                 },
-                                Span { text: clip_line(first, cols, 6), style: dim },
+                                Span { text: head, style: dim },
                             ],
                         });
+                        for row in rows {
+                            out.push(Line {
+                                spans: vec![
+                                    Span { text: " ".repeat(6), style: dim },
+                                    Span { text: row, style: dim },
+                                ],
+                            });
+                        }
                     }
                     for line in lines {
-                        out.push(diff_line(line, cols, dim));
+                        out.extend(diff_lines(line, cols, dim));
                     }
                 }
 
                 EntryKind::ToolOutput => {
                     for line in entry.content.lines() {
-                        out.push(diff_line(line, cols, dim));
+                        out.extend(diff_lines(line, cols, dim));
                     }
                 }
 
@@ -674,9 +686,13 @@ impl App {
             // TypeScript client did while streaming a long reply.
             tail = tail.split_off(hidden);
             if !tail.is_empty() {
+                let marker = format!(
+                    "  ↑ {hidden} more line{}",
+                    if hidden == 1 { "" } else { "s" },
+                );
                 tail[0] = Line {
                     spans: vec![Span {
-                        text: format!("  ↑ {hidden} more line{}", if hidden == 1 { "" } else { "s" }),
+                        text: widgets::clip(&marker, cols),
                         style: Style::fg(palette::GRAY).dim(),
                     }],
                 };
@@ -714,11 +730,12 @@ impl App {
         if subs.is_empty() {
             return Vec::new();
         }
+        let heading = format!("Subagents · {} running", subs.len());
         let mut out = vec![Line {
-            spans: vec![
-                Span { text: "Subagents".into(), style: Style::fg(palette::MAGENTA) },
-                Span { text: format!(" · {} running", subs.len()), style: dim },
-            ],
+            spans: vec![Span {
+                text: widgets::clip(&heading, cols),
+                style: Style::fg(palette::MAGENTA),
+            }],
         }];
         for sub in subs {
             let detail = if sub.detail.is_empty() { "starting" } else { &sub.detail };
@@ -792,10 +809,13 @@ impl App {
             .map(|(i, entry)| Line {
                 spans: vec![
                     Span {
-                        text: format!(
-                            "{} {:<12}",
-                            if first + i == self.suggestion { "❯" } else { " " },
-                            entry.command,
+                        text: widgets::clip(
+                            &format!(
+                                "{} {:<12}",
+                                if first + i == self.suggestion { "❯" } else { " " },
+                                entry.command,
+                            ),
+                            cols,
                         ),
                         style: if first + i == self.suggestion {
                             Style::fg(palette::PROMPT).bold()
@@ -812,11 +832,9 @@ impl App {
             .collect();
         let hidden = matches.len().saturating_sub(shown);
         if hidden > 0 {
+            let hint = format!("  … {hidden} more · ↑↓ move · Tab complete · Enter run");
             out.push(Line {
-                spans: vec![Span {
-                    text: format!("  … {hidden} more · ↑↓ move · Tab complete · Enter run"),
-                    style: dim,
-                }],
+                spans: vec![Span { text: widgets::clip(&hint, cols), style: dim }],
             });
         }
         out
@@ -970,32 +988,47 @@ fn indent(lines: Vec<Line>, by: usize, style: Style) -> Vec<Line> {
         .collect()
 }
 
-/// Truncate a preformatted line to the space left after `used` columns.
-fn clip_line(line: &str, cols: usize, used: usize) -> String {
-    crate::widgets::clip(line, cols.saturating_sub(used))
+/// Wrap a preformatted line to the space left after `used` columns.
+///
+/// Wrapped, not truncated. The TypeScript client rendered tool output through
+/// ink's `<Text>`, which wraps by default, so cutting long lines here lost
+/// content the original showed — and silently, which is the worst way to lose it.
+/// Always returns at least one row, so callers can take the first unconditionally.
+fn wrap_at(line: &str, cols: usize, used: usize) -> Vec<String> {
+    let budget = cols.saturating_sub(used).max(1);
+    let mut rows = crate::width::wrap(line, budget);
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
-/// One line of tool output, tinted when it is a diff.
+/// One line of tool output as one or more rows, tinted when it is a diff.
 ///
 /// Added and removed lines get a background rather than only coloured text, so a
 /// diff reads as blocks at a glance — the same treatment the TypeScript client
-/// gave them. This is why [`Style`] needed a background at all.
-fn diff_line(line: &str, cols: usize, dim: Style) -> Line {
-    let style = match line.trim_start().chars().next() {
-        Some('+') if !line.trim_start().starts_with("+++") => {
+/// gave them. Every row of a wrapped diff line carries the tint, or a long change
+/// would appear to stop being a change halfway through.
+fn diff_lines(line: &str, cols: usize, dim: Style) -> Vec<Line> {
+    let trimmed = line.trim_start();
+    let style = match trimmed.chars().next() {
+        Some('+') if !trimmed.starts_with("+++") => {
             Style::fg(palette::GREEN).bg(palette::DIFF_ADD_BG)
         }
-        Some('-') if !line.trim_start().starts_with("---") => {
+        Some('-') if !trimmed.starts_with("---") => {
             Style::fg(palette::RED).bg(palette::DIFF_DEL_BG)
         }
         _ => dim,
     };
-    Line {
-        spans: vec![
-            Span { text: "      ".into(), style: dim },
-            Span { text: clip_line(line, cols, 6), style },
-        ],
-    }
+    wrap_at(line, cols, 6)
+        .into_iter()
+        .map(|row| Line {
+            spans: vec![
+                Span { text: "      ".into(), style: dim },
+                Span { text: row, style },
+            ],
+        })
+        .collect()
 }
 
 /// The tail of a line that fits, so a long one scrolls horizontally rather than
@@ -1954,6 +1987,131 @@ mod tests {
         assert!(call.starts_with("    "), "call indented four: {call:?}");
         let output = lines.iter().find(|l| l.contains("file contents")).expect("the output");
         assert!(output.starts_with("      "), "output indented six: {output:?}");
+    }
+
+    /// Long tool output must wrap, not vanish. Truncating lost content the
+    /// original showed, and lost it silently.
+    #[test]
+    fn long_tool_output_wraps_rather_than_being_truncated() {
+        let mut app = App::new();
+        let long = "the quick brown fox jumps over the lazy dog and keeps on going                     for quite a while longer than any terminal is wide";
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "shell_exec".into(),
+            content: long.into(),
+        });
+
+        let lines = app.build_lines(40);
+        assert!(lines.len() > 1, "wrapped onto several rows");
+        for line in &lines {
+            assert!(line.width() <= 40, "{:?} overflows", line.plain());
+        }
+        // Nothing was dropped.
+        let joined: String = lines.iter().map(|l| l.plain().trim().to_string())
+            .collect::<Vec<_>>().join(" ");
+        for word in ["quick", "lazy", "longer", "wide"] {
+            assert!(joined.contains(word), "{word:?} was lost: {joined:?}");
+        }
+    }
+
+    /// A long tool *result* wraps under its glyph rather than being cut.
+    #[test]
+    fn a_long_tool_result_wraps_under_its_glyph() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolResult {
+            tool_name: "shell_exec".into(),
+            result: "a result line that is considerably longer than the terminal width".into(),
+            success: true,
+            subagent_id: None,
+        });
+        let lines = app.build_lines(30);
+        assert!(lines.len() > 1, "wrapped");
+        assert!(lines[0].plain().contains('⎿'), "the glyph leads the first row");
+        assert!(lines[1].plain().starts_with("      "), "continuations indent to match");
+        for line in &lines {
+            assert!(line.width() <= 30);
+        }
+    }
+
+    /// Every row of a wrapped diff line keeps the tint, or a long change appears
+    /// to stop being a change halfway through.
+    #[test]
+    fn a_wrapped_diff_line_stays_tinted_throughout() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "apply_patch".into(),
+            content: format!("+{}", "added text ".repeat(12)),
+        });
+        let lines = app.build_lines(30);
+        assert!(lines.len() > 1, "wrapped: {:?}", lines.len());
+        for line in &lines {
+            let tinted = line.spans.iter().any(|s| s.style.bg == Some(palette::DIFF_ADD_BG));
+            assert!(tinted, "row not tinted: {:?}", line.plain());
+        }
+    }
+
+    // ── Resizing ──────────────────────────────────────────────────────────
+
+    /// Narrowing the terminal must re-wrap, not clip.
+    #[test]
+    fn narrowing_rewraps_the_transcript() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::AssistantToken {
+            content: "a reply long enough that its wrapping depends entirely on the width                       of the terminal it is being shown in".into(),
+        });
+        let wide = app.build_lines(100);
+        let narrow = app.build_lines(30);
+        assert!(narrow.len() > wide.len(), "narrower means more rows");
+        for line in &narrow {
+            assert!(line.width() <= 30, "{:?} overflows", line.plain());
+        }
+    }
+
+    /// Every width must produce rows that fit it — this is the invariant that,
+    /// when broken, made messages overlap.
+    #[test]
+    fn every_width_produces_rows_that_fit() {
+        let mut app = App::new();
+        app.session_mut().push_user("日本語のテキスト with **bold** and `code`");
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "t".into(),
+            content: "+added 日本語 line\n-removed line\n plain".into(),
+        });
+        app.session_mut().apply(AgentMessage::AssistantToken {
+            content: "- a bullet that runs on\n\n```rust\nlet x = 1;\n```".into(),
+        });
+        for cols in [8usize, 12, 20, 31, 40, 79, 80, 120] {
+            for line in app.build_lines(cols) {
+                assert!(
+                    line.width() <= cols,
+                    "at {cols} cols, {:?} is {} cells",
+                    line.plain(), line.width(),
+                );
+            }
+        }
+    }
+
+    /// A resize must not leave the live block wider than the new terminal.
+    #[test]
+    fn the_live_block_fits_after_a_resize() {
+        let mut app = App::new();
+        for i in 0..12 {
+            app.session_mut().push_system(format!("entry {i} with some length to it"));
+        }
+        for c in "typed text".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        for (cols, rows) in [(100usize, 30usize), (24, 10), (40, 6), (12, 4)] {
+            let inline = crate::inline::Inline::new(cols, rows);
+            let block = app.live_lines(&inline, cols);
+            assert!(
+                block.lines.len() <= inline.live_capacity(),
+                "block of {} rows exceeds capacity {} at {cols}x{rows}",
+                block.lines.len(), inline.live_capacity(),
+            );
+            for line in &block.lines {
+                assert!(line.width() <= cols, "{:?} overflows {cols}", line.plain());
+            }
+        }
     }
 
     /// Diff lines are tinted, not just coloured — the reason Style needed a

@@ -95,6 +95,40 @@ unsafe extern "C" {
     fn raise(sig: c_int) -> c_int;
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout_ms: c_int) -> c_int;
     fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
+    fn pipe(fds: *mut c_int) -> c_int;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+}
+
+/// A pipe, as `(read, write)`.
+pub fn make_pipe() -> Option<(c_int, c_int)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: `pipe` fills exactly two descriptors.
+    let rc = unsafe { pipe(fds.as_mut_ptr()) };
+    (rc == 0).then_some((fds[0], fds[1]))
+}
+
+/// Write a single byte, for waking a `poll` from a signal handler.
+///
+/// The one operation a handler may safely perform to reach the rest of the
+/// program: `write` is async-signal-safe, where locking or allocating is not.
+pub fn notify(fd: c_int) {
+    let byte = 1u8;
+    // SAFETY: writing one byte from a valid pointer to a descriptor we own. The
+    // result is deliberately ignored — a full pipe already means a pending
+    // wake-up, which is all this is trying to achieve.
+    unsafe {
+        write(fd, (&byte as *const u8).cast(), 1);
+    }
+}
+
+/// Empty a notification pipe.
+pub fn drain(fd: c_int) {
+    let mut buf = [0u8; 64];
+    while let Some(n) = read_bytes(fd, &mut buf) {
+        if n < buf.len() {
+            break;
+        }
+    }
 }
 
 /// Replace this process with another program.
@@ -143,8 +177,9 @@ pub fn exec(program: &std::path::Path, args: &[String]) -> std::io::Error {
 /// What a wait ended with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ready {
-    /// Bytes are available.
-    Readable,
+    /// Bytes are available on the descriptors in this bitmask, indexed by their
+    /// position in the slice passed to [`wait_readable_many`].
+    Readable(u32),
     /// The timeout elapsed with nothing to read.
     TimedOut,
     /// A signal arrived. Not an error: `SIGWINCH` lands here on every resize,
@@ -160,17 +195,40 @@ pub enum Ready {
 /// user pressed something else, so Escape would appear to do nothing until the
 /// next keystroke.
 pub fn wait_readable(fd: c_int, timeout: Option<std::time::Duration>) -> Ready {
-    let mut fds = PollFd { fd, events: POLLIN, revents: 0 };
+    wait_readable_many(&[fd], timeout)
+}
+
+/// Wait until any of several descriptors is readable, or the timeout elapses.
+///
+/// Several, because a signal cannot be waited on directly. `signal` installs
+/// handlers with `SA_RESTART` on macOS and the BSDs, so an interrupted `poll` is
+/// *restarted* rather than returning `EINTR` — the handler runs, but the thread
+/// stays blocked. A resize therefore went unnoticed until the user next pressed a
+/// key. The handler now writes a byte to a pipe that is polled alongside stdin,
+/// which is the portable way to make a signal wake a wait.
+pub fn wait_readable_many(fds: &[c_int], timeout: Option<std::time::Duration>) -> Ready {
+    let mut poll_fds: Vec<PollFd> = fds
+        .iter()
+        .map(|fd| PollFd { fd: *fd, events: POLLIN, revents: 0 })
+        .collect();
     let ms = match timeout {
         // Saturate rather than wrap: a very long timeout must not become a
         // negative one, which `poll` reads as "wait forever".
         Some(d) => c_int::try_from(d.as_millis()).unwrap_or(c_int::MAX),
         None => -1,
     };
-    // SAFETY: one descriptor, and `fds` is a valid `PollFd` for the call.
-    let rc = unsafe { poll(&mut fds, 1, ms) };
+    // SAFETY: `poll_fds` is a valid array of `nfds` PollFd entries.
+    let rc = unsafe { poll(poll_fds.as_mut_ptr(), poll_fds.len() as c_ulong, ms) };
     match rc {
-        1.. => Ready::Readable,
+        1.. => {
+            let mut mask = 0u32;
+            for (i, pfd) in poll_fds.iter().enumerate() {
+                if pfd.revents & POLLIN != 0 && i < 32 {
+                    mask |= 1 << i;
+                }
+            }
+            Ready::Readable(mask)
+        }
         0 => Ready::TimedOut,
         _ => {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -344,21 +402,45 @@ mod tests {
     #[test]
     fn a_wait_with_no_data_times_out() {
         // A pipe with nothing written has nothing to read.
-        let (read_fd, _write_fd) = pipe();
+        let (read_fd, _write_fd) = make_pipe().expect("pipe");
         let ready = wait_readable(read_fd, Some(std::time::Duration::from_millis(20)));
         assert_eq!(ready, Ready::TimedOut);
     }
 
     #[test]
     fn a_wait_with_data_reports_readable() {
-        let (read_fd, write_fd) = pipe();
-        // SAFETY: writing one byte to the write end of our own pipe.
-        unsafe {
-            let byte = b'x';
-            libc_write(write_fd, (&byte as *const u8).cast(), 1);
-        }
+        let (read_fd, write_fd) = make_pipe().expect("pipe");
+        notify(write_fd);
         let ready = wait_readable(read_fd, Some(std::time::Duration::from_millis(200)));
-        assert_eq!(ready, Ready::Readable);
+        assert_eq!(ready, Ready::Readable(0b1), "the first descriptor");
+    }
+
+    /// Waiting on several descriptors has to say *which* woke it, or the caller
+    /// cannot tell input from a resize.
+    #[test]
+    fn waiting_on_two_descriptors_reports_which_is_ready() {
+        let (a_read, _a_write) = make_pipe().expect("pipe");
+        let (b_read, b_write) = make_pipe().expect("pipe");
+        notify(b_write);
+
+        let ready = wait_readable_many(
+            &[a_read, b_read],
+            Some(std::time::Duration::from_millis(200)),
+        );
+        assert_eq!(ready, Ready::Readable(0b10), "only the second");
+    }
+
+    #[test]
+    fn a_drained_pipe_is_no_longer_readable() {
+        let (read_fd, write_fd) = make_pipe().expect("pipe");
+        notify(write_fd);
+        notify(write_fd);
+        drain(read_fd);
+        assert_eq!(
+            wait_readable(read_fd, Some(std::time::Duration::from_millis(20))),
+            Ready::TimedOut,
+            "emptied",
+        );
     }
 
     /// POSIX says a negative descriptor is *ignored* by `poll` — `revents` is
@@ -382,22 +464,6 @@ mod tests {
         let huge = std::time::Duration::from_secs(u64::from(u32::MAX));
         let ms = c_int::try_from(huge.as_millis()).unwrap_or(c_int::MAX);
         assert!(ms > 0, "saturated to a positive timeout, not -1");
-    }
-
-    /// A pipe, for tests that need a readable descriptor.
-    fn pipe() -> (c_int, c_int) {
-        let mut fds = [0 as c_int; 2];
-        // SAFETY: `pipe` fills two descriptors.
-        let rc = unsafe { libc_pipe(fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "pipe() failed");
-        (fds[0], fds[1])
-    }
-
-    unsafe extern "C" {
-        #[link_name = "pipe"]
-        fn libc_pipe(fds: *mut c_int) -> c_int;
-        #[link_name = "write"]
-        fn libc_write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     }
 
     #[test]

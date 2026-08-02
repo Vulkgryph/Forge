@@ -80,17 +80,20 @@ impl Inline {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// On resize, what is on screen no longer matches what was printed.
+    /// Take a new terminal size.
     ///
-    /// The live region is forgotten rather than erased: the terminal has
-    /// reflowed it in ways we cannot model, so moving up by the old count would
-    /// land somewhere arbitrary. Leaving it behind costs a few stale rows once;
-    /// guessing could destroy committed output.
+    /// The live region's row count is *kept*, which is safe for a reason worth
+    /// stating: autowrap is off and every line is wrapped by us before printing,
+    /// so one printed line always occupies exactly one display row. A width
+    /// change therefore cannot alter how many rows the block covers, and the old
+    /// block can still be erased exactly.
+    ///
+    /// This used to discard the count and leave the previous block on screen —
+    /// visible debris after every resize, on the theory that the terminal had
+    /// reflowed it. With no wrapped lines to reflow, there was nothing to fear.
     pub fn resized(&mut self, cols: usize, rows: usize) {
         self.cols = cols;
         self.rows = rows;
-        self.live_rows = 0;
-        self.cursor_row = 0;
     }
 
     /// Print lines permanently. They scroll into the terminal's scrollback and
@@ -481,10 +484,13 @@ mod tests {
         assert_eq!(Inline::new(80, 0).live_capacity(), 1);
     }
 
-    /// After a resize the terminal has reflowed the live region, so moving up by
-    /// the old count would land somewhere arbitrary. Forget it instead.
+    /// A resize must still erase the old block, or every resize leaves debris.
+    ///
+    /// Safe because nothing printed was ever wrapped by the terminal: autowrap is
+    /// off and the lines were wrapped by us, so one line is one row and the count
+    /// survives a width change.
     #[test]
-    fn a_resize_forgets_the_live_region_rather_than_guessing() {
+    fn a_resize_still_erases_the_previous_block() {
         let mut inline = Inline::new(40, 10);
         let mut out = sink();
         inline.draw_live(&mut out, &[line("a"), line("b"), line("c")], None).unwrap();
@@ -493,12 +499,25 @@ mod tests {
         out.clear();
         inline.draw_live(&mut out, &[line("after")], None).unwrap();
         let got = text(&out);
-        assert!(
-            !got.contains("\x1b[2A"),
-            "must not climb over rows the terminal has reflowed: {got:?}",
-        );
+        assert!(got.contains("\x1b[2A"), "climbs the old three rows: {got:?}");
+        assert!(got.contains(ERASE_DOWN), "and erases them");
         assert_eq!(inline.cols(), 60);
         assert_eq!(inline.rows(), 20);
+    }
+
+    /// The new width is used immediately, so content is clipped or wrapped to
+    /// what the terminal now is rather than what it was.
+    #[test]
+    fn a_resize_takes_effect_on_the_next_draw() {
+        let mut inline = Inline::new(80, 10);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line(&"x".repeat(70))], None).unwrap();
+
+        inline.resized(20, 10);
+        out.clear();
+        inline.draw_live(&mut out, &[line(&"x".repeat(70))], None).unwrap();
+        let visible: String = text(&out).chars().filter(|c| *c == 'x').collect();
+        assert!(visible.len() <= 20, "clipped to the new width, got {}", visible.len());
     }
 
     // ── Encoding ──────────────────────────────────────────────────────────

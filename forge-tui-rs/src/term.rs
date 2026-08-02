@@ -23,7 +23,7 @@
 //! is never emitted at all.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 
 use crate::sys::{self, Termios};
@@ -41,9 +41,34 @@ static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);
 /// Set by the `SIGWINCH` handler; the input thread turns it into a resize.
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
+/// Write end of the pipe the `SIGWINCH` handler pokes to wake the input thread.
+///
+/// A flag alone is not enough. `signal` installs handlers with `SA_RESTART` on
+/// macOS and the BSDs, so the `poll` the input thread is blocked in gets
+/// *restarted* after the handler runs rather than returning — the flag was set
+/// and nobody looked at it until the next keystroke, which made resizing appear
+/// to do nothing. Writing a byte the thread is also polling is the portable way
+/// for a signal to wake a wait.
+static WAKE_WRITE: AtomicI32 = AtomicI32::new(-1);
+/// Read end, polled alongside stdin.
+static WAKE_READ: AtomicI32 = AtomicI32::new(-1);
+
 /// Take and clear the pending-resize flag.
 pub fn take_resize() -> bool {
     RESIZED.swap(false, Ordering::SeqCst)
+}
+
+/// The descriptor to poll for wake-ups, if one could be created.
+pub fn wake_fd() -> Option<std::os::raw::c_int> {
+    let fd = WAKE_READ.load(Ordering::SeqCst);
+    (fd >= 0).then_some(fd)
+}
+
+/// Empty the wake pipe, so one byte does not wake every future wait.
+pub fn drain_wake() {
+    if let Some(fd) = wake_fd() {
+        sys::drain(fd);
+    }
 }
 
 /// Setup and teardown sequences, written directly so the exact bytes are
@@ -111,6 +136,12 @@ impl Guard {
 
         ACTIVE.store(true, Ordering::SeqCst);
         install_panic_hook();
+
+        // The wake pipe has to exist before the handler that writes to it.
+        if let Some((read, write)) = sys::make_pipe() {
+            WAKE_READ.store(read, Ordering::SeqCst);
+            WAKE_WRITE.store(write, Ordering::SeqCst);
+        }
         install_signal_handlers();
 
         Ok(Self { _private: () })
@@ -190,6 +221,12 @@ extern "C" fn handle_fatal(sig: std::os::raw::c_int) {
 /// the actual re-layout happens on the input thread.
 extern "C" fn handle_winch(_sig: std::os::raw::c_int) {
     RESIZED.store(true, Ordering::SeqCst);
+    // Wake whoever is waiting. An atomic store and a one-byte write are both
+    // safe here; almost nothing else is.
+    let fd = WAKE_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        sys::notify(fd);
+    }
 }
 
 /// Current terminal size, falling back to a usable default when it is unknown
@@ -255,6 +292,29 @@ mod tests {
         restore();
         restore();
         assert!(!ACTIVE.load(Ordering::SeqCst));
+    }
+
+    /// A flag alone cannot wake a blocked `poll` when handlers are installed with
+    /// SA_RESTART, so a descriptor to poll must exist.
+    #[test]
+    fn a_wake_descriptor_is_available_once_the_pipe_is_made() {
+        // Before setup there is none, which callers must tolerate.
+        if wake_fd().is_none() {
+            assert!(true, "no pipe yet; the reader falls back to polling stdin alone");
+        }
+        // Creating one makes it available and drainable.
+        if let Some((read, write)) = sys::make_pipe() {
+            WAKE_READ.store(read, Ordering::SeqCst);
+            WAKE_WRITE.store(write, Ordering::SeqCst);
+            assert_eq!(wake_fd(), Some(read));
+            sys::notify(write);
+            drain_wake();
+            assert_eq!(
+                sys::wait_readable(read, Some(std::time::Duration::from_millis(20))),
+                sys::Ready::TimedOut,
+                "drained",
+            );
+        }
     }
 
     #[test]

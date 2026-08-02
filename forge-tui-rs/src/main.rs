@@ -36,6 +36,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
 /// to drawing rather than starving the screen.
 const MAX_BATCH: usize = 512;
 
+/// How often the spinner advances while a turn is running.
+///
+/// Only applied while something is animating: an idle session goes back to
+/// blocking indefinitely, which is what keeps it at no CPU.
+const SPINNER_TICK: Duration = Duration::from_millis(120);
+
 /// One thing that happened, from either source.
 enum Event {
     Key(Input),
@@ -94,8 +100,27 @@ fn main() -> io::Result<()> {
     app.render(&mut inline, &mut out)?;
 
     'session: loop {
-        // Blocks. An idle session costs nothing here.
-        let Ok(first) = events.recv() else { break };
+        // Blocks indefinitely when nothing is animating, so an idle session costs
+        // nothing. While a turn runs, wake on the spinner's cadence instead.
+        let first = if app.animating() {
+            match events.recv_timeout(SPINNER_TICK) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match events.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            }
+        };
+
+        // A timeout with no event is the spinner's turn.
+        let Some(first) = first else {
+            app.tick();
+            app.render(&mut inline, &mut out)?;
+            continue;
+        };
 
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {

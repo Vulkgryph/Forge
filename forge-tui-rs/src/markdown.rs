@@ -59,6 +59,9 @@ pub fn render(md: &str, cols: usize) -> Vec<Line> {
     }
     let mut out = Vec::new();
     let mut in_code = false;
+    let mut lang = String::new();
+    let mut hl = crate::highlight::State::default();
+    let dim = Style::fg(palette::BULLET).dim();
 
     for raw in md.lines() {
         let trimmed = raw.trim_start();
@@ -66,18 +69,34 @@ pub fn render(md: &str, cols: usize) -> Vec<Line> {
         // Fences toggle a verbatim region. Inside it nothing is interpreted —
         // code containing `*` or `#` must survive untouched.
         if trimmed.starts_with("```") {
-            in_code = !in_code;
+            if in_code {
+                out.push(Line { spans: vec![Span::new("  ╰─", dim)] });
+                in_code = false;
+                lang.clear();
+            } else {
+                // The fence's language tag, drawn into the top border and used
+                // for highlighting.
+                lang = trimmed.trim_start_matches('`').trim().to_string();
+                let header = if lang.is_empty() {
+                    "  ╭─".to_string()
+                } else {
+                    format!("  ╭─ {lang} ")
+                };
+                out.push(Line { spans: vec![Span::new(clip(&header, cols), dim)] });
+                in_code = true;
+                hl = crate::highlight::State::default();
+            }
             continue;
         }
         if in_code {
             // Code is not wrapped on words; it is truncated, because rewrapping
             // code changes its meaning.
-            out.push(Line {
-                spans: vec![Span::new(
-                    format!("  {}", clip(raw, cols.saturating_sub(2))),
-                    Style::fg(palette::CODE),
-                )],
-            });
+            let body = clip(raw, cols.saturating_sub(4));
+            let mut spans = vec![Span::new("  │ ", dim)];
+            for (text, token) in crate::highlight::line(&body, &lang, &mut hl) {
+                spans.push(Span::new(text, token.style()));
+            }
+            out.push(Line { spans });
             continue;
         }
 
@@ -380,12 +399,46 @@ some code that is quite wide and should be clipped rather than wrapped
         assert_eq!(plain(&render("unclosed `code", 40)), vec!["unclosed `code"]);
     }
 
+    /// A fenced block is drawn in a box, as the TypeScript client drew it: a
+    /// top border carrying the language, one bordered row per line, a bottom.
     #[test]
     fn fenced_code_is_not_interpreted() {
         let md = "```\nlet x = **2**; # not a heading\n```";
         let lines = render(md, 60);
-        assert_eq!(plain(&lines), vec!["  let x = **2**; # not a heading"]);
-        assert!(!lines[0].spans.iter().any(|s| s.style.bold));
+        let text = plain(&lines);
+        assert_eq!(text.len(), 3, "top border, the code, bottom border: {text:?}");
+        assert!(text[0].contains('╭'), "opening border: {text:?}");
+        assert!(text[1].contains("let x = **2**; # not a heading"), "verbatim");
+        assert!(text[2].contains('╰'), "closing border");
+        // Markup inside a fence is text, not markup.
+        assert!(!lines[1].spans.iter().any(|s| s.style.bold));
+    }
+
+    /// The language goes in the top border and drives highlighting.
+    #[test]
+    fn a_fence_language_is_labelled_and_highlighted() {
+        let lines = render("```rust\nlet x = 1;\n```", 60);
+        let text = plain(&lines);
+        assert!(text[0].contains("rust"), "labelled: {text:?}");
+
+        // `let` is a keyword, so it must not be the default style.
+        let code = &lines[1];
+        let keyword = code
+            .spans
+            .iter()
+            .find(|s| s.text.contains("let"))
+            .expect("a run with let");
+        assert_ne!(keyword.style, Style::default(), "highlighted: {:?}", code.spans);
+    }
+
+    /// An unknown language still gets the box, just no colouring.
+    #[test]
+    fn an_unknown_fence_language_is_still_boxed() {
+        let lines = render("```brainfuck\n+++>\n```", 60);
+        let text = plain(&lines);
+        assert!(text[0].contains("brainfuck"));
+        assert!(text[1].contains("+++>"));
+        assert_eq!(text.len(), 3);
     }
 
     #[test]
@@ -393,8 +446,24 @@ some code that is quite wide and should be clipped rather than wrapped
         // Rewrapping code would change what it means, so long lines are cut.
         let md = "```\nthis code line is definitely much wider than the budget\n```";
         let lines = render(md, 20);
-        assert_eq!(lines.len(), 1, "clipped to one line, not wrapped");
-        assert!(lines[0].width() <= 20);
+        assert_eq!(lines.len(), 3, "border, one code row, border");
+        for line in &lines {
+            assert!(line.width() <= 20, "{:?} is {} cells", line.plain(), line.width());
+        }
+    }
+
+    /// A block comment spanning lines must stay grey throughout — the lexer state
+    /// has to carry between rows of the same block.
+    #[test]
+    fn a_multiline_comment_stays_grey_across_rows() {
+        let lines = render("```rust\n/* opening\nstill inside\n*/ let x = 1;\n```", 70);
+        let comment_style = crate::highlight::Token::Comment.style();
+        // Row 2 is the middle of the comment; every run after the border is grey.
+        let middle = &lines[2];
+        assert!(
+            middle.spans.iter().skip(1).all(|s| s.style == comment_style),
+            "still inside the comment: {:?}", middle.spans,
+        );
     }
 
     #[test]

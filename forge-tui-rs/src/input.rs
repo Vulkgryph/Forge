@@ -24,6 +24,7 @@ pub fn bind(key: Key) -> Option<Input> {
         // Ctrl-T expands and collapses reasoning. The TypeScript UI prints
         // "(ctrl+t to expand)" in its own transcript, so the binding is part of
         // the design rather than a free choice.
+        Key::Ctrl('n') => Input::Newline,
         Key::Ctrl('t') => Input::ToggleReasoning,
         // The menu takes Ctrl-O, since Ctrl-T is spoken for.
         Key::Ctrl('o') => Input::Menu,
@@ -130,6 +131,12 @@ mod tests {
     }
 
     /// The menu still needs a key, or model switching is unreachable.
+    /// The placeholder advertises Ctrl+N for a newline, so it has to produce one.
+    #[test]
+    fn ctrl_n_inserts_a_newline() {
+        assert_eq!(bind(Key::Ctrl('n')), Some(Input::Newline));
+    }
+
     #[test]
     fn tab_completes_a_command() {
         assert_eq!(bind(Key::Tab), Some(Input::Complete));

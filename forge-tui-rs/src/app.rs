@@ -45,6 +45,8 @@ pub enum Input {
     ToggleReasoning,
     /// Complete the slash command being typed.
     Complete,
+    /// Insert a literal newline in the input.
+    Newline,
     Quit,
     Resize(usize, usize),
 }
@@ -87,6 +89,8 @@ pub struct App {
     menu:    Option<Menu>,
     /// Which suggestion is highlighted while a slash command is being typed.
     suggestion: usize,
+    /// Frame of the activity spinner. Only advances while a turn is running.
+    spinner: usize,
     /// How many transcript entries have been printed permanently.
     ///
     /// Everything before the current turn is settled and gets committed to the
@@ -111,6 +115,7 @@ impl App {
             dialog: None,
             menu: None,
             suggestion: 0,
+            spinner: 0,
             committed: 0,
         }
     }
@@ -246,6 +251,11 @@ impl App {
                 }
             }
 
+            Input::Newline => {
+                self.input.push('\n');
+                self.suggestion = 0;
+            }
+
             Input::ToggleReasoning => {
                 self.session.toggle_reasoning();
                 self.cache = None;
@@ -273,6 +283,14 @@ impl App {
                     self.input.truncate(keep);
                 }
                 self.suggestion = 0;
+            }
+
+            Input::Enter if self.input.ends_with('\\') => {
+                // The placeholder advertises `\+Enter` for a newline, so a
+                // trailing backslash means "continue" rather than "send". The
+                // backslash itself is consumed; it was an instruction, not text.
+                self.input.pop();
+                self.input.push('\n');
             }
 
             Input::Enter => {
@@ -548,6 +566,22 @@ impl App {
         self.build_range(0..self.session.entries().len(), cols)
     }
 
+    /// Advance the spinner one frame.
+    ///
+    /// Driven by the event loop's timer rather than a clock read here, so the
+    /// state machine stays free of time and the animation stops dead when there
+    /// is nothing running.
+    pub fn tick(&mut self) {
+        if self.session.activity.is_busy() {
+            self.spinner = self.spinner.wrapping_add(1);
+        }
+    }
+
+    /// Whether anything on screen is animating, so the loop knows to wake.
+    pub fn animating(&self) -> bool {
+        self.session.activity.is_busy()
+    }
+
     /// Print settled output, then redraw what is still changing.
     ///
     /// This is the whole point of rendering inline: the conversation goes into
@@ -625,7 +659,10 @@ impl App {
         chrome.extend(dialog_lines);
         chrome.extend(self.suggestion_lines(cols));
         let prompt_offset = chrome.len();
-        chrome.push(self.prompt_line(cols));
+        let prompt = self.prompt_lines(cols);
+        // The caret belongs on the last row of the input, not the first.
+        let caret_offset = prompt_offset + prompt.len() - 1;
+        chrome.extend(prompt);
         chrome.push(self.context_bar_line(cols));
 
         // The tail of the current turn, as much as fits above the chrome.
@@ -646,7 +683,7 @@ impl App {
             }
         }
 
-        let prompt_row = Some(tail.len() + prompt_offset);
+        let prompt_row = Some(tail.len() + caret_offset);
         let mut lines = tail;
         lines.extend(chrome);
         LiveBlock { lines, prompt_row }
@@ -659,7 +696,8 @@ impl App {
             return None; // the dialog owns the caret
         }
         let lead = str_width(PROMPT_GLYPH);
-        let typed = str_width(&self.visible_input(cols.saturating_sub(lead)));
+        let last = self.input.rsplit('\n').next().unwrap_or("");
+        let typed = str_width(&tail_of(last, cols.saturating_sub(lead)));
         Some((row, (lead + typed).min(cols.saturating_sub(1))))
     }
 
@@ -784,32 +822,51 @@ impl App {
         out
     }
 
-    fn prompt_line(&self, cols: usize) -> Line {
+    /// The prompt, one row per line of input.
+    ///
+    /// A multi-line message needs a row each, and continuation rows carry a dim
+    /// marker rather than the prompt glyph so it is clear where the message
+    /// starts.
+    fn prompt_lines(&self, cols: usize) -> Vec<Line> {
         if self.dialog.is_some() {
-            return Line {
+            return vec![Line {
                 spans: vec![Span {
                     text: "  (answer above)".into(),
                     style: Style::fg(palette::GRAY).dim(),
                 }],
-            };
+            }];
         }
         let lead = str_width(PROMPT_GLYPH);
-        let mut spans = vec![Span {
-            text: PROMPT_GLYPH.into(),
-            style: Style::fg(palette::PROMPT).bold(),
-        }];
+        let bold = Style::fg(palette::PROMPT).bold();
+        let dim = Style::fg(palette::GRAY).dim();
+
         if self.input.is_empty() {
-            spans.push(Span {
-                text: widgets::clip(PLACEHOLDER, cols.saturating_sub(lead)),
-                style: Style::fg(palette::GRAY).dim(),
-            });
-        } else {
-            spans.push(Span {
-                text: self.visible_input(cols.saturating_sub(lead)),
-                style: Style::default(),
-            });
+            return vec![Line {
+                spans: vec![
+                    Span { text: PROMPT_GLYPH.into(), style: bold },
+                    Span {
+                        text: widgets::clip(PLACEHOLDER, cols.saturating_sub(lead)),
+                        style: dim,
+                    },
+                ],
+            }];
         }
-        Line { spans }
+
+        let budget = cols.saturating_sub(lead);
+        self.input
+            .split('\n')
+            .enumerate()
+            .map(|(i, text)| Line {
+                spans: vec![
+                    Span {
+                        // Continuation rows are marked, not prompted.
+                        text: if i == 0 { PROMPT_GLYPH.to_string() } else { "· ".to_string() },
+                        style: if i == 0 { bold } else { dim },
+                    },
+                    Span { text: tail_of(text, budget), style: Style::default() },
+                ],
+            })
+            .collect()
     }
 
     fn context_bar_line(&self, cols: usize) -> Line {
@@ -830,8 +887,23 @@ impl App {
         if self.session.plan_mode {
             parts.push("PLAN".into());
         }
+        // The active endpoint's reasoning setting, as the original bar showed it.
+        if let Some(ep) = crate::model_display::active_endpoint(
+            &self.session.endpoints,
+            &self.session.model_name,
+            &self.session.model_id,
+            self.session.max_context_tokens,
+        ) {
+            if let Some(label) = crate::model_display::thinking_intensity(ep) {
+                parts.push(label);
+            }
+        }
+
         if let Some(label) = self.session.activity.label() {
-            parts.push(label);
+            // A turning spinner beside it, so a long turn looks alive rather than
+            // stuck. Only while busy — an idle session animates nothing, which is
+            // what keeps it at no CPU.
+            parts.push(format!("{} {label}", SPINNER[self.spinner % SPINNER.len()]));
         }
 
         let mut spans = vec![Span {
@@ -850,30 +922,16 @@ impl App {
         Line { spans }
     }
 
-    fn visible_input(&self, budget: usize) -> String {
-        use unicode_segmentation::UnicodeSegmentation;
-        if crate::width::str_width(&self.input) <= budget {
-            return self.input.clone();
-        }
-        let mut kept: Vec<&str> = Vec::new();
-        let mut w = 0;
-        for cluster in self.input.graphemes(true).rev() {
-            let cw = crate::width::cluster_width(cluster);
-            if w + cw > budget {
-                break;
-            }
-            kept.push(cluster);
-            w += cw;
-        }
-        kept.reverse();
-        kept.concat()
-    }
 }
 
-/// Shown when nothing has been typed, as in the TypeScript client.
-const PLACEHOLDER: &str = "Type a message...";
+/// Shown when nothing has been typed, as in the TypeScript client — including
+/// the hint about newlines, which the original advertised and this must honour.
+const PLACEHOLDER: &str = "Type a message...  (\\+Enter or Ctrl+N for newline)";
 /// The prompt, as in the TypeScript client.
 const PROMPT_GLYPH: &str = "❯ ";
+
+/// Spinner frames. Braille dots turn smoothly and take one cell.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The redrawn block, and where the prompt sits inside it.
 struct LiveBlock {
@@ -938,6 +996,27 @@ fn diff_line(line: &str, cols: usize, dim: Style) -> Line {
             Span { text: clip_line(line, cols, 6), style },
         ],
     }
+}
+
+/// The tail of a line that fits, so a long one scrolls horizontally rather than
+/// being cut off where the user is typing.
+fn tail_of(text: &str, budget: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if str_width(text) <= budget {
+        return text.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut w = 0;
+    for cluster in text.graphemes(true).rev() {
+        let cw = crate::width::cluster_width(cluster);
+        if w + cw > budget {
+            break;
+        }
+        kept.push(cluster);
+        w += cw;
+    }
+    kept.reverse();
+    kept.concat()
 }
 
 /// A duration at a readable precision.
@@ -1201,6 +1280,147 @@ mod tests {
         );
         assert_eq!(app.input(), "", "the input line was not touched");
         assert!(app.session().pending.is_some(), "still waiting");
+    }
+
+    // ── Multi-line input ──────────────────────────────────────────────────
+
+    /// The placeholder advertises Ctrl+N, so it has to insert a newline rather
+    /// than submit.
+    #[test]
+    fn ctrl_n_inserts_a_newline_without_submitting() {
+        let (mut app, _rows) = app_with(0);
+        for c in "first".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Newline, ROWS);
+        assert!(effects.is_empty(), "nothing was sent");
+        for c in "second".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        assert_eq!(app.input(), "first\nsecond");
+    }
+
+    /// The other advertised route: a trailing backslash turns Enter into a
+    /// newline, and the backslash itself is consumed as the instruction it was.
+    #[test]
+    fn a_trailing_backslash_makes_enter_a_newline() {
+        let (mut app, _rows) = app_with(0);
+        for c in "line\\".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert!(effects.is_empty(), "not submitted");
+        assert_eq!(app.input(), "line\n", "backslash consumed, newline added");
+    }
+
+    #[test]
+    fn a_multiline_message_submits_whole() {
+        let (mut app, _rows) = app_with(0);
+        for c in "one".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Newline, ROWS);
+        for c in "two".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(
+            effects,
+            vec![Effect::Send(ClientMessage::SendMessage { content: "one\ntwo".into() })],
+        );
+    }
+
+    /// Each line needs its own row, or a multi-line message is invisible.
+    #[test]
+    fn a_multiline_input_draws_a_row_per_line() {
+        let (mut app, _rows) = app_with(0);
+        for c in "alpha".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Newline, ROWS);
+        for c in "beta".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let shown = live_text(&mut app);
+        assert!(shown.contains("❯ alpha"), "first row prompted: {shown:?}");
+        assert!(shown.contains("· beta"), "continuation row marked");
+    }
+
+    /// The caret must sit on the last line, not the first.
+    #[test]
+    fn the_caret_follows_the_last_line_of_input() {
+        let mut app = App::new();
+        for c in "aaaa".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Newline, ROWS);
+        for c in "bb".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let inline = crate::inline::Inline::new(COLS, ROWS);
+        let block = app.live_lines(&inline, COLS);
+        let (row, col) = app.cursor_in(&block, COLS).expect("a caret");
+        assert_eq!(col, str_width(PROMPT_GLYPH) + 2, "after the shorter last line");
+        assert_eq!(block.prompt_row, Some(row));
+    }
+
+    #[test]
+    fn the_placeholder_advertises_the_newline_keys() {
+        let (mut app, _rows) = app_with(0);
+        let shown = live_text(&mut app);
+        assert!(shown.contains("Ctrl+N"), "the hint is shown: {shown:?}");
+    }
+
+    // ── Spinner and reasoning label ───────────────────────────────────────
+
+    /// A long turn should look alive. The spinner must only turn while busy,
+    /// because animating when idle is what would cost CPU.
+    #[test]
+    fn the_spinner_turns_only_while_busy() {
+        let (mut app, _rows) = app_with(0);
+        assert!(!app.animating(), "idle to begin with");
+
+        let before = live_text(&mut app);
+        app.tick();
+        assert_eq!(live_text(&mut app), before, "idle ticks change nothing");
+
+        app.session_mut().apply(AgentMessage::Thinking);
+        assert!(app.animating(), "a running turn animates");
+        let busy = live_text(&mut app);
+        app.tick();
+        assert_ne!(live_text(&mut app), busy, "the frame advanced");
+
+        app.session_mut().apply(AgentMessage::Done);
+        assert!(!app.animating(), "and stops when the turn ends");
+    }
+
+    #[test]
+    fn the_context_bar_shows_the_reasoning_setting() {
+        use forge_agent_proto::{EndpointInfo, EndpointReasoningConfig, ProviderToggle};
+        let mut app = App::new();
+        let mut ep = EndpointInfo {
+            name: "Claude".into(),
+            base_url: "https://api.example.invalid".into(),
+            model_id: "claude-1".into(),
+            max_context_tokens: 200_000,
+            max_output_tokens: 65_536,
+            endpoint_type: "anthropic".into(),
+            reasoning: EndpointReasoningConfig::default(),
+            xai_priority_tier: false,
+        };
+        ep.reasoning.anthropic.thinking = ProviderToggle::On;
+        ep.reasoning.anthropic.budget_tokens = 8192;
+
+        app.session_mut().apply(AgentMessage::Init(Box::new(Init {
+            model_name: "Claude".into(),
+            model_id: "claude-1".into(),
+            max_context_tokens: 200_000,
+            endpoints: vec![ep],
+            ..Default::default()
+        })));
+
+        let shown = live_text(&mut app);
+        assert!(shown.contains("thinking high"), "got {shown:?}");
     }
 
     // ── Slash commands ────────────────────────────────────────────────────
@@ -1952,14 +2172,31 @@ mod tests {
         assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
+    /// A long line scrolls horizontally so the caret stays visible.
     #[test]
     fn long_input_shows_its_tail() {
+        let visible = tail_of(&"0123456789".repeat(10), 10);
+        assert_eq!(str_width(&visible), 10);
+        assert!("0123456789".repeat(10).ends_with(&visible), "the end, not the start");
+    }
+
+    /// Each line of a multi-line input scrolls on its own, so a long first line
+    /// does not shift the row the caret is on.
+    #[test]
+    fn each_line_scrolls_independently() {
         let (mut app, _rows) = app_with(0);
-        for c in "0123456789".repeat(10).chars() {
+        for c in "x".repeat(200).chars() {
             app.update(Input::Char(c), ROWS);
         }
-        let visible = app.visible_input(10);
-        assert_eq!(crate::width::str_width(&visible), 10);
-        assert!(app.input().ends_with(&visible), "the end, not the start");
+        app.update(Input::Newline, ROWS);
+        for c in "short".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let lines = app.prompt_lines(40);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.width() <= 40, "{:?} overflows", line.plain());
+        }
+        assert!(lines[1].plain().contains("short"), "the short line is intact");
     }
 }

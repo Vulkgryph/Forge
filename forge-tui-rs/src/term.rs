@@ -55,8 +55,18 @@ pub fn take_resize() -> bool {
 /// behind a window that vanishes on exit.
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
-/// Report key presses as unambiguous sequences where the terminal supports it.
-const PUSH_KEYBOARD: &str = "\x1b[>1u";
+/// Ask for *legacy* key encoding, explicitly.
+///
+/// This used to request the Kitty keyboard protocol (`CSI > 1 u`), which was
+/// simply wrong: that protocol delivers keys as `CSI <codepoint> u`, and the
+/// decoder here reads plain bytes. We were asking the terminal to speak a
+/// language we then dropped on the floor.
+///
+/// Pushing flags of zero is the safe form. It does not merely avoid asking — it
+/// *overrides* whatever mode the terminal was left in, which matters because the
+/// mode is a stack: a previous run killed before it could pop leaves the terminal
+/// enhanced, and the next program inherits it.
+const PUSH_KEYBOARD: &str = "\x1b[>0u";
 const POP_KEYBOARD: &str = "\x1b[<u";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
@@ -191,6 +201,15 @@ pub fn size() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// We must never request an enhanced keyboard mode, because the decoder
+    /// reads plain bytes. Flags of zero explicitly asks for legacy encoding and
+    /// overrides whatever a previous program left pushed.
+    #[test]
+    fn the_keyboard_mode_requested_is_legacy() {
+        assert_eq!(PUSH_KEYBOARD, "\x1b[>0u", "flags of zero, not one");
+        assert!(POP_KEYBOARD.contains('<'), "and the stack is popped on the way out");
+    }
 
     /// The transcript belongs in the terminal's scrollback, so the alternate
     /// screen must not be entered — it would hide the history behind a window

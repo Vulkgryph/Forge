@@ -223,6 +223,15 @@ impl Decoder {
 
         self.buf.drain(..=end);
 
+        // Kitty keyboard protocol: `CSI <codepoint> [;<mods>] u`. We ask for
+        // legacy encoding and never want this — but a terminal left in enhanced
+        // mode by a program that died before popping will send it anyway, and
+        // dropping it makes the keyboard appear dead. Decoding it costs little
+        // and turns a broken session into a working one.
+        if final_byte == b'u' {
+            return self.kitty_key(&params);
+        }
+
         Step::Key(match (final_byte, params.as_str()) {
             (b'A', _) => Key::Up,
             (b'B', _) => Key::Down,
@@ -238,6 +247,54 @@ impl Decoder {
             // Unrecognised but well-formed: consumed above, nothing to report.
             _ => return Step::Skipped,
         })
+    }
+
+    /// Decode a Kitty-protocol key event.
+    ///
+    /// The shape is `codepoint[:alternate][;modifiers[:event]]`. Only the parts
+    /// that change what key was pressed are read: the codepoint, whether Ctrl was
+    /// held, and whether this is a release — a release reported as a press would
+    /// double every keystroke.
+    fn kitty_key(&mut self, params: &str) -> Step {
+        let mut fields = params.split(';');
+        let key_field = fields.next().unwrap_or("");
+        let modifier_field = fields.next().unwrap_or("");
+
+        // `1` press, `2` repeat, `3` release. Anything but a release is input.
+        let event_type = modifier_field.split(':').nth(1).unwrap_or("1");
+        if event_type == "3" {
+            return Step::Skipped;
+        }
+
+        let Ok(code) = key_field.split(':').next().unwrap_or("").parse::<u32>() else {
+            return Step::Skipped;
+        };
+
+        // Modifiers are a bitmask, biased by one: 1 means none.
+        let mods = modifier_field
+            .split(':')
+            .next()
+            .unwrap_or("1")
+            .parse::<u32>()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let ctrl = mods & 0b100 != 0;
+
+        // The special keys the protocol gives their own codepoints.
+        let key = match code {
+            13 => Key::Enter,
+            9 => Key::Tab,
+            127 | 8 => Key::Backspace,
+            27 => Key::Escape,
+            _ => match char::from_u32(code) {
+                Some(c) if ctrl && c.is_ascii_alphabetic() => {
+                    Key::Ctrl(c.to_ascii_lowercase())
+                }
+                Some(c) if !c.is_control() => Key::Char(c),
+                _ => return Step::Skipped,
+            },
+        };
+        Step::Key(key)
     }
 
     /// Assemble a bracketed paste, from after `ESC[200~` to before `ESC[201~`.
@@ -445,6 +502,70 @@ mod tests {
         let keys = d.feed(b"\x1bxa");
         assert_eq!(keys, vec![Key::Char('a')]);
         assert!(!d.has_pending());
+    }
+
+    // ── Kitty keyboard protocol ───────────────────────────────────────────
+
+    /// We never ask for this, but a terminal left in enhanced mode by a program
+    /// that died before popping will send it. Dropping it makes the keyboard
+    /// appear dead, which is far worse than decoding a mode we did not request.
+    #[test]
+    fn kitty_protocol_key_events_are_decoded() {
+        assert_eq!(decode(b"\x1b[97u"), vec![Key::Char('a')]);
+        assert_eq!(decode(b"\x1b[13u"), vec![Key::Enter]);
+        assert_eq!(decode(b"\x1b[9u"), vec![Key::Tab]);
+        assert_eq!(decode(b"\x1b[27u"), vec![Key::Escape]);
+        assert_eq!(decode(b"\x1b[127u"), vec![Key::Backspace]);
+    }
+
+    /// A release reported as a press would double every keystroke.
+    #[test]
+    fn kitty_release_events_are_ignored() {
+        assert_eq!(decode(b"\x1b[97;1:3u"), vec![], "release produces nothing");
+        assert_eq!(decode(b"\x1b[97;1:1u"), vec![Key::Char('a')], "press does");
+        assert_eq!(decode(b"\x1b[97;1:2u"), vec![Key::Char('a')], "and so does a repeat");
+    }
+
+    #[test]
+    fn kitty_ctrl_chords_are_decoded() {
+        // Modifier 5 = ctrl (bitmask 4, biased by one).
+        assert_eq!(decode(b"\x1b[99;5u"), vec![Key::Ctrl('c')]);
+        assert_eq!(decode(b"\x1b[116;5u"), vec![Key::Ctrl('t')]);
+    }
+
+    #[test]
+    fn kitty_alternate_key_codes_are_tolerated() {
+        // `codepoint:shifted` — the base codepoint is what matters.
+        assert_eq!(decode(b"\x1b[97:65u"), vec![Key::Char('a')]);
+    }
+
+    /// A `u` sequence with no usable codepoint must be skipped, and decoding
+    /// must carry on afterwards.
+    #[test]
+    fn a_malformed_kitty_sequence_is_skipped_not_fatal() {
+        let mut d = Decoder::new();
+        let keys = d.feed(b"\x1b[;;u!");
+        assert_eq!(keys, vec![Key::Char('!')], "recovered: {keys:?}");
+        assert!(!d.has_pending());
+    }
+
+    /// Worth pinning: any letter terminates a CSI sequence, whether or not we
+    /// bind it. `ESC [ a` is a complete (unbound) sequence, so it is consumed
+    /// whole and the keys after it still arrive — it does not swallow them while
+    /// waiting for a terminator that already came.
+    #[test]
+    fn an_unbound_letter_still_terminates_the_sequence() {
+        let mut d = Decoder::new();
+        let keys = d.feed(b"\x1b[a" as &[u8]);
+        assert!(keys.is_empty(), "unbound, so nothing is reported: {keys:?}");
+        assert!(!d.has_pending(), "but it was consumed, not left buffered");
+        assert_eq!(d.feed(b"z"), vec![Key::Char('z')], "the next key arrives");
+    }
+
+    #[test]
+    fn multibyte_kitty_codepoints_decode() {
+        // U+65E5 (日)
+        assert_eq!(decode("\x1b[26085u".as_bytes()), vec![Key::Char('日')]);
     }
 
     // ── Bracketed paste ───────────────────────────────────────────────────

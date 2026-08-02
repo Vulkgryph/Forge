@@ -133,6 +133,9 @@ const SNAPSHOT_SCROLLBACK: usize = 200;
 /// Main-screen state parked while the alternate screen is active.
 struct AltSaved {
     viewport: Vec<Vec<Cell>>,
+    /// Wrap flags for the parked viewport, so returning to the main screen
+    /// restores which of its lines were continuations.
+    wrapped:  Vec<bool>,
     cur_row:  usize,
     cur_col:  usize,
 }
@@ -150,8 +153,20 @@ pub struct Grid {
     /// Lines scrolled off the top of the viewport, oldest first. Never
     /// touched by cursor movement/erase — only by scrolling and resize.
     scrollback:   VecDeque<Vec<Cell>>,
+    /// Whether each scrollback row is the continuation of the line above it,
+    /// i.e. produced by autowrap rather than a newline.
+    ///
+    /// This is what makes a resize able to *reflow* rather than truncate. Without
+    /// it a narrower window simply cut every line's tail off, destroying text
+    /// that had already been printed, and a wider one left the old ragged breaks
+    /// in place. Kept parallel to the rows rather than embedded in them, which
+    /// keeps the change small; the two are moved together at every point that
+    /// alters row structure, and `debug_assert`s below catch a drift.
+    sb_wrapped:   VecDeque<bool>,
     /// The current fixed-size screen; what cursor addressing/erase target.
     viewport:     Vec<Vec<Cell>>,
+    /// Wrap flags for the viewport, as [`Grid::sb_wrapped`] is for scrollback.
+    wrapped:      Vec<bool>,
     rows:         usize,
     cols:         usize,
     cur_row:      usize, // viewport-relative (0..rows)
@@ -236,7 +251,9 @@ impl Grid {
         let cols = cols.max(1);
         Self {
             scrollback: VecDeque::new(),
+            sb_wrapped: VecDeque::new(),
             viewport:   vec![vec![Cell::blank(); cols]; rows],
+            wrapped:    vec![false; rows],
             rows, cols, cur_row: 0, cur_col: 0,
             cursor_visible: true,
             current_fg: default_fg(),
@@ -324,9 +341,7 @@ impl Grid {
         self.scrollback_version += 1;
 
         if new_cols != self.cols {
-            for row in self.viewport.iter_mut().chain(self.scrollback.iter_mut()) {
-                row.resize(new_cols, Cell::blank());
-            }
+            self.reflow(new_cols, new_rows);
             self.cols = new_cols;
             self.cur_col = self.cur_col.min(self.cols - 1);
         }
@@ -345,19 +360,24 @@ impl Grid {
             let mut pulled = 0;
             for _ in 0..grow {
                 let Some(row) = self.scrollback.pop_back() else { break };
+                let flag = self.sb_wrapped.pop_back().unwrap_or(false);
                 self.viewport.insert(0, row);
+                self.wrapped.insert(0, flag);
                 pulled += 1;
             }
             self.cur_row += pulled;
             for _ in 0..(grow - pulled) {
                 self.viewport.push(vec![Cell::blank(); self.cols]);
+                self.wrapped.push(false);
             }
         } else if new_rows < self.rows {
             let shrink = self.rows - new_rows;
             for _ in 0..shrink {
                 if self.viewport.is_empty() { break; }
                 let row = self.viewport.remove(0);
+                let flag = if self.wrapped.is_empty() { false } else { self.wrapped.remove(0) };
                 self.scrollback.push_back(row);
+                self.sb_wrapped.push_back(flag);
             }
             self.cur_row = self.cur_row.saturating_sub(shrink);
         }
@@ -370,8 +390,90 @@ impl Grid {
         let before = self.scrollback.len();
         while self.scrollback.len() > MAX_SCROLLBACK {
             self.scrollback.pop_front();
+            self.sb_wrapped.pop_front();
         }
         if self.scrollback.len() != before { self.scrollback_version += 1; }
+    }
+
+    /// Re-break every line for a new width.
+    ///
+    /// This used to resize each row in place, which truncated text on the way
+    /// narrower and left the old breaks behind on the way wider — a terminal
+    /// destroying output that had already been printed. Reflowing is what a
+    /// terminal is supposed to do, and owning the emulator is what makes it
+    /// possible: joined-then-resplit lines need to know which rows were
+    /// continuations, which is what the wrap flags record.
+    ///
+    /// The cursor is clamped rather than tracked through the reflow. Applications
+    /// redraw on `SIGWINCH`, so its exact column afterwards matters far less than
+    /// the text surviving — and guessing at it could place it inside a line it
+    /// does not belong to.
+    fn reflow(&mut self, new_cols: usize, new_rows: usize) {
+        debug_assert_eq!(self.viewport.len(), self.wrapped.len(), "viewport flags drifted");
+        debug_assert_eq!(self.scrollback.len(), self.sb_wrapped.len(), "scrollback flags drifted");
+
+        // Every row in order, oldest first, with its continuation flag.
+        let mut rows: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(
+            self.scrollback.len() + self.viewport.len(),
+        );
+        rows.extend(self.scrollback.drain(..).zip(self.sb_wrapped.drain(..)));
+        rows.extend(
+            std::mem::take(&mut self.viewport)
+                .into_iter()
+                .zip(std::mem::take(&mut self.wrapped)),
+        );
+
+        // Join continuations back into logical lines.
+        let mut logical: Vec<Vec<Cell>> = Vec::new();
+        for (cells, is_continuation) in rows {
+            match logical.last_mut() {
+                Some(last) if is_continuation => last.extend(cells),
+                _ => logical.push(cells),
+            }
+        }
+
+        // Trailing blanks are padding to the old width, not content, and keeping
+        // them would leave every reflowed line stretched to the previous size.
+        for line in &mut logical {
+            while line.last().is_some_and(|c| c.ch == ' ' && c.bg.is_none()) {
+                line.pop();
+            }
+        }
+
+        // Re-break at the new width.
+        let mut fresh: Vec<(Vec<Cell>, bool)> = Vec::new();
+        for line in logical {
+            if line.is_empty() {
+                fresh.push((vec![Cell::blank(); new_cols], false));
+                continue;
+            }
+            for (i, chunk) in line.chunks(new_cols).enumerate() {
+                let mut cells = chunk.to_vec();
+                cells.resize(new_cols, Cell::blank());
+                fresh.push((cells, i > 0));
+            }
+        }
+
+        // The last screenful becomes the viewport; the rest is history. An empty
+        // grid still needs a full viewport, so it is padded.
+        let keep = new_rows.min(fresh.len());
+        let split = fresh.len() - keep;
+        for (cells, flag) in fresh.drain(..split) {
+            self.scrollback.push_back(cells);
+            self.sb_wrapped.push_back(flag);
+        }
+        for (cells, flag) in fresh {
+            self.viewport.push(cells);
+            self.wrapped.push(flag);
+        }
+        while self.viewport.len() < new_rows {
+            self.viewport.push(vec![Cell::blank(); new_cols]);
+            self.wrapped.push(false);
+        }
+
+        self.rows = self.viewport.len();
+        self.cur_row = self.cur_row.min(self.rows.saturating_sub(1));
+        self.trim_scrollback();
     }
 
     /// Switch to the alternate screen: park the main viewport, hand the
@@ -388,6 +490,7 @@ impl Grid {
                 &mut self.viewport,
                 vec![vec![Cell::blank(); self.cols]; self.rows],
             ),
+            wrapped: std::mem::replace(&mut self.wrapped, vec![false; self.rows]),
             cur_row: if save_cursor { self.cur_row } else { 0 },
             cur_col: if save_cursor { self.cur_col } else { 0 },
         });
@@ -402,11 +505,14 @@ impl Grid {
     fn leave_alt_screen(&mut self, restore_cursor: bool) {
         let Some(saved) = self.alt_screen.take() else { return };
         self.viewport = saved.viewport;
+        self.wrapped = saved.wrapped;
         // A resize while on the alternate screen can leave the parked copy the
         // wrong shape; normalise rather than trust it.
         self.viewport.truncate(self.rows);
+        self.wrapped.truncate(self.rows);
         while self.viewport.len() < self.rows {
             self.viewport.push(vec![Cell::blank(); self.cols]);
+            self.wrapped.push(false);
         }
         for row in &mut self.viewport {
             row.truncate(self.cols);
@@ -427,12 +533,17 @@ impl Grid {
     /// buffer has no scrollback, which is why full-screen programs use it.
     fn scroll_up_one(&mut self) {
         let top = self.viewport.remove(0);
+        let top_wrapped = if self.wrapped.is_empty() { false } else { self.wrapped.remove(0) };
         if self.alt_screen.is_none() {
             self.scrollback.push_back(top);
+            self.sb_wrapped.push_back(top_wrapped);
             self.scrollback_version += 1;
             self.trim_scrollback();
         }
         self.viewport.push(vec![Cell::blank(); self.cols]);
+        // The fresh row is a new line, not a continuation — `put_char` marks it
+        // otherwise when autowrap is what brought us here.
+        self.wrapped.push(false);
     }
 
     fn line_feed(&mut self) {
@@ -448,6 +559,12 @@ impl Grid {
             if self.autowrap {
                 self.cur_col = 0;
                 self.line_feed();
+                // The row the cursor has landed on continues the one above. This
+                // is the only place a continuation is created, and recording it
+                // here is what lets a resize put the line back together.
+                if let Some(flag) = self.wrapped.get_mut(self.cur_row) {
+                    *flag = true;
+                }
             } else {
                 // DECAWM off: the cursor stays put at the last column and
                 // further characters overwrite it. Crucially it does not
@@ -490,7 +607,10 @@ impl Grid {
             }
             2 | 3 => {
                 for r in self.viewport.iter_mut() { *r = vec![Cell::blank(); self.cols]; }
-                if mode == 3 { self.scrollback.clear(); }
+                if mode == 3 {
+                    self.scrollback.clear();
+                    self.sb_wrapped.clear();
+                }
             }
             _ => {}
         }
@@ -696,6 +816,18 @@ impl Grid {
 
     /// Full contents (scrollback + current viewport) as plain text, one
     /// trimmed line per row — used by the "Copy" context-menu action.
+    /// One viewport row as text, trailing blanks trimmed.
+    ///
+    /// Exists for tests that need to see how a line was broken, which `all_text`
+    /// flattens away.
+    #[cfg(test)]
+    fn row_text(&self, row: usize) -> String {
+        self.viewport
+            .get(row)
+            .map(|cells| cells.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .unwrap_or_default()
+    }
+
     pub fn all_text(&self) -> String {
         self.scrollback.iter().chain(self.viewport.iter())
             .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
@@ -1802,6 +1934,139 @@ mod private_mode_tests {
         assert!(g.cursor_visible(), "cursor visibility applied from a batch");
         assert!(g.sync_update.is_some(), "and so was the synchronized update");
         g.process("\x1b[?2026l");
+    }
+
+    /// Narrowing the window must re-break lines, not cut their tails off.
+    ///
+    /// The old resize called `row.resize(new_cols, blank)` on every row, which
+    /// destroyed text that had already been printed — a terminal losing output
+    /// because the window got smaller.
+    #[test]
+    fn narrowing_reflows_instead_of_truncating() {
+        let mut g = Grid::with_size(6, 40);
+        let text = "the quick brown fox jumps over the lazy dog";
+        g.process(text);
+
+        g.resize(6, 20);
+        let after = g.all_text();
+        let joined: String = after.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            joined.contains("lazy dog"),
+            "the tail survived the narrowing: {joined:?}",
+        );
+        for word in ["quick", "brown", "jumps"] {
+            assert!(joined.contains(word), "{word:?} was lost: {joined:?}");
+        }
+    }
+
+    /// And widening must put the line back together rather than leaving the old
+    /// breaks frozen in place.
+    #[test]
+    fn widening_rejoins_a_wrapped_line() {
+        let mut g = Grid::with_size(8, 20);
+        g.process("abcdefghijklmnopqrstuvwxyz0123456789");
+
+        g.resize(8, 60);
+        let rows: Vec<String> = (0..8).map(|r| g.row_text(r)).collect();
+        let first: &String = rows.iter().find(|r| r.contains("abc")).expect("the line");
+        assert!(
+            first.contains("xyz0123456789"),
+            "rejoined onto one row at the wider size: {first:?}",
+        );
+    }
+
+    /// A round trip must not corrupt anything: narrow, then widen back.
+    #[test]
+    fn a_narrow_then_widen_round_trip_preserves_the_text() {
+        let mut g = Grid::with_size(10, 60);
+        let lines = ["first line of output", "second line here", "third and last"];
+        for line in lines {
+            g.process(line);
+            g.process("\r\n");
+        }
+
+        g.resize(10, 15);
+        g.resize(10, 60);
+
+        let text = g.all_text();
+        for line in lines {
+            let squashed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let want: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(squashed.contains(&want), "{want:?} lost: {squashed:?}");
+        }
+    }
+
+    /// Hard newlines are not continuations, so separate lines must stay separate
+    /// however the window is resized.
+    #[test]
+    fn separate_lines_are_never_joined_by_a_resize() {
+        let mut g = Grid::with_size(8, 40);
+        g.process("alpha\r\nbeta\r\ngamma");
+
+        g.resize(8, 100);
+        let rows: Vec<String> = (0..8).map(|r| g.row_text(r).trim_end().to_string()).collect();
+        assert!(rows.iter().any(|r| r == "alpha"), "alpha stands alone: {rows:?}");
+        assert!(rows.iter().any(|r| r == "beta"), "beta stands alone: {rows:?}");
+        assert!(rows.iter().any(|r| r == "gamma"), "gamma stands alone: {rows:?}");
+    }
+
+    /// With autowrap off nothing is a continuation, so a resize must not join
+    /// lines a full-screen application drew as separate rows.
+    #[test]
+    fn lines_drawn_with_autowrap_off_are_not_joined() {
+        let mut g = Grid::with_size(4, 10);
+        g.process("\x1b[?7l");
+        g.process("\x1b[1;1Habcdefghij");   // exactly fills row 1
+        g.process("\x1b[2;1Hklmnopqrst");   // exactly fills row 2
+
+        g.resize(4, 30);
+        let rows: Vec<String> = (0..4).map(|r| g.row_text(r).trim_end().to_string()).collect();
+        assert!(
+            rows.iter().any(|r| r == "abcdefghij"),
+            "the first row was not absorbed into a longer line: {rows:?}",
+        );
+    }
+
+    /// The flags must stay the same length as the rows they describe, through
+    /// scrolling and the alternate screen.
+    #[test]
+    fn the_wrap_flags_stay_in_step_with_the_rows() {
+        let mut g = Grid::with_size(5, 20);
+        filled(&mut g, 40, "line");
+        assert_eq!(g.viewport.len(), g.wrapped.len(), "after scrolling");
+        assert_eq!(g.scrollback.len(), g.sb_wrapped.len());
+
+        g.process("\x1b[?1049h");
+        filled(&mut g, 20, "alt");
+        assert_eq!(g.viewport.len(), g.wrapped.len(), "on the alternate screen");
+        g.process("\x1b[?1049l");
+        assert_eq!(g.viewport.len(), g.wrapped.len(), "back on the main screen");
+        assert_eq!(g.scrollback.len(), g.sb_wrapped.len());
+
+        g.resize(8, 35);
+        assert_eq!(g.viewport.len(), g.wrapped.len(), "after a resize");
+        assert_eq!(g.scrollback.len(), g.sb_wrapped.len());
+    }
+
+    /// Resizing an empty grid must still leave a full viewport.
+    #[test]
+    fn resizing_an_empty_grid_keeps_a_full_viewport() {
+        let mut g = Grid::with_size(5, 20);
+        g.resize(9, 7);
+        assert_eq!(g.viewport.len(), 9);
+        assert!(g.viewport.iter().all(|r| r.len() == 7));
+    }
+
+    /// Every size must be survivable, including degenerate ones.
+    #[test]
+    fn no_resize_sequence_panics() {
+        let mut g = Grid::with_size(10, 40);
+        filled(&mut g, 30, "content that is long enough to wrap at small widths");
+        for (rows, cols) in [(1usize, 1usize), (2, 3), (60, 200), (5, 1), (1, 200), (10, 40)] {
+            g.resize(rows, cols);
+            assert_eq!(g.viewport.len(), g.rows);
+            assert_eq!(g.viewport.len(), g.wrapped.len());
+        }
     }
 
     /// Each terminal must have its own scroll identity.

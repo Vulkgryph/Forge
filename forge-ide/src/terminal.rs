@@ -835,6 +835,16 @@ enum PtyBackend {
     Direct { master: Box<dyn portable_pty::MasterPty + Send>, writer: Box<dyn Write + Send> },
 }
 
+/// Hands out a distinct scroll id per terminal.
+///
+/// Monotonic rather than reusing freed values: an id reused by a new terminal
+/// would inherit the previous occupant's remembered scroll offset.
+fn next_scroll_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Terminal {
     // Deferred until first draw() when we know the real panel size.
     // `None` for a terminal constructed via `reattach` — already running.
@@ -843,6 +853,14 @@ pub struct Terminal {
     /// This session's id in the pty-host daemon, if backed by one — `None`
     /// for the direct-PTY fallback, which has no cross-restart identity.
     pty_id:    Option<u32>,
+    /// Distinguishes this terminal's scroll position from every other one's.
+    ///
+    /// egui keys a scroll area's remembered offset by id, and every terminal was
+    /// using the same literal — so all of them shared one offset. Switching to
+    /// another shell overwrote it, and switching back applied the other shell's
+    /// position against different content, which jumped the view to the top.
+    /// A per-instance value keeps each shell's place.
+    scroll_id: u64,
     pub grid:  Arc<Mutex<Grid>>,
     /// Kept for the terminal's lifetime (not just transiently for spawn) so
     /// session persistence can record which directory each tab was in.
@@ -961,6 +979,7 @@ impl Terminal {
             pending:   Some(cwd.to_path_buf()),
             backend:   None,
             pty_id:    None,
+            scroll_id: next_scroll_id(),
             grid:          Arc::new(Mutex::new(Grid::new())),
             cwd:           cwd.to_path_buf(),
             focused:       false,
@@ -1024,6 +1043,7 @@ impl Terminal {
             pending: None,
             backend: Some(PtyBackend::Daemon { client, id }),
             pty_id:  Some(id),
+            scroll_id: next_scroll_id(),
             grid,
             cwd:       cwd.to_path_buf(),
             focused:       false,
@@ -1237,7 +1257,8 @@ impl Terminal {
         };
 
         let scroll_resp = egui::ScrollArea::vertical()
-            .id_salt("term_scroll")
+            // Per-terminal, so each shell keeps its own scroll position.
+            .id_salt(("term_scroll", self.scroll_id))
             .auto_shrink([false, false])
             // Stickiness is tracked here rather than left to egui's own
             // `scroll_stuck_to_end`, because that flag is private and is only
@@ -1781,6 +1802,36 @@ mod private_mode_tests {
         assert!(g.cursor_visible(), "cursor visibility applied from a batch");
         assert!(g.sync_update.is_some(), "and so was the synchronized update");
         g.process("\x1b[?2026l");
+    }
+
+    /// Each terminal must have its own scroll identity.
+    ///
+    /// egui remembers a scroll area's offset by id, and every terminal shared one
+    /// literal — so switching from shell 1 to shell 2 and back applied shell 2's
+    /// offset to shell 1's content, which jumped the view to the top.
+    #[test]
+    fn terminals_get_distinct_scroll_ids() {
+        let dir = std::env::temp_dir();
+        let a = super::Terminal::new(&dir);
+        let b = super::Terminal::new(&dir);
+        let c = super::Terminal::new(&dir);
+        assert_ne!(a.scroll_id, b.scroll_id, "two terminals, two positions");
+        assert_ne!(b.scroll_id, c.scroll_id);
+        assert_ne!(a.scroll_id, c.scroll_id);
+    }
+
+    /// Ids must not be reused, or a new terminal inherits the remembered offset
+    /// of whichever one previously held that id.
+    #[test]
+    fn scroll_ids_are_not_reused_after_a_terminal_is_dropped() {
+        let dir = std::env::temp_dir();
+        let first = super::Terminal::new(&dir).scroll_id;
+        // Create and drop several.
+        for _ in 0..3 {
+            let _ = super::Terminal::new(&dir);
+        }
+        let later = super::Terminal::new(&dir).scroll_id;
+        assert!(later > first, "ids only move forwards: {first} then {later}");
     }
 
     /// Every Ctrl+letter has to reach the program.

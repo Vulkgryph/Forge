@@ -1061,7 +1061,6 @@ mod tests {
     fn switching_model_from_the_menu_sends_the_message() {
         use forge_agent_proto::{EndpointInfo, EndpointReasoningConfig};
         let mut app = App::new();
-        let screen = Screen::new(80, 24);
         app.session_mut().apply(AgentMessage::Init(Box::new(Init {
             model_name: "First".into(),
             model_id: "first-1".into(),
@@ -1435,7 +1434,6 @@ mod tests {
     #[test]
     fn ctrl_t_expands_and_collapses_reasoning() {
         let mut app = App::new();
-        let screen = Screen::new(60, 20);
         app.session_mut().apply(AgentMessage::Reasoning);
         app.session_mut().apply(AgentMessage::ReasoningToken {
             content: "the hidden thought".into(),

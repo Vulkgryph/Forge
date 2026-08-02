@@ -47,14 +47,20 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 pub struct Inline {
     cols: usize,
     rows: usize,
-    /// Display rows the live region currently occupies, which is exactly how far
-    /// up the cursor must move to redraw it.
+    /// Display rows the live region currently occupies.
     live_rows: usize,
+    /// Which row of the block the cursor was left on.
+    ///
+    /// Not always the last: placing the caret at the prompt leaves it above the
+    /// context bar. Erasing has to move up from where the cursor *is*, and
+    /// assuming it sat on the final row climbed one row too far on every redraw,
+    /// eating a line of committed transcript each time.
+    cursor_row: usize,
 }
 
 impl Inline {
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self { cols, rows, live_rows: 0 }
+        Self { cols, rows, live_rows: 0, cursor_row: 0 }
     }
 
     pub fn cols(&self) -> usize {
@@ -84,6 +90,7 @@ impl Inline {
         self.cols = cols;
         self.rows = rows;
         self.live_rows = 0;
+        self.cursor_row = 0;
     }
 
     /// Print lines permanently. They scroll into the terminal's scrollback and
@@ -101,6 +108,7 @@ impl Inline {
             buf.push_str("\r\n");
         }
         self.live_rows = 0;
+        self.cursor_row = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
     }
@@ -127,6 +135,9 @@ impl Inline {
             }
         }
         self.live_rows = lines.len();
+        // Printing ends on the final row; recorded so the next erase knows where
+        // to climb from, and corrected below if the caret is moved.
+        self.cursor_row = lines.len().saturating_sub(1);
 
         // Park the caret. Positions are relative to the block, since absolute
         // addressing is meaningless when the block's place on screen moves as
@@ -142,6 +153,7 @@ impl Inline {
                 buf.push_str(&format!("\x1b[{col}C"));
             }
             buf.push_str(SHOW_CURSOR);
+            self.cursor_row = row;
         }
 
         buf.push_str(SYNC_END);
@@ -150,15 +162,19 @@ impl Inline {
     }
 
     /// Move to the start of the live region and erase it.
+    ///
+    /// Climbs from where the cursor actually is, which is not necessarily the
+    /// block's last row — the caret is parked at the prompt, above the context
+    /// bar. Using `live_rows - 1` regardless overshot by however far the caret
+    /// had been moved up, and erased that many rows of committed transcript on
+    /// every single redraw.
     fn erase_live(&self, buf: &mut String) {
+        buf.push('\r');
         if self.live_rows == 0 {
-            buf.push('\r');
             buf.push_str(ERASE_DOWN);
             return;
         }
-        buf.push('\r');
-        // The cursor sits on the block's last row, so move up the rest.
-        let up = self.live_rows - 1;
+        let up = self.cursor_row;
         if up > 0 {
             buf.push_str(&format!("\x1b[{up}A"));
         }
@@ -169,8 +185,15 @@ impl Inline {
     pub fn finish(&mut self, out: &mut impl Write) -> io::Result<()> {
         let mut buf = String::new();
         buf.push_str(SHOW_CURSOR);
+        // Down to the block's last row first, or the shell prompt would be
+        // printed over the bottom of what we drew.
+        let down = self.live_rows.saturating_sub(1).saturating_sub(self.cursor_row);
+        if down > 0 {
+            buf.push_str(&format!("\x1b[{down}B"));
+        }
         buf.push_str("\r\n");
         self.live_rows = 0;
+        self.cursor_row = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
     }
@@ -265,6 +288,72 @@ mod tests {
         // Three rows were printed, so the cursor moves up two from the last.
         assert!(got.contains("\x1b[2A"), "expected an up-2, got {got:?}");
         assert!(got.contains(ERASE_DOWN), "and an erase-to-end");
+    }
+
+    /// Redrawing after the caret was parked above the block's last row must
+    /// climb from where the caret *is*, not from the last row.
+    ///
+    /// This is the bug that let a keypress eat the transcript: the prompt sits
+    /// above the context bar, so the caret ends one row up, and erasing as though
+    /// it were on the final row overshot by one and erased a committed line —
+    /// every redraw, so holding a key walked up through the conversation.
+    #[test]
+    fn redrawing_climbs_from_the_caret_not_the_last_row() {
+        let mut inline = Inline::new(40, 10);
+        let mut out = sink();
+
+        // Three rows, caret parked on the middle one — as the prompt is, with a
+        // context bar beneath it.
+        inline
+            .draw_live(&mut out, &[line("a"), line("prompt"), line("bar")], Some((1, 2)))
+            .unwrap();
+        out.clear();
+
+        inline.draw_live(&mut out, &[line("a"), line("prompt"), line("bar")], Some((1, 2)))
+            .unwrap();
+        let got = text(&out);
+        assert!(
+            got.contains("\x1b[1A"),
+            "must climb one row, from the caret: {got:?}",
+        );
+        assert!(
+            !got.contains("\x1b[2A"),
+            "climbing two would erase a committed line: {got:?}",
+        );
+    }
+
+    /// The same, with the caret on the first row of a tall block.
+    #[test]
+    fn a_caret_on_the_first_row_climbs_nothing() {
+        let mut inline = Inline::new(40, 10);
+        let mut out = sink();
+        inline
+            .draw_live(&mut out, &[line("prompt"), line("b"), line("c")], Some((0, 0)))
+            .unwrap();
+        out.clear();
+
+        inline.draw_live(&mut out, &[line("prompt")], None).unwrap();
+        let got = text(&out);
+        assert!(
+            !got.contains("A"),
+            "the caret was already at the top; nothing to climb: {got:?}",
+        );
+    }
+
+    /// Exiting must first come back down past the caret, or the shell's prompt
+    /// prints over the bottom of what was drawn.
+    #[test]
+    fn finishing_moves_below_the_block_first() {
+        let mut inline = Inline::new(40, 10);
+        let mut out = sink();
+        inline
+            .draw_live(&mut out, &[line("a"), line("prompt"), line("bar")], Some((1, 0)))
+            .unwrap();
+        out.clear();
+
+        inline.finish(&mut out).unwrap();
+        let got = text(&out);
+        assert!(got.contains("\x1b[1B"), "descends past the context bar: {got:?}");
     }
 
     #[test]

@@ -220,32 +220,43 @@ fn main() -> io::Result<()> {
 }
 
 /// Replace this process with a fresh one, optionally resuming a session.
+///
+/// A genuine `exec`, not a spawn-and-wait. This function used to call
+/// `Command::status`, which starts a *child* and leaves this process running —
+/// and a running terminal program still has a thread blocked reading the tty. Two
+/// readers on one terminal means every keystroke goes to whichever wins the race,
+/// so half of the user's typing vanished into the parent that no longer drew
+/// anything. It looked exactly like needing to press each key twice, and only
+/// after resuming a session, because that is the one path that restarts.
 fn exec_restart(opts: &Options, resume: Option<String>) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut args: Vec<String> = Vec::new();
     if let Some(dir) = &opts.cwd {
-        cmd.arg("--cwd").arg(dir);
+        args.push("--cwd".into());
+        args.push(dir.display().to_string());
     }
     // Carry the original flags across, minus any previous --resume-session: its
     // value is a session id, and keeping it would resume the wrong conversation
     // — or the same one forever, whatever the user just chose.
-    let mut args = opts.agent_args.iter();
-    while let Some(arg) = args.next() {
+    let mut original = opts.agent_args.iter();
+    while let Some(arg) = original.next() {
         if arg == "--resume-session" {
-            let _ = args.next(); // and its value
+            let _ = original.next(); // and its value
             continue;
         }
         if arg == "--headless" {
             continue; // added by the bridge
         }
-        cmd.arg(arg);
+        args.push(arg.clone());
     }
     if let Some(id) = resume {
-        cmd.arg("--resume-session").arg(id);
+        args.push("--resume-session".into());
+        args.push(id);
     }
 
-    let status = cmd.status()?;
-    std::process::exit(status.code().unwrap_or(0));
+    // Only returns if the replacement failed, in which case this process is
+    // still the one running and has to say so.
+    Err(sys::exec(&exe, &args))
 }
 
 /// What the loop should do after carrying out a batch of effects.

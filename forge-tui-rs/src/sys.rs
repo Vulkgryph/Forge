@@ -21,7 +21,7 @@
 
 #![cfg(unix)]
 
-use std::os::raw::{c_int, c_short, c_ulong, c_ushort, c_void};
+use std::os::raw::{c_char, c_int, c_short, c_ulong, c_ushort, c_void};
 
 /// Opaque terminal settings.
 ///
@@ -94,6 +94,50 @@ unsafe extern "C" {
     fn signal(sig: c_int, handler: usize) -> usize;
     fn raise(sig: c_int) -> c_int;
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout_ms: c_int) -> c_int;
+    fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
+}
+
+/// Replace this process with another program.
+///
+/// Only returns on failure — on success there is no "after", because the image is
+/// gone. That is the entire point: spawning a child instead leaves this process
+/// alive, and a terminal program that is still running has threads still reading
+/// the tty. Two readers on one terminal means each keystroke goes to whichever
+/// wins the race, so roughly half of the user's typing disappears into the
+/// process that is no longer drawing anything.
+pub fn exec(program: &std::path::Path, args: &[String]) -> std::io::Error {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(program.as_os_str().as_bytes()) else {
+        return std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "program path contains a nul byte",
+        );
+    };
+
+    // argv[0] is conventionally the program itself, and the array is
+    // NULL-terminated.
+    let mut owned = vec![path.clone()];
+    for arg in args {
+        match CString::new(arg.as_bytes()) {
+            Ok(c) => owned.push(c),
+            Err(_) => {
+                return std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "argument contains a nul byte",
+                )
+            }
+        }
+    }
+    let mut argv: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // SAFETY: `path` and every element of `argv` are valid nul-terminated
+    // strings owned by `owned`, which outlives the call, and `argv` is
+    // NULL-terminated as execv requires.
+    unsafe { execv(path.as_ptr(), argv.as_ptr()) };
+    std::io::Error::last_os_error()
 }
 
 /// What a wait ended with.
@@ -279,6 +323,22 @@ mod tests {
         use std::os::fd::AsRawFd;
         let mut buf = [0u8; 16];
         assert_eq!(read_bytes(file.as_raw_fd(), &mut buf), Some(0));
+    }
+
+    /// A failing exec must report rather than return success — the caller has to
+    /// know the process was *not* replaced, because it is still running.
+    #[test]
+    fn exec_of_a_missing_program_returns_an_error() {
+        let err = exec(std::path::Path::new("/nonexistent/program"), &[]);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "got {err}");
+    }
+
+    /// Paths and arguments become C strings, so an embedded nul must be refused
+    /// rather than silently truncating the argument.
+    #[test]
+    fn exec_refuses_arguments_containing_a_nul() {
+        let err = exec(std::path::Path::new("/bin/sh"), &["a\0b".to_string()]);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

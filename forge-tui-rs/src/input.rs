@@ -48,7 +48,10 @@ pub fn bind(key: Key) -> Option<Input> {
         // Unbound: Tab, arrows we do not use for navigation, and any control
         // chord not listed above. Dropped rather than inserted as a stray
         // control character into the input line.
-        Key::Tab | Key::Left | Key::Right | Key::Delete | Key::Ctrl(_) => return None,
+        // Tab completes a slash command.
+        Key::Tab => Input::Complete,
+
+        Key::Left | Key::Right | Key::Delete | Key::Ctrl(_) => return None,
     })
 }
 
@@ -114,7 +117,7 @@ mod tests {
     /// control character into the input line.
     #[test]
     fn unbound_keys_are_dropped() {
-        for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Tab, Key::Delete] {
+        for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Delete] {
             assert_eq!(bind(key.clone()), None, "{key:?} should be unbound");
         }
     }
@@ -127,6 +130,11 @@ mod tests {
     }
 
     /// The menu still needs a key, or model switching is unreachable.
+    #[test]
+    fn tab_completes_a_command() {
+        assert_eq!(bind(Key::Tab), Some(Input::Complete));
+    }
+
     #[test]
     fn ctrl_o_opens_the_menu() {
         assert_eq!(bind(Key::Ctrl('o')), Some(Input::Menu));

@@ -86,6 +86,11 @@ fn main() -> io::Result<()> {
 
     let events = merge_sources(&mut bridge);
 
+    // Set when the session ends because the agent should be restarted, carrying
+    // the session id to resume. Resuming is a restart because the agent has no
+    // runtime path for it — only the `--resume-session` flag at startup.
+    let mut restart: Option<Option<String>> = None;
+
     app.render(&mut inline, &mut out)?;
 
     'session: loop {
@@ -112,16 +117,29 @@ fn main() -> io::Result<()> {
 
                 Event::Key(decoded) => {
                     let (outcome, effects) = app.update(decoded, inline.rows());
-                    if outcome == Outcome::Quit || !dispatch(&mut bridge, effects) {
+                    if outcome == Outcome::Quit {
                         break 'session;
+                    }
+                    match dispatch(&mut bridge, effects) {
+                        Next::Continue => {}
+                        Next::Stop => break 'session,
+                        Next::Restart(resume) => {
+                            restart = Some(resume);
+                            break 'session;
+                        }
                     }
                 }
 
                 Event::Agent(BridgeEvent::Message(msg)) => {
                     let effects = app.session_mut().apply(*msg);
                     app.follow_tail();
-                    if !dispatch(&mut bridge, effects) {
-                        break 'session;
+                    match dispatch(&mut bridge, effects) {
+                        Next::Continue => {}
+                        Next::Stop => break 'session,
+                        Next::Restart(resume) => {
+                            restart = Some(resume);
+                            break 'session;
+                        }
                     }
                 }
 
@@ -164,25 +182,74 @@ fn main() -> io::Result<()> {
     inline.finish(&mut out)?;
     out.flush()?;
     bridge.shutdown(SHUTDOWN_GRACE);
+
+    // A restart replaces this process, so the new agent starts with a clean
+    // terminal and the guard above has already put it back. `exec` rather than a
+    // nested loop: the alternative is threading a second bridge and its reader
+    // threads through the loop, and the process has nothing left worth keeping.
+    if let Some(resume) = restart {
+        drop(_guard);
+        return exec_restart(&opts, resume);
+    }
     Ok(())
 }
 
-/// Carry out what the state machine asked for. False means the agent is gone.
-fn dispatch(bridge: &mut AgentBridge, effects: Vec<Effect>) -> bool {
+/// Replace this process with a fresh one, optionally resuming a session.
+fn exec_restart(opts: &Options, resume: Option<String>) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(dir) = &opts.cwd {
+        cmd.arg("--cwd").arg(dir);
+    }
+    // Carry the original flags across, minus any previous --resume-session: its
+    // value is a session id, and keeping it would resume the wrong conversation
+    // — or the same one forever, whatever the user just chose.
+    let mut args = opts.agent_args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--resume-session" {
+            let _ = args.next(); // and its value
+            continue;
+        }
+        if arg == "--headless" {
+            continue; // added by the bridge
+        }
+        cmd.arg(arg);
+    }
+    if let Some(id) = resume {
+        cmd.arg("--resume-session").arg(id);
+    }
+
+    let status = cmd.status()?;
+    std::process::exit(status.code().unwrap_or(0));
+}
+
+/// What the loop should do after carrying out a batch of effects.
+enum Next {
+    Continue,
+    /// The agent is gone, or was asked to leave.
+    Stop,
+    /// Restart it, optionally resuming a saved session.
+    Restart(Option<String>),
+}
+
+/// Carry out what the state machine asked for.
+fn dispatch(bridge: &mut AgentBridge, effects: Vec<Effect>) -> Next {
     for effect in effects {
         match effect {
             Effect::Send(msg) => {
                 if bridge.send(&msg).is_err() {
-                    return false;
+                    return Next::Stop;
                 }
             }
+            Effect::Restart { resume } => return Next::Restart(resume),
+            Effect::Quit => return Next::Stop,
             Effect::TurnComplete => {
                 // Deliberately silent. A bell belongs behind a setting, and an
                 // unconfigurable one is worse than none.
             }
         }
     }
-    true
+    Next::Continue
 }
 
 /// Fold the terminal and the agent into one channel.

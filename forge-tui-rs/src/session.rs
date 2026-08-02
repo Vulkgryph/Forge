@@ -182,6 +182,14 @@ pub enum Effect {
     Send(ClientMessage),
     /// The turn finished; ring the terminal bell if the user is not watching.
     TurnComplete,
+    /// Restart the agent process, optionally resuming a saved session.
+    ///
+    /// Resuming is a restart because the agent has no runtime path for it:
+    /// `ResumeSession` is accepted and ignored, and the only working route is the
+    /// `--resume-session` flag at startup.
+    Restart { resume: Option<String> },
+    /// Leave.
+    Quit,
 }
 
 /// Everything known about the current session.

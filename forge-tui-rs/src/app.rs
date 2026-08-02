@@ -10,7 +10,8 @@ use forge_agent_proto::ClientMessage;
 
 use crate::dialog::{Decision, Dialog};
 use crate::markdown::{self, Line, Span};
-use crate::menu::{self, Menu};
+use crate::commands::{self, Command};
+use crate::menu::{self, Menu, Page};
 use crate::screen::{Screen, Style};
 use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
 use crate::widgets::{self, Rect};
@@ -42,6 +43,8 @@ pub enum Input {
     Menu,
     /// Show or hide the full text of reasoning blocks.
     ToggleReasoning,
+    /// Complete the slash command being typed.
+    Complete,
     Quit,
     Resize(usize, usize),
 }
@@ -82,6 +85,8 @@ pub struct App {
     /// The menu, when open. Takes the whole screen, so the transcript is hidden
     /// while it is up.
     menu:    Option<Menu>,
+    /// Which suggestion is highlighted while a slash command is being typed.
+    suggestion: usize,
     /// How many transcript entries have been printed permanently.
     ///
     /// Everything before the current turn is settled and gets committed to the
@@ -105,6 +110,7 @@ impl App {
             cache: None,
             dialog: None,
             menu: None,
+            suggestion: 0,
             committed: 0,
         }
     }
@@ -233,6 +239,13 @@ impl App {
                 }
             }
 
+            Input::Complete => {
+                if let Some(entry) = self.selected_suggestion() {
+                    self.input = entry.command.to_string();
+                    self.suggestion = 0;
+                }
+            }
+
             Input::ToggleReasoning => {
                 self.session.toggle_reasoning();
                 self.cache = None;
@@ -240,6 +253,7 @@ impl App {
 
             Input::Char(c) => {
                 self.input.push(c);
+                self.suggestion = 0;
                 self.follow_tail();
             }
 
@@ -258,14 +272,34 @@ impl App {
                     let keep = self.input.len() - last.len();
                     self.input.truncate(keep);
                 }
+                self.suggestion = 0;
             }
 
             Input::Enter => {
+                // A highlighted suggestion is what Enter runs. Submitting the
+                // half-typed text instead would report it as an unknown command,
+                // which is what the prompt's "Enter select/run" hint rules out.
+                if let Some(entry) = self.selected_suggestion() {
+                    let command = entry.command;
+                    self.input.clear();
+                    self.suggestion = 0;
+                    if let Some(parsed) = commands::parse(command) {
+                        return self.run_command(parsed);
+                    }
+                }
+
                 let text = self.input.trim().to_string();
                 self.input.clear();
+                self.suggestion = 0;
                 if text.is_empty() {
                     return (Outcome::Continue, Vec::new());
                 }
+                // A slash command is for us, not the model. Sending it as a
+                // message would have the agent answer questions about it.
+                if let Some(command) = commands::parse(&text) {
+                    return self.run_command(command);
+                }
+
                 self.session_mut().push_user(&text);
                 self.follow_tail();
                 return (
@@ -274,8 +308,19 @@ impl App {
                 );
             }
 
-            // Scrolling belongs to the terminal now: the transcript is printed
-            // into its scrollback, so the mouse wheel and the scrollbar work on
+            // With suggestions showing, the arrows move through them — that is
+            // what the prompt's own hint promises.
+            Input::Up if self.has_suggestions() => {
+                let n = self.suggestions().len();
+                self.suggestion = if self.suggestion == 0 { n - 1 } else { self.suggestion - 1 };
+            }
+            Input::Down if self.has_suggestions() => {
+                let n = self.suggestions().len();
+                self.suggestion = (self.suggestion + 1) % n;
+            }
+
+            // Otherwise scrolling belongs to the terminal: the transcript is
+            // printed into its scrollback, so the wheel and the scrollbar work on
             // the real history rather than on a window we maintain.
             Input::Up | Input::Down | Input::PageUp | Input::PageDown
             | Input::Home | Input::End => {}
@@ -286,6 +331,56 @@ impl App {
     }
 
     /// Turn a dialog decision into session calls.
+    /// Carry out a slash command.
+    fn run_command(&mut self, command: Command) -> (Outcome, Vec<Effect>) {
+        let send = |msg| (Outcome::Continue, vec![Effect::Send(msg)]);
+        match command {
+            Command::Quit => (Outcome::Quit, Vec::new()),
+            Command::Restart => (Outcome::Continue, vec![Effect::Restart { resume: None }]),
+            Command::Clear => send(ClientMessage::ClearSession),
+            Command::Compact => send(ClientMessage::Compact),
+            Command::Usage => send(ClientMessage::RequestUsage),
+            Command::Plan => send(ClientMessage::EnterPlanMode),
+            Command::Login => send(ClientMessage::LoginChatgpt),
+
+            Command::Log => {
+                let path = if self.session.log_path.is_empty() {
+                    "no log path yet".to_string()
+                } else {
+                    self.session.log_path.clone()
+                };
+                self.session_mut().push_system(path);
+                (Outcome::Continue, Vec::new())
+            }
+
+            Command::Help => {
+                self.session_mut().push_system(commands::help_text());
+                (Outcome::Continue, Vec::new())
+            }
+
+            Command::OpenMenu(page) => {
+                self.menu = Some(Menu::at(match page {
+                    commands::Page::Models => Page::Models,
+                    commands::Page::Settings => Page::Settings,
+                    commands::Page::ContextStrategy => Page::ContextStrategy,
+                    commands::Page::Subagents => Page::Subagents,
+                    commands::Page::Rewind => Page::Rewind,
+                    commands::Page::Sessions => Page::Sessions,
+                    commands::Page::Thinking => Page::Thinking,
+                }));
+                (Outcome::Continue, Vec::new())
+            }
+
+            Command::Unknown(name) => {
+                // Say so rather than sending it to the model, which would answer
+                // a question about a command that does not exist.
+                self.session_mut()
+                    .push_system(format!("{name} is not a command. /help lists them."));
+                (Outcome::Continue, Vec::new())
+            }
+        }
+    }
+
     fn decide(&mut self, decision: Decision) -> Vec<Effect> {
         let is_rewind = matches!(self.session.pending, Some(Pending::Rewind { .. }));
         let effects = match decision {
@@ -528,6 +623,7 @@ impl App {
         chrome.extend(self.subagent_lines(cols));
         let dialog_lines = self.dialog_lines(cols, capacity);
         chrome.extend(dialog_lines);
+        chrome.extend(self.suggestion_lines(cols));
         let prompt_offset = chrome.len();
         chrome.push(self.prompt_line(cols));
         chrome.push(self.context_bar_line(cols));
@@ -609,6 +705,83 @@ impl App {
         canvas.begin_frame();
         dialog.draw(&mut canvas, Rect::new(0, 0, height, cols), palette::PROMPT);
         canvas.to_lines()
+    }
+
+    /// Commands matching what has been typed.
+    fn suggestions(&self) -> Vec<&'static commands::Entry> {
+        if self.dialog.is_some() || self.menu.is_some() {
+            return Vec::new();
+        }
+        commands::complete(&self.input)
+    }
+
+    fn has_suggestions(&self) -> bool {
+        !self.suggestions().is_empty()
+    }
+
+    /// The highlighted suggestion, if the list is showing.
+    ///
+    /// `None` once the input exactly matches a command, so Enter runs what was
+    /// typed rather than re-selecting it — and so a trailing argument, as
+    /// `/login chatgpt` has, is not thrown away.
+    fn selected_suggestion(&self) -> Option<&'static commands::Entry> {
+        let typed = self.input.trim();
+        if commands::TABLE.iter().any(|e| e.command == typed) {
+            return None;
+        }
+        let matches = self.suggestions();
+        matches.get(self.suggestion.min(matches.len().saturating_sub(1))).copied()
+    }
+
+    /// Matching commands, shown while a `/` is being typed.
+    fn suggestion_lines(&self, cols: usize) -> Vec<Line> {
+        if self.dialog.is_some() || !commands::is_command(&self.input) {
+            return Vec::new();
+        }
+        let matches = commands::complete(&self.input);
+        if matches.is_empty() {
+            return Vec::new();
+        }
+        let dim = Style::fg(palette::GRAY).dim();
+        // Enough to choose from without pushing the transcript off the screen.
+        let shown = matches.len().min(6);
+        // Keep the highlight in view when it is past the visible few.
+        let first = self.suggestion.saturating_sub(shown.saturating_sub(1));
+        let window = &matches[first..(first + shown).min(matches.len())];
+        let mut out: Vec<Line> = window
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| Line {
+                spans: vec![
+                    Span {
+                        text: format!(
+                            "{} {:<12}",
+                            if first + i == self.suggestion { "❯" } else { " " },
+                            entry.command,
+                        ),
+                        style: if first + i == self.suggestion {
+                            Style::fg(palette::PROMPT).bold()
+                        } else {
+                            Style::fg(palette::PROMPT)
+                        },
+                    },
+                    Span {
+                        text: widgets::clip(entry.description, cols.saturating_sub(16)),
+                        style: dim,
+                    },
+                ],
+            })
+            .collect();
+        let hidden = matches.len().saturating_sub(shown);
+        if hidden > 0 {
+            out.push(Line {
+                spans: vec![Span {
+                    text: format!("  … {hidden} more · ↑↓ move · Tab complete · Enter run"),
+                    style: dim,
+                }],
+            });
+        }
+        out
     }
 
     fn prompt_line(&self, cols: usize) -> Line {
@@ -1028,6 +1201,261 @@ mod tests {
         );
         assert_eq!(app.input(), "", "the input line was not touched");
         assert!(app.session().pending.is_some(), "still waiting");
+    }
+
+    // ── Slash commands ────────────────────────────────────────────────────
+
+    /// The command the user actually needed: resuming a conversation.
+    #[test]
+    fn resume_opens_the_sessions_page() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/resume".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (outcome, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(outcome, Outcome::Continue);
+        assert!(effects.is_empty(), "opening a menu sends nothing");
+        assert!(app.menu_open(), "the sessions page is open");
+    }
+
+    /// A command must not be sent to the model, which would answer questions
+    /// about it instead of running it.
+    #[test]
+    fn a_command_is_not_sent_as_a_message() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/compact".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(
+            effects,
+            vec![Effect::Send(ClientMessage::Compact)],
+            "ran the command rather than sending the text",
+        );
+        assert!(
+            !app.session().entries().iter().any(|e| e.content.contains("/compact")),
+            "and it does not appear as a user message",
+        );
+    }
+
+    #[test]
+    fn commands_map_to_their_messages() {
+        for (typed, expected) in [
+            ("/clear", ClientMessage::ClearSession),
+            ("/compact", ClientMessage::Compact),
+            ("/usage", ClientMessage::RequestUsage),
+            ("/plan", ClientMessage::EnterPlanMode),
+            ("/login", ClientMessage::LoginChatgpt),
+        ] {
+            let (mut app, _rows) = app_with(0);
+            for c in typed.chars() {
+                app.update(Input::Char(c), ROWS);
+            }
+            let (_, effects) = app.update(Input::Enter, ROWS);
+            assert_eq!(effects, vec![Effect::Send(expected)], "{typed}");
+        }
+    }
+
+    #[test]
+    fn quit_commands_quit() {
+        for typed in ["/quit", "/exit"] {
+            let (mut app, _rows) = app_with(0);
+            for c in typed.chars() {
+                app.update(Input::Char(c), ROWS);
+            }
+            assert_eq!(app.update(Input::Enter, ROWS).0, Outcome::Quit, "{typed}");
+        }
+    }
+
+    #[test]
+    fn restart_asks_for_a_restart_without_a_session() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/restart".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(effects, vec![Effect::Restart { resume: None }]);
+    }
+
+    /// An unknown command must be reported, not handed to the model.
+    #[test]
+    fn an_unknown_command_is_reported_locally() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/nonsense".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert!(effects.is_empty(), "nothing sent to the agent");
+        let last = app.session().entries().last().unwrap();
+        assert!(last.content.contains("not a command"), "got {:?}", last.content);
+    }
+
+    #[test]
+    fn help_lists_the_commands_in_the_transcript() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/help".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Enter, ROWS);
+        let last = app.session().entries().last().unwrap();
+        assert!(last.content.contains("/resume"), "got {:?}", last.content);
+    }
+
+    /// Suggestions have to appear, or the commands are invisible.
+    #[test]
+    fn typing_a_slash_shows_suggestions() {
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Char('/'), ROWS);
+        let shown = live_text(&mut app);
+        assert!(shown.contains("/quit"), "suggestions are drawn: {shown:?}");
+        assert!(shown.contains("Exit Forge"), "with descriptions");
+        // The list is capped so it cannot push the transcript off the screen, and
+        // says how much it left out rather than silently truncating.
+        assert!(shown.contains("more"), "the remainder is acknowledged: {shown:?}");
+    }
+
+    /// Narrowing has to reach the commands that are past the visible few.
+    #[test]
+    fn a_prefix_surfaces_a_command_that_was_below_the_cut() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/res".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let shown = live_text(&mut app);
+        assert!(shown.contains("/resume"), "got {shown:?}");
+        assert!(shown.contains("Resume a saved session"));
+    }
+
+    #[test]
+    fn suggestions_narrow_as_you_type_and_vanish_for_plain_text() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/mod".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let shown = live_text(&mut app);
+        assert!(shown.contains("/model"), "got {shown:?}");
+        assert!(!shown.contains("/resume"), "unrelated commands are filtered out");
+
+        let (mut app, _rows) = app_with(0);
+        for c in "hello".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        assert!(!live_text(&mut app).contains("/model"), "no suggestions for prose");
+    }
+
+    #[test]
+    fn tab_completes_a_unique_command() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/comp".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Complete, ROWS);
+        assert_eq!(app.input(), "/compact");
+    }
+
+    /// Tab must not guess when several commands match.
+    /// Tab takes the highlighted suggestion, which is what the prompt's hint
+    /// promises. Refusing to act when several match would make the hint a lie.
+    #[test]
+    fn tab_takes_the_highlighted_suggestion() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/se".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Complete, ROWS);
+        assert!(
+            app.input() == "/settings" || app.input() == "/sessions",
+            "completed to a real command, got {:?}", app.input(),
+        );
+    }
+
+    /// The bug this replaced: Enter on a half-typed command reported it as
+    /// unknown instead of running the highlighted one.
+    #[test]
+    fn enter_runs_the_highlighted_suggestion_not_the_partial_text() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/resu".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (outcome, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(outcome, Outcome::Continue);
+        assert!(effects.is_empty(), "opening a menu sends nothing");
+        assert!(app.menu_open(), "/resume ran: {:?}", app.session().entries().last());
+        assert!(
+            !app.session().entries().iter().any(|e| e.content.contains("not a command")),
+            "nothing was reported as unknown",
+        );
+    }
+
+    /// `/res` is ambiguous — it matches `/restart` and `/resume`, and the first
+    /// in the table is highlighted. Worth pinning, because the two do very
+    /// different things and the order decides which Enter runs.
+    #[test]
+    fn an_ambiguous_prefix_highlights_the_first_match_and_the_rest_are_reachable() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/res".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(
+            effects,
+            vec![Effect::Restart { resume: None }],
+            "/restart is first in the table, so it is what Enter runs",
+        );
+
+        // One press down reaches /resume.
+        let (mut app, _rows) = app_with(0);
+        for c in "/res".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Down, ROWS);
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert!(effects.is_empty(), "a menu, not a restart");
+        assert!(app.menu_open());
+    }
+
+    /// Arrows move through the suggestions, as the hint says.
+    #[test]
+    fn arrows_move_through_the_suggestions() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/se".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Complete, ROWS);
+        let first = app.input().to_string();
+
+        let (mut app, _rows) = app_with(0);
+        for c in "/se".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Down, ROWS);
+        app.update(Input::Complete, ROWS);
+        assert_ne!(app.input(), first, "moving changed the choice");
+    }
+
+    /// A fully typed command with an argument must survive Enter, not be
+    /// replaced by a re-selected suggestion.
+    #[test]
+    fn a_command_with_an_argument_is_not_overwritten() {
+        let (mut app, _rows) = app_with(0);
+        for c in "/login chatgpt".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert_eq!(effects, vec![Effect::Send(ClientMessage::LoginChatgpt)]);
+    }
+
+    /// Arrows still do nothing when no suggestions are open, so they cannot
+    /// silently swallow input.
+    #[test]
+    fn arrows_are_inert_without_suggestions() {
+        let (mut app, _rows) = app_with(0);
+        for c in "hello".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Up, ROWS);
+        app.update(Input::Down, ROWS);
+        assert_eq!(app.input(), "hello");
     }
 
     // ── Menu ──────────────────────────────────────────────────────────────

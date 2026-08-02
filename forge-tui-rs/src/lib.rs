@@ -26,6 +26,7 @@
 
 pub mod app;
 pub mod bridge;
+pub mod commands;
 pub mod dialog;
 pub mod inline;
 pub mod input;
@@ -34,6 +35,7 @@ pub mod markdown;
 pub mod menu;
 pub mod screen;
 pub mod session;
+pub mod sessions;
 pub mod sys;
 pub mod term;
 pub mod widgets;

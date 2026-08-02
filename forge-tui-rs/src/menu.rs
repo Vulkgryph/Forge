@@ -18,7 +18,7 @@
 //! model switch or a tool toggle is reflected immediately without a separate
 //! invalidation path to forget.
 
-use forge_agent_proto::ClientMessage;
+use forge_agent_proto::{ClientMessage, EndpointInfo};
 
 use crate::app::Input;
 use crate::screen::{Screen as Canvas, Style};
@@ -39,6 +39,10 @@ pub enum Page {
     SubagentModel,
     WebModel,
     Rewind,
+    /// Saved sessions, read from disk.
+    Sessions,
+    /// Reasoning controls per endpoint.
+    Thinking,
 }
 
 impl Page {
@@ -55,6 +59,8 @@ impl Page {
             Page::SubagentModel => "Subagent default model",
             Page::WebModel => "Web tool model",
             Page::Rewind => "Rewind",
+            Page::Sessions => "Saved sessions",
+            Page::Thinking => "Reasoning",
         }
     }
 
@@ -71,6 +77,8 @@ impl Page {
             Page::SubagentModel => "Which model subagents use unless told otherwise.",
             Page::WebModel => "Which model summarises fetched pages.",
             Page::Rewind => "Return the conversation to an earlier point.",
+            Page::Sessions => "Resuming restarts the agent with that session loaded.",
+            Page::Thinking => "Enter cycles a provider's thinking between default, on and off.",
         }
     }
 }
@@ -85,6 +93,8 @@ enum Act {
     /// Go back one level.
     Back,
     Send(ClientMessage),
+    /// Restart the agent, optionally resuming a session.
+    Restart { resume: Option<String> },
     SetPermission(PermissionMode),
     /// Nothing — an informational row.
     None,
@@ -154,6 +164,12 @@ impl Menu {
         Self { stack: vec![Page::Root], selected: 0, scroll: 0 }
     }
 
+    /// Open at a particular page, with Root beneath it so Escape still goes back
+    /// rather than closing from a page the user did not navigate to.
+    pub fn at(page: Page) -> Self {
+        Self { stack: vec![Page::Root, page], selected: 0, scroll: 0 }
+    }
+
     pub fn page(&self) -> &Page {
         self.stack.last().expect("the stack is never empty")
     }
@@ -182,6 +198,12 @@ impl Menu {
                           Act::Send(ClientMessage::Compact)),
                 Item::row("Clear session", "start over, keeping the project",
                           Act::Send(ClientMessage::ClearSession)),
+                Item::row(
+                    "Saved sessions",
+                    "resume an earlier conversation",
+                    Act::Open(Page::Sessions),
+                ),
+                Item::row("Reasoning", "thinking controls", Act::Open(Page::Thinking)),
                 Item::row("Close", "back to the conversation", Act::Close),
             ],
 
@@ -359,6 +381,49 @@ impl Menu {
                 items
             }
 
+            Page::Sessions => {
+                let sessions = crate::sessions::list(std::path::Path::new(
+                    &session.project_root,
+                ));
+                if sessions.is_empty() {
+                    vec![Item::row(
+                        "No saved sessions",
+                        "nothing to resume in this project",
+                        Act::Back,
+                    )]
+                } else {
+                    sessions
+                        .iter()
+                        .map(|meta| {
+                            Item::row(
+                                meta.label(),
+                                meta.detail(),
+                                Act::Restart { resume: Some(meta.id.clone()) },
+                            )
+                            .marked(session.session_id.as_deref() == Some(meta.id.as_str()))
+                        })
+                        .collect()
+                }
+            }
+
+            Page::Thinking => session
+                .endpoints
+                .iter()
+                .map(|ep| {
+                    let current = describe_thinking(ep);
+                    let mut next = ep.reasoning;
+                    cycle_thinking(&mut next, &ep.endpoint_type);
+                    Item::row(
+                        ep.name.clone(),
+                        format!("{} · {current}", ep.endpoint_type),
+                        Act::Send(ClientMessage::UpdateEndpointReasoning {
+                            endpoint_name: ep.name.clone(),
+                            reasoning: next,
+                        }),
+                    )
+                })
+                .collect(),
+
             Page::Rewind => {
                 if session.checkpoints.is_empty() {
                     vec![Item::row("No checkpoints yet", "nothing to rewind to", Act::Back)]
@@ -495,6 +560,9 @@ impl Menu {
             Act::Close => Outcome::Close,
             Act::None => Outcome::Stay,
             Act::Send(msg) => Outcome::Act(vec![Effect::Send(msg.clone())]),
+            Act::Restart { resume } => {
+                Outcome::Act(vec![Effect::Restart { resume: resume.clone() }])
+            }
             Act::SetPermission(mode) => {
                 // The agent only offers a toggle, so reaching a specific mode
                 // means sending it only when it would actually change.
@@ -641,6 +709,38 @@ impl Menu {
                            Style::fg(245).dim());
             }
         }
+    }
+}
+
+/// A one-word summary of a provider's thinking setting.
+fn describe_thinking(ep: &EndpointInfo) -> &'static str {
+    use forge_agent_proto::ProviderToggle::*;
+    let toggle = match ep.endpoint_type.as_str() {
+        "anthropic" => ep.reasoning.anthropic.thinking,
+        _ => ep.reasoning.open_ai_compatible.thinking,
+    };
+    match toggle {
+        ProviderDefault => "default",
+        On => "on",
+        Off => "off",
+    }
+}
+
+/// Advance a provider's thinking toggle one step, so Enter cycles it.
+///
+/// Which field applies depends on the endpoint type — the same struct carries
+/// settings for all three providers, and writing the wrong one would appear to do
+/// nothing.
+fn cycle_thinking(cfg: &mut forge_agent_proto::EndpointReasoningConfig, endpoint_type: &str) {
+    use forge_agent_proto::ProviderToggle::*;
+    let next = |t: forge_agent_proto::ProviderToggle| match t {
+        ProviderDefault => On,
+        On => Off,
+        Off => ProviderDefault,
+    };
+    match endpoint_type {
+        "anthropic" => cfg.anthropic.thinking = next(cfg.anthropic.thinking),
+        _ => cfg.open_ai_compatible.thinking = next(cfg.open_ai_compatible.thinking),
     }
 }
 

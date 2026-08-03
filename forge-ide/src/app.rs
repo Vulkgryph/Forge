@@ -342,6 +342,12 @@ pub struct NewWindowSpec {
     pub cwd:      Option<std::path::PathBuf>,
     /// SSH host to connect immediately on open.
     pub ssh_host: Option<crate::ssh::SshHost>,
+    /// Where to put the window, when reopening one that was open before.
+    /// `None` lets the platform place it, which is what a genuinely new window
+    /// wants.
+    pub frame: Option<crate::session::WindowFrame>,
+    /// Reopen zoomed.
+    pub maximized: bool,
     /// True when this process was just launched by "Reload Window", not a
     /// genuinely fresh start. Reload always restores the session it just
     /// saved — the same instance continuing, matching VS Code's Reload
@@ -8313,9 +8319,8 @@ impl IdeApp {
         if let Some(host) = connect_host_new_win {
             self.ssh_overlay        = false;
             self.pending_new_window = Some(NewWindowSpec {
-                cwd:      None,
                 ssh_host: Some(host),
-                is_reload: false,
+                ..Default::default()
             });
         }
         if close { self.ssh_overlay = false; self.ssh_add_input = None; }
@@ -12225,7 +12230,7 @@ mod output_log_tests {
             .join(format!("forge-outlog-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         IdeApp::new_with_spec(crate::app::NewWindowSpec {
-            cwd: Some(dir), ssh_host: None, is_reload: false,
+            cwd: Some(dir), ..Default::default()
         })
     }
 
@@ -12266,7 +12271,7 @@ mod folderless_window_tests {
     use super::{IdeApp, NewWindowSpec};
 
     fn spec(cwd: Option<std::path::PathBuf>) -> NewWindowSpec {
-        NewWindowSpec { cwd, ssh_host: None, is_reload: false }
+        NewWindowSpec { cwd, ..Default::default() }
     }
 
     /// "New Window" — including from the Dock menu — opens no workspace.

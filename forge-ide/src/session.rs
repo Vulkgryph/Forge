@@ -104,8 +104,8 @@ mod window_tests {
     fn an_empty_set_does_not_erase_what_was_saved() {
         let path = scratch("empty");
         let two = vec![
-            WindowRecord { cwd: Some(PathBuf::from("/one")) },
-            WindowRecord { cwd: Some(PathBuf::from("/two")) },
+            WindowRecord { cwd: Some(PathBuf::from("/one")), ..Default::default() },
+            WindowRecord { cwd: Some(PathBuf::from("/two")), ..Default::default() },
         ];
         save_windows_to(&path, &two);
         save_windows_to(&path, &[]);
@@ -120,9 +120,9 @@ mod window_tests {
     fn several_windows_round_trip() {
         let path = scratch("round-trip");
         let records = vec![
-            WindowRecord { cwd: Some(PathBuf::from("/project/one")) },
-            WindowRecord { cwd: None },
-            WindowRecord { cwd: Some(PathBuf::from("/project/three")) },
+            WindowRecord { cwd: Some(PathBuf::from("/project/one")), ..Default::default() },
+            WindowRecord { cwd: None, ..Default::default() },
+            WindowRecord { cwd: Some(PathBuf::from("/project/three")), ..Default::default() },
         ];
         save_windows_to(&path, &records);
         assert_eq!(load_windows_from(&path), records);
@@ -134,8 +134,8 @@ mod window_tests {
     #[test]
     fn a_folderless_window_records_no_folder() {
         let path = scratch("folderless");
-        save_windows_to(&path, &[WindowRecord { cwd: None }]);
-        assert_eq!(load_windows_from(&path), vec![WindowRecord { cwd: None }]);
+        save_windows_to(&path, &[WindowRecord::default()]);
+        assert_eq!(load_windows_from(&path), vec![WindowRecord::default()]);
     }
 
     /// Nothing saved yet is an empty list, not a panic, so a first run falls back
@@ -238,12 +238,38 @@ mod tests {
 // argument, so it always opened exactly one empty window and every other window
 // was silently lost.
 
+/// Where a window was on screen.
+///
+/// Physical pixels, not logical: the scale factor is per-monitor, so a logical
+/// frame saved on a Retina display and reopened against a 1x one lands somewhere
+/// else entirely. Physical coordinates reproduce the frame exactly whenever the
+/// display arrangement is unchanged, which is the case a reload cares about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowFrame {
+    /// Top-left of the whole window including its title bar — winit's *outer*
+    /// position, which is what `WindowAttributes::with_position` takes, so this
+    /// round-trips without an off-by-a-title-bar drift on every reload.
+    pub x: i32,
+    pub y: i32,
+    /// The content area — winit's *inner* size, to match `with_inner_size`.
+    pub w: u32,
+    pub h: u32,
+}
+
 /// One window to reopen.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowRecord {
     /// The workspace folder, or `None` for a window opened without one.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Where it was. `None` for a record written before this was tracked, or a
+    /// window whose position could not be read; the platform then places it.
+    #[serde(default)]
+    pub frame: Option<WindowFrame>,
+    /// Zoomed/maximized windows are restored zoomed rather than at whatever
+    /// frame they happened to occupy, since that is the state the user set.
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 // Only the folder is recorded, not a remote connection. `IdeApp` tracks a

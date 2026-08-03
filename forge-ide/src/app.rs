@@ -348,6 +348,9 @@ pub struct NewWindowSpec {
     pub frame: Option<crate::session::WindowFrame>,
     /// Reopen zoomed.
     pub maximized: bool,
+    /// Which stored session this window continues. `0` for a genuinely new
+    /// window, which is given a fresh id.
+    pub window_id: u64,
     /// True when this process was just launched by "Reload Window", not a
     /// genuinely fresh start. Reload always restores the session it just
     /// saved — the same instance continuing, matching VS Code's Reload
@@ -2923,6 +2926,8 @@ pub struct IdeApp {
     /// workspace. Guard anything workspace-shaped (tree, git, watcher, Quick
     /// Open, search, session, tasks) on this rather than on `cwd`.
     has_folder:      bool,
+    /// Identifies this window's stored session; see `session::load_for_window`.
+    pub window_id:   u64,
     file_watcher:    Option<crate::filewatch::FileWatcher>,
     terminal_height: f32,
     pub settings:    crate::settings::Settings,
@@ -3158,6 +3163,9 @@ impl IdeApp {
         // directory". That old behavior meant a window opened from the Dock —
         // where the process cwd is `/` — rendered the entire filesystem as the
         // workspace root.
+        // A record written before windows had identity carries no id; give it one
+        // so its state is kept from here on.
+        let window_id = if spec.window_id != 0 { spec.window_id } else { crate::session::new_window_id() };
         let has_folder = spec.cwd.is_some();
         let cwd = spec.cwd.unwrap_or_else(|| {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
@@ -3183,6 +3191,7 @@ impl IdeApp {
         let pending_ssh = spec.ssh_host;
         let agent_saved = crate::agent_panel::load_conversations(&cwd);
         let mut app = Self {
+            window_id,
             file_tree:       tree,
             buffers:         vec![],   // no untitled tab on startup
             active:          0,
@@ -3337,11 +3346,11 @@ impl IdeApp {
         // matching VS Code's Reload Window regardless of that setting.
         // Either way, skip it if we're opening a remote (SSH) workspace
         // instead.
-        if has_folder
-            && (app.settings.restore_session || is_reload)
+        if (app.settings.restore_session || is_reload)
             && app.pending_ssh_connect.is_none()
         {
-            if let Some(state) = crate::session::load(&app.cwd) {
+            let root = app.workspace_root();
+            if let Some(state) = crate::session::load_for_window(app.window_id, root.as_deref()) {
                 let restored: Vec<Buffer> = state.open_files.iter()
                     .filter_map(|p| Buffer::from_file(p.clone()).ok())
                     .collect();
@@ -3446,10 +3455,8 @@ impl IdeApp {
         if !self.settings.restore_session || self.pending_ssh_connect.is_some() {
             return;
         }
-        // Sessions are keyed by workspace folder; a folderless window has none.
-        if !self.has_folder { return; }
         let state = self.build_session_state();
-        crate::session::save(&self.cwd, &state);
+        crate::session::save_for_window(self.window_id, self.workspace_root().as_deref(), &state);
     }
 
     /// Restart in-place — same PID, no full quit/relaunch through the OS.
@@ -3489,10 +3496,11 @@ impl IdeApp {
     /// reload ever got its conversation/open-files state saved, and every
     /// other open window came back empty on the other end.
     pub fn save_session_for_reload(&self) {
-        if self.has_folder && self.pending_ssh_connect.is_none() {
-            let state = self.build_session_state();
-            crate::session::save(&self.cwd, &state);
+        if self.pending_ssh_connect.is_some() {
+            return;
         }
+        let state = self.build_session_state();
+        crate::session::save_for_window(self.window_id, self.workspace_root().as_deref(), &state);
     }
 
 

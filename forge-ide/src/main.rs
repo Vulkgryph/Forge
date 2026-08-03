@@ -106,8 +106,9 @@ const NO_FOLDER: &str = "--no-folder";
 /// starts somewhere sensible), and passing that along instead would silently
 /// promote it to a `$HOME` workspace on every reload.
 ///
-/// `remembered` is a closure so the file is not read when the setting is off, and
-/// so tests can supply a set without touching the user's configuration.
+/// `remembered` is a closure so tests can supply a set without touching the
+/// user's configuration, and so it is not consulted at all on the paths that must
+/// not be influenced by it.
 fn parse_window_args(args: &[String]) -> (bool, Vec<Option<std::path::PathBuf>>) {
     let is_reload = args.iter().any(|a| a == "--reload");
     let cwds = args
@@ -134,7 +135,7 @@ fn plan_initial_windows(
             .filter(still_there)
             .map(|r| NewWindowSpec {
                 cwd: r.cwd, frame: r.frame, maximized: r.maximized,
-                ssh_host: None, is_reload,
+                window_id: r.id, ssh_host: None, is_reload,
             })
             .collect()
     }
@@ -437,6 +438,7 @@ impl Ide {
         self.windows
             .iter()
             .map(|w| session::WindowRecord {
+                id:        w.app.window_id,
                 cwd:       w.app.workspace_root(),
                 // `outer_position` is unsupported on some platforms and fails
                 // while a window is being created; no frame simply means the
@@ -837,9 +839,20 @@ fn main() {
     // setting.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (is_reload, cwds) = parse_window_args(&args);
+    // Session files for windows that are no longer in the record are dead weight.
+    // Done here, once, because the recorded set is authoritative only before any
+    // window exists — doing it while running would race the windows that have
+    // been planned but not yet created.
+    session::prune_window_sessions(&session::load_windows());
+
+    // Read once rather than inside `plan_initial_windows`: the same set is what
+    // says which stored window sessions are still wanted. Without this pass every
+    // window ever opened would leave its session file behind for good.
+    let remembered = session::load_windows();
+    session::prune_window_sessions(&remembered);
     let initial_specs = plan_initial_windows(
         cwds,
-        || session::load_windows(),
+        move || remembered,
         settings::load().restore_windows,
         is_reload,
     );
@@ -936,6 +949,7 @@ mod startup_tests {
             cwds,
             || vec![session::WindowRecord {
                 cwd: Some(dir.clone()), frame: Some(saved), maximized: true,
+                ..Default::default()
             }],
             // Off on purpose: a reload restores what was open regardless of the
             // setting, which only governs a real quit-and-relaunch.
@@ -976,7 +990,7 @@ mod startup_tests {
         let specs = plan_initial_windows(
             Vec::new(),
             || vec![session::WindowRecord {
-                cwd: Some(dir), frame: Some(saved), maximized: false,
+                cwd: Some(dir), frame: Some(saved), ..Default::default()
             }],
             true,
             false,

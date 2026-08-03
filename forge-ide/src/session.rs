@@ -51,13 +51,125 @@ fn session_path(root: &Path) -> PathBuf {
     root.join(".forge").join("session.json")
 }
 
+/// A stable identity for one window, so its state can be kept apart from every
+/// other window's.
+///
+/// Nanoseconds since the epoch, plus a per-process counter for the case of two
+/// windows opened inside the same nanosecond. Two *different* processes doing so
+/// at the same nanosecond would collide, which on a desktop application is not a
+/// case worth carrying machinery for.
+pub fn new_window_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn sessions_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("forge-ide").join("sessions"))
+}
+
+/// The directory is a parameter throughout so the tests exercise these against a
+/// temporary one instead of the user's real configuration.
+fn window_session_path_in(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id}.json"))
+}
+
+/// This particular window's state.
+///
+/// Kept beside the window list rather than inside a workspace, because state
+/// stored per folder cannot express either of the two cases that need it: a
+/// window with no folder open has nowhere to put it, and two windows on the same
+/// folder overwrite each other — the second one to close wins, and both come back
+/// showing its files.
+///
+/// Falls back to the workspace's own `.forge/session.json`, which is where every
+/// session lived before windows had identity (so existing state is not orphaned)
+/// and remains the right answer for a window opening a folder it has no state of
+/// its own for: where the project was last left beats nothing at all.
+pub fn load_for_window(id: u64, root: Option<&Path>) -> Option<SessionState> {
+    load_for_window_in(sessions_dir().as_deref(), id, root)
+}
+
+fn load_for_window_in(dir: Option<&Path>, id: u64, root: Option<&Path>) -> Option<SessionState> {
+    if let Some(state) = dir.and_then(|d| read_state(&window_session_path_in(d, id))) {
+        return Some(state);
+    }
+    root.and_then(load)
+}
+
+pub fn save_for_window(id: u64, root: Option<&Path>, state: &SessionState) {
+    save_for_window_in(sessions_dir().as_deref(), id, root, state);
+}
+
+fn save_for_window_in(dir: Option<&Path>, id: u64, root: Option<&Path>, state: &SessionState) {
+    if let Some(dir) = dir {
+        write_state(&window_session_path_in(dir, id), state);
+    }
+    // Also left in the workspace, so opening that folder in a window that has no
+    // state of its own still finds where the project was left.
+    if let Some(root) = root {
+        save(root, state);
+    }
+}
+
+/// How long a window's state outlives the record that mentions it.
+///
+/// The recorded set is not a perfectly reliable census: a second Forge IDE
+/// process writes its own window set over the first one's, so a record read at
+/// startup can omit windows that are alive in another process. Deleting on the
+/// strength of that alone would throw away state belonging to an open window, so
+/// a file also has to be stale before it goes.
+const SESSION_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Forget the state of windows that are no longer in the recorded set, and have
+/// not been touched for a week.
+///
+/// Without this, every window ever opened leaves a file behind for good. Only
+/// ever called with a non-empty set: an empty one means the record could not be
+/// read, which must not be taken as "no windows exist, delete everything".
+pub fn prune_window_sessions(keep: &[WindowRecord]) {
+    if let Some(dir) = sessions_dir() {
+        prune_window_sessions_in(&dir, keep);
+    }
+}
+
+fn prune_window_sessions_in(dir: &Path, keep: &[WindowRecord]) {
+    if keep.is_empty() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok());
+        let Some(id) = id else { continue };
+        if keep.iter().any(|r| r.id == id) {
+            continue;
+        }
+        let recently_used = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age < SESSION_KEEP);
+        if !recently_used {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn load(root: &Path) -> Option<SessionState> {
-    let path = session_path(root);
+    read_state(&session_path(root))
+}
+
+fn read_state(path: &Path) -> Option<SessionState> {
     // A missing file is the normal "no session yet" case and stays quiet. A
     // file that exists but won't parse is a real failure — a truncated write, a
     // schema change — and used to be swallowed by `.ok()?`, so a whole restored
     // session silently became "nothing to restore" with no way to tell why.
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str(&text) {
         Ok(state) => Some(state),
         Err(e) => {
@@ -68,7 +180,10 @@ pub fn load(root: &Path) -> Option<SessionState> {
 }
 
 pub fn save(root: &Path, state: &SessionState) {
-    let path = session_path(root);
+    write_state(&session_path(root), state);
+}
+
+fn write_state(path: &Path, state: &SessionState) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -270,6 +385,11 @@ pub struct WindowRecord {
     /// frame they happened to occupy, since that is the state the user set.
     #[serde(default)]
     pub maximized: bool,
+    /// Which stored session belongs to this window. `0` in a record written
+    /// before windows had identity; such a window is given a fresh id and falls
+    /// back to its workspace's own session file.
+    #[serde(default)]
+    pub id: u64,
 }
 
 // Only the folder is recorded, not a remote connection. `IdeApp` tracks a
@@ -323,4 +443,136 @@ fn save_windows_to(path: &Path, records: &[WindowRecord]) {
 fn load_windows_from(path: &Path) -> Vec<WindowRecord> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     serde_json::from_str(&text).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod window_session_tests {
+    use super::*;
+
+    fn dirs_for(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir()
+            .join(format!("forge-sess-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sessions = base.join("sessions");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        (sessions, workspace)
+    }
+
+    /// `set_file_times` is not on stable, so this goes through `utimes(2)`.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        let secs = when.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        #[repr(C)]
+        struct TimeVal { sec: i64, usec: i64 }
+        unsafe extern "C" {
+            fn utimes(path: *const std::ffi::c_char, times: *const TimeVal) -> i32;
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [TimeVal { sec: secs, usec: 0 }, TimeVal { sec: secs, usec: 0 }];
+        let rc = unsafe { utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed for {}", path.display());
+    }
+
+    fn state(files: &[&str]) -> SessionState {
+        SessionState { open_files: files.iter().map(PathBuf::from).collect(), ..Default::default() }
+    }
+
+    fn files_of(s: &SessionState) -> Vec<String> {
+        s.open_files.iter().map(|p| p.display().to_string()).collect()
+    }
+
+    /// The reported requirement: a window comes back with the state it had. Two
+    /// windows on the *same* folder each need their own, which per-folder storage
+    /// could not express — the second to close overwrote the first, and both
+    /// reopened showing its files.
+    #[test]
+    fn two_windows_on_one_folder_keep_separate_state() {
+        let (sessions, ws) = dirs_for("two");
+        save_for_window_in(Some(&sessions), 1, Some(&ws), &state(["/a.rs"].as_ref()));
+        save_for_window_in(Some(&sessions), 2, Some(&ws), &state(["/b.rs"].as_ref()));
+
+        let first  = load_for_window_in(Some(&sessions), 1, Some(&ws)).unwrap();
+        let second = load_for_window_in(Some(&sessions), 2, Some(&ws)).unwrap();
+        assert_eq!(files_of(&first),  ["/a.rs"], "the first window kept its own files");
+        assert_eq!(files_of(&second), ["/b.rs"], "and did not overwrite the second's");
+    }
+
+    /// A window with no folder open used to save nothing at all, so everything in
+    /// it was lost on every restart.
+    #[test]
+    fn a_folderless_window_keeps_its_state() {
+        let (sessions, _) = dirs_for("folderless");
+        save_for_window_in(Some(&sessions), 7, None, &state(["/scratch.rs"].as_ref()));
+        let got = load_for_window_in(Some(&sessions), 7, None)
+            .expect("a window without a folder still has state");
+        assert_eq!(files_of(&got), ["/scratch.rs"]);
+    }
+
+    /// State written before windows had identity is not orphaned: a window with no
+    /// state of its own falls back to the workspace's.
+    #[test]
+    fn a_window_with_no_state_falls_back_to_the_workspace() {
+        let (sessions, ws) = dirs_for("fallback");
+        save(&ws, &state(["/legacy.rs"].as_ref()));
+        let got = load_for_window_in(Some(&sessions), 999, Some(&ws))
+            .expect("the workspace's own session is the fallback");
+        assert_eq!(files_of(&got), ["/legacy.rs"]);
+    }
+
+    /// A window's own state wins over the workspace's.
+    #[test]
+    fn a_windows_own_state_wins() {
+        let (sessions, ws) = dirs_for("wins");
+        save(&ws, &state(["/project.rs"].as_ref()));
+        save_for_window_in(Some(&sessions), 5, None, &state(["/mine.rs"].as_ref()));
+        let got = load_for_window_in(Some(&sessions), 5, Some(&ws)).unwrap();
+        assert_eq!(files_of(&got), ["/mine.rs"]);
+    }
+
+    /// Closed windows' state is forgotten once stale, or every window ever opened
+    /// leaves a file behind for good.
+    #[test]
+    fn stale_state_for_windows_that_are_gone_is_pruned() {
+        let (sessions, _) = dirs_for("prune");
+        for id in [1u64, 2, 3] {
+            save_for_window_in(Some(&sessions), id, None, &state(["/x.rs"].as_ref()));
+        }
+        // Backdate 1 and 3 past the keep window; 2 stays in the record.
+        for id in [1u64, 3] {
+            let old = std::time::SystemTime::now() - SESSION_KEEP - std::time::Duration::from_secs(60);
+            set_mtime(&window_session_path_in(&sessions, id), old);
+        }
+        let keep = vec![WindowRecord { id: 2, ..Default::default() }];
+        prune_window_sessions_in(&sessions, &keep);
+        assert!(!window_session_path_in(&sessions, 1).exists(), "1 is gone and stale");
+        assert!(window_session_path_in(&sessions, 2).exists(),  "2 is still open");
+        assert!(!window_session_path_in(&sessions, 3).exists(), "3 is gone and stale");
+    }
+
+    /// The dangerous case: a second Forge IDE process writes its own window set
+    /// over the first one's, so a record can omit windows that are alive
+    /// elsewhere. Freshly-written state must survive being absent from it.
+    #[test]
+    fn state_a_live_window_just_wrote_is_not_pruned() {
+        let (sessions, _) = dirs_for("live");
+        save_for_window_in(Some(&sessions), 11, None, &state(["/open-right-now.rs"].as_ref()));
+        // A record from another process that has never heard of window 11.
+        let keep = vec![WindowRecord { id: 99, ..Default::default() }];
+        prune_window_sessions_in(&sessions, &keep);
+        assert!(
+            window_session_path_in(&sessions, 11).exists(),
+            "state written moments ago belongs to a window that is very likely open",
+        );
+    }
+
+    /// An unreadable window list must not be read as "no windows exist".
+    #[test]
+    fn an_empty_set_prunes_nothing() {
+        let (sessions, _) = dirs_for("empty");
+        save_for_window_in(Some(&sessions), 42, None, &state(["/keep.rs"].as_ref()));
+        prune_window_sessions_in(&sessions, &[]);
+        assert!(window_session_path_in(&sessions, 42).exists(),
+                "an empty set means the record could not be read, not that nothing is open");
+    }
 }

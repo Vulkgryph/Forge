@@ -147,9 +147,13 @@ fn plan_initial_windows(
 
     let usable: Vec<NewWindowSpec> = if is_reload {
         let records = remembered();
-        let describes_the_same_windows =
-            records.len() == cwds.len() && records.iter().zip(&cwds).all(|(r, c)| &r.cwd == c);
-        if describes_the_same_windows {
+        // With no window arguments at all the record is the only information
+        // there is, so it is used rather than compared against nothing. Treating
+        // that as a disagreement — which it is not — dropped every window and
+        // opened a single empty one instead.
+        let agree_on_the_windows = cwds.is_empty()
+            || (records.len() == cwds.len() && records.iter().zip(&cwds).all(|(r, c)| &r.cwd == c));
+        if !records.is_empty() && agree_on_the_windows {
             from_records(records, is_reload)
         } else {
             from_paths(cwds, is_reload)
@@ -959,6 +963,24 @@ mod startup_tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].frame, Some(saved), "the frame came back");
         assert!(specs[0].maximized, "and so did zoomed");
+    }
+
+    /// A reload with no window arguments has only the record to go on. This fell
+    /// through to a single empty window, losing every window and all their state.
+    #[test]
+    fn a_reload_with_no_arguments_restores_the_record() {
+        let dir = std::env::temp_dir();
+        let (is_reload, cwds) = parse_window_args(&["--reload".to_string()]);
+        assert!(is_reload && cwds.is_empty());
+        let specs = plan_initial_windows(
+            cwds,
+            || vec![record(dir.to_str()), record(None)],
+            false,
+            is_reload,
+        );
+        assert_eq!(specs.len(), 2, "both windows, not one empty one: {specs:?}");
+        assert_eq!(specs[0].cwd, Some(dir));
+        assert_eq!(specs[1].cwd, None);
     }
 
     /// If the record disagrees with what the reload was told is open, the live set

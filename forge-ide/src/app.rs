@@ -333,7 +333,10 @@ enum SshOverlayStep {
 }
 
 /// Spec for a window to create. Passed from the app to the winit loop.
-#[derive(Default)]
+///
+/// `Debug` so a failing startup-planning test can print what it planned rather
+/// than only how many windows it came up with.
+#[derive(Debug, Default)]
 pub struct NewWindowSpec {
     /// Working directory for the new window (None = inherit current).
     pub cwd:      Option<std::path::PathBuf>,
@@ -7823,6 +7826,16 @@ impl IdeApp {
                         let old = s.restore_session;
                         ui.checkbox(&mut s.restore_session, "");
                         if s.restore_session != old { changed = true; }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    lbl(ui, "Reopen All Windows on Startup");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        let old = s.restore_windows;
+                        ui.checkbox(&mut s.restore_windows, "");
+                        if s.restore_windows != old { changed = true; }
                     });
                 });
                 ui.horizontal(|ui| {

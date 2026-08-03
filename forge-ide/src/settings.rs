@@ -64,6 +64,16 @@ pub struct Settings {
     /// silent default behavior change for existing users.
     pub restore_session: bool,
 
+    /// Reopen every window that was open, rather than a single empty one.
+    ///
+    /// Separate from `restore_session` deliberately: which windows were open is
+    /// a different question from what was inside them, and wanting your folders
+    /// back is not the same as wanting your editor tabs and terminals back. On
+    /// by default — losing windows on a restart is a surprise, where restoring
+    /// tabs is a preference.
+    #[serde(default = "default_true")]
+    pub restore_windows: bool,
+
     // Updates
     /// Check GitHub Releases for a newer Forge IDE version on startup. Off
     /// by default — this is the one network call Forge IDE makes on its
@@ -117,6 +127,7 @@ impl Default for Settings {
             terminal_font_size: 14.0,
             theme:              "Dark+".into(),
             restore_session:    true,
+            restore_windows:    true,
             check_for_updates:  false,
             update_check_prompted: false,
             onboarding_skipped: false,
@@ -132,6 +143,10 @@ fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("forge-ide")
         .join("settings.toml")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn load() -> Settings {

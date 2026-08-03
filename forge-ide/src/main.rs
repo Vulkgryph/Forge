@@ -44,6 +44,49 @@ use winit::window::{Window, WindowId};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
+/// Decide which windows to open at startup.
+///
+/// Paths on the command line always win: that is `forge-ide <path>`, and it is
+/// also how "Reload Window" rebuilds the set, one path per window.
+///
+/// With no paths this is a genuine launch, and the windows that were last open
+/// are reopened. Before that, startup fell through to a single window with no
+/// folder and every other window the user had was silently lost.
+///
+/// `remembered` is a closure so the file is not read when the setting is off, and
+/// so tests can supply a set without touching the user's configuration.
+fn plan_initial_windows(
+    cwds:            Vec<std::path::PathBuf>,
+    remembered:      impl FnOnce() -> Vec<session::WindowRecord>,
+    restore_windows: bool,
+    is_reload:       bool,
+) -> Vec<NewWindowSpec> {
+    if !cwds.is_empty() {
+        return cwds
+            .into_iter()
+            .map(|cwd| NewWindowSpec { cwd: Some(cwd), ssh_host: None, is_reload })
+            .collect();
+    }
+
+    let usable: Vec<NewWindowSpec> = if restore_windows {
+        remembered()
+            .into_iter()
+            // A folder that has since been deleted or moved is dropped rather
+            // than opening a window onto a path that is not there.
+            .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
+            .map(|r| NewWindowSpec { cwd: r.cwd, ssh_host: None, is_reload })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if usable.is_empty() {
+        vec![NewWindowSpec { cwd: None, ssh_host: None, is_reload }]
+    } else {
+        usable
+    }
+}
+
 /// Whatever the active backend needs to share process-wide across windows.
 #[cfg(feature = "vulkan-renderer")]
 type SharedRenderer = (SharedGfx, SharedEguiPass);
@@ -554,37 +597,12 @@ fn main() {
         .filter(|a| *a != "--reload")
         .map(std::path::PathBuf::from)
         .collect();
-    let initial_specs: Vec<NewWindowSpec> = if cwds.is_empty() {
-        // No paths on the command line: this is a genuine launch rather than a
-        // reload, so reopen the windows that were last open. Without this a
-        // restart always produced exactly one empty window and every other
-        // window the user had was silently lost.
-        //
-        // Gated on the same `restore_session` opt-in that governs restoring a
-        // workspace across a real quit: someone who has asked not to have state
-        // restored does not want their windows back either.
-        let remembered = if settings::load().restore_session {
-            session::load_windows()
-        } else {
-            Vec::new()
-        };
-        // Folders that have since been deleted or moved are dropped rather than
-        // opening a window onto a path that is not there.
-        let usable: Vec<NewWindowSpec> = remembered
-            .into_iter()
-            .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
-            .map(|r| NewWindowSpec { cwd: r.cwd, ssh_host: None, is_reload })
-            .collect();
-        if usable.is_empty() {
-            vec![NewWindowSpec { cwd: None, ssh_host: None, is_reload }]
-        } else {
-            usable
-        }
-    } else {
-        cwds.into_iter()
-            .map(|cwd| NewWindowSpec { cwd: Some(cwd), ssh_host: None, is_reload })
-            .collect()
-    };
+    let initial_specs = plan_initial_windows(
+        cwds,
+        || session::load_windows(),
+        settings::load().restore_windows,
+        is_reload,
+    );
 
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
@@ -601,4 +619,112 @@ fn main() {
     wake::set_waker(move || { let _ = proxy.send_event(()); });
 
     event_loop.run_app(&mut Ide::new(initial_specs)).expect("run");
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn record(cwd: Option<&str>) -> session::WindowRecord {
+        session::WindowRecord { cwd: cwd.map(PathBuf::from) }
+    }
+
+    /// The reported bug: a restart opened one window and lost the rest. Every
+    /// remembered window must come back, not just the first.
+    #[test]
+    fn every_remembered_window_is_reopened() {
+        // Real directories, since a missing folder is deliberately dropped.
+        let a = std::env::temp_dir();
+        let b = std::env::temp_dir().join("..");
+        let specs = plan_initial_windows(
+            Vec::new(),
+            || vec![record(a.to_str()), record(b.to_str()), record(None)],
+            true,
+            false,
+        );
+        assert_eq!(specs.len(), 3, "all three, not one: {specs:?}");
+        assert!(specs.iter().any(|s| s.cwd.is_none()), "including the folderless one");
+    }
+
+    /// With the toggle off, startup goes back to a single empty window.
+    #[test]
+    fn the_toggle_off_opens_one_empty_window() {
+        let specs = plan_initial_windows(
+            Vec::new(),
+            || vec![record(std::env::temp_dir().to_str()), record(None)],
+            false,
+            false,
+        );
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].cwd.is_none(), "and it has no folder");
+    }
+
+    /// The file must not even be read when the toggle is off.
+    #[test]
+    fn nothing_is_loaded_when_the_toggle_is_off() {
+        let mut read = false;
+        let _ = plan_initial_windows(
+            Vec::new(),
+            || {
+                read = true;
+                Vec::new()
+            },
+            false,
+            false,
+        );
+        assert!(!read, "the window list was read despite the toggle being off");
+    }
+
+    /// Paths on the command line always win — that is `forge-ide <path>`, and it
+    /// is how Reload Window rebuilds the set.
+    #[test]
+    fn command_line_paths_take_precedence() {
+        let specs = plan_initial_windows(
+            vec![PathBuf::from("/one"), PathBuf::from("/two")],
+            || panic!("the remembered set must not be consulted"),
+            true,
+            true,
+        );
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].cwd, Some(PathBuf::from("/one")));
+        assert!(specs.iter().all(|s| s.is_reload), "the reload flag is carried");
+    }
+
+    /// A folder deleted since last time must not open a window onto a path that
+    /// is not there.
+    #[test]
+    fn folders_that_no_longer_exist_are_dropped() {
+        let real = std::env::temp_dir();
+        let specs = plan_initial_windows(
+            Vec::new(),
+            || vec![record(Some("/definitely/not/a/real/path")), record(real.to_str())],
+            true,
+            false,
+        );
+        assert_eq!(specs.len(), 1, "only the one that still exists: {specs:?}");
+        assert_eq!(specs[0].cwd, Some(real));
+    }
+
+    /// And if nothing usable remains, it falls back rather than opening nothing —
+    /// an empty spec list would exit the event loop immediately.
+    #[test]
+    fn an_unusable_set_falls_back_to_one_window() {
+        for remembered in [
+            Vec::new(),
+            vec![record(Some("/gone/one")), record(Some("/gone/two"))],
+        ] {
+            let specs = plan_initial_windows(Vec::new(), || remembered.clone(), true, false);
+            assert_eq!(specs.len(), 1, "never zero windows");
+            assert!(specs[0].cwd.is_none());
+        }
+    }
+
+    /// A folderless window stays folderless rather than inheriting a directory.
+    #[test]
+    fn a_folderless_record_reopens_without_a_folder() {
+        let specs = plan_initial_windows(Vec::new(), || vec![record(None)], true, false);
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].cwd.is_none());
+    }
 }

@@ -274,6 +274,7 @@ impl ApplicationHandler for Ide {
         if let Some(spec) = specs.next() {
             if let Some(win) = IdeWindow::create(event_loop, spec, &mut self.shared) {
                 self.windows.push(win);
+                self.remember_windows();
             }
         }
         // Every window after the first goes through the normal `pending`
@@ -332,7 +333,11 @@ impl ApplicationHandler for Ide {
         }
 
         // Remove closed windows; exit if none left
+        let before = self.windows.len();
         self.windows.retain(|w| !w.closing);
+        if self.windows.len() != before {
+            self.remember_windows();
+        }
         if self.windows.is_empty() { event_loop.exit(); }
     }
 
@@ -382,6 +387,7 @@ impl ApplicationHandler for Ide {
         for spec in specs {
             if let Some(win) = IdeWindow::create(event_loop, spec, &mut self.shared) {
                 self.windows.push(win);
+                self.remember_windows();
             }
         }
 
@@ -549,7 +555,31 @@ fn main() {
         .map(std::path::PathBuf::from)
         .collect();
     let initial_specs: Vec<NewWindowSpec> = if cwds.is_empty() {
-        vec![NewWindowSpec { cwd: None, ssh_host: None, is_reload }]
+        // No paths on the command line: this is a genuine launch rather than a
+        // reload, so reopen the windows that were last open. Without this a
+        // restart always produced exactly one empty window and every other
+        // window the user had was silently lost.
+        //
+        // Gated on the same `restore_session` opt-in that governs restoring a
+        // workspace across a real quit: someone who has asked not to have state
+        // restored does not want their windows back either.
+        let remembered = if settings::load().restore_session {
+            session::load_windows()
+        } else {
+            Vec::new()
+        };
+        // Folders that have since been deleted or moved are dropped rather than
+        // opening a window onto a path that is not there.
+        let usable: Vec<NewWindowSpec> = remembered
+            .into_iter()
+            .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
+            .map(|r| NewWindowSpec { cwd: r.cwd, ssh_host: None, is_reload })
+            .collect();
+        if usable.is_empty() {
+            vec![NewWindowSpec { cwd: None, ssh_host: None, is_reload }]
+        } else {
+            usable
+        }
     } else {
         cwds.into_iter()
             .map(|cwd| NewWindowSpec { cwd: Some(cwd), ssh_host: None, is_reload })

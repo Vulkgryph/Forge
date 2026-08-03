@@ -3134,6 +3134,15 @@ pub struct IdeApp {
 }
 
 impl IdeApp {
+    /// The workspace folder, or `None` for a window with no folder open.
+    ///
+    /// Deliberately not `cwd`, which is always a real path — a folderless window
+    /// roots its terminal at `$HOME`, and recording that would reopen a
+    /// workspace the user never chose.
+    pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.has_folder.then(|| self.cwd.clone())
+    }
+
     pub fn new_with_spec(spec: NewWindowSpec) -> Self {
         let is_reload = spec.is_reload;
         // `None` means "no workspace", not "inherit the process working

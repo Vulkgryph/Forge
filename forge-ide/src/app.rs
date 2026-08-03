@@ -3489,9 +3489,6 @@ impl IdeApp {
         }
     }
 
-    /// This window's workspace folder — read by main.rs to rebuild the
-    /// full argument list across every open window on Reload Window.
-    pub fn cwd(&self) -> &std::path::Path { &self.cwd }
 
     fn draw_terminal_panels(&mut self, ctx: &egui::Context) {
         if self.show_term {

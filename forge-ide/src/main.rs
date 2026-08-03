@@ -55,8 +55,29 @@ use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 ///
 /// `remembered` is a closure so the file is not read when the setting is off, and
 /// so tests can supply a set without touching the user's configuration.
+///
+/// Each entry of `cwds` is one window, and `None` is a window with no folder —
+/// which has to stay distinguishable from a real path all the way through. A
+/// folderless window still *has* a working directory (`$HOME`, so its terminal
+/// starts somewhere sensible), and passing that along instead would silently
+/// promote it to a `$HOME` workspace on every reload.
+/// Stands in for a window with no folder in the argument list a reload builds.
+/// A bare flag rather than a path, since every path is a real workspace.
+const NO_FOLDER: &str = "--no-folder";
+
+/// Split the command line into "was this a reload?" and one entry per window.
+fn parse_window_args(args: &[String]) -> (bool, Vec<Option<std::path::PathBuf>>) {
+    let is_reload = args.iter().any(|a| a == "--reload");
+    let cwds = args
+        .iter()
+        .filter(|a| *a != "--reload")
+        .map(|a| (a != NO_FOLDER).then(|| std::path::PathBuf::from(a)))
+        .collect();
+    (is_reload, cwds)
+}
+
 fn plan_initial_windows(
-    cwds:            Vec<std::path::PathBuf>,
+    cwds:            Vec<Option<std::path::PathBuf>>,
     remembered:      impl FnOnce() -> Vec<session::WindowRecord>,
     restore_windows: bool,
     is_reload:       bool,
@@ -64,7 +85,7 @@ fn plan_initial_windows(
     if !cwds.is_empty() {
         return cwds
             .into_iter()
-            .map(|cwd| NewWindowSpec { cwd: Some(cwd), ssh_host: None, is_reload })
+            .map(|cwd| NewWindowSpec { cwd, ssh_host: None, is_reload })
             .collect();
     }
 
@@ -253,6 +274,9 @@ impl IdeWindow {
 
 struct Ide {
     windows:      Vec<IdeWindow>,
+    /// The window set as last written to disk, so it is only rewritten when it
+    /// actually changes.
+    saved_windows: Vec<session::WindowRecord>,
     /// Specs queued by app code; created in about_to_wait.
     pending:      Vec<NewWindowSpec>,
     /// Every window to create at startup — one entry per CLI path argument
@@ -282,13 +306,35 @@ struct Ide {
 impl Ide {
     fn new(initial_specs: Vec<NewWindowSpec>) -> Self {
         Self {
-            windows: Vec::new(), pending: Vec::new(), initial_specs, shared: None,
+            windows: Vec::new(), saved_windows: Vec::new(),
+            pending: Vec::new(), initial_specs, shared: None,
             dirty: false, next_deadline: None,
         }
     }
 
     fn find_mut(&mut self, id: WindowId) -> Option<&mut IdeWindow> {
         self.windows.iter_mut().find(|w| w.id == id)
+    }
+
+    /// Write down which windows are open, so a restart can reopen them.
+    ///
+    /// Compares against what was last written and does nothing when unchanged,
+    /// so this can be called every frame. That matters because the set changes
+    /// for reasons other than a window opening or closing — "Open Folder" turns
+    /// a folderless window into a workspace, and hooking only the add and remove
+    /// paths meant the recorded set went stale the moment someone opened a
+    /// folder in a window that already existed. Checking the value rather than
+    /// the event cannot miss a path.
+    fn remember_windows(&mut self) {
+        let records: Vec<session::WindowRecord> = self
+            .windows
+            .iter()
+            .map(|w| session::WindowRecord { cwd: w.app.workspace_root() })
+            .collect();
+        if records != self.saved_windows {
+            session::save_windows(&records);
+            self.saved_windows = records;
+        }
     }
 }
 
@@ -317,7 +363,6 @@ impl ApplicationHandler for Ide {
         if let Some(spec) = specs.next() {
             if let Some(win) = IdeWindow::create(event_loop, spec, &mut self.shared) {
                 self.windows.push(win);
-                self.remember_windows();
             }
         }
         // Every window after the first goes through the normal `pending`
@@ -376,11 +421,10 @@ impl ApplicationHandler for Ide {
         }
 
         // Remove closed windows; exit if none left
-        let before = self.windows.len();
         self.windows.retain(|w| !w.closing);
-        if self.windows.len() != before {
-            self.remember_windows();
-        }
+        // Records the set whenever it differs from what is on disk, which covers
+        // opening and closing a window *and* a folder being opened in one.
+        self.remember_windows();
         if self.windows.is_empty() { event_loop.exit(); }
     }
 
@@ -430,7 +474,6 @@ impl ApplicationHandler for Ide {
         for spec in specs {
             if let Some(win) = IdeWindow::create(event_loop, spec, &mut self.shared) {
                 self.windows.push(win);
-                self.remember_windows();
             }
         }
 
@@ -509,8 +552,18 @@ impl ApplicationHandler for Ide {
             if exe.as_os_str().is_empty() || !exe.exists() {
                 eprintln!("reload_window: couldn't resolve current_exe, staying open");
             } else {
-                let cwds: Vec<std::path::PathBuf> =
-                    self.windows.iter().map(|w| w.app.cwd().to_path_buf()).collect();
+                // `workspace_root()`, not `cwd()`: the former is `None` for a
+                // window with no folder open, while the latter is that window's
+                // `$HOME` fallback. Passing `cwd()` here reopened folderless
+                // windows as `$HOME` workspaces.
+                let cwds: Vec<String> = self
+                    .windows
+                    .iter()
+                    .map(|w| match w.app.workspace_root() {
+                        Some(p) => p.to_string_lossy().into_owned(),
+                        None => NO_FOLDER.to_string(),
+                    })
+                    .collect();
                 // `reload_window()` already unconditionally saved *its own*
                 // window's session — but a reload tears down every open
                 // window, not just the one that triggered it, so every
@@ -592,11 +645,7 @@ fn main() {
     // restore the session it just saved regardless of the `restore_session`
     // setting.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let is_reload = args.iter().any(|a| a == "--reload");
-    let cwds: Vec<std::path::PathBuf> = args.iter()
-        .filter(|a| *a != "--reload")
-        .map(std::path::PathBuf::from)
-        .collect();
+    let (is_reload, cwds) = parse_window_args(&args);
     let initial_specs = plan_initial_windows(
         cwds,
         || session::load_windows(),
@@ -681,7 +730,7 @@ mod startup_tests {
     #[test]
     fn command_line_paths_take_precedence() {
         let specs = plan_initial_windows(
-            vec![PathBuf::from("/one"), PathBuf::from("/two")],
+            vec![Some(PathBuf::from("/one")), Some(PathBuf::from("/two"))],
             || panic!("the remembered set must not be consulted"),
             true,
             true,
@@ -689,6 +738,33 @@ mod startup_tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].cwd, Some(PathBuf::from("/one")));
         assert!(specs.iter().all(|s| s.is_reload), "the reload flag is carried");
+    }
+
+    /// The reported bug: a reload dropped the user at a workspace they never
+    /// opened. A folderless window was passed along as its `$HOME` working
+    /// directory, so it came back as a `$HOME` workspace — and every reload after
+    /// that kept it. The marker has to survive the argv round-trip.
+    #[test]
+    fn a_folderless_window_survives_a_reload() {
+        // Exactly what the reload path builds, for a folder window and a
+        // folderless one.
+        let argv = vec!["--reload".to_string(), "/work".to_string(), NO_FOLDER.to_string()];
+        let (is_reload, cwds) = parse_window_args(&argv);
+        assert!(is_reload);
+
+        let specs = plan_initial_windows(cwds, || panic!("argv wins"), true, is_reload);
+        assert_eq!(specs.len(), 2, "both windows: {specs:?}");
+        assert_eq!(specs[0].cwd, Some(PathBuf::from("/work")), "the real folder is kept");
+        assert_eq!(specs[1].cwd, None, "and the folderless one is still folderless");
+    }
+
+    /// The marker must never be mistaken for a workspace path.
+    #[test]
+    fn the_marker_is_not_treated_as_a_path() {
+        let (_, cwds) = parse_window_args(&[NO_FOLDER.to_string()]);
+        let specs = plan_initial_windows(cwds, || panic!("argv wins"), true, true);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].cwd, None, "not a folder named {NO_FOLDER}");
     }
 
     /// A folder deleted since last time must not open a window onto a path that

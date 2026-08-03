@@ -616,9 +616,21 @@ impl App {
             self.committed = 0;
         }
 
-        // Everything before the current turn is settled. Mid-turn, nothing new
-        // is committed, because a discard can still take it back.
-        let settled = self.session.turn_start().unwrap_or_else(|| self.session.entries().len());
+        // Commit only what has scrolled above the live window.
+        //
+        // Committing at the end of every turn — which this used to do — froze all
+        // but the current turn, so resizing re-wrapped almost nothing. The
+        // TypeScript client kept its most recent entries live and archived only
+        // what fell above them, which is why resizing there appeared to reflow
+        // the conversation: everything on screen was still being re-rendered.
+        // Bounded by rows rather than a fixed entry count, so it adapts to the
+        // window instead of guessing at it.
+        let live_from = self.live_window_start(inline, cols);
+        // Never commit the current turn: a discard can still take it back, and
+        // printed output cannot be unprinted.
+        let settled = live_from.min(
+            self.session.turn_start().unwrap_or_else(|| self.session.entries().len()),
+        );
         if settled > self.committed {
             let lines = self.lines_for(self.committed..settled, cols);
             inline.commit(out, &lines)?;
@@ -645,6 +657,36 @@ impl App {
             self.committed = total;
         }
         Ok(())
+    }
+
+    /// The first entry that should stay live, walking back from the newest until
+    /// the live region is full.
+    ///
+    /// Anything before it has scrolled out of reach and is committed to the
+    /// terminal's scrollback, where it keeps the width it was written at.
+    /// Everything from here on is redrawn each frame, so it re-wraps when the
+    /// window changes size.
+    fn live_window_start(&self, inline: &crate::inline::Inline, cols: usize) -> usize {
+        let entries = self.session.entries();
+        // Chrome takes rows too; leave room for it rather than letting the
+        // transcript push the prompt off the bottom.
+        let budget = inline.live_capacity().saturating_sub(3).max(1);
+
+        let mut used = 0usize;
+        let mut start = entries.len();
+        for index in (self.committed..entries.len()).rev() {
+            // One entry, plus the blank line between entries.
+            let rows = self.build_range(index..index + 1, cols).len() + 1;
+            if used + rows > budget && start < entries.len() {
+                break;
+            }
+            used += rows;
+            start = index;
+            if used >= budget {
+                break;
+            }
+        }
+        start
     }
 
     /// The block redrawn at the bottom: whatever the current turn has produced
@@ -2050,6 +2092,106 @@ mod tests {
     }
 
     // ── Resizing ──────────────────────────────────────────────────────────
+
+    /// Recent entries stay live so a resize re-wraps them. Committing at the end
+    /// of every turn froze all but the current one, and resizing then re-wrapped
+    /// almost nothing on screen.
+    #[test]
+    fn recent_entries_stay_live_after_a_turn_ends() {
+        let mut app = App::new();
+        app.session_mut().push_user("a question");
+        app.session_mut().apply(AgentMessage::AssistantToken { content: "an answer".into() });
+        app.session_mut().apply(AgentMessage::Done);
+
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+
+        assert_eq!(app.committed, 0, "a finished turn is still redrawable");
+        let shown = live_text(&mut app);
+        assert!(shown.contains("an answer"), "and still on screen: {shown:?}");
+    }
+
+    /// Which means a resize re-wraps it, rather than leaving it at the old width.
+    #[test]
+    fn a_resize_rewraps_a_finished_turn() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::AssistantToken {
+            content: "an answer long enough that its wrapping depends entirely on how                       wide the terminal happens to be at the time".into(),
+        });
+        app.session_mut().apply(AgentMessage::Done);
+
+        let narrow = crate::inline::Inline::new(40, ROWS);
+        let wide = crate::inline::Inline::new(100, ROWS);
+        let narrow_rows = app.live_lines(&narrow, 40).lines.len();
+        let wide_rows = app.live_lines(&wide, 100).lines.len();
+        assert!(
+            narrow_rows > wide_rows,
+            "the finished turn re-wraps: {narrow_rows} rows at 40 vs {wide_rows} at 100",
+        );
+    }
+
+    /// History still has to reach the scrollback, or the transcript would grow
+    /// without bound in a region that is redrawn every frame.
+    #[test]
+    fn entries_that_scroll_out_of_reach_are_committed() {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.session_mut().push_system(format!("entry number {i}"));
+        }
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+
+        assert!(app.committed > 0, "older entries were printed to scrollback");
+        assert!(
+            app.committed < 60,
+            "but not all of them — the newest stay live, got {}", app.committed,
+        );
+        // Escapes stripped: each word is its own styled span, so the phrase is
+        // not a contiguous substring of the raw output.
+        let text = visible(&String::from_utf8_lossy(&out));
+        assert!(text.contains("entry number 0"), "the oldest was committed");
+        // The newest is in the live block, not the committed prefix — both reach
+        // the same stream, so the distinction is which range produced them.
+        let live = live_text(&mut app);
+        assert!(live.contains("entry number 59"), "the newest is live: {live:?}");
+        assert!(
+            !live.contains("entry number 0"),
+            "and the oldest is not, having scrolled out of reach",
+        );
+    }
+
+    /// The current turn is never committed, because a discard can still take it
+    /// back and printed output cannot be unprinted.
+    #[test]
+    fn a_turn_in_progress_is_never_committed() {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.session_mut().push_system(format!("filler {i}"));
+        }
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+        let before = app.committed;
+
+        // Open a turn, then produce a lot within it.
+        app.session_mut().apply(AgentMessage::Thinking);
+        for _ in 0..40 {
+            app.session_mut().apply(AgentMessage::ToolOutput {
+                tool_name: "t".into(),
+                content: "a line of output".into(),
+            });
+        }
+        app.render(&mut inline, &mut out).unwrap();
+
+        let turn_start = app.session().turn_start().expect("a turn is open");
+        assert!(
+            app.committed <= turn_start,
+            "committed {} must not pass the turn start {turn_start}", app.committed,
+        );
+        assert!(app.committed >= before, "and never goes backwards");
+    }
 
     /// Narrowing the terminal must re-wrap, not clip.
     #[test]

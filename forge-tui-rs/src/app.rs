@@ -755,7 +755,10 @@ impl App {
         }
         let lead = str_width(PROMPT_GLYPH);
         let last = self.input.rsplit('\n').next().unwrap_or("");
-        let typed = str_width(&tail_of(last, cols.saturating_sub(lead)));
+        // The caret follows the text onto the last row it wrapped onto, so its
+        // column is measured against that row rather than the whole line.
+        let last_row = wrap_at(last, cols, lead).pop().unwrap_or_default();
+        let typed = str_width(&last_row);
         Some((row, (lead + typed).min(cols.saturating_sub(1))))
     }
 
@@ -912,21 +915,34 @@ impl App {
             }];
         }
 
-        let budget = cols.saturating_sub(lead);
-        self.input
-            .split('\n')
-            .enumerate()
-            .map(|(i, text)| Line {
-                spans: vec![
-                    Span {
-                        // Continuation rows are marked, not prompted.
-                        text: if i == 0 { PROMPT_GLYPH.to_string() } else { "· ".to_string() },
-                        style: if i == 0 { bold } else { dim },
-                    },
-                    Span { text: tail_of(text, budget), style: Style::default() },
-                ],
-            })
-            .collect()
+        // Wrapped, not truncated. This used to keep only each line's tail, which
+        // hid the beginning of the user's own text the moment a line outgrew the
+        // window. The TypeScript client rendered the line into an ink `<Text>`,
+        // which wraps, so the whole of it stayed readable — and wrapping is also
+        // the only version that survives a narrowing terminal intact.
+        let mut out: Vec<Line> = Vec::new();
+        for (i, text) in self.input.split('\n').enumerate() {
+            // A marker introduces a *logical* line. Rows a long line wraps onto are
+            // indented to the text instead, matching how ink laid the prefix and
+            // the text out as a flex row.
+            let (marker, marker_style) = if i == 0 {
+                (PROMPT_GLYPH.to_string(), bold)
+            } else {
+                ("· ".to_string(), dim)
+            };
+            for (j, segment) in wrap_at(text, cols, lead).into_iter().enumerate() {
+                out.push(Line {
+                    spans: vec![
+                        Span {
+                            text:  if j == 0 { marker.clone() } else { " ".repeat(lead) },
+                            style: marker_style,
+                        },
+                        Span { text: segment, style: Style::default() },
+                    ],
+                });
+            }
+        }
+        out
     }
 
     fn context_bar_line(&self, cols: usize) -> Line {
@@ -1073,26 +1089,6 @@ fn diff_lines(line: &str, cols: usize, dim: Style) -> Vec<Line> {
         .collect()
 }
 
-/// The tail of a line that fits, so a long one scrolls horizontally rather than
-/// being cut off where the user is typing.
-fn tail_of(text: &str, budget: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    if str_width(text) <= budget {
-        return text.to_string();
-    }
-    let mut kept: Vec<&str> = Vec::new();
-    let mut w = 0;
-    for cluster in text.graphemes(true).rev() {
-        let cw = crate::width::cluster_width(cluster);
-        if w + cw > budget {
-            break;
-        }
-        kept.push(cluster);
-        w += cw;
-    }
-    kept.reverse();
-    kept.concat()
-}
 
 /// A duration at a readable precision.
 ///
@@ -2472,20 +2468,32 @@ mod tests {
         assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
-    /// A long line scrolls horizontally so the caret stays visible.
+    /// A long line wraps, so all of what was typed stays readable. It used to keep
+    /// only the tail, which hid the start of the user's own text — and the
+    /// TypeScript client wrapped it (an ink `<Text>`, which has no other mode).
     #[test]
-    fn long_input_shows_its_tail() {
-        let visible = tail_of(&"0123456789".repeat(10), 10);
-        assert_eq!(str_width(&visible), 10);
-        assert!("0123456789".repeat(10).ends_with(&visible), "the end, not the start");
+    fn long_input_wraps_rather_than_hiding_its_start() {
+        let (mut app, _rows) = app_with(0);
+        let typed: String = (0..8).map(|i| format!("segment{i} ")).collect();
+        for c in typed.chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let lines = app.prompt_lines(40);
+        assert!(lines.len() > 1, "a line longer than the window has to wrap: {lines:?}");
+        for line in &lines {
+            assert!(line.width() <= 40, "{:?} overflows", line.plain());
+        }
+        let joined: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("");
+        assert!(joined.contains("segment0"), "the beginning is still on screen");
+        assert!(joined.contains("segment7"), "and so is the end");
     }
 
-    /// Each line of a multi-line input scrolls on its own, so a long first line
-    /// does not shift the row the caret is on.
+    /// Only a real newline earns a `·`. Rows that a single long line wrapped onto
+    /// are indented instead, or a wrapped line would read as several lines.
     #[test]
-    fn each_line_scrolls_independently() {
+    fn wrapped_rows_are_indented_and_new_lines_are_marked() {
         let (mut app, _rows) = app_with(0);
-        for c in "x".repeat(200).chars() {
+        for c in "x".repeat(90).chars() {
             app.update(Input::Char(c), ROWS);
         }
         app.update(Input::Newline, ROWS);
@@ -2493,10 +2501,30 @@ mod tests {
             app.update(Input::Char(c), ROWS);
         }
         let lines = app.prompt_lines(40);
-        assert_eq!(lines.len(), 2);
+        let plain: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        assert!(plain[0].starts_with(PROMPT_GLYPH), "the first row is prompted: {plain:?}");
+        // 90 x's at 38 usable columns is three rows; the two after the first carry
+        // no marker.
+        assert!(!plain[1].trim_start().starts_with('·'), "wrapped row marked: {plain:?}");
+        assert!(!plain[2].trim_start().starts_with('·'), "wrapped row marked: {plain:?}");
+        let second = plain.iter().find(|p| p.contains("short")).expect("the second line");
+        assert!(second.starts_with('·'), "a real newline is marked: {second:?}");
         for line in &lines {
             assert!(line.width() <= 40, "{:?} overflows", line.plain());
         }
-        assert!(lines[1].plain().contains("short"), "the short line is intact");
+    }
+
+    /// The caret follows the text onto the row it wrapped onto.
+    #[test]
+    fn the_caret_lands_on_the_last_wrapped_row() {
+        let (mut app, rows) = app_with(0);
+        for c in "y".repeat(50).chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let block = app.live_lines(&crate::inline::Inline::new(40, rows), 40);
+        let (row, col) = app.cursor_in(&block, 40).expect("a caret");
+        assert_eq!(block.lines[row].plain().trim_end().len() % 40, col % 40,
+                   "the caret sits at the end of the row it is on");
+        assert!(col < 40, "and inside the window");
     }
 }

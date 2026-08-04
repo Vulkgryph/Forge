@@ -2468,6 +2468,67 @@ mod tests {
         assert_eq!(app.update(Input::Quit, ROWS).0, Outcome::Quit);
     }
 
+    /// Paragraphs keep their shape at any width: the blank line between them
+    /// survives, and each paragraph re-wraps on its own rather than running
+    /// together.
+    #[test]
+    fn paragraphs_rewrap_and_keep_the_gap_between_them() {
+        let (mut app, _rows) = app_with(0);
+        let text = "Paragraph one runs on for a while so that it has to wrap \
+several times over at any sensible terminal width.\n\nParagraph two is also \
+long enough to wrap, and must stay separated from the first.";
+        app.session_mut().apply(AgentMessage::AssistantMessage { content: text.into() });
+
+        for cols in [100usize, 60, 30, 20] {
+            let lines = app.lines_for(0..app.session().entries().len(), cols);
+            let plain: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+            for line in &lines {
+                assert!(line.width() <= cols, "at {cols}: {:?} overflows", line.plain());
+            }
+            // Every word survives the wrap, in order.
+            let joined = plain.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+            for word in ["Paragraph", "one", "sensible", "two", "separated", "first."] {
+                assert!(joined.contains(word), "at {cols}: lost {word:?} in {joined:?}");
+            }
+            // The paragraphs stay apart: a blank row between the last row of the
+            // first and the first row of the second.
+            let first_end = plain.iter().position(|p| p.contains("width.")).unwrap();
+            let second_start = plain.iter().position(|p| p.contains("Paragraph two")
+                || (p.contains("two") && !p.contains("one"))).unwrap();
+            assert!(second_start > first_end, "at {cols}: paragraphs out of order");
+            assert!(
+                plain[first_end + 1..second_start].iter().any(|p| p.trim().is_empty()),
+                "at {cols}: no blank row between paragraphs: {plain:?}",
+            );
+        }
+    }
+
+    /// Narrow far enough and one line has to become three or more. Every row still
+    /// fits, and nothing is dropped on the way.
+    #[test]
+    fn one_line_becoming_several_keeps_all_of_it() {
+        let (mut app, _rows) = app_with(0);
+        let sentence: String =
+            (0..14).map(|i| format!("word{i:02} ")).collect::<String>().trim_end().to_string();
+        app.session_mut()
+            .apply(AgentMessage::AssistantMessage { content: sentence.clone() });
+
+        let wide = app.lines_for(0..app.session().entries().len(), 120);
+        let narrow = app.lines_for(0..app.session().entries().len(), 24);
+        assert!(
+            narrow.len() >= wide.len() + 2,
+            "24 columns should need several more rows than 120: {} vs {}",
+            narrow.len(), wide.len(),
+        );
+        for line in &narrow {
+            assert!(line.width() <= 24, "{:?} overflows 24", line.plain());
+        }
+        let joined = narrow.iter().map(|l| l.plain()).collect::<Vec<_>>().join(" ");
+        for i in 0..14 {
+            assert!(joined.contains(&format!("word{i:02}")), "lost word{i:02}: {joined:?}");
+        }
+    }
+
     /// A long line wraps, so all of what was typed stays readable. It used to keep
     /// only the tail, which hid the start of the user's own text — and the
     /// TypeScript client wrapped it (an ink `<Text>`, which has no other mode).

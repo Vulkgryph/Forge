@@ -548,6 +548,27 @@ mod tests {
         assert!(text.contains("\x1b[4A"), "expected a climb of 4 rows, got: {text:?}");
     }
 
+    /// A single row can become several, not just two — the caret has to be found
+    /// however many rows down that is.
+    #[test]
+    fn one_row_becoming_four_is_climbed_in_full() {
+        let mut inline = Inline::new(120, 20);
+        let mut out = sink();
+        let wide = "w".repeat(120);
+        inline.draw_live(&mut out, &[line(&wide)], Some((0, 100))).unwrap();
+        assert_eq!(inline.live_rows, 1);
+        assert_eq!(inline.cursor_row, 0);
+
+        inline.resized(30, 20);
+        assert_eq!(inline.live_rows, 4, "120 columns of text needs four rows at 30");
+        assert_eq!(inline.cursor_row, 3, "column 100 is on the fourth of them");
+
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line(&wide)], None).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[3A"), "expected a climb of 3 rows, got {text:?}");
+    }
+
     /// The caret's own column re-wraps too: parked beyond the new width, it is a
     /// row further down than where its line starts.
     #[test]

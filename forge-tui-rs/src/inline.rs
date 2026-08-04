@@ -56,11 +56,22 @@ pub struct Inline {
     /// assuming it sat on the final row climbed one row too far on every redraw,
     /// eating a line of committed transcript each time.
     cursor_row: usize,
+    /// Display width of each row of the live block, as it was actually drawn.
+    ///
+    /// Kept so a width change can work out how tall the block has *become*. The
+    /// rows on screen were drawn at the old width; when the window narrows, the
+    /// terminal re-wraps any of them that no longer fit, and the block covers more
+    /// rows than it was printed with.
+    drawn_widths: Vec<usize>,
+    /// Column the caret was parked at, needed for the same recomputation: after a
+    /// re-wrap the caret sits `col / cols` rows further down than its row started.
+    cursor_col: usize,
 }
 
 impl Inline {
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self { cols, rows, live_rows: 0, cursor_row: 0 }
+        Self { cols, rows, live_rows: 0, cursor_row: 0,
+               drawn_widths: Vec::new(), cursor_col: 0 }
     }
 
     pub fn cols(&self) -> usize {
@@ -82,16 +93,32 @@ impl Inline {
 
     /// Take a new terminal size.
     ///
-    /// The live region's row count is *kept*, which is safe for a reason worth
-    /// stating: autowrap is off and every line is wrapped by us before printing,
-    /// so one printed line always occupies exactly one display row. A width
-    /// change therefore cannot alter how many rows the block covers, and the old
-    /// block can still be erased exactly.
+    /// Autowrap is off and every line is wrapped by us before printing, so a row
+    /// *as drawn* always occupies exactly one display row. That was once taken to
+    /// mean a width change cannot alter how many rows the block covers — but it
+    /// only holds while the width stays the same or grows. Narrow the window and
+    /// rows drawn at the old width no longer fit; the terminal re-wraps them and
+    /// the block becomes taller than it was printed. Erasing then climbed the old,
+    /// too-small distance, started below the top of the block, and left the upper
+    /// rows on screen — a duplicate of the frame, accumulating one more copy on
+    /// every shrink. Measured in tmux: four copies of the model line after five
+    /// resizes.
     ///
-    /// This used to discard the count and leave the previous block on screen —
-    /// visible debris after every resize, on the theory that the terminal had
-    /// reflowed it. With no wrapped lines to reflow, there was nothing to fear.
+    /// So the block's height and the caret's row are recomputed for the new width,
+    /// from the widths actually drawn.
     pub fn resized(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        if cols != self.cols && self.live_rows > 0 {
+            let rows_for = |w: usize| w.max(1).div_ceil(cols).max(1);
+            let above: usize = self
+                .drawn_widths
+                .iter()
+                .take(self.cursor_row)
+                .map(|&w| rows_for(w))
+                .sum();
+            self.cursor_row = above + self.cursor_col / cols;
+            self.live_rows = self.drawn_widths.iter().map(|&w| rows_for(w)).sum();
+        }
         self.cols = cols;
         self.rows = rows;
     }
@@ -112,6 +139,8 @@ impl Inline {
         }
         self.live_rows = 0;
         self.cursor_row = 0;
+        self.drawn_widths.clear();
+        self.cursor_col = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
     }
@@ -129,8 +158,9 @@ impl Inline {
         buf.push_str(HIDE_CURSOR);
         self.erase_live(&mut buf);
 
+        self.drawn_widths.clear();
         for (i, line) in lines.iter().enumerate() {
-            encode(line, &mut buf, self.cols);
+            self.drawn_widths.push(encode(line, &mut buf, self.cols));
             // No trailing newline on the last line: it would scroll the screen
             // and leave a blank row below the prompt that grows on every redraw.
             if i + 1 < lines.len() {
@@ -157,6 +187,9 @@ impl Inline {
             }
             buf.push_str(SHOW_CURSOR);
             self.cursor_row = row;
+            self.cursor_col = col;
+        } else {
+            self.cursor_col = self.drawn_widths.last().copied().unwrap_or(0);
         }
 
         buf.push_str(SYNC_END);
@@ -197,6 +230,8 @@ impl Inline {
         buf.push_str("\r\n");
         self.live_rows = 0;
         self.cursor_row = 0;
+        self.drawn_widths.clear();
+        self.cursor_col = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
     }
@@ -207,7 +242,7 @@ impl Inline {
 /// Clipped rather than wrapped: the caller has already wrapped to this width,
 /// and a line that slipped through longer than the terminal must not be allowed
 /// to wrap — that is precisely the miscount that made ink overlap text.
-fn encode(line: &Line, buf: &mut String, cols: usize) {
+fn encode(line: &Line, buf: &mut String, cols: usize) -> usize {
     let mut used = 0;
     for span in &line.spans {
         if used >= cols {
@@ -228,6 +263,7 @@ fn encode(line: &Line, buf: &mut String, cols: usize) {
     }
     // Reset, so a style cannot leak into the next line or into the shell.
     buf.push_str("\x1b[0m");
+    used
 }
 
 #[cfg(test)]
@@ -482,6 +518,62 @@ mod tests {
         // which would make the caller divide by it or draw nothing at all.
         assert_eq!(Inline::new(80, 1).live_capacity(), 1);
         assert_eq!(Inline::new(80, 0).live_capacity(), 1);
+    }
+
+    /// The reported bug: shrinking the terminal left a copy of the frame behind,
+    /// and every further shrink added another. Rows drawn at the old width no
+    /// longer fit, the terminal re-wraps them, and the block is taller than it was
+    /// printed — so the erase has to climb the re-wrapped distance.
+    #[test]
+    fn narrowing_accounts_for_rows_the_terminal_rewraps() {
+        let mut inline = Inline::new(100, 20);
+        let mut out = sink();
+        // Three rows, each 100 wide, caret parked on the last.
+        let wide = "x".repeat(100);
+        let lines = vec![line(&wide), line(&wide), line(&wide)];
+        inline.draw_live(&mut out, &lines, Some((2, 0))).unwrap();
+        assert_eq!(inline.live_rows, 3);
+        assert_eq!(inline.cursor_row, 2);
+
+        // Halve the width: every 100-wide row now needs two rows, so the block is
+        // six rows tall and the caret is four rows below its top.
+        inline.resized(50, 20);
+        assert_eq!(inline.live_rows, 6, "three 100-wide rows become six at 50 cols");
+        assert_eq!(inline.cursor_row, 4, "two re-wrapped rows sit above the caret");
+
+        // And the next erase climbs that far, rather than the old two.
+        let mut out = sink();
+        inline.draw_live(&mut out, &lines, Some((2, 0))).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[4A"), "expected a climb of 4 rows, got: {text:?}");
+    }
+
+    /// The caret's own column re-wraps too: parked beyond the new width, it is a
+    /// row further down than where its line starts.
+    #[test]
+    fn the_caret_column_rewraps_onto_a_later_row() {
+        let mut inline = Inline::new(100, 20);
+        let mut out = sink();
+        let wide = "y".repeat(100);
+        inline.draw_live(&mut out, &[line(&wide), line(&wide)], Some((1, 80))).unwrap();
+        assert_eq!(inline.cursor_row, 1);
+
+        inline.resized(40, 20);
+        // Row 0 (100 wide) becomes 3 rows; the caret's column 80 is 2 rows into
+        // its own line, so it lands on row 5.
+        assert_eq!(inline.cursor_row, 5, "column 80 at 40 cols is two rows down");
+    }
+
+    /// Widening cannot make the block taller, and must not invent a climb.
+    #[test]
+    fn widening_leaves_the_block_one_row_per_line() {
+        let mut inline = Inline::new(50, 20);
+        let mut out = sink();
+        let text = "z".repeat(50);
+        inline.draw_live(&mut out, &[line(&text), line(&text)], Some((1, 0))).unwrap();
+        inline.resized(120, 20);
+        assert_eq!(inline.live_rows, 2, "each row still fits on one row");
+        assert_eq!(inline.cursor_row, 1);
     }
 
     /// A resize must still erase the old block, or every resize leaves debris.

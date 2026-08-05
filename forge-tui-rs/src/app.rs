@@ -688,6 +688,20 @@ impl App {
     /// Everything from here on is redrawn each frame, so it re-wraps when the
     /// window changes size.
     ///
+    /// An entry taller than the whole live region is *not* kept live. This used to
+    /// keep the newest entry whatever its size, on the reasoning that something
+    /// should always be re-wrappable — but the live block is then trimmed to fit
+    /// the window, and the rows trimmed off it were printed nowhere at all. A
+    /// single long message therefore showed its tail under an "↑ N more lines"
+    /// marker with no way to reach the rest: not on screen, not in the
+    /// scrollback, and not expandable. Measured on a resumed session in a
+    /// 20-row window: "↑ 360 more lines", and the first message of the
+    /// conversation absent from the terminal's history entirely.
+    ///
+    /// Left to be committed instead, such an entry is printed whole and scrolls
+    /// into the scrollback like any other terminal output. It stops re-wrapping
+    /// on resize, which is the unavoidable cost of being in the scrollback, and
+    /// is plainly better than being unreadable.
     fn live_window_start(&self, inline: &crate::inline::Inline, cols: usize) -> usize {
         let entries = self.session.entries();
         // Chrome takes rows too; leave room for it rather than letting the
@@ -699,7 +713,7 @@ impl App {
         for index in (self.committed..entries.len()).rev() {
             // One entry, plus the blank line between entries.
             let rows = self.build_range(index..index + 1, cols).len() + 1;
-            if used + rows > budget && start < entries.len() {
+            if used + rows > budget {
                 break;
             }
             used += rows;
@@ -2128,6 +2142,45 @@ mod tests {
         assert_eq!(app.committed, 0, "a finished turn is still redrawable");
         let shown = live_text(&mut app);
         assert!(shown.contains("an answer"), "and still on screen: {shown:?}");
+    }
+
+    /// The reported bug: a message too tall for the window showed its tail under
+    /// an "↑ N more lines" marker, and the rest was nowhere — not on screen, not in
+    /// the scrollback, and not reachable. Measured on a resumed session in a
+    /// 20-row window: "↑ 360 more lines", with the whole of that message absent
+    /// from the terminal's history.
+    ///
+    /// Such an entry has to be committed instead, so it is printed whole and
+    /// scrolls into the scrollback like any other output.
+    #[test]
+    fn a_message_taller_than_the_window_is_printed_whole() {
+        let mut app = App::new();
+        app.session_mut().push_user("a question");
+        // Far more rows than the live region can hold, each line identifiable.
+        let long: String =
+            (0..200).map(|i| format!("line{i:03} of a very long reply\n")).collect();
+        app.session_mut().apply(AgentMessage::AssistantMessage { content: long });
+        app.session_mut().apply(AgentMessage::Done);
+
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+
+        let printed = visible(&String::from_utf8_lossy(&out));
+        // Every row reached the terminal, top included.
+        for i in [0usize, 1, 99, 150, 199] {
+            assert!(
+                printed.contains(&format!("line{i:03}")),
+                "line{i:03} was never printed",
+            );
+        }
+        // And nothing was hidden behind a marker.
+        assert!(
+            !printed.contains("more lines"),
+            "content was hidden instead of printed: {:?}",
+            printed.lines().filter(|l: &&str| l.contains("more lines")).collect::<Vec<_>>(),
+        );
+        assert!(app.committed > 0, "the oversized entry was committed");
     }
 
     /// Which means a resize re-wraps it, rather than leaving it at the old width.

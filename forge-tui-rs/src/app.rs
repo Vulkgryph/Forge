@@ -55,23 +55,40 @@ pub enum Input {
 ///
 /// ink names map onto the terminal's first sixteen: blue is 12, magenta 13,
 /// yellow 11, red 9, green 10, gray 8. Using the same indices means the TUI
-/// picks up the user's terminal theme exactly as the old one did, rather than
-/// imposing colours of its own.
+/// picks up the user's terminal theme — which is the right default, since it is
+/// the user's own choice of palette.
+///
+/// Three roles are exceptions, given explicit 256-colour values because the
+/// theme's version of them was not readable. Index 12 is a dark indigo in many
+/// dark themes, and it carried the prompt, the user's own messages, the menu
+/// selection and the dialog accent — the most important chrome in the interface,
+/// in the one colour hardest to see on black. Index 8 is often near #555, too
+/// close to the background for text that still has to be read. These are picked
+/// for luminance against a dark background instead.
 mod palette {
-    /// User messages: bold blue.
-    pub const USER:     u8 = 12;
-    /// Reasoning, subagents, plan content: magenta.
+    /// User messages, the prompt, the menu selection, dialog accents.
+    ///
+    /// A light sky blue rather than index 12's dark indigo: same family, but
+    /// legible on black.
+    pub const USER:     u8 = 117;
+    /// Reasoning and the "Thinking…" label.
+    ///
+    /// Warm, so it reads as distinct from the blue chrome without competing with
+    /// the assistant's own text, and bright enough to be read rather than merely
+    /// noticed. Was magenta, which it shared with subagents and plan content.
+    pub const THINKING: u8 = 179;
+    /// Subagents and plan content: magenta.
     pub const MAGENTA:  u8 = 13;
     /// Plan status and the pause indicator: yellow.
     pub const YELLOW:   u8 = 11;
     pub const RED:      u8 = 9;
     pub const GREEN:    u8 = 10;
-    /// Dim text throughout.
-    pub const GRAY:     u8 = 8;
+    /// Dim text throughout — hints, placeholders, the context bar.
+    pub const GRAY:     u8 = 245;
     /// Diff line tints, as close as 256 colours get to ink's #002800/#280000.
     pub const DIFF_ADD_BG: u8 = 22;
     pub const DIFF_DEL_BG: u8 = 52;
-    pub const PROMPT:   u8 = 12;
+    pub const PROMPT:   u8 = USER;
 }
 
 pub struct App {
@@ -461,8 +478,12 @@ impl App {
                     };
                     out.push(Line {
                         spans: vec![
-                            Span { text: "✻ ".into(), style: Style::fg(palette::MAGENTA) },
-                            Span { text: head, style: Style::fg(palette::MAGENTA).dim() },
+                            Span { text: "✻ ".into(), style: Style::fg(palette::THINKING) },
+                            // Not dimmed: dimming a colour on a black background
+                            // is what made this hard to read in the first place.
+                            // The hint beside it stays dim, so the label still
+                            // reads as the louder of the two.
+                            Span { text: head, style: Style::fg(palette::THINKING) },
                             Span { text: hint.into(), style: dim },
                         ],
                     });
@@ -666,6 +687,7 @@ impl App {
     /// terminal's scrollback, where it keeps the width it was written at.
     /// Everything from here on is redrawn each frame, so it re-wraps when the
     /// window changes size.
+    ///
     fn live_window_start(&self, inline: &crate::inline::Inline, cols: usize) -> usize {
         let entries = self.session.entries();
         // Chrome takes rows too; leave room for it rather than letting the

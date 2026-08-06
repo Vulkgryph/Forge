@@ -71,11 +71,46 @@ pub enum PermissionMode {
     /// Ask before every tool that requests approval.
     #[default]
     Ask,
+    /// Approve edits without asking, but still ask before running anything.
+    ///
+    /// Distinct from `AllowAll`: the TypeScript client auto-approved calls whose
+    /// kind is `write` and nothing else, so a command still stops for permission.
+    /// This label used to sit on `AllowAll`, which claimed "auto-accept edits"
+    /// while in fact approving commands too.
+    AutoAccept,
     /// Approve everything without asking. Set by the agent's
     /// `--dangerously-allow-all`, or toggled at runtime.
     AllowAll,
-    /// Read-only planning; the agent enforces this, we only display it.
+    /// Read-only planning: anything that is not a read is refused here rather
+    /// than being sent on, which is what the TypeScript client did.
     Plan,
+}
+
+impl PermissionMode {
+    /// The next mode Shift-Tab moves to.
+    ///
+    /// Ask, auto-accept, plan — the three the TypeScript client cycled.
+    /// `AllowAll` is deliberately not in the ring: it comes from
+    /// `--dangerously-allow-all` or an explicit choice in the menu, and must not
+    /// be something a stray keypress can turn on.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::AutoAccept,
+            Self::AutoAccept => Self::Plan,
+            Self::Plan | Self::AllowAll => Self::Ask,
+        }
+    }
+
+    /// What the transcript says when the mode changes, as the TypeScript client
+    /// worded it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Normal mode",
+            Self::AutoAccept => "Auto-accept edits",
+            Self::AllowAll => "Approving everything",
+            Self::Plan => "Plan mode (read-only)",
+        }
+    }
 }
 
 /// What kind of line this is in the transcript.
@@ -474,7 +509,18 @@ impl Session {
                 // The gate. Approval is skipped when the whole session allows
                 // it, or when this tool was approved earlier — matching the
                 // agent's own `needs_approval` rather than second-guessing it.
+                // Plan mode is read-only: refuse anything else here rather than
+                // asking, which is how the TypeScript client enforced it.
+                if self.permission_mode == PermissionMode::Plan && kind != "read" {
+                    self.push_system(format!("Blocked by plan mode: {tool_name}"));
+                    return vec![Effect::Send(ClientMessage::DenyAction {
+                        tool_id,
+                        reason: "plan mode is read-only".into(),
+                    })];
+                }
+
                 let pre_approved = self.permission_mode == PermissionMode::AllowAll
+                    || (self.permission_mode == PermissionMode::AutoAccept && kind == "write")
                     || self.approved_tools.contains(&tool_name);
                 if needs_approval && !pre_approved {
                     self.pending = Some(Pending::Approval {
@@ -738,6 +784,13 @@ impl Session {
                 Vec::new()
             }
         }
+    }
+
+    /// Step to the next permission mode, saying so in the transcript.
+    pub fn cycle_permission_mode(&mut self) {
+        self.permission_mode = self.permission_mode.next();
+        let label = self.permission_mode.label();
+        self.push_system(label.to_string());
     }
 
     /// Confirm a pending rewind.
@@ -1678,6 +1731,107 @@ mod tests {
                 "{tool} was approved by a plan, which it must not be",
             );
         }
+    }
+
+    /// Shift-Tab walks the three modes the TypeScript client cycled, and says which
+    /// one it landed on.
+    #[test]
+    fn cycling_steps_ask_autoaccept_plan_and_back() {
+        let mut session = Session::new();
+        assert_eq!(session.permission_mode, PermissionMode::Ask);
+        for want in [PermissionMode::AutoAccept, PermissionMode::Plan, PermissionMode::Ask] {
+            session.cycle_permission_mode();
+            assert_eq!(session.permission_mode, want);
+            let last = session.entries().last().expect("a line saying so");
+            assert_eq!(last.content, want.label());
+        }
+    }
+
+    /// Approve-everything is not in the ring: a stray keypress must not be able to
+    /// turn off every prompt. Cycling out of it lands on asking.
+    #[test]
+    fn cycling_never_reaches_approve_everything() {
+        let mut mode = PermissionMode::Ask;
+        for _ in 0..12 {
+            mode = mode.next();
+            assert_ne!(mode, PermissionMode::AllowAll);
+        }
+        assert_eq!(PermissionMode::AllowAll.next(), PermissionMode::Ask);
+    }
+
+    fn write_request(id: &str) -> AgentMessage {
+        AgentMessage::ToolRequest {
+            tool_name: "write_file".into(),
+            tool_args: "{}".into(),
+            tool_id: id.into(),
+            kind: "write".into(),
+            subagent_id: None,
+            needs_approval: true,
+        }
+    }
+
+    fn exec_request(id: &str) -> AgentMessage {
+        AgentMessage::ToolRequest {
+            tool_name: "shell_exec".into(),
+            tool_args: "{}".into(),
+            tool_id: id.into(),
+            kind: "execute".into(),
+            subagent_id: None,
+            needs_approval: true,
+        }
+    }
+
+    /// Auto-accept lets edits through and still asks before running anything —
+    /// exactly the distinction the TypeScript client drew, and the reason it is not
+    /// the same thing as approving everything.
+    #[test]
+    fn auto_accept_passes_edits_but_still_asks_to_run() {
+        let mut session = Session::new();
+        session.permission_mode = PermissionMode::AutoAccept;
+
+        session.apply(write_request("t1"));
+        assert!(session.pending.is_none(), "an edit should not stop for approval");
+
+        session.apply(exec_request("t2"));
+        assert!(
+            matches!(session.pending, Some(Pending::Approval { .. })),
+            "running a command still asks",
+        );
+    }
+
+    /// Plan mode is read-only: anything else is refused here rather than asked
+    /// about, which is how the TypeScript client enforced it.
+    #[test]
+    fn plan_mode_refuses_anything_that_is_not_a_read() {
+        let mut session = Session::new();
+        session.permission_mode = PermissionMode::Plan;
+
+        let effects = session.apply(write_request("t1"));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(ClientMessage::DenyAction { tool_id, .. })] if tool_id == "t1"
+            ),
+            "the write should be denied, got {effects:?}",
+        );
+        assert!(session.pending.is_none(), "and not queued as a question");
+        assert!(
+            session.entries().iter().any(|e| e.content.contains("Blocked by plan mode")),
+            "the transcript says why",
+        );
+
+        let reads = session.apply(AgentMessage::ToolRequest {
+            tool_name: "read_file".into(),
+            tool_args: "{}".into(),
+            tool_id: "t2".into(),
+            kind: "read".into(),
+            subagent_id: None,
+            needs_approval: false,
+        });
+        assert!(
+            !matches!(reads.as_slice(), [Effect::Send(ClientMessage::DenyAction { .. })]),
+            "a read is allowed through: {reads:?}",
+        );
     }
 
 }

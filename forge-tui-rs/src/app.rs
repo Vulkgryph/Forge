@@ -45,6 +45,8 @@ pub enum Input {
     ToggleReasoning,
     /// Complete the slash command being typed.
     Complete,
+    /// Shift-Tab: step to the next permission mode.
+    CyclePermission,
     /// Insert a literal newline in the input.
     Newline,
     Quit,
@@ -261,6 +263,16 @@ impl App {
                 }
             }
 
+            // Shift-Tab. Ignored while a dialog or the menu owns the screen, so it
+            // cannot change the rules underneath a question already being asked —
+            // the same guard the TypeScript client had.
+            Input::CyclePermission => {
+                if self.dialog.is_none() && self.menu.is_none() {
+                    self.session.cycle_permission_mode();
+                    self.cache = None;
+                    self.follow_tail();
+                }
+            }
             Input::Complete => {
                 if let Some(entry) = self.selected_suggestion() {
                     self.input = entry.command.to_string();
@@ -1057,7 +1069,10 @@ impl App {
             style: dim,
         }];
         let (label, colour) = match self.session.permission_mode {
-            PermissionMode::AllowAll => (Some("⏵⏵ auto-accept edits"), palette::GREEN),
+            PermissionMode::AutoAccept => (Some("⏵⏵ auto-accept edits"), palette::GREEN),
+            // Says what it does. This label used to read "auto-accept edits",
+            // which understated a mode that approves commands as well.
+            PermissionMode::AllowAll => (Some("⏵⏵ approving everything"), palette::RED),
             PermissionMode::Plan => (Some("⏸ plan mode"), palette::YELLOW),
             PermissionMode::Ask => (None, palette::GRAY),
         };
@@ -2104,13 +2119,26 @@ mod tests {
         assert!(!grid.contains("● ready"), "and no status line");
     }
 
-    /// Auto-approve has to be visible, since it means prompts are being skipped.
+    /// Skipping prompts has to be visible, and each mode has to say what it
+    /// actually skips: "auto-accept edits" once described a mode that approved
+    /// commands as well, which understated it.
     #[test]
-    fn the_context_bar_flags_auto_approve() {
+    fn the_context_bar_names_the_permission_mode() {
+        for (mode, want) in [
+            (PermissionMode::AutoAccept, "auto-accept edits"),
+            (PermissionMode::AllowAll, "approving everything"),
+            (PermissionMode::Plan, "plan mode"),
+        ] {
+            let (mut app, _rows) = app_with(0);
+            app.session_mut().permission_mode = mode;
+            let grid = live_text(&mut app);
+            assert!(grid.contains(want), "{mode:?} should say {want:?}, got {grid:?}");
+        }
+        // Asking each time is the default and says nothing.
         let (mut app, _rows) = app_with(0);
-        app.session_mut().permission_mode = PermissionMode::AllowAll;
+        app.session_mut().permission_mode = PermissionMode::Ask;
         let grid = live_text(&mut app);
-        assert!(grid.contains("auto-accept"), "got {grid:?}");
+        assert!(!grid.contains("auto-accept"), "no flag when nothing is skipped: {grid:?}");
     }
 
     /// Tool calls indent four columns and their output six, so a turn reads as a

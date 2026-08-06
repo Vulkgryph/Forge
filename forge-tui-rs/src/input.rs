@@ -51,6 +51,7 @@ pub fn bind(key: Key) -> Option<Input> {
         // control character into the input line.
         // Tab completes a slash command.
         Key::Tab => Input::Complete,
+        Key::BackTab => Input::CyclePermission,
 
         Key::Left | Key::Right | Key::Delete | Key::Ctrl(_) => return None,
     })

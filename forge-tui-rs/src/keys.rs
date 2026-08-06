@@ -23,6 +23,8 @@ pub enum Key {
     Enter,
     Backspace,
     Tab,
+    /// Shift-Tab, which terminals send as `CSI Z` rather than as a modified Tab.
+    BackTab,
     Escape,
     Up,
     Down,
@@ -233,6 +235,8 @@ impl Decoder {
         }
 
         Step::Key(match (final_byte, params.as_str()) {
+            // Shift-Tab. Its own final byte, not Tab with a modifier parameter.
+            (b'Z', _) => Key::BackTab,
             (b'A', _) => Key::Up,
             (b'B', _) => Key::Down,
             (b'C', _) => Key::Right,
@@ -278,11 +282,15 @@ impl Decoder {
             .parse::<u32>()
             .unwrap_or(1)
             .saturating_sub(1);
-        let ctrl = mods & 0b100 != 0;
+        let ctrl  = mods & 0b100 != 0;
+        let shift = mods & 0b1 != 0;
 
         // The special keys the protocol gives their own codepoints.
         let key = match code {
             13 => Key::Enter,
+            // Shift-Tab arrives here as Tab with the shift bit rather than as
+            // `CSI Z`, when a terminal is in enhanced mode.
+            9 if shift => Key::BackTab,
             9 => Key::Tab,
             127 | 8 => Key::Backspace,
             27 => Key::Escape,
@@ -460,8 +468,9 @@ mod tests {
     #[test]
     fn an_unrecognised_sequence_is_consumed_not_left_behind() {
         let mut d = Decoder::new();
-        // A well-formed but unbound sequence, then a real key.
-        let keys = d.feed(b"\x1b[99Za");
+        // A well-formed but unbound sequence, then a real key. Not `CSI ... Z`,
+        // which is Shift-Tab.
+        let keys = d.feed(b"\x1b[99Wa");
         assert_eq!(keys, vec![Key::Char('a')], "the letter still arrives");
         assert!(!d.has_pending(), "nothing left to confuse the next read");
     }
@@ -653,4 +662,22 @@ mod tests {
             }
         }
     }
+    /// Shift-Tab, which cycles permission modes. Terminals send it as `CSI Z`,
+    /// not as Tab with a modifier.
+    #[test]
+    fn shift_tab_decodes() {
+        assert_eq!(decode(b"\x1b[Z"), vec![Key::BackTab]);
+        // And with a parameter, as some terminals send it.
+        assert_eq!(decode(b"\x1b[1;2Z"), vec![Key::BackTab]);
+        // Plain Tab is still Tab.
+        assert_eq!(decode(b"\t"), vec![Key::Tab]);
+    }
+
+    /// In enhanced mode it arrives as Tab with the shift bit instead.
+    #[test]
+    fn shift_tab_decodes_from_the_kitty_form() {
+        assert_eq!(decode(b"\x1b[9;2u"), vec![Key::BackTab]);
+        assert_eq!(decode(b"\x1b[9u"), vec![Key::Tab]);
+    }
+
 }

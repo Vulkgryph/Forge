@@ -69,7 +69,7 @@ impl Page {
             Page::Root => "Everything about this session.",
             Page::Models => "Switches the primary model. Takes effect immediately.",
             Page::Settings => "Permissions, tools, context and connectivity.",
-            Page::Permission => "Whether tools are approved one at a time.",
+            Page::Permission => "Also cycled with Shift+Tab, except for approve-everything.",
             Page::Tools => "Enter toggles. A disabled tool is not offered to the model.",
             Page::ContextStrategy => "What happens as the context window fills.",
             Page::Offline => "Offline refuses network tools rather than failing on them.",
@@ -235,6 +235,7 @@ impl Menu {
                     "Permission mode",
                     match session.permission_mode {
                         PermissionMode::Ask => "ask before each tool",
+                        PermissionMode::AutoAccept => "auto-accept edits",
                         PermissionMode::AllowAll => "approve everything",
                         PermissionMode::Plan => "planning, read-only",
                     },
@@ -266,6 +267,12 @@ impl Menu {
                 Item::row("Ask each time", "approve tools one at a time",
                           Act::SetPermission(PermissionMode::Ask))
                     .marked(session.permission_mode == PermissionMode::Ask),
+                Item::row("Auto-accept edits", "edits go through; commands still ask",
+                          Act::SetPermission(PermissionMode::AutoAccept))
+                    .marked(session.permission_mode == PermissionMode::AutoAccept),
+                Item::row("Plan mode", "read-only — the agent drafts a plan first",
+                          Act::SetPermission(PermissionMode::Plan))
+                    .marked(session.permission_mode == PermissionMode::Plan),
                 Item::row("Approve everything", "no prompts — be sure",
                           Act::SetPermission(PermissionMode::AllowAll))
                     .marked(session.permission_mode == PermissionMode::AllowAll),

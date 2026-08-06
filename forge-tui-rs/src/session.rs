@@ -248,6 +248,13 @@ impl Default for Session {
     }
 }
 
+/// The tools an approved plan is allowed to use without asking again.
+///
+/// The edit tools only. Approving a plan is not a blanket approval: running
+/// commands still asks, since a plan describing an edit is not consent to execute
+/// anything.
+const PLAN_EDIT_TOOLS: &[&str] = &["apply_patch", "write_file", "edit_file"];
+
 impl Session {
     pub fn new() -> Self {
         Self {
@@ -711,11 +718,21 @@ impl Session {
 
     pub fn approve_plan(&mut self, clear_context: bool) -> Vec<Effect> {
         match self.pending.take() {
-            Some(Pending::Plan { .. }) => vec![Effect::Send(if clear_context {
-                ClientMessage::ClearAndApprovePlan
-            } else {
-                ClientMessage::ApprovePlan
-            })],
+            Some(Pending::Plan { .. }) => {
+                // Approving a plan approves the edits it describes. Without this the
+                // agent stopped for permission on every single write while working
+                // through a plan the user had just accepted — which is not what
+                // "approved" means, and is not what the TypeScript client did: it
+                // added these three to its approved set on both approve paths.
+                for tool in PLAN_EDIT_TOOLS {
+                    self.approved_tools.insert((*tool).to_string());
+                }
+                vec![Effect::Send(if clear_context {
+                    ClientMessage::ClearAndApprovePlan
+                } else {
+                    ClientMessage::ApprovePlan
+                })]
+            }
             other => {
                 self.pending = other;
                 Vec::new()
@@ -1624,4 +1641,43 @@ mod tests {
         );
         assert!(Activity::Streaming.is_busy());
     }
+    /// Approving a plan approves the edits it describes. Without this the agent
+    /// stopped for permission on every write while working through a plan the user
+    /// had just accepted.
+    #[test]
+    fn approving_a_plan_approves_the_edit_tools() {
+        let mut session = Session::new();
+        session.apply(AgentMessage::PlanReady {
+            plan_path: "/tmp/plan.md".into(),
+            content: "do the thing".into(),
+        });
+        let effects = session.approve_plan(false);
+        assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::ApprovePlan)]));
+
+        for tool in ["apply_patch", "write_file", "edit_file"] {
+            assert!(
+                session.approved_tools.contains(tool),
+                "{tool} still needs approval after the plan was approved",
+            );
+        }
+    }
+
+    /// It is not a blanket approval: a plan describing an edit is not consent to
+    /// run commands.
+    #[test]
+    fn approving_a_plan_does_not_approve_running_commands() {
+        let mut session = Session::new();
+        session.apply(AgentMessage::PlanReady {
+            plan_path: "/tmp/plan.md".into(),
+            content: "do the thing".into(),
+        });
+        session.approve_plan(true);
+        for tool in ["execute_command", "run_command", "bash"] {
+            assert!(
+                !session.approved_tools.contains(tool),
+                "{tool} was approved by a plan, which it must not be",
+            );
+        }
+    }
+
 }

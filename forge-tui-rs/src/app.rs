@@ -705,8 +705,9 @@ impl App {
     fn live_window_start(&self, inline: &crate::inline::Inline, cols: usize) -> usize {
         let entries = self.session.entries();
         // Chrome takes rows too; leave room for it rather than letting the
-        // transcript push the prompt off the bottom.
-        let budget = inline.live_capacity().saturating_sub(3).max(1);
+        // transcript push the prompt off the bottom. Four: the blank row above the
+        // input, the input, the context bar, and one to spare.
+        let budget = inline.live_capacity().saturating_sub(4).max(1);
 
         let mut used = 0usize;
         let mut start = entries.len();
@@ -747,6 +748,11 @@ impl App {
         chrome.extend(self.subagent_lines(cols));
         let dialog_lines = self.dialog_lines(cols, capacity);
         chrome.extend(dialog_lines);
+        // A blank row between the conversation and the input, so the prompt is not
+        // flush against the last thing said. The TypeScript client had this — its
+        // `PromptInput` sat in a `<Box marginTop={1}>`, above the suggestions as
+        // well as the input itself — and the port dropped it.
+        chrome.push(Line::default());
         chrome.extend(self.suggestion_lines(cols));
         let prompt_offset = chrome.len();
         let prompt = self.prompt_lines(cols);
@@ -2142,6 +2148,33 @@ mod tests {
         assert_eq!(app.committed, 0, "a finished turn is still redrawable");
         let shown = live_text(&mut app);
         assert!(shown.contains("an answer"), "and still on screen: {shown:?}");
+    }
+
+    /// The input is separated from the conversation by a blank row, as it was in
+    /// the TypeScript client (`<Box marginTop={1}>` around `PromptInput`). Without
+    /// it the prompt sits flush against the last thing said.
+    #[test]
+    fn a_blank_row_separates_the_conversation_from_the_input() {
+        let mut app = App::new();
+        app.session_mut().push_user("a question");
+        app.session_mut().apply(AgentMessage::AssistantToken { content: "an answer".into() });
+        app.session_mut().apply(AgentMessage::Done);
+
+        let shown = live_text(&mut app);
+        let rows: Vec<&str> = shown.lines().collect();
+        let prompt = rows.iter().position(|r| r.starts_with(PROMPT_GLYPH))
+            .expect("the prompt is drawn");
+        assert!(prompt > 0, "the prompt cannot be the first row here");
+        assert!(
+            rows[prompt - 1].trim().is_empty(),
+            "no gap above the input: {:?}",
+            &rows[prompt.saturating_sub(2)..=prompt],
+        );
+        // And the gap is one row, not several.
+        assert!(
+            !rows[prompt - 2].trim().is_empty(),
+            "two blank rows above the input: {rows:?}",
+        );
     }
 
     /// The reported bug: a message too tall for the window showed its tail under

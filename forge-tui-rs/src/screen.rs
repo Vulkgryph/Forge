@@ -39,6 +39,12 @@ pub struct Style {
     pub bg:   Option<u8>,
     pub bold: bool,
     pub dim:  bool,
+    /// Italic, strikethrough and underline, for markdown emphasis and links.
+    /// Not every terminal honours italic; the text stays readable where it does
+    /// not, which is why emphasis never relies on it alone for meaning.
+    pub italic:    bool,
+    pub strike:    bool,
+    pub underline: bool,
 }
 
 impl Style {
@@ -46,6 +52,9 @@ impl Style {
     pub fn bg(mut self, idx: u8) -> Self { self.bg = Some(idx); self }
     pub fn bold(mut self) -> Self { self.bold = true; self }
     pub fn dim(mut self) -> Self { self.dim = true; self }
+    pub fn italic(mut self) -> Self { self.italic = true; self }
+    pub fn strike(mut self) -> Self { self.strike = true; self }
+    pub fn underline(mut self) -> Self { self.underline = true; self }
 
     /// The escape sequence that moves the terminal's pen from `from` to `self`.
     ///
@@ -67,8 +76,11 @@ impl Style {
             return "\x1b[0m".to_string();
         }
         let mut s = String::from("\x1b[0");
-        if self.bold { s.push_str(";1"); }
-        if self.dim  { s.push_str(";2"); }
+        if self.bold      { s.push_str(";1"); }
+        if self.dim       { s.push_str(";2"); }
+        if self.italic    { s.push_str(";3"); }
+        if self.underline { s.push_str(";4"); }
+        if self.strike    { s.push_str(";9"); }
         if let Some(fg) = self.fg { let _ = write!(s, ";38;5;{fg}"); }
         if let Some(bg) = self.bg { let _ = write!(s, ";48;5;{bg}"); }
         s.push('m');

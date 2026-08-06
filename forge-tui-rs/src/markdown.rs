@@ -17,6 +17,11 @@ use crate::width::str_width;
 /// Colours, kept in one place so the palette can be seen at a glance.
 mod palette {
     pub const HEADING: u8 = 39;
+    /// Link labels. A light blue rather than the terminal's own, which is the
+    /// dark indigo that was unreadable on black.
+    pub const LINK:    u8 = 117;
+    /// Table borders.
+    pub const RULE:    u8 = 245;
     pub const BULLET:  u8 = 245;
     pub const CODE:    u8 = 215;
     pub const QUOTE:   u8 = 245;
@@ -63,7 +68,11 @@ pub fn render(md: &str, cols: usize) -> Vec<Line> {
     let mut hl = crate::highlight::State::default();
     let dim = Style::fg(palette::BULLET).dim();
 
-    for raw in md.lines() {
+    let lines: Vec<&str> = md.lines().collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let raw = lines[idx];
+        idx += 1;
         let trimmed = raw.trim_start();
 
         // Fences toggle a verbatim region. Inside it nothing is interpreted —
@@ -105,11 +114,196 @@ pub fn render(md: &str, cols: usize) -> Vec<Line> {
             continue;
         }
 
+        // A pipe row followed by a `|---|` rule is a table. Consumed as a block,
+        // since a table cannot be rendered one line at a time.
+        if trimmed.starts_with('|') && idx < lines.len() && is_table_rule(lines[idx].trim()) {
+            let header = split_row(trimmed);
+            idx += 1; // the rule
+            let mut rows = Vec::new();
+            while idx < lines.len() && lines[idx].trim_start().starts_with('|') {
+                rows.push(split_row(lines[idx].trim_start()));
+                idx += 1;
+            }
+            out.extend(table_lines(&header, &rows, cols));
+            continue;
+        }
+
+        // A horizontal rule, drawn as one rather than left as three hyphens.
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            let width = cols.saturating_sub(2).min(40);
+            out.push(Line {
+                spans: vec![Span::new(format!("  {}", "─".repeat(width)), dim)],
+            });
+            continue;
+        }
+
         let (prefix, body, style, hanging) = classify(trimmed);
         let spans = parse_inline(body, style);
         out.extend(wrap_spans(&spans, cols, prefix, hanging));
     }
 
+    out
+}
+
+/// `|---|:--:|` — the row that makes the line above it a header.
+fn is_table_rule(line: &str) -> bool {
+    line.starts_with('|')
+        && line.contains('-')
+        && line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Cells of one pipe row, with the empty edges either side dropped.
+///
+/// Each cell is reduced to its plain text: `**`forge-agent/`**` is measured and
+/// drawn as `forge-agent/`, not with its markers showing. The TypeScript client
+/// did the same — cells went through `partsToPlain` — and it has to be the plain
+/// text, since the column widths are measured from what is actually drawn.
+fn split_row(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    inner.split('|').map(|c| inline_plain(c.trim())).collect()
+}
+
+/// Inline markdown with the syntax resolved away, keeping only the text.
+fn inline_plain(text: &str) -> String {
+    parse_inline(text, Style::default())
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect()
+}
+
+/// One cell, padded to `width` or truncated into it with an ellipsis.
+///
+/// Deliberately not this module's own `clip`, which truncates silently — right for
+/// a line of code, wrong for a table cell, where the reader has to be able to see
+/// that something was cut. The TypeScript client's `truncateCell` marked it too.
+fn cell(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let clipped = crate::widgets::clip(text, width);
+    let pad = width.saturating_sub(str_width(&clipped));
+    format!("{clipped}{}", " ".repeat(pad))
+}
+
+/// Fit the columns into the space available, shrinking the widest first so short
+/// labels stay readable — the rule the TypeScript client used.
+fn fit_widths(raw: &[usize], max_total: usize) -> Vec<usize> {
+    let mut widths: Vec<usize> = raw.iter().map(|w| (*w).max(3)).collect();
+    let total = |w: &Vec<usize>| w.iter().sum::<usize>() + w.len() * 3 + 1;
+    if total(&widths) <= max_total {
+        return widths;
+    }
+    const FLOOR: usize = 4;
+    while total(&widths) > max_total {
+        let widest = (0..widths.len()).max_by_key(|i| widths[*i]).unwrap_or(0);
+        if widths[widest] <= FLOOR {
+            // Every column is at the floor; take one from each and stop when it
+            // cannot shrink further, rather than looping forever.
+            let before = total(&widths);
+            for w in widths.iter_mut() {
+                if *w > 2 {
+                    *w -= 1;
+                }
+            }
+            if total(&widths) >= before {
+                break;
+            }
+        } else {
+            widths[widest] -= 1;
+        }
+    }
+    widths
+}
+
+/// A table as lines: a framed grid, or a stacked key/value list when a grid
+/// cannot fit.
+///
+/// Cells hold plain text. The TypeScript client measured and drew them through
+/// `partsToPlain`, so emphasis inside a cell was never styled there either, and
+/// styling it here would mean the frame no longer lines up with what is measured.
+fn table_lines(header: &[String], rows: &[Vec<String>], cols: usize) -> Vec<Line> {
+    if header.is_empty() {
+        return Vec::new();
+    }
+    let edge = Style::fg(palette::RULE);
+    // The TypeScript client budgeted `max(24, columns - 2)` and then clipped every
+    // row to it. Two problems with taking that literally: the budget leaves out
+    // the two-space indent the rows actually carry, so a "fitting" table came out
+    // two columns too wide; and the floor of 24 is wider than the window itself
+    // below 24 columns. Both were invisible there because the clip hid them —
+    // as a cut border. Budget honestly instead, and never exceed the window.
+    let indent = 2usize;
+    let max_total = cols.saturating_sub(indent).max(24).min(cols.max(1));
+
+    let raw: Vec<usize> = (0..header.len())
+        .map(|c| {
+            std::iter::once(header[c].as_str())
+                .chain(rows.iter().map(|r| r.get(c).map(String::as_str).unwrap_or("")))
+                .map(str_width)
+                .max()
+                .unwrap_or(3)
+                .max(3)
+        })
+        .collect();
+    let widths = fit_widths(&raw, max_total.saturating_sub(indent));
+    let frame_width = widths.iter().sum::<usize>() + widths.len() * 3 + 1 + indent;
+
+    // Too many columns, or too narrow even at the floor: stack each row as
+    // `label: value` instead of emitting rows wider than the terminal.
+    if frame_width > max_total || widths.len() > 6 {
+        let mut out = Vec::new();
+        for (ri, row) in rows.iter().enumerate() {
+            if ri > 0 {
+                out.push(Line::default());
+            }
+            for (ci, value) in row.iter().enumerate() {
+                let label = header
+                    .get(ci)
+                    .filter(|h| !h.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("col{}", ci + 1));
+                out.push(Line {
+                    spans: vec![Span::new(
+                        crate::widgets::clip(&format!("  {label}: {value}"), cols),
+                        Style::default(),
+                    )],
+                });
+            }
+        }
+        return out;
+    }
+
+    let rule = |left: &str, mid: &str, right: &str| {
+        let bars: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        Line {
+            spans: vec![Span::new(clip(&format!("  {left}{}{right}", bars.join(mid)), cols), edge)],
+        }
+    };
+    // A last guard on the total: a row must never be wider than the window, which
+    // is what left a screen-high blank gap under a reply in the ink client.
+    let row_line = |cells: &[String], style: Style| {
+        let mut spans = vec![Span::new("  │", edge)];
+        let mut used = 3usize;
+        for (ci, w) in widths.iter().enumerate() {
+            let text = cells.get(ci).map(String::as_str).unwrap_or("");
+            let body = format!(" {} ", cell(text, *w));
+            if used + str_width(&body) + 1 > cols {
+                break;
+            }
+            used += str_width(&body) + 1;
+            spans.push(Span::new(body, style));
+            spans.push(Span::new("│", edge));
+        }
+        Line { spans }
+    };
+
+    let mut out = vec![rule("┌", "┬", "┐")];
+    out.push(row_line(header, Style::default().bold()));
+    out.push(rule("├", "┼", "┤"));
+    for row in rows {
+        out.push(row_line(row, Style::default()));
+    }
+    out.push(rule("└", "┴", "┘"));
     out
 }
 
@@ -172,9 +366,68 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span> {
                 let inner = &text[i + 2..i + 2 + end];
                 let mut style = base;
                 style.bold = true;
-                spans.push(Span::new(inner, style));
+                // Parsed rather than taken raw, so `**`code`**` is bold code and
+                // not bold backticks. ink's parser nested its tokens and flattened
+                // them recursively; taking the inner text as written left the
+                // markers of anything inside it on screen.
+                spans.extend(parse_nested(inner, style));
                 i += end + 4;
                 continue;
+            }
+        }
+        // After `**`, so bold is not mistaken for two italics.
+        if bytes[i..].starts_with(b"~~") {
+            if let Some(end) = text[i + 2..].find("~~") {
+                flush(&mut plain, &mut spans);
+                let inner = &text[i + 2..i + 2 + end];
+                spans.extend(parse_nested(inner, base.strike()));
+                i += end + 4;
+                continue;
+            }
+        }
+        if bytes[i] == b'*' || bytes[i] == b'_' {
+            let marker = bytes[i] as char;
+            // Only when it closes on the same line and wraps something: `a * b`
+            // and snake_case identifiers are not emphasis.
+            if let Some(end) = text[i + 1..].find(marker) {
+                let inner = &text[i + 1..i + 1 + end];
+                let closes_a_word = !inner.is_empty()
+                    && !inner.starts_with(char::is_whitespace)
+                    && !inner.ends_with(char::is_whitespace);
+                let bare_underscore = marker == '_'
+                    && (i > 0 && text[..i].ends_with(|c: char| c.is_alphanumeric()));
+                if closes_a_word && !bare_underscore {
+                    flush(&mut plain, &mut spans);
+                    spans.extend(parse_nested(inner, base.italic()));
+                    i += end + 2;
+                    continue;
+                }
+            }
+        }
+        // `[label](href)`. The label is styled and the target follows it dimmed,
+        // as ink drew it — a terminal cannot make the label itself clickable.
+        if bytes[i] == b'[' {
+            if let Some(close) = text[i..].find("](") {
+                let rest = &text[i + close + 2..];
+                if let Some(paren) = rest.find(')') {
+                    let label = &text[i + 1..i + close];
+                    let href = &rest[..paren];
+                    if !label.is_empty() && !href.contains(char::is_whitespace) {
+                        flush(&mut plain, &mut spans);
+                        spans.push(Span::new(
+                            label,
+                            Style::fg(palette::LINK).underline(),
+                        ));
+                        if href != label {
+                            spans.push(Span::new(
+                                format!(" ({href})"),
+                                Style::fg(palette::RULE),
+                            ));
+                        }
+                        i += close + 2 + paren + 1;
+                        continue;
+                    }
+                }
             }
         }
         // Advance one whole character, not one byte, or multi-byte text breaks.
@@ -188,6 +441,18 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span> {
         spans.push(Span::new(String::new(), base));
     }
     spans
+}
+
+/// Inline content inside an emphasis run.
+///
+/// Separate from `parse_inline` only to keep the empty case out of the recursion:
+/// `parse_inline` returns one empty span when it finds nothing, which would add a
+/// stray span for every `****`.
+fn parse_nested(text: &str, style: Style) -> Vec<Span> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    parse_inline(text, style)
 }
 
 /// Greedily wrap styled spans to `cols`, keeping styles attached to their text.
@@ -495,5 +760,146 @@ some code that is quite wide and should be clipped rather than wrapped
         let lines = render("日本 **語** テキスト `コード` 終", 40);
         assert!(lines[0].plain().contains('語'));
         assert!(!lines[0].plain().contains('\u{FFFD}'));
+    }
+    // ── Emphasis, links, rules and tables ────────────────────────────────
+
+    fn spans_of(md: &str, cols: usize) -> Vec<Span> {
+        render(md, cols).into_iter().flat_map(|l| l.spans).collect()
+    }
+
+    /// `*x*` and `_x_` are emphasis; the markers go and the text is italic.
+    #[test]
+    fn italics_are_styled_and_their_markers_removed() {
+        let spans = spans_of("*soft* and _also_", 60);
+        let soft = spans.iter().find(|s| s.text == "soft").expect("the emphasised run");
+        assert!(soft.style.italic, "not italic: {:?}", soft.style);
+        assert!(spans.iter().any(|s| s.text == "also" && s.style.italic));
+        let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(!plain.contains('*') && !plain.contains('_'), "markers left: {plain:?}");
+    }
+
+    /// An underscore inside a word is not emphasis — `snake_case_word` must not
+    /// come out italicised with its underscores eaten.
+    #[test]
+    fn underscores_inside_a_word_are_left_alone() {
+        let plain: String = spans_of("snake_case_word", 60).iter()
+            .map(|s| s.text.as_str()).collect();
+        assert_eq!(plain, "snake_case_word");
+    }
+
+    #[test]
+    fn strikethrough_is_styled() {
+        let spans = spans_of("~~gone~~", 60);
+        let gone = spans.iter().find(|s| s.text == "gone").expect("the struck run");
+        assert!(gone.style.strike, "not struck: {:?}", gone.style);
+    }
+
+    /// A link shows its label, then its target dimly — a terminal cannot make the
+    /// label itself clickable, which is how ink drew it too.
+    #[test]
+    fn a_link_shows_its_label_then_its_target() {
+        let spans = spans_of("see [the docs](https://example.com/x) here", 80);
+        // Wrapping rebuilds spans word by word, so match on style rather than on
+        // the label arriving as one span.
+        let label: Vec<&Span> = spans.iter()
+            .filter(|s| s.style.underline && s.style.fg == Some(palette::LINK))
+            .collect();
+        assert!(!label.is_empty(), "no styled label in {spans:?}");
+        let text: String = label.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("docs"), "the label is styled: {text:?}");
+        assert!(
+            spans.iter().any(|s| s.text.contains("https://example.com/x")),
+            "the target is shown: {spans:?}",
+        );
+        let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(!plain.contains("]("), "the syntax is gone: {plain:?}");
+    }
+
+    /// A bare `[not a link]` is left as written.
+    #[test]
+    fn brackets_that_are_not_a_link_are_untouched() {
+        let plain: String = spans_of("[not a link] here", 60).iter()
+            .map(|s| s.text.as_str()).collect();
+        assert_eq!(plain, "[not a link] here");
+    }
+
+    #[test]
+    fn a_horizontal_rule_is_drawn_as_a_rule() {
+        let lines = render("---", 60);
+        assert_eq!(lines.len(), 1);
+        let text = lines[0].plain();
+        assert!(text.trim().chars().all(|c| c == '─'), "not a rule: {text:?}");
+        assert!(text.starts_with("  "), "indented like the other blocks");
+    }
+
+    const TABLE: &str = "| lang | files |\n|------|------:|\n| rust | 42 |\n| ts | 7 |";
+
+    /// A table was passed through as raw pipes before this; it is a framed grid
+    /// now, with every row the same width so the borders line up.
+    #[test]
+    fn a_table_is_framed_and_aligned() {
+        let lines = render(TABLE, 60);
+        let text: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        assert!(text[0].contains('┌') && text[0].contains('┬'), "top: {text:?}");
+        assert!(text[2].contains('├') && text[2].contains('┼'), "header rule: {text:?}");
+        assert!(text[text.len() - 1].contains('└'), "bottom: {text:?}");
+        let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged rows: {widths:?}");
+        let all = text.join("\n");
+        for want in ["lang", "files", "rust", "42", "ts", "7"] {
+            assert!(all.contains(want), "lost {want:?} in {all:?}");
+        }
+    }
+
+    /// A cut cell says so. Silent truncation reads as if that were the whole value.
+    #[test]
+    fn a_truncated_cell_is_marked() {
+        let md = "| description | v |\n|---|---|\n| a description far too long for the column | 1 |";
+        let text: Vec<String> = render(md, 34).iter().map(|l| l.plain()).collect();
+        // The header also says "description"; the body row is the one with "far".
+        let body = text.iter().find(|l| l.contains("far")).expect("the body row");
+        assert!(body.contains('…'), "no ellipsis in {body:?}");
+    }
+
+    /// A cell's markdown is resolved, not shown. Measuring the raw text would also
+    /// make the columns wider than what is drawn.
+    #[test]
+    fn table_cells_show_text_not_markdown() {
+        let md = "| Project | Stack |\n|---|---|\n| **`forge-agent/`** | Rust |";
+        let text: Vec<String> = render(md, 60).iter().map(|l| l.plain()).collect();
+        let all = text.join("\n");
+        assert!(all.contains("forge-agent/"), "the cell's text is there: {all:?}");
+        assert!(!all.contains("**"), "bold markers left in a cell: {all:?}");
+        assert!(!all.contains('`'), "code markers left in a cell: {all:?}");
+    }
+
+    /// Narrow the window and the cells are truncated into it; no row may be wider
+    /// than the terminal, which is what made ink leave a blank gap under a reply.
+    #[test]
+    fn a_table_narrows_without_overflowing() {
+        let wide = "| description | value |\n|---|---|\n| a very long description indeed that will not fit | 12345678 |";
+        for cols in [80usize, 40, 30, 24, 16] {
+            for line in render(wide, cols) {
+                assert!(
+                    line.width() <= cols,
+                    "at {cols}: {:?} is {} wide",
+                    line.plain(), line.width(),
+                );
+            }
+        }
+    }
+
+    /// More columns than a grid can carry: stacked as `label: value` rather than
+    /// emitting rows wider than the window.
+    #[test]
+    fn too_many_columns_stack_instead_of_overflowing() {
+        let many = "| a | b | c | d | e | f | g |\n|---|---|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 |";
+        let lines = render(many, 60);
+        let text: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        assert!(text.iter().all(|l| !l.contains('┌')), "should not be framed: {text:?}");
+        assert!(text.iter().any(|l| l.contains("a: 1")), "stacked as label: value: {text:?}");
+        for line in &lines {
+            assert!(line.width() <= 60, "{:?} overflows", line.plain());
+        }
     }
 }

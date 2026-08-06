@@ -885,11 +885,18 @@ impl App {
             return Vec::new();
         }
         let dim = Style::fg(palette::GRAY).dim();
+        // The border is not dimmed: ink's was a plain grey, and dimming a grey
+        // against black is what made other chrome hard to read.
+        let edge = Style::fg(palette::GRAY);
         // Enough to choose from without pushing the transcript off the screen.
         let shown = matches.len().min(6);
         // Keep the highlight in view when it is past the visible few.
         let first = self.suggestion.saturating_sub(shown.saturating_sub(1));
         let window = &matches[first..(first + shown).min(matches.len())];
+
+        // Room inside the box: two border columns and a column of padding either
+        // side, matching ink's `paddingX={1}`.
+        let inner = cols.saturating_sub(4);
         let mut out: Vec<Line> = window
             .iter()
             .enumerate()
@@ -902,7 +909,7 @@ impl App {
                                 if first + i == self.suggestion { "❯" } else { " " },
                                 entry.command,
                             ),
-                            cols,
+                            inner,
                         ),
                         style: if first + i == self.suggestion {
                             Style::fg(palette::PROMPT).bold()
@@ -911,7 +918,7 @@ impl App {
                         },
                     },
                     Span {
-                        text: widgets::clip(entry.description, cols.saturating_sub(16)),
+                        text: widgets::clip(entry.description, inner.saturating_sub(16)),
                         style: dim,
                     },
                 ],
@@ -919,12 +926,33 @@ impl App {
             .collect();
         let hidden = matches.len().saturating_sub(shown);
         if hidden > 0 {
-            let hint = format!("  … {hidden} more · ↑↓ move · Tab complete · Enter run");
+            let hint = format!("… {hidden} more · ↑↓ move · Tab complete · Enter run");
             out.push(Line {
-                spans: vec![Span { text: widgets::clip(&hint, cols), style: dim }],
+                spans: vec![Span { text: widgets::clip(&hint, inner), style: dim }],
             });
         }
-        out
+
+        // Boxed, the way the TypeScript client drew it: a rounded grey border
+        // around the list. It makes the list read as one object and marks where
+        // the input begins, which a bare list left ambiguous.
+        //
+        // Below a certain width there is no room for borders and anything useful
+        // inside them, so the list is left unboxed rather than reduced to edges.
+        if inner < 12 {
+            return out;
+        }
+        let rule = "─".repeat(cols.saturating_sub(2));
+        let mut boxed = Vec::with_capacity(out.len() + 2);
+        boxed.push(Line { spans: vec![Span { text: format!("╭{rule}╮"), style: edge }] });
+        for line in out {
+            let pad = inner.saturating_sub(line.width());
+            let mut spans = vec![Span { text: "│ ".into(), style: edge }];
+            spans.extend(line.spans);
+            spans.push(Span { text: format!("{} │", " ".repeat(pad)), style: edge });
+            boxed.push(Line { spans });
+        }
+        boxed.push(Line { spans: vec![Span { text: format!("╰{rule}╯"), style: edge }] });
+        boxed
     }
 
     /// The prompt, one row per line of input.
@@ -1645,6 +1673,47 @@ mod tests {
         // The list is capped so it cannot push the transcript off the screen, and
         // says how much it left out rather than silently truncating.
         assert!(shown.contains("more"), "the remainder is acknowledged: {shown:?}");
+    }
+
+    /// The list is boxed, as the TypeScript client drew it (`borderStyle="round"`
+    /// with `paddingX={1}`). A bare list left it ambiguous where the input began.
+    #[test]
+    fn the_suggestion_list_is_boxed() {
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Char('/'), ROWS);
+        let lines = app.suggestion_lines(COLS);
+        assert!(lines.len() >= 3, "border rows plus content: {lines:?}");
+
+        let first = lines[0].plain();
+        let last = lines[lines.len() - 1].plain();
+        assert!(first.starts_with('╭') && first.ends_with('╮'), "top border: {first:?}");
+        assert!(last.starts_with('╰') && last.ends_with('╯'), "bottom border: {last:?}");
+
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), COLS, "row {i} is not the full width: {:?}", line.plain());
+            if i > 0 && i + 1 < lines.len() {
+                let p = line.plain();
+                assert!(p.starts_with("│ ") && p.ends_with(" │"), "row {i} unwalled: {p:?}");
+            }
+        }
+        // The commands are still in there.
+        let inside: String = lines.iter().map(|l| l.plain()).collect();
+        assert!(inside.contains("/quit"), "content survived the box: {inside:?}");
+    }
+
+    /// Too narrow for borders *and* content, the list is left unboxed rather than
+    /// reduced to edges with nothing between them.
+    #[test]
+    fn a_very_narrow_window_drops_the_box() {
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Char('/'), ROWS);
+        let lines = app.suggestion_lines(10);
+        assert!(!lines.is_empty(), "the list is still offered");
+        assert!(
+            !lines[0].plain().starts_with('╭'),
+            "a 10-column box has no room for anything inside it: {:?}",
+            lines[0].plain(),
+        );
     }
 
     /// Narrowing has to reach the commands that are past the visible few.

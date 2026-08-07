@@ -183,6 +183,16 @@ pub enum Pending {
         tool_id:  String,
         items:    Vec<QuestionItem>,
     },
+    /// The provider turned the request away because it is at capacity, and the
+    /// endpoint in use has a priority tier that is not switched on.
+    ///
+    /// Its own pending state rather than an error line, because there is
+    /// something the user can do about it — which was the whole reason the agent
+    /// tags this rejection distinctly instead of reporting a generic failure.
+    ProviderBusy {
+        message:       String,
+        endpoint_name: String,
+    },
     /// A foreground process wants stdin.
     ProcessInput {
         prompt: String,
@@ -282,6 +292,11 @@ impl Default for Session {
         Self::new()
     }
 }
+
+/// How the agent marks a provider-capacity rejection, as opposed to any other
+/// failure. Matching on a message prefix is not lovely, but it is the contract
+/// the agent offers and the TypeScript client used the same one.
+const PROVIDER_AT_CAPACITY: &str = "Provider at capacity:";
 
 /// The tools an approved plan is allowed to use without asking again.
 ///
@@ -475,10 +490,34 @@ impl Session {
             AgentMessage::Error { message } => {
                 self.finish_reasoning();
                 self.streaming = None;
-                self.entries.push(Entry::new(EntryKind::Error, message));
                 self.activity = Activity::Idle;
-                self.pending = None;
                 self.turn_start = None;
+
+                // The agent tags a capacity rejection with this prefix precisely so
+                // a client can offer the priority tier rather than printing red text
+                // with no way forward. Only xAI has one to offer, and only when it
+                // is not already on — anything else is an ordinary error.
+                let busy = message.starts_with(PROVIDER_AT_CAPACITY);
+                let endpoint = busy
+                    .then(|| {
+                        crate::model_display::active_endpoint(
+                            &self.endpoints,
+                            &self.model_name,
+                            &self.model_id,
+                            self.max_context_tokens,
+                        )
+                    })
+                    .flatten();
+                match endpoint {
+                    Some(ep) if crate::model_display::is_xai(ep) && !ep.xai_priority_tier => {
+                        let endpoint_name = ep.name.clone();
+                        self.pending = Some(Pending::ProviderBusy { message, endpoint_name });
+                    }
+                    _ => {
+                        self.entries.push(Entry::new(EntryKind::Error, message));
+                        self.pending = None;
+                    }
+                }
             }
 
             AgentMessage::ApiRetry { attempt, max_attempts, delay_secs, error } => {
@@ -783,6 +822,37 @@ impl Session {
                 self.pending = other;
                 Vec::new()
             }
+        }
+    }
+
+    /// Turn the priority tier on for the endpoint that was turned away, and note
+    /// it locally so the offer is not made again for the same endpoint.
+    pub fn switch_to_priority_tier(&mut self) -> Vec<Effect> {
+        match self.pending.take() {
+            Some(Pending::ProviderBusy { endpoint_name, .. }) => {
+                for ep in self.endpoints.iter_mut() {
+                    if ep.name == endpoint_name {
+                        ep.xai_priority_tier = true;
+                    }
+                }
+                self.push_system(format!("Priority tier on for {endpoint_name}"));
+                vec![Effect::Send(ClientMessage::UpdateXaiPriorityTier {
+                    endpoint_name,
+                    enabled: true,
+                })]
+            }
+            other => {
+                self.pending = other;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Leave the tier alone and keep the message as an ordinary error, so the
+    /// transcript still records what happened.
+    pub fn dismiss_provider_busy(&mut self) {
+        if let Some(Pending::ProviderBusy { message, .. }) = self.pending.take() {
+            self.entries.push(Entry::new(EntryKind::Error, message));
         }
     }
 
@@ -1832,6 +1902,100 @@ mod tests {
             !matches!(reads.as_slice(), [Effect::Send(ClientMessage::DenyAction { .. })]),
             "a read is allowed through: {reads:?}",
         );
+    }
+
+    fn xai_session(priority_on: bool) -> Session {
+        let mut session = Session::new();
+        session.model_name = "Grok".into();
+        session.model_id = "grok-4".into();
+        session.max_context_tokens = 200_000;
+        session.endpoints = vec![EndpointInfo {
+            name: "Grok".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            model_id: "grok-4".into(),
+            max_context_tokens: 200_000,
+            max_output_tokens: 8192,
+            endpoint_type: "openai".into(),
+            reasoning: Default::default(),
+            xai_priority_tier: priority_on,
+        }];
+        session
+    }
+
+    const BUSY: &str = "Provider at capacity: xAI is at capacity right now";
+
+    /// A capacity rejection on an xAI endpoint without the tier on is an offer,
+    /// not just red text — which is why the agent tags it distinctly.
+    #[test]
+    fn a_capacity_rejection_offers_the_priority_tier() {
+        let mut session = xai_session(false);
+        session.apply(AgentMessage::Error { message: BUSY.into() });
+        assert!(
+            matches!(session.pending, Some(Pending::ProviderBusy { .. })),
+            "expected the offer, got {:?}", session.pending,
+        );
+        // Not also dumped into the transcript as an error; the dialog carries it.
+        assert!(!session.entries().iter().any(|e| e.kind == EntryKind::Error));
+    }
+
+    /// Taking the offer turns the tier on for that endpoint and remembers it, so
+    /// the same offer is not made again.
+    #[test]
+    fn switching_turns_the_tier_on_for_that_endpoint() {
+        let mut session = xai_session(false);
+        session.apply(AgentMessage::Error { message: BUSY.into() });
+        let effects = session.switch_to_priority_tier();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(ClientMessage::UpdateXaiPriorityTier { endpoint_name, enabled: true })]
+                    if endpoint_name == "Grok"
+            ),
+            "got {effects:?}",
+        );
+        assert!(session.endpoints[0].xai_priority_tier, "noted locally too");
+        assert!(session.pending.is_none());
+    }
+
+    /// Dismissing keeps the message: the turn still failed, and the transcript has
+    /// to say so.
+    #[test]
+    fn dismissing_keeps_the_error_in_the_transcript() {
+        let mut session = xai_session(false);
+        session.apply(AgentMessage::Error { message: BUSY.into() });
+        session.dismiss_provider_busy();
+        assert!(session.pending.is_none());
+        let last = session.entries().last().expect("an error line");
+        assert_eq!(last.kind, EntryKind::Error);
+        assert!(last.content.contains("at capacity"));
+    }
+
+    /// Already on the tier: there is nothing to offer, so it is an ordinary error.
+    #[test]
+    fn no_offer_when_the_tier_is_already_on() {
+        let mut session = xai_session(true);
+        session.apply(AgentMessage::Error { message: BUSY.into() });
+        assert!(session.pending.is_none(), "nothing to offer");
+        assert!(session.entries().iter().any(|e| e.kind == EntryKind::Error));
+    }
+
+    /// Another provider has no priority tier to switch to.
+    #[test]
+    fn no_offer_for_a_provider_that_has_no_such_tier() {
+        let mut session = xai_session(false);
+        session.endpoints[0].base_url = "https://api.openai.com/v1".into();
+        session.apply(AgentMessage::Error { message: BUSY.into() });
+        assert!(session.pending.is_none(), "not an xAI endpoint");
+        assert!(session.entries().iter().any(|e| e.kind == EntryKind::Error));
+    }
+
+    /// And an ordinary failure stays an ordinary failure.
+    #[test]
+    fn an_unrelated_error_is_not_turned_into_an_offer() {
+        let mut session = xai_session(false);
+        session.apply(AgentMessage::Error { message: "connection reset".into() });
+        assert!(session.pending.is_none());
+        assert!(session.entries().iter().any(|e| e.kind == EntryKind::Error));
     }
 
 }

@@ -30,6 +30,10 @@ pub enum Decision {
     /// Free text, or a chosen option's label.
     Answer(String),
     ApprovePlan { clear_context: bool },
+    /// Turn on the provider's priority tier for the endpoint that was refused.
+    SwitchToPriorityTier,
+    /// Keep the capacity rejection as an ordinary error and move on.
+    DismissProviderBusy,
     /// Dismissed without answering. Only offered where the agent is not blocked.
     Cancel,
 }
@@ -43,6 +47,7 @@ enum Kind {
     /// Free text only — a process waiting on stdin has nothing to choose from.
     FreeText,
     Rewind,
+    ProviderBusy,
 }
 
 pub struct Dialog {
@@ -75,6 +80,24 @@ impl Dialog {
                     ("Yes".into(), "run it once".into()),
                     ("Yes, always".into(), format!("don't ask again for {tool_name}")),
                     ("No".into(), "deny and tell the agent".into()),
+                ],
+                selected: 0,
+                checked: Vec::new(),
+                typing: None,
+            },
+
+            Pending::ProviderBusy { message, .. } => Self {
+                kind:  Kind::ProviderBusy,
+                title: message.clone(),
+                // Whose charge this is, said plainly. The wording is the
+                // TypeScript client's, which was careful about the same thing.
+                body: "Priority requests higher scheduling priority from xAI during \
+high demand, at double the standard per-token price. This is a charge from xAI, \
+not Forge."
+                    .into(),
+                options: vec![
+                    ("Switch to priority tier".into(), "2x cost, from xAI".into()),
+                    ("Dismiss".into(), "leave the tier alone".into()),
                 ],
                 selected: 0,
                 checked: Vec::new(),
@@ -284,6 +307,11 @@ impl Dialog {
                 _ => Decision::Deny,
             }),
             Kind::Plan => Some(Decision::ApprovePlan { clear_context: self.selected == 1 }),
+            Kind::ProviderBusy => Some(if self.selected == 0 {
+                Decision::SwitchToPriorityTier
+            } else {
+                Decision::DismissProviderBusy
+            }),
             Kind::Rewind => Some(if self.selected == 0 {
                 Decision::Approve { remember: false }
             } else {
@@ -328,6 +356,10 @@ impl Dialog {
             (Kind::Rewind, 'n') => Some(Decision::Deny),
             (Kind::Plan, 'y') => Some(Decision::ApprovePlan { clear_context: false }),
             (Kind::Plan, 'c') => Some(Decision::ApprovePlan { clear_context: true }),
+            // The shortcuts the TypeScript client bound: `p` to switch, `d` to
+            // dismiss. Both are easily undone, unlike standing approval.
+            (Kind::ProviderBusy, 'p') => Some(Decision::SwitchToPriorityTier),
+            (Kind::ProviderBusy, 'd') => Some(Decision::DismissProviderBusy),
             // A numbered pick, for a list of choices.
             (Kind::Question { multi_select: false }, d) if d.is_ascii_digit() => {
                 let idx = (d as u8 - b'1') as usize;
@@ -350,6 +382,9 @@ impl Dialog {
     fn escape(&self) -> Decision {
         match self.kind {
             Kind::Approval { .. } | Kind::Rewind => Decision::Deny,
+            // Escape here is "leave it as it was", which still records the error
+            // rather than losing it — the agent is not waiting on this.
+            Kind::ProviderBusy => Decision::DismissProviderBusy,
             Kind::Plan | Kind::Question { .. } | Kind::FreeText => Decision::Cancel,
         }
     }
@@ -429,6 +464,7 @@ impl Dialog {
             Kind::Question { multi_select: false } => "↑↓ move · 1-9 pick · Enter choose",
             Kind::FreeText => "Enter to send",
             Kind::Rewind => "↑↓ move · Enter choose · y/n",
+            Kind::ProviderBusy => "↑↓ move · Enter choose · p switch · d dismiss",
         }
     }
 }

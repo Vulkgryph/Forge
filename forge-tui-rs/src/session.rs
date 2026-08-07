@@ -298,6 +298,23 @@ impl Default for Session {
 /// the agent offers and the TypeScript client used the same one.
 const PROVIDER_AT_CAPACITY: &str = "Provider at capacity:";
 
+/// Why a tool call was refused in plan mode, as the model will read it.
+///
+/// The agent turns a denial into a tool result of `DENIED: <reason>` and hands
+/// that to the model, so this string is the *only* thing telling it what
+/// happened. Terse wording — the TypeScript client sent "Blocked by plan mode" —
+/// leaves it to guess whether to retry, work around the refusal, or stop, and a
+/// model that guesses "retry" will be refused again in a loop.
+///
+/// So it says the rule, that retrying will not help, and what the alternatives
+/// are: draft the plan, or ask. Someone who has toggled plan mode by accident
+/// gets told what happened by an agent that can explain it, rather than watching
+/// it fail at the same edit repeatedly.
+const PLAN_MODE_DENIAL: &str = "Plan mode is on, so only read-only tools are permitted. \
+Retrying this call will be refused again. Either finish drafting the plan and present it \
+for approval, or — if this change really is needed now — stop and ask the user to leave \
+plan mode (Shift+Tab cycles permission modes) or to confirm how they want to proceed.";
+
 /// The tools an approved plan is allowed to use without asking again.
 ///
 /// The edit tools only. Approving a plan is not a blanket approval: running
@@ -554,7 +571,7 @@ impl Session {
                     self.push_system(format!("Blocked by plan mode: {tool_name}"));
                     return vec![Effect::Send(ClientMessage::DenyAction {
                         tool_id,
-                        reason: "plan mode is read-only".into(),
+                        reason: PLAN_MODE_DENIAL.into(),
                     })];
                 }
 
@@ -1877,6 +1894,31 @@ mod tests {
         assert!(
             matches!(session.pending, Some(Pending::Approval { .. })),
             "running a command still asks",
+        );
+    }
+
+    /// The reason a plan-mode denial carries has to be usable by the model, since
+    /// the agent hands it over as the tool's result. It is the only way an agent
+    /// can tell that plan mode — rather than the tool itself — is what stopped it,
+    /// and the only route to asking the user about it.
+    #[test]
+    fn a_plan_mode_denial_tells_the_model_what_to_do() {
+        let mut session = Session::new();
+        session.permission_mode = PermissionMode::Plan;
+        let effects = session.apply(write_request("t1"));
+        let reason = match effects.as_slice() {
+            [Effect::Send(ClientMessage::DenyAction { reason, .. })] => reason.clone(),
+            other => panic!("expected a denial, got {other:?}"),
+        };
+        assert!(reason.contains("Plan mode"), "names the cause: {reason:?}");
+        assert!(reason.contains("read-only"), "states the rule: {reason:?}");
+        assert!(
+            reason.to_lowercase().contains("retrying"),
+            "says retrying will not help, or a model will loop on it: {reason:?}",
+        );
+        assert!(
+            reason.contains("ask the user"),
+            "offers asking as the way out: {reason:?}",
         );
     }
 

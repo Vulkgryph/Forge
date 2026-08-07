@@ -735,11 +735,26 @@ impl App {
         // Bounded by rows rather than a fixed entry count, so it adapts to the
         // window instead of guessing at it.
         let live_from = self.live_window_start(inline, cols);
-        // Never commit the current turn: a discard can still take it back, and
-        // printed output cannot be unprinted.
-        let settled = live_from.min(
-            self.session.turn_start().unwrap_or_else(|| self.session.entries().len()),
-        );
+        let entries = self.session.entries().len();
+        let turn = self.session.turn_start().unwrap_or(entries);
+
+        // The current turn normally stays live, so a discard can take it back:
+        // printed output cannot be unprinted. That holds only while the turn fits
+        // the window. Once it has outgrown it, the choice is between committing its
+        // finished entries and hiding them behind a "more lines" marker — and
+        // hidden output is printed nowhere at all, not on screen and not in the
+        // scrollback. Reported against a long-running task: "↑ 2715 more lines"
+        // over the output of a job that had been running for hours.
+        //
+        // So a turn that outgrows the window is committed as it goes, up to but
+        // never including the entry being streamed: committing half a message
+        // would print it and then redraw the remainder underneath.
+        let streaming = self.session.streaming_entry().unwrap_or(entries);
+        let settled = if live_from <= turn {
+            live_from.min(turn)
+        } else {
+            live_from.min(streaming)
+        };
         if settled > self.committed {
             let lines = self.lines_for(self.committed..settled, cols);
             inline.commit(out, &lines)?;
@@ -2622,6 +2637,86 @@ mod tests {
         assert!(
             !rows[prompt - 2].trim().is_empty(),
             "two blank rows above the input: {rows:?}",
+        );
+    }
+
+    /// The reported bug: a long-running task's output was collapsed behind
+    /// "↑ 2715 more lines" while the turn was still going, and those lines were
+    /// printed nowhere — not on screen, not in the scrollback. A job running for
+    /// hours is exactly when its output matters.
+    #[test]
+    fn a_long_running_turn_prints_its_output_instead_of_hiding_it() {
+        let mut app = App::new();
+        app.session_mut().push_user("run the training job");
+        // A turn that is still in flight, producing far more output than fits.
+        app.session_mut().apply(AgentMessage::ToolRequest {
+            tool_name: "shell_exec".into(),
+            tool_args: "{}".into(),
+            tool_id: "t1".into(),
+            kind: "execute".into(),
+            subagent_id: None,
+            needs_approval: false,
+        });
+        for i in 1..=120 {
+            app.session_mut().apply(AgentMessage::ToolOutput {
+                tool_name: "shell_exec".into(),
+                content: format!("[R1full s0] step={i} loss=2.4"),
+            });
+        }
+
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+        let printed = visible(&String::from_utf8_lossy(&out));
+
+        assert!(
+            !printed.contains("more lines"),
+            "output was hidden rather than printed: {:?}",
+            printed.lines().filter(|l: &&str| l.contains("more lines")).collect::<Vec<_>>(),
+        );
+        for step in [1usize, 40, 90] {
+            assert!(printed.contains(&format!("step={step} ")), "step={step} never printed");
+        }
+        assert!(app.committed > 0, "the finished output was committed");
+    }
+
+    /// A turn that fits stays live, so a discard can still take it back.
+    #[test]
+    fn a_short_turn_is_still_discardable() {
+        let mut app = App::new();
+        app.session_mut().push_user("a question");
+        app.session_mut().apply(AgentMessage::AssistantToken { content: "brief".into() });
+
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+        assert_eq!(app.committed, 0, "nothing printed permanently yet");
+    }
+
+    /// The entry being streamed is never committed: half a message printed, with
+    /// the rest redrawn underneath, would show it twice.
+    #[test]
+    fn the_streaming_entry_is_never_committed() {
+        let mut app = App::new();
+        app.session_mut().push_user("go");
+        for i in 1..=120 {
+            app.session_mut().apply(AgentMessage::ToolOutput {
+                tool_name: "shell_exec".into(),
+                content: format!("line {i}"),
+            });
+        }
+        // A reply now starts streaming; it must stay live however full the window is.
+        app.session_mut().apply(AgentMessage::AssistantToken { content: "partial".into() });
+
+        let mut inline = crate::inline::Inline::new(COLS, ROWS);
+        let mut out: Vec<u8> = Vec::new();
+        app.render(&mut inline, &mut out).unwrap();
+
+        let streaming = app.session().streaming_entry().expect("something is streaming");
+        assert!(
+            app.committed <= streaming,
+            "committed {} reached the streaming entry {streaming}",
+            app.committed,
         );
     }
 

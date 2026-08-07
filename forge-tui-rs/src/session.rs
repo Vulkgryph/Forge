@@ -359,6 +359,14 @@ impl Session {
         &self.entries
     }
 
+    /// The entry currently being appended to, if any.
+    ///
+    /// Committing this one would print half a message and then redraw the rest
+    /// below it, so it is the one thing that must stay live.
+    pub fn streaming_entry(&self) -> Option<usize> {
+        self.streaming
+    }
+
     /// Where the current turn's output begins, if a turn is in progress.
     ///
     /// The inline renderer needs it to decide what is settled: everything before

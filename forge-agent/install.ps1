@@ -3,7 +3,7 @@
 # Usage:
 #   .\install.ps1
 #
-# Builds forge-agent.exe and the UI bundle, installs symlink-style wrappers
+# Builds forge-agent.exe and the terminal UI, installs symlink-style wrappers
 # into %USERPROFILE%\.local\bin, and runs the same 5-way config wizard as
 # install.sh on Unix.
 
@@ -31,7 +31,7 @@ Write-Info "Detected Windows $arch"
 # -------------------------------------------------------------------
 # Pre-load PATHs for tools that install under $env:USERPROFILE but may not
 # have propagated into this PowerShell session yet (winget can be slow to
-# update PATH; bun's installer puts itself under ~/.bun/bin which often
+# update PATH; some installers put themselves under ~/.bun/bin which often
 # isn't on PATH on a fresh shell). Without this the presence checks would
 # spuriously re-install on every install.ps1 invocation.
 $knownToolDirs = @(
@@ -72,7 +72,6 @@ function Ensure-Tool {
 
 Ensure-Tool -cmdName "git"    -wingetId "Git.Git"          -friendlyName "Git"
 Ensure-Tool -cmdName "rustup" -wingetId "Rustlang.Rustup"  -friendlyName "Rust (rustup)"
-Ensure-Tool -cmdName "bun"    -wingetId "Oven-sh.Bun"      -friendlyName "Bun"
 
 # Make sure a stable toolchain is installed and active. Idempotent.
 & rustup default stable | Out-Null
@@ -99,32 +98,28 @@ $cargoExe = Join-Path $toolchainBin "cargo.exe"
 if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed" }
 Write-Ok "forge-agent built"
 
-Write-Info "Building UI (Bun)..."
-Push-Location ui
-bun install
-if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "bun install failed" }
-bun run build
-if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Err "bun run build failed" }
-Pop-Location
-Write-Ok "UI built"
+Write-Info "Building the terminal UI (Rust)..."
+& $cargoExe build --release -p forge-tui-rs
+if ($LASTEXITCODE -ne 0) { Write-Err "cargo build -p forge-tui-rs failed" }
+Write-Ok "Terminal UI built"
 
 # -------------------------------------------------------------------
 # 4. Install
 # -------------------------------------------------------------------
 Write-Info "Installing to $INSTALL_BIN and $INSTALL_SHARE..."
 
-New-Item -ItemType Directory -Force -Path $INSTALL_BIN, (Join-Path $INSTALL_SHARE "ui\dist") | Out-Null
+New-Item -ItemType Directory -Force -Path $INSTALL_BIN | Out-Null
 
-# Copy (not symlink - Windows symlinks require admin or developer mode)
-Copy-Item -Force "$REPO_ROOT\target\release\forge-agent.exe" "$INSTALL_BIN\forge-agent.exe"
-Copy-Item -Force "$REPO_ROOT\ui\dist\forge.js"               "$INSTALL_SHARE\ui\dist\forge.js"
+# Copy (not symlink - Windows symlinks require admin or developer mode). The two
+# binaries have to sit in the same directory: the UI locates forge-agent by
+# looking beside its own executable.
+Copy-Item -Force "$REPO_ROOT\target\release\forge-agent.exe"  "$INSTALL_BIN\forge-agent.exe"
+Copy-Item -Force "$REPO_ROOT\target\release\forge-tui-rs.exe" "$INSTALL_BIN\forge.exe"
 
-# Bundle ui/node_modules and package.json so bun can resolve dependencies at runtime
-if (Test-Path "$REPO_ROOT\ui\node_modules") {
-    if (Test-Path "$INSTALL_SHARE\ui\node_modules") { Remove-Item -Recurse -Force "$INSTALL_SHARE\ui\node_modules" }
-    Copy-Item -Recurse "$REPO_ROOT\ui\node_modules" "$INSTALL_SHARE\ui\node_modules"
+# The Bun UI's files, from installs that predate the Rust one.
+if (Test-Path (Join-Path $INSTALL_SHARE "ui")) {
+    Remove-Item -Recurse -Force (Join-Path $INSTALL_SHARE "ui")
 }
-Copy-Item -Force "$REPO_ROOT\ui\package.json" "$INSTALL_SHARE\ui\package.json"
 
 # Version stamp - graceful when not in a git checkout
 try {
@@ -133,12 +128,9 @@ try {
 } catch { $sha = "unknown" }
 Set-Content -Path (Join-Path $INSTALL_SHARE "version") -Value $sha
 
-# Wrapper: forge.cmd
-$wrapper = @"
-@echo off
-bun run "%USERPROFILE%\.local\share\forge\ui\dist\forge.js" %*
-"@
-Set-Content -Path "$INSTALL_BIN\forge.cmd" -Value $wrapper -Encoding ASCII
+# No wrapper for `forge`: it is the executable itself now. Remove the old one, or
+# `forge` would keep resolving to a .cmd that shells out to an interpreter.
+if (Test-Path "$INSTALL_BIN\forge.cmd") { Remove-Item -Force "$INSTALL_BIN\forge.cmd" }
 
 # Updater wrapper: forge-update.cmd
 $updater = @"
@@ -147,7 +139,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$REPO_ROOT\update.ps1" %*
 "@
 Set-Content -Path "$INSTALL_BIN\forge-update.cmd" -Value $updater -Encoding ASCII
 
-Write-Ok "Installed forge       -> $INSTALL_BIN\forge.cmd"
+Write-Ok "Installed forge       -> $INSTALL_BIN\forge.exe"
 Write-Ok "Installed forge-agent -> $INSTALL_BIN\forge-agent.exe"
 Write-Ok "Installed forge-update-> $INSTALL_BIN\forge-update.cmd"
 

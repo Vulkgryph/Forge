@@ -35,17 +35,15 @@ info "Detected $OS $ARCH"
 # -------------------------------------------------------------------
 # 2. Check system dependencies
 # -------------------------------------------------------------------
-# Pre-load PATHs for tools installed under $HOME. rustup and bun both write
+# Pre-load PATHs for tools installed under $HOME. rustup writes
 # their PATH update to ~/.bashrc / ~/.zshrc, which only takes effect for new
 # shells — not for this script's subshell or any re-run from the same parent.
 # Pulling these in explicitly makes the presence check idempotent.
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
-[[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
 
 MISSING_APT=()
 command -v git    &>/dev/null || MISSING_APT+=(git)
-command -v curl   &>/dev/null || MISSING_APT+=(curl)      # downloads rustup/bun installers; web_search uses curl
-command -v unzip  &>/dev/null || MISSING_APT+=(unzip)     # bun installer requires unzip
+command -v curl   &>/dev/null || MISSING_APT+=(curl)      # downloads the rustup installer; web_search uses curl
 command -v cc     &>/dev/null || MISSING_APT+=(build-essential)  # Rust crates with C deps need a linker
 # ripgrep tracked separately from the rest: on macOS it does NOT come from
 # Xcode CLI tools (unlike git/curl/unzip/cc), so it needs its own remedy —
@@ -138,14 +136,9 @@ else
     ok "Rust found: $(rustc --version)"
 fi
 
-if ! command -v bun &>/dev/null; then
-    warn "Bun not found — installing..."
-    fetch_and_run "https://bun.sh/install" "${FORGE_BUN_SHA256:-}" "bun"
-    export PATH="$HOME/.bun/bin:$PATH"
-    ok "Bun installed"
-else
-    ok "Bun found: $(bun --version)"
-fi
+# Bun is no longer needed. The terminal UI used to be a Bun/React-Ink program;
+# it is a Rust binary in the same workspace now, so the only toolchain required
+# is the one already installed above.
 
 # -------------------------------------------------------------------
 # 3. Build
@@ -157,7 +150,7 @@ fi
 # ui/ subdirectory.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TUI_DIR="$REPO_ROOT/forge-tui"
+TUI_DIR="$REPO_ROOT/forge-tui-rs"
 BUILD_DIR="$REPO_ROOT/target/release"
 cd "$SCRIPT_DIR"
 
@@ -165,45 +158,37 @@ info "Building forge-agent (Rust)..."
 cargo build --release
 ok "forge-agent built"
 
-info "Building UI (Bun)..."
-(cd "$TUI_DIR" && bun install && bun run build)
-ok "UI built"
+info "Building the terminal UI (Rust)..."
+(cd "$REPO_ROOT" && cargo build --release -p forge-tui-rs)
+ok "Terminal UI built"
 
 # -------------------------------------------------------------------
 # 4. Install
 # -------------------------------------------------------------------
 info "Installing to $INSTALL_BIN and $INSTALL_SHARE..."
 
-mkdir -p "$INSTALL_BIN" "$INSTALL_SHARE/ui/dist"
+mkdir -p "$INSTALL_BIN" "$INSTALL_SHARE/bin"
 
-ln -sf "$BUILD_DIR/forge-agent" "$INSTALL_BIN/forge-agent"
-ln -sf "$TUI_DIR/dist/forge.js" "$INSTALL_SHARE/ui/dist/forge.js"
+# Copied, not symlinked into target/. `cargo clean` would otherwise leave a
+# dangling `forge` on PATH, and the TUI locates forge-agent by looking beside its
+# own executable — so the two have to sit together in a directory that persists.
+cp "$BUILD_DIR/forge-tui-rs" "$INSTALL_SHARE/bin/forge"
+cp "$BUILD_DIR/forge-agent"  "$INSTALL_SHARE/bin/forge-agent"
+ln -sf "$INSTALL_SHARE/bin/forge-agent" "$INSTALL_BIN/forge-agent"
 ln -sf "$SCRIPT_DIR/update.sh" "$INSTALL_BIN/forge-update"
-cp -r "$TUI_DIR/node_modules"   "$INSTALL_SHARE/ui/node_modules"
-cp "$TUI_DIR/package.json"      "$INSTALL_SHARE/ui/package.json"
+
+# The Bun UI's files, from installs that predate the Rust one. Left in place they
+# are just dead weight, and `~/.local/share/forge/ui` is large.
+rm -rf "$INSTALL_SHARE/ui"
 # Stamp the install with the source SHA if we're in a git checkout — non-fatal for tarball installs.
 git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null > "$INSTALL_SHARE/version" || echo "unknown" > "$INSTALL_SHARE/version"
 
-# Write wrapper script
-cat > "$INSTALL_BIN/forge" << 'WRAPPER'
-#!/usr/bin/env bash
-set -euo pipefail
+# `forge` is the binary itself. The wrapper existed only to find an interpreter
+# and hand it a script; there is nothing left for it to do.
+ln -sf "$INSTALL_SHARE/bin/forge" "$INSTALL_BIN/forge"
 
-FORGE_HOME="$HOME/.local/share/forge"
-
-if [[ -x "$HOME/.bun/bin/bun" ]]; then
-  BUN="$HOME/.bun/bin/bun"
-elif command -v bun >/dev/null 2>&1; then
-  BUN="$(command -v bun)"
-else
-  echo "error: bun not found. Expected it at \$HOME/.bun/bin/bun or in PATH." >&2
-  exit 127
-fi
-
-exec "$BUN" run "$FORGE_HOME/ui/dist/forge.js" "$@"
-WRAPPER
-
-chmod +x "$INSTALL_BIN/forge" "$INSTALL_BIN/forge-agent" "$INSTALL_BIN/forge-update" update.sh
+chmod +x "$INSTALL_SHARE/bin/forge" "$INSTALL_SHARE/bin/forge-agent" \
+         "$INSTALL_BIN/forge-update" update.sh
 
 # Remove wrappers from the pre-rename "sinter" install if they are still present.
 rm -f "$INSTALL_BIN/sinter" "$INSTALL_BIN/sinter-agent" "$INSTALL_BIN/sinter-update"

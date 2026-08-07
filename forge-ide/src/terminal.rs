@@ -219,6 +219,14 @@ pub struct Grid {
     /// had just drawn shifted out from under it while writing the next one,
     /// leaving two frames on screen at once.
     autowrap:     bool,
+    /// Whether the program has asked for pasted text to be bracketed
+    /// (`CSI ?2004h`).
+    ///
+    /// Unhonoured, a paste is indistinguishable from typing: every newline in it
+    /// arrives as Enter. Pasting a multi-line message into a program that submits
+    /// on Enter therefore sent it a line at a time — observed with the Rust TUI,
+    /// which asks for this mode precisely so that cannot happen.
+    bracketed_paste: bool,
     /// Bumped on every content-affecting mutation (`process`, `resize`,
     /// `restore_snapshot`). Lets `Terminal::draw_sized` cache its rendered
     /// viewport `Galley` and skip rebuilding + re-shaping it on every single
@@ -262,6 +270,7 @@ impl Grid {
             parse_st: PState::Ground, parse_params: String::new(),
             alt_screen: None, sync_update: None,
             autowrap: true,
+            bracketed_paste: false,
             version: 0,
             scrollback_version: 0,
         }
@@ -694,6 +703,8 @@ impl Grid {
                     }
                     // Autowrap — see `autowrap`.
                     "7" => self.autowrap = set,
+                    // Bracketed paste — see `paste`.
+                    "2004" => self.bracketed_paste = set,
                     // Synchronized update — see `sync_update`.
                     "2026" => {
                         if set {
@@ -1264,6 +1275,21 @@ impl Terminal {
         self.last_cols = cols;
     }
 
+    /// Send pasted text to the program.
+    ///
+    /// Two things a paste is not allowed to be mistaken for. Line breaks go as CR,
+    /// which is what Enter transmits — a bare LF means "down one row" to a terminal
+    /// program, not "new line". And when the program has asked for bracketed paste,
+    /// the block is wrapped in the markers that tell it this was pasted rather than
+    /// typed; without them a pasted multi-line message is submitted a line at a
+    /// time by anything that sends on Enter.
+    fn paste(&mut self, text: &str) {
+        let bracketed = self.grid.lock().map(|g| g.bracketed_paste).unwrap_or(false);
+        let bytes = paste_bytes(text, bracketed);
+        self.pending_input.push(bytes.clone());
+        self.write_bytes(&bytes);
+    }
+
     fn write_bytes(&mut self, data: &[u8]) {
         self.last_input_at = Some(std::time::Instant::now());
         match &mut self.backend {
@@ -1556,7 +1582,7 @@ impl Terminal {
                                 })
                             });
                             if let Some(text) = clip {
-                                self.write_bytes(text.as_bytes());
+                                self.paste(&text);
                             }
                             close = true;
                         }
@@ -1651,9 +1677,8 @@ impl Terminal {
                     // silently did nothing (only the right-click "Paste"
                     // menu item worked, which reads the clipboard itself).
                     egui::Event::Paste(s) => {
-                        let bytes = s.as_bytes().to_vec();
-                        self.pending_input.push(bytes.clone());
-                        self.write_bytes(&bytes);
+                        let text = s.clone();
+                        self.paste(&text);
                     }
                     // Cmd+C (not Ctrl+C, which is SIGINT) — copy. There's no
                     // partial mouse-selection yet, so this matches the
@@ -1682,6 +1707,22 @@ impl Terminal {
             }
         }
     }
+}
+
+/// The bytes a paste sends.
+///
+/// Kept out of `Terminal::paste` so it can be tested without a pty behind it.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let body = text.replace("\r\n", "\r").replace('\n', "\r");
+    let mut bytes = Vec::with_capacity(body.len() + 12);
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(body.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
 }
 
 pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
@@ -2170,6 +2211,41 @@ mod private_mode_tests {
         // Plain Tab is unchanged.
         let none = egui::Modifiers::default();
         assert_eq!(super::key_to_pty(egui::Key::Tab, none), Some(b"\t".to_vec()));
+    }
+
+    /// The reported bug: pasting a multi-line message into the Rust TUI submitted
+    /// it a line at a time. This terminal ignored `CSI ?2004h`, so a paste was
+    /// indistinguishable from typing and every newline in it was an Enter.
+    #[test]
+    fn a_paste_is_bracketed_when_the_program_asked_for_it() {
+        let mut g = Grid::with_size(6, 20);
+        assert!(!g.bracketed_paste, "off until asked for");
+
+        g.process("\x1b[?2004h");
+        assert!(g.bracketed_paste, "CSI ?2004h turns it on");
+        let bytes = super::paste_bytes("one\ntwo", true);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with('\u{1b}'), "starts with the marker: {text:?}");
+        assert!(text.contains("[200~") && text.contains("[201~"), "bracketed: {text:?}");
+
+        g.process("\x1b[?2004l");
+        assert!(!g.bracketed_paste, "and off again");
+        let plain = String::from_utf8_lossy(&super::paste_bytes("one\ntwo", false)).to_string();
+        assert!(!plain.contains("[200~"), "not bracketed when unasked: {plain:?}");
+    }
+
+    /// Line breaks travel as CR either way. A bare LF means "down one row" to a
+    /// terminal program, not "new line", so a pasted block would come out as a
+    /// staircase.
+    #[test]
+    fn pasted_line_breaks_become_carriage_returns() {
+        for (name, pasted) in [("LF", "a\nb"), ("CRLF", "a\r\nb"), ("CR", "a\rb")] {
+            let bytes = super::paste_bytes(pasted, false);
+            assert_eq!(
+                String::from_utf8_lossy(&bytes), "a\rb",
+                "{name} should travel as CR",
+            );
+        }
     }
 
     /// The keys the Rust TUI binds, and the bytes this terminal owes it.

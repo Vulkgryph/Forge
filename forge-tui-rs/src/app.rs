@@ -227,6 +227,11 @@ impl App {
                     self.cache = None;
                     (Outcome::Continue, Vec::new())
                 }
+                menu::Outcome::SetPermission(mode) => {
+                    self.session.set_permission_mode(mode);
+                    self.cache = None;
+                    (Outcome::Continue, Vec::new())
+                }
                 menu::Outcome::Act(effects) => {
                     // Settings pages stay open so several can be changed in one
                     // visit; anything that ends the session's state closes.

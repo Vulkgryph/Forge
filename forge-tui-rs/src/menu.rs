@@ -191,6 +191,11 @@ pub enum Outcome {
     Close,
     /// Dismissed, with messages to send.
     Act(Vec<Effect>),
+    /// Set the permission mode. Its own outcome because the mode is the client's
+    /// own gate rather than something the agent is told: the menu cannot reach
+    /// into the session itself, and turning it into an outgoing message is what
+    /// broke it before.
+    SetPermission(PermissionMode),
 }
 
 pub struct Menu {
@@ -619,15 +624,15 @@ impl Menu {
             Act::Restart { resume } => {
                 Outcome::Act(vec![Effect::Restart { resume: resume.clone() }])
             }
-            Act::SetPermission(mode) => {
-                // The agent only offers a toggle, so reaching a specific mode
-                // means sending it only when it would actually change.
-                if *mode == PermissionMode::AllowAll {
-                    Outcome::Act(vec![Effect::Send(ClientMessage::ToggleAutoMode)])
-                } else {
-                    Outcome::Act(vec![Effect::Send(ClientMessage::ToggleAutoMode)])
-                }
-            }
+            // Choosing a mode sets it, and nothing is sent: the permission mode is
+            // the client's own approval gate, and the agent goes on asking exactly
+            // as before — this side decides what to do with the question.
+            //
+            // This used to send `ToggleAutoMode` from both arms of an `if` whose
+            // branches were identical, and never set the mode at all. So choosing
+            // "Plan mode" did not enter plan mode; it toggled the agent's auto
+            // mode, which is neither the mode chosen nor the one displayed.
+            Act::SetPermission(mode) => Outcome::SetPermission(*mode),
         }
     }
 
@@ -1445,6 +1450,48 @@ mod tests {
     fn an_unknown_tool_keeps_its_name() {
         assert_eq!(tool_label("some_new_tool"), "some_new_tool");
         assert_eq!(tool_label("read_file"), "Read files");
+    }
+
+    /// Choosing a mode has to set that mode. This sent `ToggleAutoMode` from both
+    /// arms of an identical `if` and never set anything, so picking "Plan mode"
+    /// toggled the agent's auto mode instead of entering plan mode.
+    #[test]
+    fn choosing_a_mode_sets_that_mode() {
+        for (label, want) in [
+            ("Ask each time", PermissionMode::Ask),
+            ("Auto-accept edits", PermissionMode::AutoAccept),
+            ("Plan mode", PermissionMode::Plan),
+            ("Approve everything", PermissionMode::AllowAll),
+        ] {
+            let s = session();
+            let mut menu = Menu::new();
+            select(&mut menu, &s, "Settings");
+            menu.handle(Input::Enter, &s);
+            select(&mut menu, &s, "Permission mode");
+            menu.handle(Input::Enter, &s);
+            select(&mut menu, &s, label);
+            match menu.handle(Input::Enter, &s) {
+                Outcome::SetPermission(mode) => assert_eq!(mode, want, "for {label}"),
+                other => panic!("{label} gave {other:?}"),
+            }
+        }
+    }
+
+    /// And it sends nothing: the mode is this client's gate, not a setting the
+    /// agent is told about.
+    #[test]
+    fn choosing_a_mode_sends_nothing_to_the_agent() {
+        let s = session();
+        let mut menu = Menu::new();
+        select(&mut menu, &s, "Settings");
+        menu.handle(Input::Enter, &s);
+        select(&mut menu, &s, "Permission mode");
+        menu.handle(Input::Enter, &s);
+        select(&mut menu, &s, "Plan mode");
+        assert!(
+            !matches!(menu.handle(Input::Enter, &s), Outcome::Act(_)),
+            "no outgoing message for a local gate",
+        );
     }
 
 }

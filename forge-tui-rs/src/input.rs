@@ -172,4 +172,57 @@ mod tests {
             let _ = bind(key);
         }
     }
+    /// Every binding, driven by the bytes Forge IDE's terminal actually emits.
+    ///
+    /// The TUI runs inside that terminal, so a binding is only real if the
+    /// emulator sends something the decoder recognises — and a key that is not
+    /// translated is indistinguishable, from here, from a key that does nothing.
+    /// Shift+Tab was exactly that: the emulator sent a plain Tab, so cycling
+    /// permission modes completed a slash command instead.
+    ///
+    /// The other half of this contract is `shift_tab_sends_back_tab_not_a_plain_tab`
+    /// and the ctrl-code tests in `forge-ide`, which pin what it emits.
+    #[test]
+    fn the_bindings_survive_forge_ides_terminal() {
+        use crate::keys::Decoder;
+        let cases: &[(&str, &[u8], Input)] = &[
+            ("Ctrl-C",    &[0x03],                   Input::Quit),
+            ("Ctrl-D",    &[0x04],                   Input::Quit),
+            ("Ctrl-X",    &[0x18],                   Input::Interrupt),
+            ("Ctrl-N",    &[0x0e],                   Input::Newline),
+            ("Ctrl-T",    &[0x14],                   Input::ToggleReasoning),
+            ("Ctrl-O",    &[0x0f],                   Input::Menu),
+            ("Ctrl-U",    &[0x15],                   Input::PageUp),
+            ("Ctrl-G",    &[0x07],                   Input::Home),
+            ("Enter",     &[0x0d],                   Input::Enter),
+            ("Backspace", &[0x7f],                   Input::Backspace),
+            ("Up",        b"\x1b[A",                 Input::Up),
+            ("Down",      b"\x1b[B",                 Input::Down),
+            ("PageUp",    b"\x1b[5~",                Input::PageUp),
+            ("PageDown",  b"\x1b[6~",                Input::PageDown),
+            ("Home",      b"\x1b[H",                 Input::Home),
+            ("End",       b"\x1b[F",                 Input::End),
+            ("Tab",       &[0x09],                   Input::Complete),
+            ("Shift-Tab", b"\x1b[Z",                 Input::CyclePermission),
+        ];
+        for (name, bytes, want) in cases {
+            let mut d = Decoder::new();
+            let keys = d.feed(bytes);
+            let actions: Vec<Input> = keys.into_iter().filter_map(bind).collect();
+            assert_eq!(actions, vec![want.clone()], "{name} did not arrive as {want:?}");
+        }
+    }
+
+    /// Escape is the one that needs the timeout: the emulator sends a bare `ESC`,
+    /// which has to be held in case a sequence follows it.
+    #[test]
+    fn escape_from_the_ide_arrives_after_the_timeout() {
+        use crate::keys::Decoder;
+        let mut d = Decoder::new();
+        assert!(d.feed(&[0x1b]).is_empty(), "held, in case more follows");
+        assert!(d.has_pending());
+        let key = d.flush_pending_escape().expect("flushed once nothing followed");
+        assert_eq!(bind(key), Some(Input::Escape));
+    }
+
 }

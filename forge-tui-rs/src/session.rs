@@ -858,9 +858,20 @@ impl Session {
 
     /// Step to the next permission mode, saying so in the transcript.
     pub fn cycle_permission_mode(&mut self) {
-        self.permission_mode = self.permission_mode.next();
-        let label = self.permission_mode.label();
-        self.push_system(label.to_string());
+        self.set_permission_mode(self.permission_mode.next());
+    }
+
+    /// Change the permission mode, saying so in the transcript.
+    ///
+    /// Takes effect at once and locally: the mode is this client's approval gate,
+    /// checked as each tool request arrives, so the next request is judged by the
+    /// new mode with no round trip to the agent.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        if self.permission_mode == mode {
+            return;
+        }
+        self.permission_mode = mode;
+        self.push_system(mode.label().to_string());
     }
 
     /// Confirm a pending rewind.

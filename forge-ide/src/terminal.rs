@@ -2172,6 +2172,47 @@ mod private_mode_tests {
         assert_eq!(super::key_to_pty(egui::Key::Tab, none), Some(b"\t".to_vec()));
     }
 
+    /// The keys the Rust TUI binds, and the bytes this terminal owes it.
+    ///
+    /// The pairing is what matters: `forge-tui-rs` has
+    /// `the_bindings_survive_forge_ides_terminal`, which feeds these same bytes
+    /// through its decoder. Pinning both halves is what catches a key going quiet,
+    /// which is otherwise indistinguishable from a key that does nothing.
+    #[test]
+    fn the_keys_the_tui_binds_are_all_encoded() {
+        let ctrl  = egui::Modifiers { ctrl: true, ..Default::default() };
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        let none  = egui::Modifiers::default();
+        let cases: &[(&str, egui::Key, egui::Modifiers, &[u8])] = &[
+            ("Ctrl-C",    egui::Key::C, ctrl,          &[0x03]),
+            ("Ctrl-D",    egui::Key::D, ctrl,          &[0x04]),
+            ("Ctrl-X",    egui::Key::X, ctrl,          &[0x18]),
+            ("Ctrl-N",    egui::Key::N, ctrl,          &[0x0e]),
+            ("Ctrl-T",    egui::Key::T, ctrl,          &[0x14]),
+            ("Ctrl-O",    egui::Key::O, ctrl,          &[0x0f]),
+            ("Ctrl-U",    egui::Key::U, ctrl,          &[0x15]),
+            ("Ctrl-G",    egui::Key::G, ctrl,          &[0x07]),
+            ("Enter",     egui::Key::Enter, none,      &[0x0d]),
+            ("Backspace", egui::Key::Backspace, none,  &[0x7f]),
+            ("Escape",    egui::Key::Escape, none,     &[0x1b]),
+            ("Up",        egui::Key::ArrowUp, none,    b"\x1b[A"),
+            ("Down",      egui::Key::ArrowDown, none,  b"\x1b[B"),
+            ("PageUp",    egui::Key::PageUp, none,     b"\x1b[5~"),
+            ("PageDown",  egui::Key::PageDown, none,   b"\x1b[6~"),
+            ("Home",      egui::Key::Home, none,       b"\x1b[H"),
+            ("End",       egui::Key::End, none,        b"\x1b[F"),
+            ("Tab",       egui::Key::Tab, none,        &[0x09]),
+            ("Shift-Tab", egui::Key::Tab, shift,       b"\x1b[Z"),
+        ];
+        for (name, key, m, want) in cases {
+            assert_eq!(
+                super::key_to_pty(*key, *m).as_deref(),
+                Some(*want),
+                "{name} is not encoded as the TUI expects",
+            );
+        }
+    }
+
     /// With autowrap off, filling the last row must not scroll.
     ///
     /// This is the bug behind two frames appearing on screen at once: a

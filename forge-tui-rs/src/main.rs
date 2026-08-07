@@ -315,6 +315,33 @@ fn merge_sources(bridge: &mut AgentBridge) -> mpsc::Receiver<Event> {
 
 /// Read stdin, decode it, and post keys onto the loop's channel.
 ///
+/// Whether a chunk of input was pasted rather than typed.
+///
+/// The tell is a line break with something after it. A person cannot type one
+/// anywhere but at the end of what a single `read` returns — pressing Enter is
+/// what ends the read — so text following a break in the same chunk was not typed.
+/// One trailing break is ignored before looking, which is exactly what a typed
+/// Enter is, and covers a terminal that sends CRLF for it.
+///
+/// Chunks containing an escape byte are left alone: those are sequences, possibly
+/// the bracketed-paste markers themselves, and the decoder owns them.
+///
+/// The failure this exists for: pasting a structured message into Apple's
+/// Terminal.app submitted it one line at a time. The TUI asks for bracketed paste
+/// at startup, but that terminal does not implement it, so the request buys
+/// nothing and the paste arrives indistinguishable from typing.
+fn looks_pasted(chunk: &[u8]) -> bool {
+    if chunk.contains(&0x1b) {
+        return false;
+    }
+    let body = chunk
+        .strip_suffix(b"\r\n")
+        .or_else(|| chunk.strip_suffix(b"\r"))
+        .or_else(|| chunk.strip_suffix(b"\n"))
+        .unwrap_or(chunk);
+    body.iter().any(|b| *b == b'\r' || *b == b'\n')
+}
+
 /// Waits with a timeout only while the decoder is holding a partial sequence.
 /// Otherwise it blocks indefinitely, which is what keeps an idle session at no
 /// CPU — polling on a timer would wake many times a second to find nothing.
@@ -383,6 +410,18 @@ fn read_terminal(tx: mpsc::Sender<Event>) {
             // reports as zero. Re-polling distinguishes them without guessing.
             Some(0) => continue,
             Some(n) => {
+                // A terminal that does not implement bracketed paste hands pasted
+                // text over as if it had been typed, so the line breaks in it are
+                // Enters and a multi-line message is submitted a line at a time.
+                // Apple's Terminal.app is one such terminal, and asking for the
+                // mode (`?2004h`, which this does at startup) buys nothing there.
+                if !decoder.has_pending() && looks_pasted(&buf[..n]) {
+                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if tx.send(Event::Key(Input::Paste(text))).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 for key in decoder.feed(&buf[..n]) {
                     if let Some(action) = input::bind(key) {
                         if tx.send(Event::Key(action)).is_err() {
@@ -461,4 +500,48 @@ In the menu: Up/Down or j/k to move, Enter to choose, Esc to go back.
 At a prompt: y approves, n denies; always-allow must be selected.
 "
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_pasted;
+
+    /// The reported bug: a structured message pasted into Apple's Terminal.app was
+    /// submitted one line at a time. That terminal does not implement bracketed
+    /// paste, so the text arrives as if typed and every break in it is an Enter.
+    #[test]
+    fn a_multi_line_chunk_is_recognised_as_a_paste() {
+        for (name, chunk) in [
+            ("two lines",      &b"first\rsecond"[..]),
+            ("trailing break", &b"first\rsecond\r"[..]),
+            ("CRLF",           &b"first\r\nsecond\r\n"[..]),
+            ("LF",             &b"first\nsecond"[..]),
+            ("blank line",     &b"first\r\rsecond"[..]),
+        ] {
+            assert!(looks_pasted(chunk), "{name} should read as a paste");
+        }
+    }
+
+    /// Typing must not be mistaken for a paste, or Enter would stop submitting.
+    #[test]
+    fn typing_is_not_mistaken_for_a_paste() {
+        for (name, chunk) in [
+            ("a bare Enter",            &b"\r"[..]),
+            ("Enter as CRLF",           &b"\r\n"[..]),
+            ("fast typing, then Enter", &b"hello\r"[..]),
+            ("ordinary characters",     &b"hello"[..]),
+            ("nothing at all",          &b""[..]),
+        ] {
+            assert!(!looks_pasted(chunk), "{name} should read as typing");
+        }
+    }
+
+    /// Anything with an escape byte belongs to the decoder — including a paste the
+    /// terminal *did* bracket, which must not be handled twice.
+    #[test]
+    fn sequences_are_left_to_the_decoder() {
+        assert!(!looks_pasted(b"\x1b[200~one\rtwo\x1b[201~"), "already bracketed");
+        assert!(!looks_pasted(b"\x1b[A"), "an arrow key");
+        assert!(!looks_pasted(b"a\x1b[Ab\r c"), "text mixed with a sequence");
+    }
 }

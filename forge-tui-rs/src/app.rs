@@ -47,6 +47,8 @@ pub enum Input {
     Complete,
     /// Shift-Tab: step to the next permission mode.
     CyclePermission,
+    /// Escape: interrupt a running turn, or nothing when idle.
+    Escape,
     /// Insert a literal newline in the input.
     Newline,
     Quit,
@@ -364,6 +366,20 @@ impl App {
             Input::Down if self.has_suggestions() => {
                 let n = self.suggestions().len();
                 self.suggestion = (self.suggestion + 1) % n;
+            }
+
+            // Escape stops a turn that is running. Reaching here already means no
+            // menu and no dialog is open — both take input before this — which is
+            // the same condition the TypeScript client checked before cancelling.
+            // Idle, it does nothing rather than something surprising.
+            Input::Escape => {
+                if self.session.activity.is_busy() {
+                    return (
+                        Outcome::Continue,
+                        vec![Effect::Send(ClientMessage::CancelRun)],
+                    );
+                }
+                self.follow_tail();
             }
 
             // Otherwise scrolling belongs to the terminal: the transcript is
@@ -1889,7 +1905,7 @@ mod tests {
         app.update(Input::Menu, ROWS);
         assert!(app.menu_open());
         // Escape at the top level closes it.
-        app.update(Input::End, ROWS);
+        app.update(Input::Escape, ROWS);
         assert!(!app.menu_open());
     }
 
@@ -2798,4 +2814,54 @@ long enough to wrap, and must stay separated from the first.";
                    "the caret sits at the end of the row it is on");
         assert!(col < 40, "and inside the window");
     }
+    /// Escape is the instinctive "stop that", and the TypeScript client cancelled
+    /// a running turn with it. This did nothing at all before.
+    #[test]
+    fn escape_interrupts_a_running_turn() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::Thinking);
+        assert!(app.session().activity.is_busy(), "a turn is in flight");
+
+        let (outcome, effects) = app.update(Input::Escape, ROWS);
+        assert_eq!(outcome, Outcome::Continue);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Send(ClientMessage::CancelRun)]),
+            "expected a cancel, got {effects:?}",
+        );
+    }
+
+    /// Idle, it does nothing rather than something surprising.
+    #[test]
+    fn escape_when_idle_sends_nothing() {
+        let (mut app, _rows) = app_with(0);
+        assert!(!app.session().activity.is_busy());
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert!(effects.is_empty(), "got {effects:?}");
+    }
+
+    /// With a prompt up, Escape still belongs to the prompt: it denies, rather than
+    /// cancelling the whole turn out from under a question already asked.
+    #[test]
+    fn escape_answers_a_prompt_rather_than_cancelling_the_turn() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(ClientMessage::DenyAction { tool_id, .. })] if tool_id == "t1"
+            ),
+            "expected the prompt to be denied, got {effects:?}",
+        );
+    }
+
+    /// End is not a cancel key and never was.
+    #[test]
+    fn end_does_not_interrupt() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::Thinking);
+        let (_, effects) = app.update(Input::End, ROWS);
+        assert!(effects.is_empty(), "End must not cancel: {effects:?}");
+    }
+
 }

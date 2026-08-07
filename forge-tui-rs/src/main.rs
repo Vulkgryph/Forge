@@ -455,7 +455,7 @@ Keys:
   Enter          send                 Ctrl-T   expand/collapse reasoning
   Up/Down        scroll               Ctrl-O   menu (model, tools, settings)
   PgUp/PgDn      scroll a page        Ctrl-X   interrupt the current turn
-  Esc            follow newest output Ctrl-C   quit
+  Esc            interrupt the turn   Ctrl-C   quit
 
 In the menu: Up/Down or j/k to move, Enter to choose, Esc to go back.
 At a prompt: y approves, n denies; always-allow must be selected.

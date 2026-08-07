@@ -524,7 +524,7 @@ impl Menu {
         match input {
             // Escape goes back a level, and closes at the top. A menu you can
             // only leave from one particular page is a menu you get stuck in.
-            Input::End => {
+            Input::Escape => {
                 if self.stack.len() > 1 {
                     self.pop(session);
                     Outcome::Stay
@@ -1031,7 +1031,7 @@ mod tests {
         menu.handle(Input::Enter, &s);
         assert_eq!(*menu.page(), Page::Settings);
 
-        assert_eq!(menu.handle(Input::End, &s), Outcome::Stay);
+        assert_eq!(menu.handle(Input::Escape, &s), Outcome::Stay);
         assert_eq!(*menu.page(), Page::Root, "back at the top");
     }
 
@@ -1041,7 +1041,7 @@ mod tests {
     fn escape_at_the_root_closes() {
         let s = session();
         let mut menu = Menu::new();
-        assert_eq!(menu.handle(Input::End, &s), Outcome::Close);
+        assert_eq!(menu.handle(Input::Escape, &s), Outcome::Close);
     }
 
     #[test]
@@ -1054,11 +1054,11 @@ mod tests {
         menu.handle(Input::Enter, &s);
         assert_eq!(*menu.page(), Page::BasicTools);
 
-        menu.handle(Input::End, &s);
+        menu.handle(Input::Escape, &s);
         assert_eq!(*menu.page(), Page::Settings);
-        menu.handle(Input::End, &s);
+        menu.handle(Input::Escape, &s);
         assert_eq!(*menu.page(), Page::Root);
-        assert_eq!(menu.handle(Input::End, &s), Outcome::Close);
+        assert_eq!(menu.handle(Input::Escape, &s), Outcome::Close);
     }
 
     /// Entering a page must not carry the parent's cursor position with it.
@@ -1413,7 +1413,7 @@ mod tests {
         assert!(basic.iter().any(|l| l == "Shell commands"), "basic has shell: {basic:?}");
         assert!(!basic.iter().any(|l| l == "Read files"), "basic excludes reads: {basic:?}");
 
-        menu.handle(Input::End, &s);
+        menu.handle(Input::Escape, &s);
         select(&mut menu, &s, "Advanced tools");
         menu.handle(Input::Enter, &s);
         let advanced: Vec<String> = menu.items(&s).iter().map(|i| i.label.clone()).collect();

@@ -42,9 +42,13 @@ pub fn bind(key: Key) -> Option<Input> {
         Key::PageDown => Input::PageDown,
         Key::Home => Input::Home,
 
-        // Escape and End both mean "stop scrolling and follow the newest
+        // Escape is the instinctive "stop that", and the TypeScript client bound
+        // it to cancelling a running turn. It is its own input rather than being
+        // folded in with End, which has never meant cancel.
+        Key::Escape => Input::Escape,
+        // End means "stop scrolling and follow the newest
         // output", which is also how a dialog reads a dismissal.
-        Key::Escape | Key::End => Input::End,
+        Key::End => Input::End,
 
         // Unbound: Tab, arrows we do not use for navigation, and any control
         // chord not listed above. Dropped rather than inserted as a stray
@@ -104,7 +108,7 @@ mod tests {
 
     #[test]
     fn escape_follows_the_newest_output() {
-        assert_eq!(bind(Key::Escape), Some(Input::End));
+        assert_eq!(bind(Key::Escape), Some(Input::Escape));
     }
 
     #[test]

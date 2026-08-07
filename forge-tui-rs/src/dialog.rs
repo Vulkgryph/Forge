@@ -239,7 +239,7 @@ not Forge."
             Input::Char(c) => self.shortcut(c),
 
             // Escape must not leave the agent blocked with nothing on screen.
-            Input::End => Some(self.escape()),
+            Input::Escape => Some(self.escape()),
 
             _ => None,
         }
@@ -278,7 +278,7 @@ not Forge."
                     _ => Some(Decision::Answer(text)),
                 }
             }
-            Input::End => {
+            Input::Escape => {
                 // Leave the text field, back to the options if there are any.
                 if self.options.is_empty() {
                     Some(self.escape())
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn escape_denies_an_approval_rather_than_dismissing_it() {
         let mut d = Dialog::for_pending(&approval());
-        assert_eq!(d.handle(Input::End), Some(Decision::Deny));
+        assert_eq!(d.handle(Input::Escape), Some(Decision::Deny));
     }
 
     /// Approving without seeing the arguments is not consent.
@@ -828,14 +828,14 @@ mod tests {
         let mut d = Dialog::for_pending(&question(false, &["Alpha"]));
         d.handle(Input::Down);
         d.handle(Input::Enter);
-        assert_eq!(d.handle(Input::End), None, "not a decision");
+        assert_eq!(d.handle(Input::Escape), None, "not a decision");
         assert!(!d.is_typing());
     }
 
     #[test]
     fn escape_from_a_text_only_prompt_cancels() {
         let mut d = Dialog::for_pending(&Pending::ProcessInput { prompt: "?".into() });
-        assert_eq!(d.handle(Input::End), Some(Decision::Cancel));
+        assert_eq!(d.handle(Input::Escape), Some(Decision::Cancel));
     }
 
     #[test]
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(d.handle(Input::Char('n')), Some(Decision::Deny));
         // Escaping a rewind declines it rather than doing it.
         let mut d = Dialog::for_pending(&rewind);
-        assert_eq!(d.handle(Input::End), Some(Decision::Deny));
+        assert_eq!(d.handle(Input::Escape), Some(Decision::Deny));
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────

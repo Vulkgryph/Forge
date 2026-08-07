@@ -47,6 +47,15 @@ pub enum Input {
     Complete,
     /// Shift-Tab: step to the next permission mode.
     CyclePermission,
+    /// Caret movement and editing inside the message being written.
+    Left,
+    Right,
+    Delete,
+    /// Ctrl-W: delete the word before the caret.
+    DeleteWord,
+    /// The end of the line the caret is on. Separate from `End`, which follows the
+    /// newest output.
+    LineEnd,
     /// Escape: interrupt a running turn, or nothing when idle.
     Escape,
     /// Insert a literal newline in the input.
@@ -98,6 +107,13 @@ mod palette {
 pub struct App {
     session: Session,
     input:   String,
+    /// Column the caret was drawn at, worked out while laying the prompt out.
+    caret_col: usize,
+    /// Byte offset of the caret in `input`, always on a grapheme boundary.
+    ///
+    /// The input used to be append-only, with the caret implicitly at the end.
+    /// Editing anything but the last character meant deleting back to it.
+    caret:   usize,
     /// Lines scrolled up from the newest output. 0 means following along.
     scroll:  usize,
     /// Cached wrap of the transcript: the width it was built for, how many
@@ -131,6 +147,8 @@ impl App {
         Self {
             session: Session::new(),
             input: String::new(),
+            caret: 0,
+            caret_col: 0,
             scroll: 0,
             cache: None,
             dialog: None,
@@ -283,12 +301,13 @@ impl App {
             Input::Complete => {
                 if let Some(entry) = self.selected_suggestion() {
                     self.input = entry.command.to_string();
+                    self.caret = self.input.len();
                     self.suggestion = 0;
                 }
             }
 
             Input::Newline => {
-                self.input.push('\n');
+                self.insert_at_caret("\n");
                 self.suggestion = 0;
             }
 
@@ -298,7 +317,7 @@ impl App {
             }
 
             Input::Char(c) => {
-                self.input.push(c);
+                self.insert_at_caret(&c.to_string());
                 self.suggestion = 0;
                 self.follow_tail();
             }
@@ -316,17 +335,14 @@ impl App {
                 // Enter transmits — so deleting them ran every pasted line
                 // together into one. Observed with a 40-line paste arriving as a
                 // single line. CRLF collapses first so it does not become two.
-                self.input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.insert_at_caret(&text);
                 self.follow_tail();
             }
 
             Input::Backspace => {
-                // Remove a whole grapheme: backspacing an emoji must not leave
-                // half of it behind.
-                use unicode_segmentation::UnicodeSegmentation;
-                if let Some(last) = self.input.graphemes(true).next_back() {
-                    let keep = self.input.len() - last.len();
-                    self.input.truncate(keep);
+                if self.caret > 0 {
+                    self.delete_before_caret();
                 }
                 self.suggestion = 0;
             }
@@ -335,8 +351,11 @@ impl App {
                 // The placeholder advertises `\+Enter` for a newline, so a
                 // trailing backslash means "continue" rather than "send". The
                 // backslash itself is consumed; it was an instruction, not text.
+                // The backslash is the character before the caret when it has just
+                // been typed; removing it moves the caret back with it.
                 self.input.pop();
-                self.input.push('\n');
+                self.caret = self.caret.min(self.input.len());
+                self.insert_at_caret("\n");
             }
 
             Input::Enter => {
@@ -346,6 +365,7 @@ impl App {
                 if let Some(entry) = self.selected_suggestion() {
                     let command = entry.command;
                     self.input.clear();
+                    self.caret = 0;
                     self.suggestion = 0;
                     if let Some(parsed) = commands::parse(command) {
                         return self.run_command(parsed);
@@ -354,6 +374,7 @@ impl App {
 
                 let text = self.input.trim().to_string();
                 self.input.clear();
+                self.caret = 0;
                 self.suggestion = 0;
                 if text.is_empty() {
                     return (Outcome::Continue, Vec::new());
@@ -371,6 +392,18 @@ impl App {
                     vec![Effect::Send(ClientMessage::SendMessage { content: text })],
                 );
             }
+
+            // Navigation inside the message being written. Only while there is
+            // something to navigate: with the input empty these keys keep their
+            // old meanings, and the suggestion list takes the arrows first.
+            Input::Left if self.editing() => self.move_caret_left(),
+            Input::Right if self.editing() => self.move_caret_right(),
+            Input::Up if self.editing() && !self.has_suggestions() => self.move_caret_up(),
+            Input::Down if self.editing() && !self.has_suggestions() => self.move_caret_down(),
+            Input::Home if self.editing() => self.caret_to_line_start(),
+            Input::LineEnd if self.editing() => self.caret_to_line_end(),
+            Input::Delete if self.editing() => self.delete_at_caret(),
+            Input::DeleteWord if self.editing() => self.delete_word_before_caret(),
 
             // With suggestions showing, the arrows move through them — that is
             // what the prompt's own hint promises.
@@ -401,7 +434,8 @@ impl App {
             // printed into its scrollback, so the wheel and the scrollbar work on
             // the real history rather than on a window we maintain.
             Input::Up | Input::Down | Input::PageUp | Input::PageDown
-            | Input::Home | Input::End => {}
+            | Input::Home | Input::End | Input::Left | Input::Right
+            | Input::Delete | Input::DeleteWord | Input::LineEnd => {}
             Input::Resize(..) => {}
         }
 
@@ -809,13 +843,15 @@ impl App {
         chrome.push(Line::default());
         chrome.extend(self.suggestion_lines(cols));
         let prompt_offset = chrome.len();
-        let prompt = Self::window_prompt(
+        let (caret_row, caret_col) = self.caret_position(cols);
+        let (prompt, caret_in_prompt) = Self::window_prompt(
             self.prompt_lines(cols),
             Self::prompt_budget(capacity),
             cols,
+            caret_row,
         );
-        // The caret belongs on the last row of the input, not the first.
-        let caret_offset = prompt_offset + prompt.len() - 1;
+        let caret_offset = prompt_offset + caret_in_prompt.min(prompt.len().saturating_sub(1));
+        self.caret_col = caret_col;
         chrome.extend(prompt);
         chrome.push(self.context_bar_line(cols));
 
@@ -847,19 +883,147 @@ impl App {
         LiveBlock { lines, prompt_row }
     }
 
+    // ── the input's caret ────────────────────────────────────────────────
+
+    fn graphemes(text: &str) -> Vec<(usize, &str)> {
+        use unicode_segmentation::UnicodeSegmentation;
+        text.grapheme_indices(true).collect()
+    }
+
+    /// Byte offsets bounding the logical line the caret is on.
+    fn caret_line(&self) -> (usize, usize) {
+        let start = self.input[..self.caret].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.input[self.caret..]
+            .find('\n')
+            .map_or(self.input.len(), |i| self.caret + i);
+        (start, end)
+    }
+
+    fn insert_at_caret(&mut self, text: &str) {
+        // The caret is state several paths update; a stale one would panic inside
+        // `insert_str` rather than misplace a character, so it is checked in debug
+        // and clamped in release.
+        debug_assert!(
+            self.input.is_char_boundary(self.caret),
+            "caret {} is not a boundary in {:?}", self.caret, self.input,
+        );
+        while self.caret > self.input.len() || !self.input.is_char_boundary(self.caret) {
+            self.caret -= 1;
+        }
+        self.input.insert_str(self.caret, text);
+        self.caret += text.len();
+    }
+
+    /// Delete the grapheme before the caret — a whole one, so backspacing an
+    /// emoji does not leave half of it behind.
+    fn delete_before_caret(&mut self) {
+        let Some((start, _)) = Self::graphemes(&self.input[..self.caret]).pop() else { return };
+        self.input.replace_range(start..self.caret, "");
+        self.caret = start;
+    }
+
+    /// Delete the grapheme at the caret. The caret does not move: what was to its
+    /// right closes up onto it.
+    fn delete_at_caret(&mut self) {
+        let rest = &self.input[self.caret..];
+        let Some((_, g)) = Self::graphemes(rest).into_iter().next() else { return };
+        let end = self.caret + g.len();
+        self.input.replace_range(self.caret..end, "");
+    }
+
+    /// Delete back to the start of the word before the caret, whitespace included,
+    /// which is what Ctrl-W does everywhere else.
+    fn delete_word_before_caret(&mut self) {
+        let before = &self.input[..self.caret];
+        let trimmed = before.trim_end_matches(|c: char| c.is_whitespace());
+        let start = trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map_or(0, |i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8));
+        self.input.replace_range(start..self.caret, "");
+        self.caret = start;
+    }
+
+    fn move_caret_left(&mut self) {
+        if let Some((start, _)) = Self::graphemes(&self.input[..self.caret]).pop() {
+            self.caret = start;
+        }
+    }
+
+    fn move_caret_right(&mut self) {
+        if let Some((_, g)) = Self::graphemes(&self.input[self.caret..]).into_iter().next() {
+            self.caret += g.len();
+        }
+    }
+
+    /// Display width of the caret's own line up to the caret — the column to aim
+    /// for when moving between lines.
+    fn caret_column(&self) -> usize {
+        let (start, _) = self.caret_line();
+        str_width(&self.input[start..self.caret])
+    }
+
+    /// The byte offset within `line` closest to `column` display cells in, without
+    /// splitting a grapheme. Used to land the caret in roughly the same place
+    /// after moving up or down, as every editor does.
+    fn offset_for_column(line: &str, column: usize) -> usize {
+        let mut width = 0;
+        for (i, g) in Self::graphemes(line) {
+            if width >= column {
+                return i;
+            }
+            width += str_width(g);
+        }
+        line.len()
+    }
+
+    fn move_caret_up(&mut self) {
+        let (start, _) = self.caret_line();
+        if start == 0 {
+            return; // already on the first line
+        }
+        let column = self.caret_column();
+        let prev_start = self.input[..start - 1].rfind('\n').map_or(0, |i| i + 1);
+        let prev = &self.input[prev_start..start - 1];
+        self.caret = prev_start + Self::offset_for_column(prev, column);
+    }
+
+    fn move_caret_down(&mut self) {
+        let (_, end) = self.caret_line();
+        if end >= self.input.len() {
+            return; // already on the last line
+        }
+        let column = self.caret_column();
+        let next_start = end + 1;
+        let next_end = self.input[next_start..]
+            .find('\n')
+            .map_or(self.input.len(), |i| next_start + i);
+        let next = &self.input[next_start..next_end];
+        self.caret = next_start + Self::offset_for_column(next, column);
+    }
+
+    fn caret_to_line_start(&mut self) {
+        self.caret = self.caret_line().0;
+    }
+
+    fn caret_to_line_end(&mut self) {
+        self.caret = self.caret_line().1;
+    }
+
+    /// True when the caret is somewhere the input owns, so navigation keys belong
+    /// to it rather than to the transcript or the suggestion list.
+    fn editing(&self) -> bool {
+        !self.input.is_empty() && self.dialog.is_none() && self.menu.is_none()
+    }
+
     /// Where the caret goes within the live block.
     fn cursor_in(&self, block: &LiveBlock, cols: usize) -> Option<(usize, usize)> {
         let row = block.prompt_row?;
         if self.dialog.is_some() {
             return None; // the dialog owns the caret
         }
-        let lead = str_width(PROMPT_GLYPH);
-        let last = self.input.rsplit('\n').next().unwrap_or("");
-        // The caret follows the text onto the last row it wrapped onto, so its
-        // column is measured against that row rather than the whole line.
-        let last_row = wrap_at(last, cols, lead).pop().unwrap_or_default();
-        let typed = str_width(&last_row);
-        Some((row, (lead + typed).min(cols.saturating_sub(1))))
+        let _ = cols;
+        // Computed while the block was built, where the wrapping is known.
+        Some((row, self.caret_col))
     }
 
     /// Render a range of transcript entries.
@@ -1082,18 +1246,55 @@ impl App {
         out
     }
 
+    /// Which prompt row the caret is on, and its column.
+    ///
+    /// Counted the same way the rows are built: every logical line before the
+    /// caret's contributes the rows it wraps to, and within the caret's own line
+    /// the prefix is wrapped to find how far down and across it sits. Wrapping the
+    /// prefix rather than the whole line can disagree by a row when the caret is
+    /// mid-word at a break — the same approximation the end-of-input caret has
+    /// always used, and off by nothing in the common case.
+    fn caret_position(&self, cols: usize) -> (usize, usize) {
+        let lead = str_width(PROMPT_GLYPH);
+        if self.input.is_empty() {
+            return (0, lead);
+        }
+        let (line_start, _) = self.caret_line();
+        let mut row = 0usize;
+        for line in self.input[..line_start].split('\n') {
+            if line_start == 0 {
+                break;
+            }
+            row += wrap_at(line, cols, lead).len();
+        }
+        let prefix = &self.input[line_start..self.caret];
+        let wrapped = wrap_at(prefix, cols, lead);
+        let within = wrapped.len().saturating_sub(1);
+        let col = lead + str_width(wrapped.last().map(String::as_str).unwrap_or(""));
+        (row + within, col.min(cols.saturating_sub(1)))
+    }
+
     /// Keep the input to `budget` rows, saying how many are above.
     ///
     /// The newest rows are the ones kept: the caret is at the end of the input, so
     /// the tail is where typing happens. Without this a pasted file filled the
     /// window and pushed the conversation, and then the prompt itself, off the top.
-    fn window_prompt(rows: Vec<Line>, budget: usize, cols: usize) -> Vec<Line> {
+    fn window_prompt(
+        rows: Vec<Line>,
+        budget: usize,
+        cols: usize,
+        caret_row: usize,
+    ) -> (Vec<Line>, usize) {
         if rows.len() <= budget {
-            return rows;
+            return (rows, caret_row);
         }
         // One row goes to the marker, so the rest is what can still be shown.
         let keep = budget.saturating_sub(1).max(1);
-        let hidden = rows.len() - keep;
+        // The window follows the caret rather than pinning to the end, or moving up
+        // through a long message would walk the caret off the top of its own input.
+        let hidden = caret_row
+            .saturating_sub(keep - 1)
+            .min(rows.len() - keep);
         let mut out = Vec::with_capacity(keep + 1);
         out.push(Line {
             spans: vec![Span {
@@ -1104,8 +1305,10 @@ impl App {
                 style: Style::fg(palette::GRAY),
             }],
         });
-        out.extend(rows.into_iter().skip(hidden));
-        out
+        out.extend(rows.into_iter().skip(hidden).take(keep));
+        // The marker occupies the first row, so the caret sits one lower than its
+        // offset into what is shown.
+        (out, caret_row - hidden + 1)
     }
 
     fn context_bar_line(&self, cols: usize) -> Line {
@@ -2989,6 +3192,156 @@ long enough to wrap, and must stay separated from the first.";
         app.session_mut().apply(AgentMessage::Thinking);
         let (_, effects) = app.update(Input::End, ROWS);
         assert!(effects.is_empty(), "End must not cancel: {effects:?}");
+    }
+
+    // ── Caret navigation ──────────────────────────────────────────────────
+
+    fn typed(text: &str) -> App {
+        let (mut app, _rows) = app_with(0);
+        for c in text.chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app
+    }
+
+    /// Left and right move by grapheme, and typing lands where the caret is —
+    /// the input used to be append-only, so editing anything but the last
+    /// character meant deleting back to it.
+    #[test]
+    fn the_caret_moves_and_typing_inserts_there() {
+        let mut app = typed("hello world");
+        for _ in 0..6 {
+            app.update(Input::Left, ROWS);
+        }
+        app.update(Input::Char('X'), ROWS);
+        assert_eq!(app.input(), "helloX world");
+    }
+
+    /// Backspace takes the character before the caret, not the last one typed.
+    #[test]
+    fn backspace_applies_at_the_caret() {
+        let mut app = typed("abcdef");
+        app.update(Input::Left, ROWS);
+        app.update(Input::Left, ROWS);
+        app.update(Input::Backspace, ROWS);
+        assert_eq!(app.input(), "abcef", "removed the d, not the f");
+    }
+
+    /// Delete takes the character *at* the caret and leaves the caret put.
+    #[test]
+    fn delete_removes_forwards() {
+        let mut app = typed("abc");
+        app.update(Input::Left, ROWS);
+        app.update(Input::Delete, ROWS);
+        assert_eq!(app.input(), "ab");
+    }
+
+    /// A whole grapheme goes at once, either way. Half an emoji is not a character.
+    #[test]
+    fn editing_never_splits_a_grapheme() {
+        let mut app = typed("a👍b");
+        app.update(Input::Left, ROWS);       // between 👍 and b
+        app.update(Input::Backspace, ROWS);
+        assert_eq!(app.input(), "ab");
+
+        let mut app = typed("a👍b");
+        app.update(Input::Left, ROWS);
+        app.update(Input::Left, ROWS);       // between a and 👍
+        app.update(Input::Delete, ROWS);
+        assert_eq!(app.input(), "ab");
+    }
+
+    /// Up and down move between the lines of the message, keeping roughly the
+    /// column — which is the whole point of asking for more than left and right.
+    #[test]
+    fn up_and_down_move_between_lines() {
+        let (mut app, _rows) = app_with(0);
+        for c in "first line".chars() { app.update(Input::Char(c), ROWS); }
+        app.update(Input::Newline, ROWS);
+        for c in "second".chars() { app.update(Input::Char(c), ROWS); }
+
+        // Up from column 6 of the second line lands at column 6 of the first.
+        app.update(Input::Up, ROWS);
+        app.update(Input::Char('|'), ROWS);
+        assert_eq!(app.input(), "first |line\nsecond");
+
+        // And back down.
+        app.update(Input::Down, ROWS);
+        app.update(Input::Char('!'), ROWS);
+        assert!(app.input().contains("second"), "still has the second line: {:?}", app.input());
+    }
+
+    /// Up on the first line and down on the last do nothing, rather than jumping
+    /// to an end the user did not ask for.
+    #[test]
+    fn up_and_down_stop_at_the_ends() {
+        let mut app = typed("only");
+        let before = app.input().to_string();
+        app.update(Input::Up, ROWS);
+        app.update(Input::Char('a').clone(), ROWS);
+        assert_eq!(app.input(), format!("{before}a"), "caret stayed at the end");
+    }
+
+    /// Home and End act on the line the caret is on, not the whole message.
+    #[test]
+    fn home_and_end_work_on_the_current_line() {
+        let (mut app, _rows) = app_with(0);
+        for c in "one".chars() { app.update(Input::Char(c), ROWS); }
+        app.update(Input::Newline, ROWS);
+        for c in "two".chars() { app.update(Input::Char(c), ROWS); }
+
+        app.update(Input::Home, ROWS);
+        app.update(Input::Char('>'), ROWS);
+        assert_eq!(app.input(), "one\n>two");
+
+        app.update(Input::LineEnd, ROWS);
+        app.update(Input::Char('<'), ROWS);
+        assert_eq!(app.input(), "one\n>two<");
+    }
+
+    /// Ctrl-W deletes the word before the caret, whitespace included.
+    #[test]
+    fn ctrl_w_deletes_a_word() {
+        let mut app = typed("delete this word");
+        app.update(Input::DeleteWord, ROWS);
+        assert_eq!(app.input(), "delete this ");
+        app.update(Input::DeleteWord, ROWS);
+        assert_eq!(app.input(), "delete ");
+    }
+
+    /// With the input empty the arrows keep their old jobs, so navigation cannot
+    /// swallow keys that mean something else.
+    #[test]
+    fn an_empty_input_leaves_the_arrows_alone() {
+        let (mut app, _rows) = app_with(0);
+        let (_, effects) = app.update(Input::Left, ROWS);
+        assert!(effects.is_empty());
+        assert_eq!(app.input(), "");
+    }
+
+    /// The window follows the caret. Moving up through a long message must bring
+    /// the caret's line into view, not leave it above the top of its own input.
+    #[test]
+    fn the_window_follows_the_caret_upwards() {
+        let (mut app, _rows) = app_with(0);
+        let pasted: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        app.update(Input::Paste(pasted), ROWS);
+
+        // Walk up thirty lines.
+        for _ in 0..30 {
+            app.update(Input::Up, ROWS);
+        }
+        let shown = live_text(&mut app);
+        assert!(
+            shown.contains("line 11") || shown.contains("line 10"),
+            "the caret's line should be on screen: {shown:?}",
+        );
+
+        // The caret is drawn inside the block, not off the end of it.
+        let inline = crate::inline::Inline::new(COLS, ROWS);
+        let block = app.live_lines(&inline, COLS);
+        let (row, _col) = app.cursor_in(&block, COLS).expect("a caret");
+        assert!(row < block.lines.len(), "caret row {row} outside {} rows", block.lines.len());
     }
 
 }

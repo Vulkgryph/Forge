@@ -41,6 +41,15 @@ pub fn bind(key: Key) -> Option<Input> {
         Key::PageUp => Input::PageUp,
         Key::PageDown => Input::PageDown,
         Key::Home => Input::Home,
+        Key::Delete => Input::Delete,
+        Key::Left => Input::Left,
+        Key::Right => Input::Right,
+
+        // Readline's line-start and line-end, which work in every terminal —
+        // unlike modified arrows, which Forge IDE's own terminal does not send.
+        Key::Ctrl('a') => Input::Home,
+        Key::Ctrl('e') => Input::LineEnd,
+        Key::Ctrl('w') => Input::DeleteWord,
 
         // Escape is the instinctive "stop that", and the TypeScript client bound
         // it to cancelling a running turn. It is its own input rather than being
@@ -57,7 +66,7 @@ pub fn bind(key: Key) -> Option<Input> {
         Key::Tab => Input::Complete,
         Key::BackTab => Input::CyclePermission,
 
-        Key::Left | Key::Right | Key::Delete | Key::Ctrl(_) => return None,
+        Key::Ctrl(_) => return None,
     })
 }
 
@@ -123,7 +132,8 @@ mod tests {
     /// control character into the input line.
     #[test]
     fn unbound_keys_are_dropped() {
-        for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Delete] {
+        // Delete used to be here; it removes the grapheme at the caret now.
+        for key in [Key::Ctrl('q'), Key::Ctrl('z'), Key::Ctrl('p')] {
             assert_eq!(bind(key.clone()), None, "{key:?} should be unbound");
         }
     }

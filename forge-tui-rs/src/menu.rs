@@ -681,7 +681,7 @@ impl Menu {
                 title_row,
                 area.col + self.page().title().len() as u16 as usize + 2,
                 &text,
-                Style::fg(245).dim(),
+                Style::fg(245),
             );
         }
 
@@ -701,7 +701,7 @@ impl Menu {
 
         if scrolling && self.scroll > 0 {
             canvas.put(area.row + 1, area.col, &format!("  ↑ {} more", self.scroll),
-                       Style::fg(245).dim());
+                       Style::fg(245));
         }
 
         for (offset, item) in items[self.scroll..end].iter().enumerate() {
@@ -718,14 +718,14 @@ impl Menu {
             let y = first_list_row + visible;
             if y < area.row + area.rows.saturating_sub(2) {
                 canvas.put(y, area.col, &format!("  ↓ {hidden_below} more"),
-                           Style::fg(245).dim());
+                           Style::fg(245));
             }
         }
 
         // Footer and hint.
         let footer_row = area.row + area.rows.saturating_sub(2);
         canvas.put(footer_row, area.col, &widgets::clip(self.page().footer(), area.cols),
-                   Style::fg(245).dim());
+                   Style::fg(245));
         let hint = if self.stack.len() > 1 {
             "↑↓/jk move · Enter choose · Esc back"
         } else {
@@ -750,7 +750,7 @@ impl Menu {
     ) {
         if item.is_header() {
             canvas.put(y, area.col + 2, &widgets::clip(&item.label, area.cols),
-                       Style::fg(245).dim());
+                       Style::fg(245));
             return;
         }
 
@@ -767,7 +767,7 @@ impl Menu {
             let room = area.cols.saturating_sub(used).saturating_sub(2);
             if room > 4 {
                 canvas.put(y, col + 2, &widgets::clip(&item.description, room),
-                           Style::fg(245).dim());
+                           Style::fg(245));
             }
         }
     }

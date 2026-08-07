@@ -66,7 +66,7 @@ pub fn render(md: &str, cols: usize) -> Vec<Line> {
     let mut in_code = false;
     let mut lang = String::new();
     let mut hl = crate::highlight::State::default();
-    let dim = Style::fg(palette::BULLET).dim();
+    let dim = Style::fg(palette::BULLET);
 
     let lines: Vec<&str> = md.lines().collect();
     let mut idx = 0usize;
@@ -320,7 +320,7 @@ fn classify(line: &str) -> (String, &str, Style, usize) {
         return (String::new(), rest, Style::fg(palette::HEADING).bold(), 0);
     }
     if let Some(rest) = line.strip_prefix("> ") {
-        return ("│ ".to_string(), rest, Style::fg(palette::QUOTE).dim(), 2);
+        return ("│ ".to_string(), rest, Style::fg(palette::QUOTE), 2);
     }
     for marker in ["- ", "* "] {
         if let Some(rest) = line.strip_prefix(marker) {

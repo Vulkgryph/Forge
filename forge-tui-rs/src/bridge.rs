@@ -603,8 +603,22 @@ mod tests {
         assert!(err.is_err(), "must report the broken connection");
     }
 
+    /// The environment is process-wide while tests run in parallel threads, so
+    /// these two raced: one cleared `FORGE_AGENT_PATH` while the other was
+    /// asserting on it, and the suite failed roughly one run in ten. Held for the
+    /// whole of each test, not just the mutation, since the assertion depends on
+    /// the variable just as much as the setup does.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A poisoned lock here means a *different* test failed; that failure is the
+    /// one worth reporting, so carry on rather than masking it with this one.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn binary_discovery_prefers_the_environment_override() {
+        let _guard = env_guard();
         // Safe here: the test asserts on the value it just set, and the
         // discovery function reads it directly.
         let sentinel = "/nonexistent/sentinel-forge-agent";
@@ -615,6 +629,7 @@ mod tests {
 
     #[test]
     fn binary_discovery_falls_back_to_a_path_lookup() {
+        let _guard = env_guard();
         unsafe { std::env::remove_var("FORGE_AGENT_PATH") };
         let found = find_agent_binary();
         // Either a real build was located, or the bare name for PATH lookup.

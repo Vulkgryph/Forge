@@ -450,7 +450,7 @@ not Forge."
         }
 
         let hint = widgets::clip(self.hint(), inner.cols);
-        screen.put(hint_row, inner.col, &hint, Style::fg(245).dim());
+        screen.put(hint_row, inner.col, &hint, Style::fg(245));
     }
 
     fn hint(&self) -> &'static str {

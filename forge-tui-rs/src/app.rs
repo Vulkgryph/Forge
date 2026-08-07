@@ -483,7 +483,7 @@ impl App {
     /// The indentation is the point: tool calls sit four columns in and their
     /// output six, so a turn reads as a hierarchy rather than a wall of text.
     fn build_range(&self, range: std::ops::Range<usize>, cols: usize) -> Vec<Line> {
-        let dim = Style::fg(palette::GRAY).dim();
+        let dim = Style::fg(palette::GRAY);
         let mut out = Vec::new();
 
         for (i, entry) in self.session.entries()[range.clone()].iter().enumerate() {
@@ -536,11 +536,17 @@ impl App {
 
                 // Four columns in, with a status glyph.
                 EntryKind::ToolCall => {
+                    // The call itself is ordinary text; only its output is
+                    // secondary. What the agent decided to do is the line you scan
+                    // for, and it read as background when it was grey — the same
+                    // split Claude Code draws. (The TypeScript client used cyan
+                    // here, which distinguishes it but colours a line that is not
+                    // a category of its own.)
                     let mut spans = vec![
                         Span { text: "    ".into(), style: dim },
                         Span { text: "⏺ ".into(), style: Style::fg(palette::MAGENTA) },
                     ];
-                    spans.push(Span { text: entry.content.clone(), style: dim });
+                    spans.push(Span { text: entry.content.clone(), style: Style::default() });
                     out.push(Line { spans });
                 }
 
@@ -815,7 +821,7 @@ impl App {
                 tail[0] = Line {
                     spans: vec![Span {
                         text: widgets::clip(&marker, cols),
-                        style: Style::fg(palette::GRAY).dim(),
+                        style: Style::fg(palette::GRAY),
                     }],
                 };
             }
@@ -850,7 +856,7 @@ impl App {
     }
 
     fn subagent_lines(&self, cols: usize) -> Vec<Line> {
-        let dim = Style::fg(palette::GRAY).dim();
+        let dim = Style::fg(palette::GRAY);
         let subs = &self.session.subagents;
         if subs.is_empty() {
             return Vec::new();
@@ -922,7 +928,7 @@ impl App {
         if matches.is_empty() {
             return Vec::new();
         }
-        let dim = Style::fg(palette::GRAY).dim();
+        let dim = Style::fg(palette::GRAY);
         // The border is not dimmed: ink's was a plain grey, and dimming a grey
         // against black is what made other chrome hard to read.
         let edge = Style::fg(palette::GRAY);
@@ -1003,13 +1009,13 @@ impl App {
             return vec![Line {
                 spans: vec![Span {
                     text: "  (answer above)".into(),
-                    style: Style::fg(palette::GRAY).dim(),
+                    style: Style::fg(palette::GRAY),
                 }],
             }];
         }
         let lead = str_width(PROMPT_GLYPH);
         let bold = Style::fg(palette::PROMPT).bold();
-        let dim = Style::fg(palette::GRAY).dim();
+        let dim = Style::fg(palette::GRAY);
 
         if self.input.is_empty() {
             return vec![Line {
@@ -1054,7 +1060,7 @@ impl App {
     }
 
     fn context_bar_line(&self, cols: usize) -> Line {
-        let dim = Style::fg(palette::GRAY).dim();
+        let dim = Style::fg(palette::GRAY);
         let mut parts: Vec<String> = Vec::new();
         if !self.session.model_name.is_empty() {
             parts.push(self.session.model_name.clone());

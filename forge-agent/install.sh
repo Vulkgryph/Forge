@@ -172,8 +172,14 @@ mkdir -p "$INSTALL_BIN" "$INSTALL_SHARE/bin"
 # Copied, not symlinked into target/. `cargo clean` would otherwise leave a
 # dangling `forge` on PATH, and the TUI locates forge-agent by looking beside its
 # own executable — so the two have to sit together in a directory that persists.
-cp "$BUILD_DIR/forge-tui-rs" "$INSTALL_SHARE/bin/forge"
-cp "$BUILD_DIR/forge-agent"  "$INSTALL_SHARE/bin/forge-agent"
+# Installed by rename, not by copying over the existing file. Writing into a
+# running executable is a SIGKILL on macOS — reinstalling while a session is open
+# would kill it mid-turn. A rename swaps the directory entry and leaves the
+# running process holding the old inode until it exits.
+cp "$BUILD_DIR/forge-tui-rs" "$INSTALL_SHARE/bin/.forge.new"
+cp "$BUILD_DIR/forge-agent"  "$INSTALL_SHARE/bin/.forge-agent.new"
+mv -f "$INSTALL_SHARE/bin/.forge.new"       "$INSTALL_SHARE/bin/forge"
+mv -f "$INSTALL_SHARE/bin/.forge-agent.new" "$INSTALL_SHARE/bin/forge-agent"
 ln -sf "$INSTALL_SHARE/bin/forge-agent" "$INSTALL_BIN/forge-agent"
 ln -sf "$SCRIPT_DIR/update.sh" "$INSTALL_BIN/forge-update"
 

@@ -142,7 +142,7 @@ pub fn list(screen: &mut Screen, area: Rect, rows: &[Row<'_>], accent: u8) -> us
             let left = area.cols.saturating_sub(used).saturating_sub(2);
             if left > 4 {
                 let text = clip(row.description, left);
-                screen.put(y, col + 2, &text, Style::fg(245).dim());
+                screen.put(y, col + 2, &text, Style::fg(245));
             }
         }
         drawn += 1;

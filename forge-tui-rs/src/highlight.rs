@@ -42,7 +42,7 @@ impl Token {
             Token::Keyword => Style::fg(13), // magenta
             Token::Str => Style::fg(10),     // green
             Token::Number => Style::fg(11),  // yellow
-            Token::Comment => Style::fg(8).dim(),
+            Token::Comment => Style::fg(244),
             Token::Meta => Style::fg(14),    // cyan
         }
     }

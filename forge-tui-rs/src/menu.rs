@@ -32,7 +32,10 @@ pub enum Page {
     Models,
     Settings,
     Permission,
-    Tools,
+    /// The handful of tools worth reaching for often.
+    BasicTools,
+    /// Every tool, the basic ones included.
+    AdvancedTools,
     ContextStrategy,
     Offline,
     Subagents,
@@ -52,7 +55,8 @@ impl Page {
             Page::Models => "Main model",
             Page::Settings => "Settings",
             Page::Permission => "Permission mode",
-            Page::Tools => "Tools",
+            Page::BasicTools => "Basic tools",
+            Page::AdvancedTools => "Advanced tools",
             Page::ContextStrategy => "Context strategy",
             Page::Offline => "Offline mode",
             Page::Subagents => "Agents",
@@ -70,7 +74,8 @@ impl Page {
             Page::Models => "Switches the primary model. Takes effect immediately.",
             Page::Settings => "Permissions, tools, context and connectivity.",
             Page::Permission => "Also cycled with Shift+Tab, except for approve-everything.",
-            Page::Tools => "Enter toggles. A disabled tool is not offered to the model.",
+            Page::BasicTools => "Enter toggles. A disabled tool is not offered to the model.",
+            Page::AdvancedTools => "Every tool, the basic ones included.",
             Page::ContextStrategy => "What happens as the context window fills.",
             Page::Offline => "Offline refuses network tools rather than failing on them.",
             Page::Subagents => "Definitions available for delegation.",
@@ -80,6 +85,49 @@ impl Page {
             Page::Sessions => "Resuming restarts the agent with that session loaded.",
             Page::Thinking => "Enter cycles a provider's thinking between default, on and off.",
         }
+    }
+}
+
+/// The tools the basic list offers — the ones worth turning on and off often,
+/// rather than the whole set. The TypeScript client's shortlist, unchanged.
+const BASIC_TOOLS: &[&str] = &["web_search", "web_fetch", "shell_exec", "delegate_task"];
+
+fn is_basic_tool(name: &str) -> bool {
+    BASIC_TOOLS.contains(&name)
+}
+
+/// A readable name for a tool, falling back to the tool's own name for anything
+/// not in the list — a tool added later shows up rather than disappearing.
+fn tool_label(name: &str) -> String {
+    let label = match name {
+        "read_file" => "Read files",
+        "list_directory" => "List directory",
+        "search_code" => "Search code",
+        "apply_patch" => "Apply patch",
+        "write_file" => "Write files",
+        "edit_file" => "Edit files",
+        "glob_files" => "Glob files",
+        "todo_write" => "Todo write",
+        "web_search" => "Web search",
+        "web_fetch" => "Web fetch",
+        "shell_exec" => "Shell commands",
+        "delegate_task" => "Subagents",
+        other => other,
+    };
+    label.to_string()
+}
+
+/// "N disabled", or "All enabled" when none are.
+fn disabled_summary(session: &Session, basic_only: bool) -> String {
+    let disabled = session
+        .available_tools
+        .iter()
+        .filter(|t| !t.enabled && (!basic_only || is_basic_tool(&t.name)))
+        .count();
+    if disabled == 0 {
+        "All enabled".to_string()
+    } else {
+        format!("{disabled} disabled")
     }
 }
 
@@ -241,15 +289,13 @@ impl Menu {
                     },
                     Act::Open(Page::Permission),
                 ),
-                Item::row(
-                    "Tools",
-                    format!(
-                        "{} of {} enabled",
-                        session.available_tools.iter().filter(|t| t.enabled).count(),
-                        session.available_tools.len(),
-                    ),
-                    Act::Open(Page::Tools),
-                ),
+                // Two lists rather than one, as the TypeScript client had them: a
+                // short one for the tools people actually turn on and off, and the
+                // full set behind "Advanced". Counted as "N disabled" rather than
+                // "N of M enabled", since what a reader wants from this row is
+                // whether anything is switched off.
+                Item::row("Basic tools", disabled_summary(session, true), Act::Open(Page::BasicTools)),
+                Item::row("Advanced tools", disabled_summary(session, false), Act::Open(Page::AdvancedTools)),
                 Item::row("Context strategy", session.context_strategy.clone(),
                           Act::Open(Page::ContextStrategy)),
                 Item::row(
@@ -278,13 +324,16 @@ impl Menu {
                     .marked(session.permission_mode == PermissionMode::AllowAll),
             ],
 
-            Page::Tools => session
+            Page::BasicTools | Page::AdvancedTools => session
                 .available_tools
                 .iter()
+                .filter(|tool| *self.page() != Page::BasicTools || is_basic_tool(&tool.name))
                 .map(|tool| {
                     Item::row(
+                        // The tool's own name is the description, so the label can
+                        // be readable without hiding what it actually is.
+                        tool_label(&tool.name),
                         tool.name.clone(),
-                        if tool.enabled { "enabled" } else { "disabled" },
                         Act::Send(ClientMessage::UpdateToolConfig {
                             tool: tool.name.clone(),
                             // Enter flips it.
@@ -1001,9 +1050,9 @@ mod tests {
         let mut menu = Menu::new();
         select(&mut menu, &s, "Settings");
         menu.handle(Input::Enter, &s);
-        select(&mut menu, &s, "Tools");
+        select(&mut menu, &s, "Basic tools");
         menu.handle(Input::Enter, &s);
-        assert_eq!(*menu.page(), Page::Tools);
+        assert_eq!(*menu.page(), Page::BasicTools);
 
         menu.handle(Input::End, &s);
         assert_eq!(*menu.page(), Page::Settings);
@@ -1080,11 +1129,12 @@ mod tests {
         let mut menu = Menu::new();
         select(&mut menu, &s, "Settings");
         menu.handle(Input::Enter, &s);
-        select(&mut menu, &s, "Tools");
+        // read_file is not on the basic shortlist, so it lives under Advanced.
+        select(&mut menu, &s, "Advanced tools");
         menu.handle(Input::Enter, &s);
 
         // read_file starts enabled, so choosing it must disable it.
-        select(&mut menu, &s, "read_file");
+        select(&mut menu, &s, "Read files");
         match menu.handle(Input::Enter, &s) {
             Outcome::Act(effects) => match &effects[0] {
                 Effect::Send(ClientMessage::UpdateToolConfig { tool, enabled }) => {
@@ -1103,9 +1153,9 @@ mod tests {
         let mut menu = Menu::new();
         select(&mut menu, &s, "Settings");
         menu.handle(Input::Enter, &s);
-        select(&mut menu, &s, "Tools");
+        select(&mut menu, &s, "Basic tools");
         menu.handle(Input::Enter, &s);
-        select(&mut menu, &s, "shell_exec");
+        select(&mut menu, &s, "Shell commands");
         match menu.handle(Input::Enter, &s) {
             Outcome::Act(effects) => match &effects[0] {
                 Effect::Send(ClientMessage::UpdateToolConfig { enabled, .. }) => {
@@ -1310,7 +1360,7 @@ mod tests {
         let mut menu = Menu::new();
         select(&mut menu, &s, "Settings");
         menu.handle(Input::Enter, &s);
-        select(&mut menu, &s, "Tools");
+        select(&mut menu, &s, "Advanced tools");
         menu.handle(Input::Enter, &s);
 
         let out = draw(&mut menu, &s, 70, 12);
@@ -1349,4 +1399,52 @@ mod tests {
         let text = String::from_utf8_lossy(&sink);
         assert!(!text.contains("\x1b[3J"));
     }
+    /// The basic list is a shortlist, not everything — that is the whole point of
+    /// there being two.
+    #[test]
+    fn the_basic_list_is_a_shortlist_and_advanced_is_everything() {
+        let s = session();
+        let mut menu = Menu::new();
+        select(&mut menu, &s, "Settings");
+        menu.handle(Input::Enter, &s);
+        select(&mut menu, &s, "Basic tools");
+        menu.handle(Input::Enter, &s);
+        let basic: Vec<String> = menu.items(&s).iter().map(|i| i.label.clone()).collect();
+        assert!(basic.iter().any(|l| l == "Shell commands"), "basic has shell: {basic:?}");
+        assert!(!basic.iter().any(|l| l == "Read files"), "basic excludes reads: {basic:?}");
+
+        menu.handle(Input::End, &s);
+        select(&mut menu, &s, "Advanced tools");
+        menu.handle(Input::Enter, &s);
+        let advanced: Vec<String> = menu.items(&s).iter().map(|i| i.label.clone()).collect();
+        assert!(advanced.iter().any(|l| l == "Read files"), "advanced has reads: {advanced:?}");
+        assert!(advanced.iter().any(|l| l == "Shell commands"),
+                "and the basic ones too: {advanced:?}");
+        assert!(advanced.len() > basic.len());
+    }
+
+    /// The row says whether anything is off, which is what a reader wants from it.
+    /// `shell_exec` is disabled in the test session and is on the basic shortlist.
+    #[test]
+    fn the_settings_rows_count_what_is_disabled() {
+        let s = session();
+        let mut menu = Menu::new();
+        select(&mut menu, &s, "Settings");
+        menu.handle(Input::Enter, &s);
+        let rows: Vec<(String, String)> = menu
+            .items(&s)
+            .iter()
+            .map(|i| (i.label.clone(), i.description.clone()))
+            .collect();
+        let basic = rows.iter().find(|(l, _)| l == "Basic tools").expect("the basic row");
+        assert_eq!(basic.1, "1 disabled", "got {rows:?}");
+    }
+
+    /// A tool the label list has never heard of still appears, under its own name.
+    #[test]
+    fn an_unknown_tool_keeps_its_name() {
+        assert_eq!(tool_label("some_new_tool"), "some_new_tool");
+        assert_eq!(tool_label("read_file"), "Read files");
+    }
+
 }

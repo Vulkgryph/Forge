@@ -1715,6 +1715,15 @@ pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
     // Cmd+V had no case at all (and wasn't handled anywhere else either —
     // see the `Paste` event handling below), breaking the two most basic
     // macOS clipboard shortcuts in the terminal entirely.
+    // Shift+Tab is a sequence of its own, not Tab with a flag: terminals send
+    // `CSI Z` for it. Sending a plain Tab means a program that binds Shift+Tab
+    // sees an ordinary Tab and does whatever Tab does — the Rust TUI cycles
+    // permission modes with it, and inside this terminal that keypress instead
+    // completed a slash command.
+    if m.shift && key == egui::Key::Tab {
+        return Some(b"\x1b[Z".to_vec());
+    }
+
     if m.ctrl {
         // Every letter, computed rather than listed. Ctrl+<letter> is the
         // letter's position in the alphabet as a control code: Ctrl+A is 0x01
@@ -2147,6 +2156,20 @@ mod private_mode_tests {
             Some(vec![0x03]),
             "Cmd+C copies; it must not send SIGINT",
         );
+    }
+
+    /// Shift+Tab has its own sequence. Sending a plain Tab means a program that
+    /// binds it never sees it — the Rust TUI cycles permission modes with
+    /// Shift+Tab, and inside this terminal the keypress completed a slash command
+    /// instead.
+    #[test]
+    fn shift_tab_sends_back_tab_not_a_plain_tab() {
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(super::key_to_pty(egui::Key::Tab, shift), Some(b"\x1b[Z".to_vec()));
+
+        // Plain Tab is unchanged.
+        let none = egui::Modifiers::default();
+        assert_eq!(super::key_to_pty(egui::Key::Tab, none), Some(b"\t".to_vec()));
     }
 
     /// With autowrap off, filling the last row must not scroll.

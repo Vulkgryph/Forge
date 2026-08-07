@@ -304,9 +304,19 @@ impl App {
             }
 
             Input::Paste(text) => {
-                // Newlines would submit partway through a paste; a multi-line
-                // composer is out of scope here.
-                self.input.push_str(&text.replace(['\n', '\r'], " "));
+                // Newlines are kept. A paste arrives as one bracketed block, so
+                // they cannot submit it partway through — that only happens for a
+                // typed Enter, which never appears inside the block. Flattening
+                // them to spaces was a holdover from before the input could hold
+                // more than one line, and left it able to type a newline but not
+                // paste one, which mangled every snippet.
+                //
+                // Carriage returns become newlines rather than being dropped. A
+                // terminal sends CR for a line break inside a paste — that is what
+                // Enter transmits — so deleting them ran every pasted line
+                // together into one. Observed with a 40-line paste arriving as a
+                // single line. CRLF collapses first so it does not become two.
+                self.input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 self.follow_tail();
             }
 
@@ -799,7 +809,11 @@ impl App {
         chrome.push(Line::default());
         chrome.extend(self.suggestion_lines(cols));
         let prompt_offset = chrome.len();
-        let prompt = self.prompt_lines(cols);
+        let prompt = Self::window_prompt(
+            self.prompt_lines(cols),
+            Self::prompt_budget(capacity),
+            cols,
+        );
         // The caret belongs on the last row of the input, not the first.
         let caret_offset = prompt_offset + prompt.len() - 1;
         chrome.extend(prompt);
@@ -1004,6 +1018,15 @@ impl App {
     /// A multi-line message needs a row each, and continuation rows carry a dim
     /// marker rather than the prompt glyph so it is clear where the message
     /// starts.
+    /// How many rows the input may occupy before it is windowed.
+    ///
+    /// A share of the window rather than the TypeScript client's fixed eight:
+    /// eight rows is most of a 12-row terminal and a corner of a 60-row one. The
+    /// floor keeps a couple of lines visible however short the window is.
+    fn prompt_budget(capacity: usize) -> usize {
+        (capacity / 3).clamp(3, 12)
+    }
+
     fn prompt_lines(&self, cols: usize) -> Vec<Line> {
         if self.dialog.is_some() {
             return vec![Line {
@@ -1056,6 +1079,32 @@ impl App {
                 });
             }
         }
+        out
+    }
+
+    /// Keep the input to `budget` rows, saying how many are above.
+    ///
+    /// The newest rows are the ones kept: the caret is at the end of the input, so
+    /// the tail is where typing happens. Without this a pasted file filled the
+    /// window and pushed the conversation, and then the prompt itself, off the top.
+    fn window_prompt(rows: Vec<Line>, budget: usize, cols: usize) -> Vec<Line> {
+        if rows.len() <= budget {
+            return rows;
+        }
+        // One row goes to the marker, so the rest is what can still be shown.
+        let keep = budget.saturating_sub(1).max(1);
+        let hidden = rows.len() - keep;
+        let mut out = Vec::with_capacity(keep + 1);
+        out.push(Line {
+            spans: vec![Span {
+                text: widgets::clip(
+                    &format!("  ↑ {hidden} line{} above", if hidden == 1 { "" } else { "s" }),
+                    cols,
+                ),
+                style: Style::fg(palette::GRAY),
+            }],
+        });
+        out.extend(rows.into_iter().skip(hidden));
         out
     }
 
@@ -1360,12 +1409,79 @@ mod tests {
         assert!(effects.is_empty());
     }
 
+    /// A paste never submits, and it keeps its newlines: the point of pasting a
+    /// snippet is to send the snippet, not one long run-on line. Newlines used to
+    /// be flattened to spaces here, from before the input could hold more than one
+    /// line.
     #[test]
-    fn a_multiline_paste_does_not_submit() {
+    fn a_multiline_paste_keeps_its_lines_and_does_not_submit() {
         let (mut app, _rows) = app_with(0);
         let (_, effects) = app.update(Input::Paste("one\ntwo".into()), ROWS);
         assert!(effects.is_empty(), "paste never submits");
-        assert_eq!(app.input(), "one two");
+        assert_eq!(app.input(), "one\ntwo");
+    }
+
+    /// Line breaks arrive as CR from a terminal, as CRLF from a Windows file, and
+    /// as LF from everything else. All three are line breaks, and one of them used
+    /// to be deleted — which ran a 40-line paste together into a single line.
+    #[test]
+    fn every_kind_of_line_break_in_a_paste_becomes_a_newline() {
+        for (name, pasted) in [
+            ("LF",   "one\ntwo"),
+            ("CR",   "one\rtwo"),
+            ("CRLF", "one\r\ntwo"),
+        ] {
+            let (mut app, _rows) = app_with(0);
+            app.update(Input::Paste(pasted.into()), ROWS);
+            assert_eq!(app.input(), "one\ntwo", "{name} did not become a newline");
+        }
+    }
+
+    /// A long paste is windowed rather than filling the screen: the newest rows
+    /// stay, and the count above says what is out of sight. Without this a pasted
+    /// file pushed the conversation, and then the prompt itself, off the top.
+    #[test]
+    fn a_long_paste_is_windowed_with_a_count_above() {
+        let (mut app, _rows) = app_with(0);
+        let pasted: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        app.update(Input::Paste(pasted), ROWS);
+
+        let shown = live_text(&mut app);
+        let rows: Vec<&str> = shown.lines().collect();
+        let marker = rows.iter().find(|r| r.contains("lines above")).expect("a count: {shown:?}");
+        assert!(marker.contains('↑'), "marked as above: {marker:?}");
+
+        // The newest lines are the ones on screen, and the oldest are not.
+        assert!(shown.contains("line 40"), "the tail is visible");
+        assert!(!shown.contains("line 1\n"), "the head is windowed away");
+
+        // And the whole block still fits the window it was given.
+        let inline = crate::inline::Inline::new(COLS, ROWS);
+        let block = app.live_lines(&inline, COLS);
+        assert!(
+            block.lines.len() <= inline.live_capacity(),
+            "{} rows in a {} row window",
+            block.lines.len(), inline.live_capacity(),
+        );
+    }
+
+    /// Short input is untouched — no marker, no window.
+    #[test]
+    fn a_short_input_is_not_windowed() {
+        let (mut app, _rows) = app_with(0);
+        app.update(Input::Paste("one\ntwo".into()), ROWS);
+        let shown = live_text(&mut app);
+        assert!(!shown.contains("above"), "nothing to hide: {shown:?}");
+    }
+
+    /// The cap follows the window: a fixed eight rows is most of a short terminal
+    /// and a corner of a tall one.
+    #[test]
+    fn the_prompt_budget_scales_with_the_window() {
+        assert_eq!(App::prompt_budget(12), 4);
+        assert_eq!(App::prompt_budget(24), 8);
+        assert_eq!(App::prompt_budget(60), 12, "capped, not a third of a tall window");
+        assert_eq!(App::prompt_budget(3), 3, "and never less than a few rows");
     }
 
     // ── Interrupt ─────────────────────────────────────────────────────────

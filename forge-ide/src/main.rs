@@ -601,6 +601,8 @@ impl ApplicationHandler for Ide {
         // spawn another reload process).
         if self.terminating { return; }
 
+
+
         // Dock-menu clicks land on a queue rather than calling in directly: the
         // click arrives on the main thread inside AppKit, which has no handle on
         // the state that owns the window list. Drained here, just before the
@@ -728,43 +730,52 @@ impl ApplicationHandler for Ide {
                 self.windows.clear();
                 self.shared = None;
                 if std::process::Command::new(&exe).arg("--reload").args(&cwds).spawn().is_ok() {
-                    // Exit through AppKit rather than `process::exit`, which
-                    // returns from `main` the instant it is called and cuts the
-                    // shutdown short. `terminate:` runs the normal sequence —
-                    // including `applicationWillTerminate:`, which is where
-                    // `exiting` saves every window's session and the window set
-                    // itself — so a reload cannot race the writes it depends on.
+                    // Leave through winit rather than AppKit's `terminate:`.
                     //
-                    // This was originally added reaching for something it does not
-                    // achieve: having AppKit write `~/Library/Saved Application
-                    // State/` so macOS would restore window placement, and with it
-                    // which Space each window was on. That cannot work here. The
-                    // windows are torn down a few lines above, so there is nothing
-                    // left for AppKit to record; the new process is spawned before
-                    // the old one writes anything, so there would be nothing to
-                    // read; and Space assignment has no public API at all —
-                    // `NSWindowCollectionBehavior` can say "all Spaces" but not
-                    // "that one". Position and size are restored explicitly
-                    // instead, through the window record; a window reopened while
-                    // on a secondary Space comes back on the active one.
-                    #[cfg(target_os = "macos")]
-                    {
-                        use objc2_app_kit::NSApplication;
-                        use objc2_foundation::MainThreadMarker;
-                        if let Some(mtm) = MainThreadMarker::new() {
-                            // Asynchronous: this returns and AppKit tears the
-                            // process down over the following run-loop turns, so
-                            // guard against re-entering this block meanwhile.
-                            self.terminating = true;
-                            unsafe { NSApplication::sharedApplication(mtm).terminate(None) };
-                            return;
-                        }
-                    }
-                    #[allow(unreachable_code)]
-                    { std::process::exit(0); }
+                    // `terminate:` looked right — it runs the documented
+                    // shutdown, including `applicationWillTerminate:` — but it
+                    // cannot be called from in here. This is a winit callback,
+                    // and winit dispatches callbacks through a handler it holds
+                    // borrowed for the duration; `terminate:` spins a *nested*
+                    // run loop (`_waitForPendingChangesToFinish`, saving the
+                    // persistent-UI state) which pumps more events straight back
+                    // into that handler, and winit panics on the re-entrancy by
+                    // design. A panic crossing back into Objective-C aborts, so
+                    // every reload ended as SIGABRT — which is exactly what
+                    // macOS then reported as having quit unexpectedly. The crash
+                    // report says so plainly: `terminate:` →
+                    // `discardAllPersistentStateAndClose` →
+                    // `_waitForPendingChangesToFinish` → our handler → abort.
+                    //
+                    // `exit()` asks the loop to stop between callbacks, so the
+                    // teardown happens with nothing borrowed and the process
+                    // leaves with status 0. It also calls `exiting` on the way
+                    // out, which is what `terminate:` was reached for in the
+                    // first place — and everything that has to reach disk was
+                    // already written a few lines above, before the windows
+                    // were torn down.
+                    //
+                    // Nothing is lost by not going through AppKit. `terminate:`
+                    // was also once hoped to make macOS restore window
+                    // placement, and with it each window's Space, by writing
+                    // `~/Library/Saved Application State/`. It cannot: the
+                    // windows are torn down a few lines above so there is
+                    // nothing left to record, the new process starts before the
+                    // old one would write anything, and Space assignment has no
+                    // public API at all. Position and size are restored
+                    // explicitly through the window record instead.
+                    self.terminating = true;
+                    event_loop.exit();
+                    return;
                 }
                 eprintln!("reload_window: spawn failed after teardown");
-                if self.windows.is_empty() { event_loop.exit(); }
+                if self.windows.is_empty() {
+                    // Same reason as the success path: the windows are already
+                    // gone and already saved, so `exiting` must not write the
+                    // empty list over the record.
+                    self.terminating = true;
+                    event_loop.exit();
+                }
             }
         }
 
@@ -806,6 +817,12 @@ impl ApplicationHandler for Ide {
     /// every session was silently dropped on the most common way to quit.
     /// winit surfaces that as `LoopExiting`, which is this hook.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // A reload has already saved everything and then emptied `windows` on
+        // purpose. Running the save again from here would ask an empty list
+        // where its windows are and write *that* — erasing the record the
+        // process being started right now is about to read.
+        if self.terminating { return; }
+
         // Before the sessions, while the windows still exist and can still be
         // asked where they are.
         self.remember_windows_now();

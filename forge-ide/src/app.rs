@@ -2926,6 +2926,8 @@ pub struct IdeApp {
     /// workspace. Guard anything workspace-shaped (tree, git, watcher, Quick
     /// Open, search, session, tasks) on this rather than on `cwd`.
     has_folder:      bool,
+    /// What the last "Add to Dock" attempt did, shown under the button.
+    dock_status: Option<String>,
     /// Identifies this window's stored session; see `session::load_for_window`.
     pub window_id:   u64,
     file_watcher:    Option<crate::filewatch::FileWatcher>,
@@ -3191,6 +3193,7 @@ impl IdeApp {
         let pending_ssh = spec.ssh_host;
         let agent_saved = crate::agent_panel::load_conversations(&cwd);
         let mut app = Self {
+            dock_status: None,
             window_id,
             file_tree:       tree,
             buffers:         vec![],   // no untitled tab on startup
@@ -7866,6 +7869,36 @@ impl IdeApp {
                     });
                 });
                 ui.add_space(6.0);
+
+                // Keeping the app in the Dock is a system-level convenience, not a
+                // setting of ours: there is nothing to remember, so it is an action
+                // that either happens or explains why it did not.
+                #[cfg(target_os = "macos")]
+                {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        if ui.button("Add Forge IDE to the Dock").clicked() {
+                            self.dock_status = Some(match crate::dock_install::add_to_dock() {
+                                Ok(crate::dock_install::Outcome::Added) =>
+                                    "Added — the Dock restarts to pick it up.".to_string(),
+                                Ok(crate::dock_install::Outcome::AlreadyThere) =>
+                                    "Already in the Dock.".to_string(),
+                                Err(why) => why,
+                            });
+                        }
+                    });
+                    if let Some(status) = self.dock_status.clone() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            ui.vertical(|ui| {
+                                ui.set_max_width(ui.available_width() - 14.0);
+                                ui.label(egui::RichText::new(status)
+                                    .size(10.0).color(egui::Color32::from_gray(100)));
+                            });
+                        });
+                    }
+                    ui.add_space(6.0);
+                }
 
                 ui.separator();
                 ui.add_space(8.0);

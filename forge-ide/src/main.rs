@@ -3,6 +3,7 @@ mod app;
 mod buffer;
 mod dap;
 #[cfg(target_os = "macos")]
+mod dock_install;
 mod dock_menu;
 #[cfg(feature = "vulkan-renderer")]
 mod egui_pass;

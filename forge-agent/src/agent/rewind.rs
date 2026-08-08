@@ -326,8 +326,73 @@ pub fn ensure_git_repo(project_root: &Path) -> Result<bool> {
     if git_worktree_root_for_path(project_root).is_some() {
         return Ok(false);
     }
+    // Never turn a home directory, a filesystem root, or a container of
+    // unrelated trees into a repo — see `is_unsafe_git_root`. Returning
+    // `Ok(false)` (rather than an error) keeps this quiet: the project simply
+    // goes without git backing, exactly as it would for any other project we
+    // can't initialize.
+    if is_unsafe_git_root(project_root) {
+        return Ok(false);
+    }
     git_output(project_root, &["init"])?;
     Ok(true)
+}
+
+/// Directories forge must never treat as a project's git worktree, and never
+/// `git init` into: a filesystem root, the user's home directory, and the
+/// containers that homes and volumes are mounted under.
+///
+/// Two distinct hazards, both of which have actually happened:
+///
+///   * `git init` run on `$HOME` turns the user's entire home directory into
+///     a repository they never asked for. Worse, it's silent and sticky —
+///     from then on *every* project inside it that has no `.git` of its own
+///     resolves its worktree root by walking *up* to `$HOME`, so forge stops
+///     operating on the project entirely.
+///
+///   * Once that's happened (or the user genuinely does have a home-level
+///     repo), every snapshot, restore and `git clean -fd` forge runs is
+///     scoped to that root instead of the project. Restore is destructive;
+///     a home directory is not somewhere to point it.
+///
+/// Reporting these as "not a worktree" makes the whole rewind/snapshot layer
+/// no-op for such a project, which is the safe default: checkpoints fall back
+/// to the per-file snapshots forge keeps regardless.
+fn is_unsafe_git_root(path: &Path) -> bool {
+    // Both forms matter. The literal path is what a caller passed; the
+    // resolved one is what it actually points at — `/tmp` vs `/private/tmp`,
+    // or a symlinked home, would otherwise slip past an equality check. macOS
+    // firmlinks mean neither alone is enough: `/home` canonicalizes to
+    // `/System/Volumes/Data/home`, so checking only the resolved path misses
+    // the name every caller actually uses, and checking only the literal
+    // misses the resolved one.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    // A filesystem root ("/", "C:\") has no parent.
+    if path.parent().is_none() || resolved.parent().is_none() {
+        return true;
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let resolved_home = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        if path == home || resolved == resolved_home {
+            return true;
+        }
+    }
+
+    // A repo at one of these levels spans every user, or every mount — never
+    // a single project.
+    const CONTAINERS: [&str; 5] = ["/Users", "/home", "/Volumes", "/mnt", "/media"];
+    // The macOS data-volume firmlink prefix, so the resolved form of `/home`
+    // is recognized as `/home` rather than something under `/System`.
+    const MACOS_DATA_VOLUME: &str = "/System/Volumes/Data";
+
+    [path, resolved.as_path()].iter().any(|candidate| {
+        candidate
+            .to_str()
+            .map(|s| s.strip_prefix(MACOS_DATA_VOLUME).unwrap_or(s))
+            .is_some_and(|s| CONTAINERS.contains(&s))
+    })
 }
 
 pub fn git_worktree_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -340,6 +405,10 @@ pub fn git_worktree_root_for_path(path: &Path) -> Option<PathBuf> {
         .ok()
         .map(|out| PathBuf::from(out.trim()))
         .filter(|path| !path.as_os_str().is_empty())
+        // The single chokepoint every caller resolves a worktree root
+        // through, so filtering here is what makes an unsafe root invisible
+        // to snapshotting, restore and `is_git_worktree` alike.
+        .filter(|root| !is_unsafe_git_root(root))
 }
 
 pub fn create_turn_snapshots(
@@ -470,10 +539,15 @@ pub fn create_turn_snapshot(
     Ok(Some(GitTurnSnapshot { commit, ref_name }))
 }
 
+/// Deliberately resolved through `git_worktree_root_for_path` rather than
+/// asking git `--is-inside-work-tree` directly: that answers "is there a repo
+/// somewhere above me", which is true for a project sitting inside an
+/// accidental `$HOME` repo. Going through the shared resolver means the
+/// `is_unsafe_git_root` filter applies here too, so every snapshot and
+/// restore path gated on this function no-ops for such a project instead of
+/// operating on the home directory.
 fn is_git_worktree(project_root: &Path) -> bool {
-    git_output(project_root, &["rev-parse", "--is-inside-work-tree"])
-        .map(|out| out.trim() == "true")
-        .unwrap_or(false)
+    git_worktree_root_for_path(project_root).is_some()
 }
 
 fn canonical_worktree_root(project_root: &Path) -> PathBuf {
@@ -654,7 +728,6 @@ fn is_zombie(pid: i32) -> bool {
 fn process_exists(_pid: i32) -> bool {
     true
 }
-
 
 impl Drop for RewindLock {
     fn drop(&mut self) {
@@ -851,5 +924,52 @@ mod tests {
         restore_file_snapshots(&snapshots).unwrap();
         assert_eq!(std::fs::read_to_string(existing).unwrap(), "before\n");
         assert!(!created.exists());
+    }
+
+    #[test]
+    fn home_and_filesystem_roots_are_never_worktree_roots() {
+        assert!(is_unsafe_git_root(Path::new("/")));
+        assert!(is_unsafe_git_root(Path::new("/Users")));
+        assert!(is_unsafe_git_root(Path::new("/home")));
+        assert!(is_unsafe_git_root(Path::new("/Volumes")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(
+                is_unsafe_git_root(&home),
+                "the home directory must never be treated as a project worktree root"
+            );
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        assert!(
+            !is_unsafe_git_root(project.path()),
+            "an ordinary project directory must still be usable"
+        );
+    }
+
+    #[test]
+    fn ensure_git_repo_refuses_to_initialize_a_home_directory() {
+        let Some(home) = dirs::home_dir() else { return };
+        let had_git_before = home.join(".git").exists();
+
+        assert!(
+            !ensure_git_repo(&home).unwrap(),
+            "must never report having initialized a home directory"
+        );
+        assert_eq!(
+            home.join(".git").exists(),
+            had_git_before,
+            "ensure_git_repo must not create a repository in the home directory"
+        );
+    }
+
+    #[test]
+    fn ensure_git_repo_initializes_the_project_directory_itself() {
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(ensure_git_repo(project.path()).unwrap());
+        assert!(
+            project.path().join(".git").exists(),
+            "the repo belongs in the project directory, not anywhere above it"
+        );
     }
 }

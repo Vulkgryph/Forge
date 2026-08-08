@@ -1,0 +1,75 @@
+# Runs the tests that guard the agent and the two protocol/UI crates on every
+# push and pull request.
+#
+# forge-ide is built and tested on macOS only, and not on Linux. That is the same
+# reason `default-members` in the workspace root excludes it: it pulls in a GPU
+# stack that a headless runner may not have. Its logic tests do not open a window,
+# but its dependencies still have to compile, so it gets the runner that matches
+# what it is actually shipped on.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in this codebase is treated as a defect; the crates are kept at
+  # zero and CI should say so rather than let one drift in unnoticed.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  agent:
+    name: agent, protocol and terminal UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p forge-agent -p forge-agent-proto -p forge-tui-rs --verbose
+
+      - name: Test
+        run: cargo test -p forge-agent -p forge-agent-proto -p forge-tui-rs --verbose
+
+  ide:
+    name: editor (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p forge-ide -p forge-proto -p forge-server --verbose
+
+      - name: Test
+        run: cargo test -p forge-ide -p forge-proto -p forge-server --verbose
+
+  packaging:
+    name: the installer and the app bundle still work
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Shell syntax only — running the installer would write into the runner's
+      # home directory and fetch a toolchain. Catches the class of mistake that
+      # breaks `install.sh` for everyone while every test still passes.
+      - name: Installer parses
+        run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh
+
+      - name: Package the app bundle
+        run: bash forge-ide/scripts/package_macos.sh
+
+      - name: The bundle contains what it claims to
+        run: |
+          app="target/dist/Forge IDE.app"
+          test -x "$app/Contents/MacOS/forge-ide"   || { echo "no editor binary"; exit 1; }
+          test -x "$app/Contents/MacOS/forge-agent" || { echo "no agent binary"; exit 1; }
+          test -f "$app/Contents/Info.plist"        || { echo "no Info.plist";  exit 1; }

@@ -105,22 +105,67 @@ fn path_to_url(path: &str) -> String {
 ///
 /// Written the way the Dock writes its own entries: a `file://` URL with
 /// `_CFURLStringType` 15. Every entry in a real Dock has that shape — checked
-/// against one with 34 icons, none of which used the plain-path form — and
-/// matching it is what keeps the duplicate check above honest.
-fn tile_entry(bundle: &Path) -> String {
-    // The URL is the only variable, and it goes into XML. Percent-encoding has
-    // already removed everything XML would care about, but a path is
-    // user-controlled and this is cheap.
-    let url = path_to_url(&bundle.to_string_lossy())
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+/// against one with 34 icons, none of which used the plain-path form.
+///
+/// `tile-type`, `file-label` and `bundle-identifier` are included because the
+/// Dock stores them on every tile it makes itself. A tile can be resolved without
+/// them, but then the Dock has to work out what the entry means, and an entry it
+/// cannot tie to a running application is drawn in the recents section instead of
+/// the permanent one — which is exactly the symptom of getting this wrong.
+///
+/// No `book` bookmark: that encodes a file's identity, not its path, so it goes
+/// stale the moment the application is replaced — as it is on every rebuild.
+/// Leaving it out means the Dock resolves the path afresh.
+fn tile_entry(bundle: &Path, label: &str, identifier: Option<&str>) -> String {
+    let url = xml_escape(&path_to_url(&bundle.to_string_lossy()));
+    let label = xml_escape(label);
+    let identifier = identifier
+        .map(|id| format!("<key>bundle-identifier</key><string>{}</string>", xml_escape(id)))
+        .unwrap_or_default();
     format!(
-        "<dict><key>tile-data</key><dict><key>file-data</key><dict>\
+        "<dict>\
+         <key>tile-data</key><dict>\
+         <key>file-data</key><dict>\
          <key>_CFURLString</key><string>{url}</string>\
          <key>_CFURLStringType</key><integer>15</integer>\
-         </dict></dict></dict>"
+         </dict>\
+         <key>file-label</key><string>{label}</string>\
+         <key>file-type</key><integer>1</integer>\
+         {identifier}\
+         </dict>\
+         <key>tile-type</key><string>file-tile</string>\
+         </dict>"
     )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// The application's name and bundle identifier, as its own `Info.plist` gives
+/// them.
+///
+/// Read straight out of the file rather than through a plist parser: the two
+/// values wanted are `<key>…</key><string>…</string>` pairs, and a dependency for
+/// that would be a poor trade. Either may be missing, and the entry is still
+/// valid without them.
+fn bundle_identity(bundle: &Path) -> (String, Option<String>) {
+    let fallback = bundle
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Forge IDE".to_string());
+    let Ok(plist) = std::fs::read_to_string(bundle.join("Contents/Info.plist")) else {
+        return (fallback, None);
+    };
+    let value_of = |key: &str| -> Option<String> {
+        let at = plist.find(&format!("<key>{key}</key>"))?;
+        let rest = &plist[at..];
+        let open = rest.find("<string>")? + "<string>".len();
+        let close = rest[open..].find("</string>")?;
+        Some(rest[open..open + close].trim().to_string())
+    };
+    let name = value_of("CFBundleName").filter(|n| !n.is_empty()).unwrap_or(fallback);
+    (name, value_of("CFBundleIdentifier").filter(|i| !i.is_empty()))
 }
 
 /// Put Forge IDE in the Dock, permanently.
@@ -151,7 +196,10 @@ pub fn add_to_dock() -> Result<Outcome, String> {
 
     let written = Command::new("defaults")
         .args(["write", "com.apple.dock", "persistent-apps", "-array-add"])
-        .arg(tile_entry(&bundle))
+        .arg({
+            let (label, identifier) = bundle_identity(&bundle);
+            tile_entry(&bundle, &label, identifier.as_deref())
+        })
         .output()
         .map_err(|e| format!("could not write the Dock's settings: {e}"))?;
     if !written.status.success() {
@@ -253,12 +301,25 @@ mod tests {
     /// duplicate check above able to recognise it afterwards.
     #[test]
     fn the_entry_matches_the_form_the_dock_uses() {
-        let entry = tile_entry(Path::new("/Applications/Forge IDE.app"));
+        let entry = tile_entry(Path::new("/Applications/Forge IDE.app"), "Forge IDE",
+                               Some("com.windingcreek.forge-ide"));
         assert!(
             entry.contains("<string>file:///Applications/Forge%20IDE.app/</string>"),
             "got {entry}",
         );
         assert!(entry.contains("<key>_CFURLStringType</key><integer>15</integer>"));
+        // The identity the Dock stores on its own tiles. Without it the Dock has
+        // to infer what the entry means, and an entry it cannot tie to a running
+        // application is drawn in the recents section rather than the permanent
+        // one — the symptom this was reported as.
+        assert!(entry.contains("<key>tile-type</key><string>file-tile</string>"), "got {entry}");
+        assert!(entry.contains("<key>file-label</key><string>Forge IDE</string>"), "got {entry}");
+        assert!(
+            entry.contains("<string>com.windingcreek.forge-ide</string>"),
+            "the bundle identifier: {entry}",
+        );
+        assert!(!entry.contains("<key>book</key>"),
+                "no bookmark: it encodes file identity and goes stale on every rebuild");
 
         // And the round trip closes: an entry this wrote is found by the check.
         let listed = format!(r#""_CFURLString" = "file:///Applications/Forge%20IDE.app/";"#);
@@ -270,7 +331,7 @@ mod tests {
     #[test]
     fn an_awkward_path_is_encoded_not_injected() {
         let path = Path::new("/Apps/A & B <beta>.app");
-        let entry = tile_entry(path);
+        let entry = tile_entry(path, "A & B <beta>", None);
         assert!(!entry.contains("A & B <beta>"), "raw markup left in: {entry}");
         assert!(entry.contains("%20") && entry.contains("%26"), "encoded: {entry}");
 
@@ -279,4 +340,34 @@ mod tests {
         let url = path_to_url(&path.to_string_lossy());
         assert_eq!(url_to_path(&url).trim_end_matches('/'), "/Apps/A & B <beta>.app");
     }
+    /// The label and identifier come from the application itself, so a rename or
+    /// a fork does not have to be tracked here.
+    #[test]
+    fn identity_is_read_from_the_bundles_own_plist() {
+        let dir = std::env::temp_dir().join(format!("forge-dock-{}.app", std::process::id()));
+        std::fs::create_dir_all(dir.join("Contents")).unwrap();
+        std::fs::write(dir.join("Contents/Info.plist"), r#"<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Forge IDE</string>
+  <key>CFBundleIdentifier</key><string>com.windingcreek.forge-ide</string>
+</dict></plist>"#).unwrap();
+
+        let (label, id) = bundle_identity(&dir);
+        assert_eq!(label, "Forge IDE");
+        assert_eq!(id.as_deref(), Some("com.windingcreek.forge-ide"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bundle with no readable plist still produces a usable entry rather than
+    /// refusing to add anything.
+    #[test]
+    fn a_bundle_without_a_plist_falls_back_to_its_name() {
+        let (label, id) = bundle_identity(Path::new("/nowhere/Forge IDE.app"));
+        assert_eq!(label, "Forge IDE");
+        assert_eq!(id, None);
+        let entry = tile_entry(Path::new("/nowhere/Forge IDE.app"), &label, id.as_deref());
+        assert!(entry.contains("file-tile"), "still a valid tile: {entry}");
+        assert!(!entry.contains("bundle-identifier"), "and claims no identity it lacks");
+    }
+
 }

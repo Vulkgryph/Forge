@@ -7175,6 +7175,12 @@ impl IdeApp {
                     }
                     item_idx += 1;
                 }
+                // The conversation otherwise ends flush against the bottom of
+                // the viewport, so the newest card — the one being read — sits
+                // touching the status line and the input box below it. Inside
+                // the scroll area rather than after it, so it is content the
+                // view scrolls to and not a permanent band of empty panel.
+                ui.add_space(10.0);
             });
 
         if let Some((idx, approve)) = pending_action {

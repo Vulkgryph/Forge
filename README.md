@@ -37,6 +37,27 @@ What *can* diverge is each client's own hand-maintained mirror of the wire proto
       └─────────────────────┘          └─────────────────────┘
 ```
 
+## Install / defaults
+
+This monorepo is the **canonical** Forge source. The standalone `forge` and `Forge-IDE` checkouts are retired.
+
+```bash
+# from a checkout of this repo:
+./forge-agent/install.sh
+# or later:
+forge-update
+```
+
+That installs:
+
+| Command | Points at |
+|---|---|
+| `forge` | `forge-tui-rs`, built from this workspace and installed as `~/.local/share/forge/bin/forge` |
+| `forge-agent` | `target/release/forge-agent` from this workspace |
+| `forge-update` | `forge-agent/update.sh` in this repo |
+
+`forge-ide` is optional and built separately (`cargo build -p forge-ide`) when you want the editor; it is not part of the default PATH install.
+
 ## License
 
 All three projects are licensed under the [Apache License, Version 2.0](LICENSE), copyright © 2026 Vulkgryph LLC. See each project's own `LICENSE`/`NOTICE` for its own copy, and `SECURITY.md` for how to report a vulnerability in that specific project.

@@ -55,7 +55,15 @@ function InlineParts({ parts }: { parts: InlinePart[] }): React.ReactElement {
 
 // ── Block renderer ────────────────────────────────────────────────────
 
-function BlockRenderer({ block, depth = 0 }: { block: MarkdownBlock; depth?: number }): React.ReactElement | null {
+function BlockRenderer({
+  block,
+  depth = 0,
+  columns = 80,
+}: {
+  block: MarkdownBlock;
+  depth?: number;
+  columns?: number;
+}): React.ReactElement | null {
   const indent = "  ".repeat(depth);
 
   switch (block.type) {
@@ -117,50 +125,19 @@ function BlockRenderer({ block, depth = 0 }: { block: MarkdownBlock; depth?: num
           {block.blocks.map((b, i) => (
             <Box key={i}>
               <Text dimColor>{indent}│ </Text>
-              <BlockRenderer block={b} depth={depth + 1} />
+              <BlockRenderer block={b} depth={depth + 1} columns={columns} />
             </Box>
           ))}
         </Box>
       );
 
     case "table": {
-      // Compute column widths
-      const allRows = [block.headers, ...block.rows];
-      const colWidths = block.headers.map((_, ci) =>
-        Math.max(...allRows.map((row) =>
-          row[ci]?.reduce((s, p) => s + inlinePartLength(p), 0) ?? 0
-        ), 3)
-      );
-      const pad = (n: number) => " ".repeat(n);
-      return (
-        <Box flexDirection="column">
-          <Text dimColor>{"  ┌" + colWidths.map((w) => "─".repeat(w + 2)).join("┬") + "┐"}</Text>
-          <Box>
-            <Text dimColor>{"  │"}</Text>
-            {block.headers.map((parts, ci) => (
-              <React.Fragment key={ci}>
-                <Text> </Text><Text bold><InlineParts parts={parts} /></Text>
-                <Text>{pad(colWidths[ci]! - flatLength(parts) + 1)}</Text>
-                <Text dimColor>│</Text>
-              </React.Fragment>
-            ))}
-          </Box>
-          <Text dimColor>{"  ├" + colWidths.map((w) => "─".repeat(w + 2)).join("┼") + "┤"}</Text>
-          {block.rows.map((row, ri) => (
-            <Box key={ri}>
-              <Text dimColor>{"  │"}</Text>
-              {row.map((parts, ci) => (
-                <React.Fragment key={ci}>
-                  <Text> </Text><InlineParts parts={parts} />
-                  <Text>{pad(colWidths[ci]! - flatLength(parts) + 1)}</Text>
-                  <Text dimColor>│</Text>
-                </React.Fragment>
-              ))}
-            </Box>
-          ))}
-          <Text dimColor>{"  └" + colWidths.map((w) => "─".repeat(w + 2)).join("┴") + "┘"}</Text>
-        </Box>
-      );
+      // Render as monospaced single-line strings, NOT a horizontal Ink Box of
+      // many <Text> children. Multi-Text rows wider than the terminal wrap at
+      // arbitrary boundaries and leave a multi-screen blank gap under the
+      // message once Ink repaints the live region (the "finished reply then
+      // huge empty space before Thought/Worked for" bug).
+      return <TableBlock headers={block.headers} rows={block.rows} columns={columns} />;
     }
 
     case "hr":
@@ -187,18 +164,138 @@ function inlinePartLength(part: InlinePart): number {
   return part.content.length;
 }
 
+function partsToPlain(parts: InlinePart[]): string {
+  return renderInlinePlainText(parts);
+}
+
+function truncateCell(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (text.length <= width) return text.padEnd(width, " ");
+  if (width === 1) return "…";
+  return text.slice(0, Math.max(0, width - 1)) + "…";
+}
+
+/**
+ * Fit column widths into the terminal. Prefer shrinking the widest columns
+ * first so short labels stay readable.
+ */
+function fitColWidths(raw: number[], maxTotal: number): number[] {
+  const widths = raw.map((w) => Math.max(3, w));
+  const total = () => widths.reduce((a, b) => a + b, 0) + widths.length * 3 + 1; // padding + borders
+  if (total() <= maxTotal) return widths;
+
+  // Hard floor per column so the frame still looks like a table.
+  const floor = 4;
+  while (total() > maxTotal) {
+    let widest = 0;
+    for (let i = 1; i < widths.length; i++) {
+      if (widths[i]! > widths[widest]!) widest = i;
+    }
+    if (widths[widest]! <= floor) {
+      // Still too wide — collapse evenly as best-effort.
+      for (let i = 0; i < widths.length && total() > maxTotal; i++) {
+        if (widths[i]! > 2) widths[i]! -= 1;
+      }
+      if (total() > maxTotal) break;
+    } else {
+      widths[widest]! -= 1;
+    }
+  }
+  return widths;
+}
+
+function TableBlock({
+  headers,
+  rows,
+  columns,
+}: {
+  headers: InlinePart[][];
+  rows: InlinePart[][][];
+  columns: number;
+}): React.ReactElement {
+  const maxTableWidth = Math.max(24, columns - 2);
+  const allRows = [headers, ...rows];
+  const rawWidths = headers.map((_, ci) =>
+    Math.max(
+      3,
+      ...allRows.map((row) => flatLength(row[ci] ?? [{ type: "text", content: "" }]))
+    )
+  );
+  const colWidths = fitColWidths(rawWidths, maxTableWidth);
+  const frameWidth = colWidths.reduce((a, b) => a + b, 0) + colWidths.length * 3 + 1;
+
+  // If even the floor widths overflow (tiny terminal / many columns), fall
+  // back to a stacked key/value list — never emit a row longer than the
+  // terminal, which is what creates the blank-gap repaint bug.
+  if (frameWidth > maxTableWidth || colWidths.length > 6) {
+    const headerPlain = headers.map(partsToPlain);
+    return (
+      <Box flexDirection="column">
+        {rows.map((row, ri) => (
+          <Box key={ri} flexDirection="column" marginTop={ri === 0 ? 0 : 1}>
+            {row.map((parts, ci) => {
+              const label = headerPlain[ci] || `col${ci + 1}`;
+              const value = partsToPlain(parts);
+              const line = `  ${label}: ${value}`;
+              const clipped =
+                line.length > maxTableWidth
+                  ? line.slice(0, Math.max(0, maxTableWidth - 1)) + "…"
+                  : line;
+              return <Text key={ci}>{clipped}</Text>;
+            })}
+          </Box>
+        ))}
+      </Box>
+    );
+  }
+
+  const top = "  ┌" + colWidths.map((w) => "─".repeat(w + 2)).join("┬") + "┐";
+  const mid = "  ├" + colWidths.map((w) => "─".repeat(w + 2)).join("┼") + "┤";
+  const bot = "  └" + colWidths.map((w) => "─".repeat(w + 2)).join("┴") + "┘";
+  const fmtRow = (cells: InlinePart[][]): string =>
+    "  │" +
+    cells
+      .map((parts, ci) => {
+        const w = colWidths[ci] ?? 3;
+        return " " + truncateCell(partsToPlain(parts), w) + " ";
+      })
+      .join("│") +
+    "│";
+
+  // Pad short rows so borders stay aligned.
+  const normalize = (cells: InlinePart[][]): InlinePart[][] => {
+    const out = cells.slice(0, colWidths.length);
+    while (out.length < colWidths.length) out.push([{ type: "text", content: "" }]);
+    return out;
+  };
+
+  return (
+    <Box flexDirection="column">
+      <Text dimColor>{top.slice(0, maxTableWidth)}</Text>
+      <Text>{fmtRow(normalize(headers)).slice(0, maxTableWidth)}</Text>
+      <Text dimColor>{mid.slice(0, maxTableWidth)}</Text>
+      {rows.map((row, ri) => (
+        <Text key={ri}>{fmtRow(normalize(row)).slice(0, maxTableWidth)}</Text>
+      ))}
+      <Text dimColor>{bot.slice(0, maxTableWidth)}</Text>
+    </Box>
+  );
+}
+
 // ── Public component ─────────────────────────────────────────────────
 
 interface Props {
   content: string;
+  /** Terminal width — used to clamp tables so they cannot overflow/wrap. */
+  columns?: number;
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content }: Props) {
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, columns = 80 }: Props) {
   const blocks = useMemo(() => parseMarkdownBlocks(content), [content]);
   return (
     <Box flexDirection="column">
       {blocks.map((block, i) => (
-        <BlockRenderer key={i} block={block} />
+        <BlockRenderer key={i} block={block} columns={columns} />
       ))}
     </Box>
   );

@@ -48,7 +48,7 @@ export function PlanApproval({ content, onClearAndApprove, onApprove, onReject }
       {/* Plan content */}
       <Box flexDirection="column" marginBottom={1} borderStyle="single" borderColor="cyan" paddingX={1}>
         <Text bold color="cyan">Plan</Text>
-        <MarkdownRenderer content={content || "(no plan content)"} />
+        <MarkdownRenderer content={content || "(no plan content)"} columns={process.stdout.columns || 80} />
       </Box>
 
       <Box flexDirection="column">

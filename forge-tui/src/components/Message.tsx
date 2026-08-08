@@ -127,7 +127,7 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
     case "assistant":
       return (
         <Box flexDirection="column" marginTop={1}>
-          <MarkdownRenderer content={entry.content} />
+          <MarkdownRenderer content={entry.content} columns={columns} />
         </Box>
       );
 
@@ -199,7 +199,7 @@ export const Message = React.memo(function Message({ entry, columns = 80, stream
       return (
         <Box flexDirection="column" marginTop={1}>
           {tail.hiddenLines > 0 && <Text dimColor>  ↑ {tail.hiddenLines} lines above</Text>}
-          <MarkdownRenderer content={tail.text} />
+          <MarkdownRenderer content={tail.text} columns={columns} />
         </Box>
       );
     }

@@ -581,6 +581,26 @@ pub struct AgentSession {
     pub request_input_focus: bool,
 }
 
+/// Fold a streamed chunk of tool output into the card it belongs to.
+///
+/// Output arrives in chunks — often a line at a time — so a card per chunk
+/// turned one `cargo build` into a column of hundreds of identical
+/// "ok shell_exec" boxes each holding a single line.
+fn append_tool_output(items: &mut Vec<ChatItem>, tool_name: String, content: String) {
+    if let Some(ChatItem::ToolResult { name, content: existing, .. }) = items.last_mut() {
+        if *name == tool_name {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(&content);
+            return;
+        }
+    }
+    items.push(ChatItem::ToolResult {
+        name: tool_name, content, success: true, expanded: false,
+    });
+}
+
 impl AgentSession {
     /// True while this session is mid-turn (a request is in flight).
     pub fn is_active(&self) -> bool { self.turn_active }
@@ -845,9 +865,12 @@ impl AgentSession {
                 // Not mirrored into shell_events here — the tool_result that follows
                 // carries the same content already formatted with command + exit code,
                 // so mirroring both would double-print every shell command.
-                self.items.push(ChatItem::ToolResult {
-                    name: tool_name, content, success: true, expanded: false,
-                });
+                //
+                // Appended to the card already streaming, not pushed as a new one.
+                // Output arrives in chunks — often a line at a time — and a card per
+                // chunk turned one `cargo build` into a column of hundreds of
+                // identical "ok shell_exec" boxes, each holding a single line.
+                append_tool_output(&mut self.items, tool_name, content);
             }
             AgentMsg::Error { message } => {
                 // forge-agent reports this and exits immediately, before
@@ -1293,5 +1316,62 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child { let _ = child.kill(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(items: &[ChatItem]) -> (&str, &str) {
+        match items.last().unwrap() {
+            ChatItem::ToolResult { name, content, .. } => (name.as_str(), content.as_str()),
+            _ => panic!("expected a tool card as the last item"),
+        }
+    }
+
+    #[test]
+    fn streamed_output_lands_in_one_card() {
+        // A build streams a line at a time. Before this, each line got its own
+        // "ok shell_exec" box, so `cargo build` produced a column of hundreds.
+        let mut items = Vec::new();
+        for line in ["Compiling a v0.1.0", "Compiling b v0.1.0", "Finished"] {
+            append_tool_output(&mut items, "shell_exec".into(), line.into());
+        }
+        assert_eq!(items.len(), 1, "one running command should be one card");
+        assert_eq!(
+            card(&items),
+            ("shell_exec", "Compiling a v0.1.0\nCompiling b v0.1.0\nFinished"),
+        );
+    }
+
+    #[test]
+    fn a_different_tool_starts_a_new_card() {
+        let mut items = Vec::new();
+        append_tool_output(&mut items, "shell_exec".into(), "building".into());
+        append_tool_output(&mut items, "read_file".into(), "src/main.rs".into());
+        assert_eq!(items.len(), 2);
+        assert_eq!(card(&items), ("read_file", "src/main.rs"));
+    }
+
+    #[test]
+    fn chunks_that_already_end_in_a_newline_are_not_double_spaced() {
+        // The agent may send whole lines with their terminator, or fragments
+        // without one; joining must not depend on which.
+        let mut items = Vec::new();
+        append_tool_output(&mut items, "shell_exec".into(), "one\n".into());
+        append_tool_output(&mut items, "shell_exec".into(), "two".into());
+        assert_eq!(card(&items).1, "one\ntwo");
+    }
+
+    #[test]
+    fn output_after_a_finished_card_does_not_merge_into_it() {
+        // A completed result and the next command's output are separate cards
+        // even when both are shell_exec — the finished one is pushed by the
+        // ToolResult arm and must not absorb the next command's stream.
+        let mut items = vec![ChatItem::Status("between".into())];
+        append_tool_output(&mut items, "shell_exec".into(), "after".into());
+        assert_eq!(items.len(), 2);
+        assert_eq!(card(&items), ("shell_exec", "after"));
     }
 }

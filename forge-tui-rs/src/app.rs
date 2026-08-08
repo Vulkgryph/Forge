@@ -448,7 +448,19 @@ impl App {
         let send = |msg| (Outcome::Continue, vec![Effect::Send(msg)]);
         match command {
             Command::Quit => (Outcome::Quit, Vec::new()),
-            Command::Restart => (Outcome::Continue, vec![Effect::Restart { resume: None }]),
+            // Restarting replaces the agent process, not the conversation. Without
+            // the session id the new process starts empty and the conversation has
+            // to be resumed by hand — which is what `/clear` is for. The
+            // TypeScript client passed `--resume-session` here for the same
+            // reason, and said which session it was restarting.
+            Command::Restart => {
+                let resume = self.session.session_id.clone();
+                match resume.as_deref() {
+                    Some(id) => self.session.push_system(format!("Restarting agent for session {id}…")),
+                    None => self.session.push_system("Restarting agent…".to_string()),
+                }
+                (Outcome::Continue, vec![Effect::Restart { resume }])
+            }
             Command::Clear => send(ClientMessage::ClearSession),
             Command::Compact => send(ClientMessage::Compact),
             Command::Usage => send(ClientMessage::RequestUsage),
@@ -3448,6 +3460,38 @@ long enough to wrap, and must stay separated from the first.";
         let block = app.live_lines(&inline, COLS);
         let (row, _col) = app.cursor_in(&block, COLS).expect("a caret");
         assert!(row < block.lines.len(), "caret row {row} outside {} rows", block.lines.len());
+    }
+
+    /// Restarting replaces the agent, not the conversation. This restarted into an
+    /// empty session, so every restart meant resuming by hand afterwards.
+    #[test]
+    fn restart_carries_the_session_forward() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().session_id = Some("20260807_120000_abc".into());
+        for c in "/restart".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Restart { resume: Some(id) }] if id == "20260807_120000_abc"
+            ),
+            "expected the session to be carried, got {effects:?}",
+        );
+    }
+
+    /// With no session yet there is nothing to carry, and it starts fresh rather
+    /// than refusing.
+    #[test]
+    fn restart_without_a_session_still_restarts() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().session_id = None;
+        for c in "/restart".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        let (_, effects) = app.update(Input::Enter, ROWS);
+        assert!(matches!(effects.as_slice(), [Effect::Restart { resume: None }]), "{effects:?}");
     }
 
 }

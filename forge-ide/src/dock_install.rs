@@ -16,10 +16,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// Where a permanent icon should point.
+///
+/// `/Applications` is the only location that stays put. Pinning a build
+/// directory means pinning something that is deleted and recreated on every
+/// build, and macOS then treats each rebuild as a different application: the
+/// Dock cannot match its tile to what is running, and it draws the icon among
+/// the recents instead.
+const APPLICATIONS: &str = "/Applications";
+
 /// What happened, so the caller can say something true.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Added,
+    /// Copied to `/Applications` first, because it was running from somewhere
+    /// that does not survive a rebuild.
+    InstalledAndAdded,
     /// It was already there. Adding again would put a second identical icon in
     /// the Dock, which is not what "add to Dock" means to anyone.
     AlreadyThere,
@@ -177,11 +189,26 @@ pub fn add_to_dock() -> Result<Outcome, String> {
     use std::process::Command;
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this program: {e}"))?;
-    let bundle = bundle_from_exe(&exe).ok_or_else(|| {
+    let running_from = bundle_from_exe(&exe).ok_or_else(|| {
         "Forge IDE is running from a build directory rather than an installed app, \
          and the Dock can only hold an application."
             .to_string()
     })?;
+
+    // Pin the copy in /Applications, installing it there first if that is not
+    // where this is running from. Pinning a build directory pins something that
+    // will not survive the next build.
+    let (bundle, installed) = match stable_location(&running_from) {
+        Some(stable) => (stable, false),
+        None => {
+            let name = running_from
+                .file_name()
+                .ok_or_else(|| "that application has no name".to_string())?;
+            let target = Path::new(APPLICATIONS).join(name);
+            install_to_applications(&running_from, &target)?;
+            (target, true)
+        }
+    };
 
     let listed = Command::new("defaults")
         .args(["read", "com.apple.dock", "persistent-apps"])
@@ -194,12 +221,10 @@ pub fn add_to_dock() -> Result<Outcome, String> {
         return Ok(Outcome::AlreadyThere);
     }
 
+    let (label, identifier) = bundle_identity(&bundle);
     let written = Command::new("defaults")
         .args(["write", "com.apple.dock", "persistent-apps", "-array-add"])
-        .arg({
-            let (label, identifier) = bundle_identity(&bundle);
-            tile_entry(&bundle, &label, identifier.as_deref())
-        })
+        .arg(tile_entry(&bundle, &label, identifier.as_deref()))
         .output()
         .map_err(|e| format!("could not write the Dock's settings: {e}"))?;
     if !written.status.success() {
@@ -216,7 +241,48 @@ pub fn add_to_dock() -> Result<Outcome, String> {
         .output()
         .map_err(|e| format!("added, but the Dock could not be restarted: {e}"))?;
 
-    Ok(Outcome::Added)
+    Ok(if installed { Outcome::InstalledAndAdded } else { Outcome::Added })
+}
+
+/// The application's path, if it is somewhere permanent enough to pin.
+///
+/// `/Applications` and its per-user counterpart. Anywhere else — a build tree, a
+/// download, a disk image — is somewhere the application is likely to move from
+/// or be replaced in.
+fn stable_location(bundle: &Path) -> Option<PathBuf> {
+    let parent = bundle.parent()?;
+    let user_apps = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Applications"));
+    let stable = parent == Path::new(APPLICATIONS)
+        || user_apps.as_deref().is_some_and(|p| parent == p);
+    stable.then(|| bundle.to_path_buf())
+}
+
+/// Copy the application to `/Applications`, replacing an older copy.
+///
+/// `ditto` rather than a recursive copy written here: it preserves the resource
+/// forks, symlinks and permissions inside a bundle, and getting that wrong
+/// produces an application that launches but misbehaves in ways that are hard to
+/// trace back to the copy.
+#[cfg(target_os = "macos")]
+fn install_to_applications(from: &Path, to: &Path) -> Result<(), String> {
+    use std::process::Command;
+
+    if to.exists() {
+        std::fs::remove_dir_all(to)
+            .map_err(|e| format!("could not replace the copy in {APPLICATIONS}: {e}"))?;
+    }
+    let out = Command::new("ditto")
+        .arg(from)
+        .arg(to)
+        .output()
+        .map_err(|e| format!("could not copy to {APPLICATIONS}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not copy to {APPLICATIONS}: {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -368,6 +434,36 @@ mod tests {
         let entry = tile_entry(Path::new("/nowhere/Forge IDE.app"), &label, id.as_deref());
         assert!(entry.contains("file-tile"), "still a valid tile: {entry}");
         assert!(!entry.contains("bundle-identifier"), "and claims no identity it lacks");
+    }
+
+    /// Only somewhere permanent is worth pinning. A build directory is deleted
+    /// and recreated on every build, and the tile then points at something that
+    /// no longer exists.
+    #[test]
+    fn only_an_installed_location_counts_as_stable() {
+        assert_eq!(
+            stable_location(Path::new("/Applications/Forge IDE.app")),
+            Some(PathBuf::from("/Applications/Forge IDE.app")),
+        );
+        assert_eq!(
+            stable_location(Path::new("/repo/target/dist/Forge IDE.app")),
+            None,
+            "a build directory is not somewhere to pin",
+        );
+        assert_eq!(
+            stable_location(Path::new("/Users/someone/Downloads/Forge IDE.app")),
+            None,
+            "nor is a download",
+        );
+    }
+
+    /// `~/Applications` is an install too, and pinning it must not trigger a copy
+    /// into `/Applications`.
+    #[test]
+    fn a_per_user_applications_folder_is_stable() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let path = PathBuf::from(home).join("Applications/Forge IDE.app");
+        assert_eq!(stable_location(&path), Some(path.clone()));
     }
 
 }

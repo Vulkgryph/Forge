@@ -84,4 +84,35 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# ── Sign ──────────────────────────────────────────────────────────────────────
+# macOS ties a folder's permission grant to the application's code signature, and
+# `cargo` leaves the binary ad-hoc "linker-signed" under an identifier derived
+# from its own hash — a different identifier on every build. So every rebuild
+# looked like a different application: the folders you had already approved were
+# asked for again, and the Dock could not match its tile to what was running.
+#
+# Signing with the Developer ID makes the requirement identity-and-team based, so
+# it survives rebuilds and the grants stick. Falls back to ad-hoc with a fixed
+# identifier where that certificate is absent (CI, another machine): still not
+# stable across rebuilds — nothing ad-hoc can be — but at least the app claims one
+# consistent name instead of a hash.
+SIGN_ID="${FORGE_SIGN_ID:-Developer ID Application: Vulkgryph LLC (W5DSR5XA65)}"
+
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
+    echo "==> Signing with $SIGN_ID"
+    # --deep is deprecated for distribution but right here: the bundled
+    # forge-agent and forge-server are nested executables and have to be signed
+    # too, innermost first, or the outer signature is invalid.
+    codesign --force --deep --options runtime --timestamp \
+             --identifier "$BUNDLE_ID" \
+             --sign "$SIGN_ID" "$APP"
+    codesign --verify --deep --strict "$APP"
+else
+    echo "==> No Developer ID in the keychain; ad-hoc signing"
+    echo "    Folder permissions will be asked for again after each rebuild."
+    codesign --force --deep --identifier "$BUNDLE_ID" --sign - "$APP"
+fi
+
+echo "==> Signed as: $(codesign -dv "$APP" 2>&1 | grep '^Identifier=' || echo unknown)"
+
 echo "==> Done: $APP"

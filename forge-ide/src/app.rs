@@ -7881,6 +7881,10 @@ impl IdeApp {
                             self.dock_status = Some(match crate::dock_install::add_to_dock() {
                                 Ok(crate::dock_install::Outcome::Added) =>
                                     "Added — the Dock restarts to pick it up.".to_string(),
+                                Ok(crate::dock_install::Outcome::InstalledAndAdded) =>
+                                    "Copied to /Applications and added. Pinning the build \
+                                     directory would break on the next build."
+                                        .to_string(),
                                 Ok(crate::dock_install::Outcome::AlreadyThere) =>
                                     "Already in the Dock.".to_string(),
                                 Err(why) => why,

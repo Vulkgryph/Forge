@@ -1720,6 +1720,105 @@ fn read_group_meta(name: &str, result: Option<&str>) -> Option<String> {
     }
 }
 
+/// A hover-revealed "Copy" button under a message, so a message can be taken
+/// whole without dragging a selection across it — selection is fiddly for
+/// anything taller than the viewport, and it also picks up the soft-wrap
+/// breaks rather than the text as it was written.
+///
+/// The 16pt strip is allocated whether or not the button is showing, so
+/// moving the pointer down the conversation doesn't reflow it.
+fn copy_message_button(ui: &mut egui::Ui, body: egui::Rect, id: egui::Id, text: &str, pad_l: f32) {
+    /// How long the button stays on "Copied" — long enough to read, short
+    /// enough that it's back to normal by the next time you look at it.
+    const ACK: f64 = 1.2;
+
+    let (strip, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 16.0),
+        egui::Sense::hover(),
+    );
+    let now = ui.input(|i| i.time);
+    let copied_at = ui.data(|d| d.get_temp::<f64>(id));
+    let acking = copied_at.is_some_and(|t| now - t < ACK);
+    if !acking && !ui.rect_contains_pointer(body) && !ui.rect_contains_pointer(strip) {
+        return;
+    }
+
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(strip.left() + pad_l, strip.top()),
+        egui::vec2(if acking { 52.0 } else { 44.0 }, 15.0),
+    );
+    let label = if acking { "Copied" } else { "Copy" };
+    let resp = ui.put(
+        rect,
+        egui::Button::new(egui::RichText::new(label).size(10.0).color(egui::Color32::from_gray(170)))
+            .fill(egui::Color32::from_gray(38))
+            .small(),
+    );
+    if resp.clicked() {
+        ui.output_mut(|o| o.copied_text = text.to_string());
+        ui.data_mut(|d| d.insert_temp(id, now));
+    }
+    if acking {
+        // Nothing else asks for a frame once the pointer stops, so the label
+        // would sit on "Copied" until something unrelated redrew.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(ACK));
+    }
+}
+
+/// Points to scroll a list this frame while a selection drag is being held
+/// past its edge, or `None` to stay put. `overshoot` is how far beyond the
+/// edge the pointer is, negative above and positive below.
+///
+/// Speed ramps with the overshoot so a small overrun creeps and a big one
+/// moves, and is capped so a pointer parked far outside the window can't
+/// slingshot past everything before the user lets go.
+fn edge_scroll_step(overshoot: f32, dt: f32) -> Option<f32> {
+    /// Overshoot at which the ramp reaches full speed.
+    const RAMP: f32 = 60.0;
+    /// Points per second at full speed — roughly four lines' worth.
+    const MAX_SPEED: f32 = 900.0;
+    /// Below this the pointer is effectively still on the edge.
+    const DEAD: f32 = 1.0;
+
+    if overshoot.abs() < DEAD || dt <= 0.0 {
+        return None;
+    }
+    let ramp = (overshoot.abs() / RAMP).min(1.0);
+    Some(overshoot.signum() * ramp * MAX_SPEED * dt.min(0.1))
+}
+
+/// `edge_scroll_step` for the ui's own viewport, applied only while the
+/// primary button is held down on a drag that began inside it — so dragging
+/// the scrollbar, or holding the button down over some other panel, doesn't
+/// drag the conversation along with it.
+fn selection_autoscroll(ui: &egui::Ui) -> Option<f32> {
+    let view = ui.clip_rect();
+    let (down, origin, pos, dt) = ui.input(|i| {
+        (
+            i.pointer.primary_down(),
+            i.pointer.press_origin(),
+            i.pointer.interact_pos(),
+            i.stable_dt,
+        )
+    });
+    if !down {
+        return None;
+    }
+    let origin = origin?;
+    if !view.contains(origin) {
+        return None;
+    }
+    let y = pos?.y;
+    let overshoot = if y < view.top() {
+        y - view.top()
+    } else if y > view.bottom() {
+        y - view.bottom()
+    } else {
+        return None;
+    };
+    edge_scroll_step(overshoot, dt)
+}
+
 /// Whether `items[i]` (a `ToolRequest`) is immediately followed by its
 /// `ToolResult` — forge's top-level agent runs one tool call at a time, so
 /// request/result always arrive as an adjacent pair once the call finishes;
@@ -6808,6 +6907,22 @@ impl IdeApp {
             // scroll and the scrollbar itself are untouched by this.
             .drag_to_scroll(false)
             .show(ui, |ui| {
+                // Selecting past the top or bottom edge scrolls the list, the
+                // way every other text view does. Without this, a selection
+                // could only ever cover what happened to be on screen when the
+                // drag started: with drag_to_scroll off (see above) a drag
+                // that leaves the viewport produced no scrolling at all, and
+                // the wheel can't be reached mid-drag.
+                if let Some(dy) = selection_autoscroll(ui) {
+                    ui.scroll_with_delta_animation(
+                        egui::vec2(0.0, -dy),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                    // The pointer sitting still generates no events, so ask
+                    // for the next frame explicitly or scrolling stalls until
+                    // the mouse moves again.
+                    ui.ctx().request_repaint();
+                }
                 ui.add_space(4.0);
                 let pad_l = 10.0;
                 let pad_r = 10.0;
@@ -6856,7 +6971,7 @@ impl IdeApp {
                     match &items[item_idx] {
                         ChatItem::User(text) => {
                             ui.add_space(8.0);
-                            ui.horizontal(|ui| {
+                            let body = ui.horizontal(|ui| {
                                 ui.add_space(pad_l);
                                 egui::Frame::none()
                                     .fill(egui::Color32::from_rgb(38,44,56))
@@ -6873,17 +6988,23 @@ impl IdeApp {
                                             ui.label(egui::RichText::new(soft_wrap(text, 40)).color(egui::Color32::WHITE));
                                         });
                                     });
-                            });
+                            }).response.rect;
+                            copy_message_button(
+                                ui, body, ui.make_persistent_id(("copy_msg", item_idx)), text, pad_l,
+                            );
                         }
                         ChatItem::Assistant { text, .. } => {
                             ui.add_space(8.0);
-                            ui.horizontal_top(|ui| {
+                            let body = ui.horizontal_top(|ui| {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(ui.available_width() - pad_r);
                                     crate::markdown::render(ui, text, 40);
                                 });
-                            });
+                            }).response.rect;
+                            copy_message_button(
+                                ui, body, ui.make_persistent_id(("copy_msg", item_idx)), text, pad_l,
+                            );
                         }
                         ChatItem::Reasoning { text, .. } => {
                             ui.add_space(6.0);
@@ -12351,5 +12472,43 @@ mod folderless_window_tests {
         assert!(app.has_folder);
         assert_eq!(app.cwd, dir.canonicalize().unwrap_or(dir.clone()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod selection_autoscroll_tests {
+    use super::edge_scroll_step;
+
+    const FRAME: f32 = 1.0 / 60.0;
+
+    #[test]
+    fn inside_the_edge_does_not_scroll() {
+        assert_eq!(edge_scroll_step(0.0, FRAME), None);
+        assert_eq!(edge_scroll_step(0.5, FRAME), None, "sub-pixel jitter is not a drag past the edge");
+    }
+
+    #[test]
+    fn direction_follows_which_edge_was_passed() {
+        assert!(edge_scroll_step(20.0, FRAME).unwrap() > 0.0, "below the bottom scrolls down");
+        assert!(edge_scroll_step(-20.0, FRAME).unwrap() < 0.0, "above the top scrolls up");
+    }
+
+    #[test]
+    fn speed_ramps_with_overshoot_then_caps() {
+        let near = edge_scroll_step(10.0, FRAME).unwrap();
+        let far = edge_scroll_step(50.0, FRAME).unwrap();
+        assert!(far > near, "further out should scroll faster: {far} vs {near}");
+        // Past the ramp everything moves at the same capped speed, so parking
+        // the pointer at the bottom of the screen can't outrun one at the
+        // window's edge.
+        assert_eq!(edge_scroll_step(60.0, FRAME), edge_scroll_step(4000.0, FRAME));
+    }
+
+    #[test]
+    fn a_stalled_frame_cannot_jump_the_whole_conversation() {
+        // dt is wall-clock: a frame that took a second (a big repaint, a
+        // laptop waking up) would otherwise scroll 900 points in one go.
+        let hitch = edge_scroll_step(200.0, 1.0).unwrap();
+        assert!(hitch <= 90.0, "one hitched frame scrolled {hitch} points");
     }
 }

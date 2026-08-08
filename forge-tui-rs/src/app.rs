@@ -126,6 +126,12 @@ pub struct App {
     /// The menu, when open. Takes the whole screen, so the transcript is hidden
     /// while it is up.
     menu:    Option<Menu>,
+    /// How far back through sent messages the up arrow has gone, counted from
+    /// the newest. `None` means the line is the user's own, not a recalled one.
+    history_pos: Option<usize>,
+    /// What was on the line when history navigation started, so arrowing back
+    /// down past the newest message returns it rather than an empty line.
+    draft: String,
     /// Which suggestion is highlighted while a slash command is being typed.
     suggestion: usize,
     /// Frame of the activity spinner. Only advances while a turn is running.
@@ -156,6 +162,8 @@ impl App {
             dialog: None,
             menu: None,
             suggestion: 0,
+            history_pos: None,
+            draft: String::new(),
             spinner: 0,
             committed: 0,
         }
@@ -425,8 +433,34 @@ impl App {
             // old meanings, and the suggestion list takes the arrows first.
             Input::Left if self.editing() => self.move_caret_left(),
             Input::Right if self.editing() => self.move_caret_right(),
-            Input::Up if self.editing() && !self.has_suggestions() => self.move_caret_up(),
-            Input::Down if self.editing() && !self.has_suggestions() => self.move_caret_down(),
+            // On the first line there is nowhere further up to go inside the
+            // message, so the arrow means the previous message instead — the
+            // same place a shell puts it. Deeper in a multi-line message it
+            // still moves the caret, which is what the caret is for.
+            Input::Up if self.editing() && !self.has_suggestions() => {
+                if self.caret_line().0 == 0 {
+                    self.recall_previous();
+                } else {
+                    self.move_caret_up();
+                }
+            }
+            Input::Down if self.editing() && !self.has_suggestions() => {
+                let on_last_line = self.caret_line().1 == self.input.len();
+                if self.history_pos.is_some() && on_last_line {
+                    self.recall_next();
+                } else {
+                    self.move_caret_down();
+                }
+            }
+            // Nothing typed: the arrow can only mean history.
+            Input::Up if !self.has_suggestions() && self.dialog.is_none() && self.menu.is_none() => {
+                self.recall_previous();
+            }
+            Input::Down if !self.has_suggestions() && self.dialog.is_none() && self.menu.is_none()
+                && self.history_pos.is_some() =>
+            {
+                self.recall_next();
+            }
             Input::Home if self.editing() => self.caret_to_line_start(),
             Input::LineEnd if self.editing() => self.caret_to_line_end(),
             Input::Delete if self.editing() => self.delete_at_caret(),
@@ -988,6 +1022,11 @@ impl App {
     }
 
     fn insert_at_caret(&mut self, text: &str) {
+        // Typing makes the line the user's own again, so the next arrow back
+        // starts from the newest message rather than continuing from wherever
+        // the recall had got to.
+        self.history_pos = None;
+
         // The caret is state several paths update; a stale one would panic inside
         // `insert_str` rather than misplace a character, so it is checked in debug
         // and clamped in release.
@@ -1005,6 +1044,10 @@ impl App {
     /// Delete the grapheme before the caret — a whole one, so backspacing an
     /// emoji does not leave half of it behind.
     fn delete_before_caret(&mut self) {
+        // As in `insert_at_caret`: editing a recalled message makes the line
+        // the user's own again.
+        self.history_pos = None;
+
         let Some((start, _)) = Self::graphemes(&self.input[..self.caret]).pop() else { return };
         self.input.replace_range(start..self.caret, "");
         self.caret = start;
@@ -1062,6 +1105,57 @@ impl App {
             width += str_width(g);
         }
         line.len()
+    }
+
+    /// Step one message further back and put it on the line.
+    fn recall_previous(&mut self) {
+        let history = self.session.sent_messages();
+        if history.is_empty() {
+            return;
+        }
+        let pos = match self.history_pos {
+            // First step back: whatever was being typed is kept, so arrowing
+            // forward again returns it rather than throwing it away.
+            None => {
+                self.draft = std::mem::take(&mut self.input);
+                0
+            }
+            // Already at the oldest — stay there rather than wrapping around
+            // to the newest, which loses your place with no way back to it.
+            Some(i) => (i + 1).min(history.len() - 1),
+        };
+        let text = history[history.len() - 1 - pos].to_string();
+        self.history_pos = Some(pos);
+        self.set_line(text);
+    }
+
+    /// Step one message forward, and past the newest back to the draft.
+    fn recall_next(&mut self) {
+        let Some(pos) = self.history_pos else { return };
+        if pos == 0 {
+            self.history_pos = None;
+            let draft = std::mem::take(&mut self.draft);
+            self.set_line(draft);
+            return;
+        }
+        let text = {
+            let history = self.session.sent_messages();
+            if history.len() <= pos - 1 {
+                return;
+            }
+            history[history.len() - pos].to_string()
+        };
+        self.history_pos = Some(pos - 1);
+        self.set_line(text);
+    }
+
+    /// Replace the whole line, caret at the end and ready to keep typing.
+    fn set_line(&mut self, text: String) {
+        self.caret = text.len();
+        self.input = text;
+        self.suggestion = 0;
+        self.cache = None;
+        self.follow_tail();
     }
 
     fn move_caret_up(&mut self) {
@@ -2374,6 +2468,110 @@ mod tests {
         let (_, effects) = app.update(Input::Escape, ROWS);
         assert_eq!(app.input(), "", "an answered message stays sent");
         assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::CancelRun)]));
+    }
+
+    /// An app that has already sent these messages, in this order.
+    fn app_having_sent(messages: &[&str]) -> App {
+        let (mut app, _) = app_with(0);
+        for m in messages {
+            for c in m.chars() {
+                app.update(Input::Char(c), ROWS);
+            }
+            app.update(Input::Enter, ROWS);
+        }
+        app
+    }
+
+    #[test]
+    fn the_up_arrow_brings_back_the_last_message() {
+        let mut app = app_having_sent(&["first", "second"]);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "second");
+    }
+
+    #[test]
+    fn arrowing_up_again_reaches_the_one_before() {
+        let mut app = app_having_sent(&["first", "second"]);
+        app.update(Input::Up, ROWS);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "first");
+    }
+
+    #[test]
+    fn the_oldest_message_is_where_it_stops() {
+        // Wrapping round to the newest would lose your place with no way back.
+        let mut app = app_having_sent(&["first", "second"]);
+        for _ in 0..5 {
+            app.update(Input::Up, ROWS);
+        }
+        assert_eq!(app.input(), "first");
+    }
+
+    #[test]
+    fn arrowing_back_down_returns_what_was_being_typed() {
+        let mut app = app_having_sent(&["sent one"]);
+        for c in "half a thou".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "sent one", "the recall replaces the line");
+        app.update(Input::Down, ROWS);
+        assert_eq!(app.input(), "half a thou", "and gives it back");
+    }
+
+    #[test]
+    fn the_same_message_twice_is_offered_once() {
+        let mut app = app_having_sent(&["again", "again", "different"]);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "different");
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "again");
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "again", "there is nothing older to reach");
+    }
+
+    #[test]
+    fn typing_after_a_recall_starts_the_next_search_from_the_newest() {
+        let mut app = app_having_sent(&["first", "second"]);
+        app.update(Input::Up, ROWS);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "first");
+        app.update(Input::Char('!'), ROWS);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "second", "not the one before 'first'");
+    }
+
+    #[test]
+    fn the_caret_lands_at_the_end_of_a_recalled_message() {
+        let mut app = app_having_sent(&["fix the thing"]);
+        app.update(Input::Up, ROWS);
+        app.update(Input::Char('s'), ROWS);
+        assert_eq!(app.input(), "fix the things");
+    }
+
+    #[test]
+    fn inside_a_multi_line_message_the_arrow_still_moves_the_caret() {
+        // Recall belongs to the first line; below it the caret is what the
+        // arrow is for, or a message being written could not be navigated.
+        let mut app = app_having_sent(&["earlier"]);
+        for c in "top".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Newline, ROWS);
+        for c in "bottom".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "top\nbottom", "the line is untouched");
+        app.update(Input::Char('X'), ROWS);
+        assert!(app.input().starts_with("topX"), "the caret moved up: {:?}", app.input());
+    }
+
+    #[test]
+    fn there_is_nothing_to_recall_before_anything_is_sent() {
+        let (mut app, _) = app_with(0);
+        app.update(Input::Up, ROWS);
+        assert_eq!(app.input(), "");
     }
 
     /// Keystrokes must go to the menu, not the input line, or opening it would

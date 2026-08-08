@@ -954,6 +954,27 @@ impl Session {
         self.push_system(mode.label().to_string());
     }
 
+    /// The messages this user has sent, oldest first — what the up arrow steps
+    /// back through.
+    ///
+    /// Consecutive duplicates collapse into one: having sent the same thing
+    /// twice, being offered it twice on the way back is a keystroke that does
+    /// nothing visible. Non-adjacent repeats stay, since the messages between
+    /// them are what makes their position meaningful.
+    ///
+    /// Read from the transcript rather than kept alongside it, so a resumed
+    /// session comes back with its history already there.
+    pub fn sent_messages(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for e in self.entries.iter().filter(|e| matches!(e.kind, EntryKind::User)) {
+            let text = e.content.as_str();
+            if out.last() != Some(&text) {
+                out.push(text);
+            }
+        }
+        out
+    }
+
     /// Take back the message that started this turn, returning its text so it
     /// can go back in the input line to be edited and sent again.
     ///

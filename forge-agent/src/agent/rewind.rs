@@ -2,6 +2,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -539,25 +540,121 @@ struct RewindLock {
     path: std::path::PathBuf,
 }
 
+/// How long a lock file with nothing readable in it is still believed. A lock
+/// is created and then written to, so one glimpsed in between is genuinely
+/// held — but only for the instant that takes.
+const UNWRITTEN_GRACE: Duration = Duration::from_secs(10);
+
+/// Past this, a lock is treated as abandoned whatever it says. Snapshotting
+/// takes seconds; nothing legitimately holds this for an hour. This is also
+/// the only recovery on platforms where the owning process can't be checked.
+const ABANDONED: Duration = Duration::from_secs(60 * 60);
+
 impl RewindLock {
     fn acquire(project_root: &Path) -> Result<Self> {
         let forge_dir = project_root.join(".forge");
         std::fs::create_dir_all(&forge_dir)?;
         let path = forge_dir.join("rewind.lock");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "Another Forge session is snapshotting or rewinding this worktree ({})",
-                    path.display()
-                )
-            })?;
+
+        let held = || {
+            anyhow!(
+                "Another Forge session is snapshotting or rewinding this worktree ({})",
+                path.display()
+            )
+        };
+
+        match Self::create(&path) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).context(held()),
+        }
+
+        // The lock is removed when the guard drops, which never happens if the
+        // process is killed rather than asked to stop — and Reload Window kills
+        // the agent by definition. A leftover file would otherwise refuse every
+        // snapshot in that project for good, with nothing to point the user at
+        // but a path to delete by hand.
+        if !lock_is_stale(&std::fs::read_to_string(&path).unwrap_or_default(), lock_age(&path)) {
+            return Err(held());
+        }
+        // Racing another process that decided the same thing is harmless: one
+        // of them wins `create_new` and the other reports the lock as held,
+        // which by then it is.
+        let _ = std::fs::remove_file(&path);
+        Self::create(&path).map_err(|_| held())
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         writeln::write_pid(file)?;
-        Ok(Self { path })
+        Ok(Self { path: path.to_path_buf() })
     }
 }
+
+/// How long ago the lock file was written, or zero if that can't be told —
+/// the conservative answer, since age is only ever used to justify breaking it.
+fn lock_age(path: &Path) -> Duration {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or_default()
+}
+
+/// Whether an existing lock is a leftover rather than a live claim.
+fn lock_is_stale(contents: &str, age: Duration) -> bool {
+    if age > ABANDONED {
+        return true;
+    }
+    match contents.trim().parse::<i32>() {
+        Ok(pid) => !process_exists(pid),
+        // Nothing readable: either a lock from a forge old enough not to have
+        // written a pid, or one whose owner died between creating the file and
+        // writing to it.
+        Err(_) => age > UNWRITTEN_GRACE,
+    }
+}
+
+/// Whether a process with this id is still around. Signal 0 performs the
+/// permission checks and finds the process without delivering anything;
+/// `EPERM` means it exists and belongs to another user, which still counts.
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    // A zombie answers signal 0 exactly like a running process — it still has a
+    // process table entry, it just has nothing left to run. This is not a
+    // corner case here: forge's agent is a child of the editor, so when the
+    // agent dies it stays a zombie until the editor reaps it, and the editor
+    // outliving its agent is the normal shape of the bug this whole check is
+    // for. Without this, the lock would be honoured until the *editor* quit.
+    !is_zombie(pid)
+}
+
+/// `ps` rather than a per-platform peek into the kernel's process table:
+/// macOS wants `sysctl(KERN_PROC_PID)` and a `kinfo_proc`, Linux wants
+/// `/proc/<pid>/stat`, and this runs only on the rare path where a lock is
+/// already there. Anything unexpected is read as "not a zombie", which errs
+/// towards respecting the lock.
+#[cfg(unix)]
+fn is_zombie(pid: i32) -> bool {
+    Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
+        .unwrap_or(false)
+}
+
+/// No cheap equivalent here, so a lock is only ever broken by `ABANDONED`.
+#[cfg(not(unix))]
+fn process_exists(_pid: i32) -> bool {
+    true
+}
+
 
 impl Drop for RewindLock {
     fn drop(&mut self) {
@@ -601,6 +698,93 @@ mod tests {
         std::fs::write(path.join("file.txt"), format!("{name} base\n")).unwrap();
         git(path, &["add", "."]);
         git(path, &["commit", "-m", "base"]);
+    }
+
+    /// A pid that is definitely not running: a real child, reaped.
+    fn dead_pid() -> i32 {
+        let mut child = Command::new("true").spawn().expect("spawn");
+        child.wait().expect("wait");
+        child.id() as i32
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_process_is_stale() {
+        // Reload Window kills the agent, so its guard never drops and the file
+        // stays. Before this, that refused every snapshot in the project until
+        // someone deleted it by hand.
+        let pid = dead_pid();
+        assert!(lock_is_stale(&format!("{pid}\n"), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_lock_held_by_an_unreaped_child_is_stale() {
+        // The exact shape seen in the wild: the editor's agent died, the editor
+        // had not reaped it yet, and the leftover lock named a pid that
+        // `kill(pid, 0)` still reported as alive.
+        let mut child = Command::new("true").spawn().expect("spawn");
+        // Wait for it to actually finish without reaping it, so it is a zombie
+        // and not merely a process that has not got going yet.
+        let pid = child.id() as i32;
+        while !is_zombie(pid) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(lock_is_stale(&format!("{pid}\n"), Duration::from_secs(1)));
+        child.wait().expect("reap");
+    }
+
+    #[test]
+    fn a_lock_held_by_a_live_process_is_not_stale() {
+        let mine = std::process::id();
+        assert!(!lock_is_stale(&format!("{mine}\n"), Duration::from_secs(1)));
+        assert!(!lock_is_stale(&format!("{mine}\n"), UNWRITTEN_GRACE * 10));
+    }
+
+    #[test]
+    fn an_unwritten_lock_is_believed_only_briefly() {
+        // The window between creating the file and writing the pid into it.
+        assert!(!lock_is_stale("", Duration::from_secs(0)));
+        assert!(lock_is_stale("", UNWRITTEN_GRACE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_lock_is_abandoned_eventually_whatever_it_says() {
+        // The only recovery where the owning process cannot be checked, and a
+        // backstop against a pid that has been recycled by something long-lived.
+        let mine = std::process::id();
+        assert!(lock_is_stale(&format!("{mine}"), ABANDONED + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn acquire_takes_over_a_lock_whose_owner_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".forge")).unwrap();
+        let lock = root.join(".forge/rewind.lock");
+        std::fs::write(&lock, format!("{}\n", dead_pid())).unwrap();
+
+        let guard = RewindLock::acquire(root).expect("stale lock should be taken over");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().trim(),
+            std::process::id().to_string(),
+            "the lock should now name us"
+        );
+        drop(guard);
+        assert!(!lock.exists(), "dropping the guard should remove it");
+    }
+
+    #[test]
+    fn acquire_refuses_a_lock_that_is_genuinely_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _held = RewindLock::acquire(root).expect("first acquire");
+        let err = match RewindLock::acquire(root) {
+            Ok(_) => panic!("second acquire must fail while the first is held"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Another Forge session"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

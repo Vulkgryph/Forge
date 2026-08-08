@@ -84,6 +84,18 @@ pub const SIGHUP: c_int = 1;
 pub type SigHandler = extern "C" fn(c_int);
 
 unsafe extern "C" {
+    // Local wall-clock time. `localtime` hands its `tm` straight to `strftime`
+    // without this crate ever having to know that struct's layout, which differs
+    // between platforms and is the part that would otherwise need a dependency.
+    fn time(out: *mut i64) -> i64;
+    fn localtime(clock: *const i64) -> *mut core::ffi::c_void;
+    fn strftime(
+        buf: *mut core::ffi::c_char,
+        max: usize,
+        format: *const core::ffi::c_char,
+        tm: *const core::ffi::c_void,
+    ) -> usize;
+
     fn tcgetattr(fd: c_int, termios: *mut c_void) -> c_int;
     fn tcsetattr(fd: c_int, action: c_int, termios: *mut c_void) -> c_int;
     /// Sets every flag raw mode needs, so this side never touches a bitmask.
@@ -470,5 +482,52 @@ mod tests {
     fn reading_from_a_bad_descriptor_reports_failure() {
         let mut buf = [0u8; 4];
         assert_eq!(read_bytes(-1, &mut buf), None);
+    }
+}
+
+/// The current local time, formatted with a `strftime` pattern.
+///
+/// `None` if the platform declines to convert it, which callers treat as "say
+/// nothing" rather than printing a wrong or fabricated time.
+pub fn local_time(format: &str) -> Option<String> {
+    let mut buf = [0i8; 64];
+    let fmt = std::ffi::CString::new(format).ok()?;
+    // SAFETY: `time` writes one i64; `localtime` returns a pointer to storage it
+    // owns, valid until the next call in this thread; `strftime` writes at most
+    // `buf.len()` bytes and reports how many, excluding the terminator.
+    let written = unsafe {
+        let mut now: i64 = 0;
+        time(&mut now);
+        let tm = localtime(&now);
+        if tm.is_null() {
+            return None;
+        }
+        strftime(buf.as_mut_ptr() as *mut core::ffi::c_char, buf.len(), fmt.as_ptr(), tm)
+    };
+    if written == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..written].iter().map(|b| *b as u8).collect();
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(test)]
+mod clock_tests {
+    /// A real local time, in the shape asked for. Not the value — that changes
+    /// every minute — but that the platform answered and the pattern was applied.
+    #[test]
+    fn local_time_is_formatted() {
+        let now = super::local_time("%H:%M").expect("the platform can tell the time");
+        assert_eq!(now.len(), 5, "HH:MM, got {now:?}");
+        assert_eq!(now.as_bytes()[2], b':', "got {now:?}");
+        assert!(now.chars().filter(|c| c.is_ascii_digit()).count() == 4, "got {now:?}");
+        let hour: u32 = now[..2].parse().expect("hours are a number");
+        assert!(hour < 24, "got {now:?}");
+    }
+
+    /// A pattern the platform cannot fill must not fabricate anything.
+    #[test]
+    fn an_empty_result_is_none() {
+        assert!(super::local_time("").is_none());
     }
 }

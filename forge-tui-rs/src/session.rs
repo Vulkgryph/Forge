@@ -113,9 +113,27 @@ impl PermissionMode {
     }
 }
 
+/// Round a token count for reading rather than accounting: the difference between
+/// 5,132 and 5,140 never matters at a glance, and the narrow line this sits on
+/// does.
+fn compact_count(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let thousands = n as f64 / 1000.0;
+    if thousands < 10.0 {
+        format!("{thousands:.1}k")
+    } else {
+        format!("{}k", thousands.round() as u64)
+    }
+}
+
 /// What kind of line this is in the transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
+    /// The footnote closing a finished turn: when it ended, how long it took, and
+    /// what it cost.
+    TurnSummary,
     User,
     Assistant,
     /// A reasoning block still being emitted.
@@ -270,6 +288,12 @@ pub struct Session {
     /// whole. Tracking only the *open* entries is not enough: a reasoning block
     /// that already closed is still part of the turn being thrown away.
     turn_start: Option<usize>,
+    /// When the current turn began, and the token counters as they stood then.
+    ///
+    /// Kept so a finished turn can say when it ended and what it cost. The
+    /// counters are cumulative, so a turn's own usage is the difference.
+    turn_began_at: Option<std::time::Instant>,
+    turn_tokens_at_start: (u64, u64),
 
     // ── Interaction ───────────────────────────────────────────────────────
     pub pending:     Option<Pending>,
@@ -346,6 +370,8 @@ impl Session {
             streaming: None,
             reasoning: None,
             turn_start: None,
+            turn_began_at: None,
+            turn_tokens_at_start: (0, 0),
             pending: None,
             usage: None,
             subagents: Vec::new(),
@@ -396,6 +422,12 @@ impl Session {
         // The first output of a turn fixes the point a discard would rewind to.
         if self.turn_start.is_none() && starts_a_turn(&msg) {
             self.turn_start = Some(self.entries.len());
+            self.turn_began_at = Some(std::time::Instant::now());
+            self.turn_tokens_at_start = self
+                .usage
+                .as_ref()
+                .map(|u| (u.total_prompt_tokens, u.total_completion_tokens))
+                .unwrap_or_default();
         }
 
         match msg {
@@ -496,6 +528,7 @@ impl Session {
             }
 
             AgentMessage::Done => {
+                self.push_turn_summary();
                 self.end_turn();
                 effects.push(Effect::TurnComplete);
             }
@@ -962,6 +995,41 @@ impl Session {
                 self.shift_indices_after(idx);
             }
         }
+    }
+
+    /// Close a finished turn with when it ended, how long it took, and what it
+    /// cost.
+    ///
+    /// The completion time is the point of it: a turn that ran while you were
+    /// elsewhere leaves no other trace of when it actually finished, and
+    /// scrollback has no timestamps. Local time, because the question being
+    /// answered is "when was I away".
+    fn push_turn_summary(&mut self) {
+        let Some(began) = self.turn_began_at.take() else { return };
+        let mut parts: Vec<String> = Vec::new();
+
+        // A clock the platform declines to read is left out rather than guessed.
+        if let Some(at) = crate::sys::local_time("%H:%M:%S") {
+            parts.push(at);
+        }
+        parts.push(crate::app::format_duration(began.elapsed()));
+
+        if let Some(usage) = self.usage.as_ref() {
+            let (p0, c0) = self.turn_tokens_at_start;
+            let sent = usage.total_prompt_tokens.saturating_sub(p0);
+            let back = usage.total_completion_tokens.saturating_sub(c0);
+            // Only when this turn actually accounted for something: a turn that
+            // did no work should not claim "0 in".
+            if sent > 0 || back > 0 {
+                parts.push(format!("{} in", compact_count(sent)));
+                parts.push(format!("{} out", compact_count(back)));
+            }
+        }
+
+        if parts.is_empty() {
+            return;
+        }
+        self.entries.push(Entry::new(EntryKind::TurnSummary, parts.join(" · ")));
     }
 
     fn end_turn(&mut self) {
@@ -2057,6 +2125,86 @@ mod tests {
         session.apply(AgentMessage::Error { message: "connection reset".into() });
         assert!(session.pending.is_none());
         assert!(session.entries().iter().any(|e| e.kind == EntryKind::Error));
+    }
+
+    fn usage_after(prompt: u64, completion: u64) -> AgentMessage {
+        AgentMessage::UsageUpdate {
+            snapshot: UsageSnapshot {
+                last_prompt_tokens: prompt as u32,
+                last_completion_tokens: completion as u32,
+                total_prompt_tokens: prompt,
+                total_completion_tokens: completion,
+                total_requests: 1,
+                max_context_tokens: 200_000,
+                history_messages: 4,
+            },
+        }
+    }
+
+    /// A finished turn says when it ended. Scrollback carries no timestamps, so a
+    /// turn that ran while you were elsewhere otherwise leaves no trace of when it
+    /// actually completed — which is the point of the line.
+    #[test]
+    fn a_finished_turn_records_when_it_ended() {
+        let mut s = Session::new();
+        s.apply(AgentMessage::Thinking);
+        s.apply(AgentMessage::Done);
+
+        let last = s.entries().last().expect("a summary");
+        assert_eq!(last.kind, EntryKind::TurnSummary);
+        // HH:MM:SS, then the duration.
+        let clock = last.content.split(' ').next().unwrap_or("");
+        assert_eq!(clock.len(), 8, "expected a wall-clock time, got {:?}", last.content);
+        assert_eq!(clock.matches(':').count(), 2, "got {:?}", last.content);
+    }
+
+    /// And what the turn cost, as the difference between cumulative counters —
+    /// not the totals, which would report the whole session every time.
+    #[test]
+    fn the_summary_reports_only_this_turns_tokens() {
+        let mut s = Session::new();
+        // An earlier turn already spent some.
+        s.apply(usage_after(1000, 200));
+        s.apply(AgentMessage::Thinking);
+        s.apply(usage_after(6200, 540));
+        s.apply(AgentMessage::Done);
+
+        let summary = s.entries().last().expect("a summary").content.clone();
+        assert!(summary.contains("5.2k in"), "this turn's prompt tokens: {summary:?}");
+        assert!(summary.contains("340 out"), "this turn's completion tokens: {summary:?}");
+    }
+
+    /// A turn that accounted for nothing does not claim "0 in".
+    #[test]
+    fn a_turn_with_no_usage_reports_only_time() {
+        let mut s = Session::new();
+        s.apply(AgentMessage::Thinking);
+        s.apply(AgentMessage::Done);
+        let summary = s.entries().last().expect("a summary").content.clone();
+        assert!(!summary.contains(" in"), "got {summary:?}");
+    }
+
+    /// Counts are rounded for reading; the exact figure is in /usage.
+    #[test]
+    fn token_counts_are_rounded_for_reading() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1000), "1.0k");
+        assert_eq!(compact_count(5132), "5.1k");
+        assert_eq!(compact_count(12_400), "12k");
+    }
+
+    /// Cancelling still closes the turn, but there is nothing to summarise: the
+    /// line would claim a completion that did not happen.
+    #[test]
+    fn a_cancelled_turn_gets_no_summary() {
+        let mut s = Session::new();
+        s.apply(AgentMessage::Thinking);
+        s.apply(AgentMessage::Cancelled);
+        assert!(
+            !s.entries().iter().any(|e| e.kind == EntryKind::TurnSummary),
+            "a cancelled turn did not complete",
+        );
     }
 
 }

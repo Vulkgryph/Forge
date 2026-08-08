@@ -638,6 +638,17 @@ impl App {
                     }
                 }
 
+                // A quiet footnote, not part of the conversation: dim, and set in
+                // from the left so the eye skips it unless it is looking for it.
+                EntryKind::TurnSummary => {
+                    out.push(Line {
+                        spans: vec![Span {
+                            text: widgets::clip(&format!("  {}", entry.content), cols),
+                            style: dim,
+                        }],
+                    });
+                }
+
                 EntryKind::System => {
                     out.extend(restyle(markdown::render(&entry.content, cols), dim));
                 }
@@ -1479,7 +1490,7 @@ fn diff_lines(line: &str, cols: usize, dim: Style) -> Vec<Line> {
 /// Truncating to whole seconds reported "thought for 0s" for anything under a
 /// second, which is both wrong-looking and useless — most reasoning blocks are
 /// fast, so that was the common case rather than an edge one.
-fn format_duration(d: std::time::Duration) -> String {
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
     let ms = d.as_millis();
     if ms < 1_000 {
         return format!("{ms}ms");

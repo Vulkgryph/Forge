@@ -8028,6 +8028,19 @@ impl IdeApp {
                 ui.separator();
                 ui.add_space(8.0);
 
+                // The window is centred and sized to its contents, so once the
+                // settings list grew past the screen the bottom of it simply
+                // had nowhere to be — no scrollbar, no way to reach it, and on
+                // a shorter display that is most of the list. Bounded to the
+                // screen with the title bar kept out of the scroll, so what is
+                // being scrolled is always identifiable.
+                let body_max = (ctx.screen_rect().height() - 160.0).max(200.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_body")
+                    .max_height(body_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+
                 let s = &mut self.settings;
                 let lbl = |ui: &mut egui::Ui, text: &str| {
                     ui.label(egui::RichText::new(text)
@@ -8416,6 +8429,8 @@ impl IdeApp {
                         .size(10.5).color(egui::Color32::from_gray(100)));
                 });
                 ui.add_space(8.0);
+
+                });
 
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
             });

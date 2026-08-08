@@ -449,6 +449,19 @@ impl App {
             // Idle, it does nothing rather than something surprising.
             Input::Escape => {
                 if self.session.activity.is_busy() {
+                    // Escape as "wait, let me put that better": while the agent
+                    // has done nothing but think, the message comes back to the
+                    // input line to be edited instead of just being stopped.
+                    // Only with the line empty — whatever is already typed there
+                    // is worth more than the convenience of not retyping.
+                    if self.input.is_empty() {
+                        if let Some(text) = self.session_mut().reclaim_unanswered_message() {
+                            self.caret = text.len();
+                            self.input = text;
+                            self.suggestion = 0;
+                            self.cache = None;
+                        }
+                    }
                     return (
                         Outcome::Continue,
                         vec![Effect::Send(ClientMessage::CancelRun)],
@@ -2312,6 +2325,55 @@ mod tests {
         // Escape at the top level closes it.
         app.update(Input::Escape, ROWS);
         assert!(!app.menu_open());
+    }
+
+    /// Send a message, then have the agent do nothing but think about it.
+    fn sent_and_thinking(text: &str) -> App {
+        let (mut app, _) = app_with(0);
+        for c in text.chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Enter, ROWS);
+        app.session_mut()
+            .apply(AgentMessage::ReasoningToken { content: "hmm".into() });
+        app
+    }
+
+    #[test]
+    fn escape_takes_an_unanswered_message_back_for_editing() {
+        let mut app = sent_and_thinking("wat is teh capitol");
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert_eq!(app.input(), "wat is teh capitol", "back in the input line");
+        // The caret has to come back with it, at the end, or the first
+        // correction typed would land at the front of the message.
+        app.update(Input::Char('?'), ROWS);
+        assert_eq!(app.input(), "wat is teh capitol?");
+        assert!(
+            matches!(effects.as_slice(), [Effect::Send(ClientMessage::CancelRun)]),
+            "the agent still has to be told to stop",
+        );
+    }
+
+    #[test]
+    fn escape_does_not_overwrite_a_message_already_being_typed() {
+        // Losing what is on the line would be a far worse trade than having to
+        // retype the one being taken back.
+        let mut app = sent_and_thinking("first");
+        for c in "second".chars() {
+            app.update(Input::Char(c), ROWS);
+        }
+        app.update(Input::Escape, ROWS);
+        assert_eq!(app.input(), "second");
+    }
+
+    #[test]
+    fn escape_after_the_agent_has_replied_only_interrupts() {
+        let mut app = sent_and_thinking("go");
+        app.session_mut()
+            .apply(AgentMessage::AssistantToken { content: "On it".into() });
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert_eq!(app.input(), "", "an answered message stays sent");
+        assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::CancelRun)]));
     }
 
     /// Keystrokes must go to the menu, not the input line, or opening it would

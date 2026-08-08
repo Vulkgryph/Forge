@@ -280,6 +280,10 @@ pub struct Session {
 
     // ── Transcript ────────────────────────────────────────────────────────
     entries: Vec<Entry>,
+    /// Set when the user took their message back rather than merely stopping
+    /// the turn, so the agent's acknowledgement is not announced as a
+    /// cancellation — from where they are sitting, the message was never sent.
+    took_message_back: bool,
     /// Index of the assistant entry being streamed into.
     streaming: Option<usize>,
     /// Index of the reasoning entry being streamed into, and when it began.
@@ -369,6 +373,7 @@ impl Session {
             entries: Vec::new(),
             streaming: None,
             reasoning: None,
+            took_message_back: false,
             turn_start: None,
             turn_began_at: None,
             turn_tokens_at_start: (0, 0),
@@ -548,8 +553,11 @@ impl Session {
             }
 
             AgentMessage::Cancelled => {
+                let took_back = std::mem::take(&mut self.took_message_back);
                 self.end_turn();
-                self.entries.push(Entry::new(EntryKind::System, "cancelled"));
+                if !took_back {
+                    self.entries.push(Entry::new(EntryKind::System, "cancelled"));
+                }
             }
 
             AgentMessage::TurnDiscarded => {
@@ -946,6 +954,48 @@ impl Session {
         self.push_system(mode.label().to_string());
     }
 
+    /// Take back the message that started this turn, returning its text so it
+    /// can go back in the input line to be edited and sent again.
+    ///
+    /// Only while nothing has come back but thought. Reasoning is not an
+    /// answer — the agent has read the message but not acted on or replied to
+    /// it, so there is nothing to be inconsistent with. A written reply, a
+    /// tool call, a plan or a question all mean the message has been acted on,
+    /// and taking it back then would leave the transcript describing work
+    /// nobody asked for.
+    ///
+    /// The turn's thinking goes with it, along with the message itself, so the
+    /// transcript reads as though it was never sent. What this cannot undo is
+    /// the agent's own context: it has already received the message, and
+    /// cancelling is all this client can ask for. The next turn therefore
+    /// still sees the original alongside the edited one, exactly as it would
+    /// for any other interruption.
+    pub fn reclaim_unanswered_message(&mut self) -> Option<String> {
+        if !self.activity.is_busy() || self.pending.is_some() {
+            return None;
+        }
+        let user = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e.kind, EntryKind::User))?;
+        if self.entries[user + 1..]
+            .iter()
+            .any(|e| !matches!(e.kind, EntryKind::Reasoning | EntryKind::Thought))
+        {
+            return None;
+        }
+
+        let text = self.entries[user].content.clone();
+        self.entries.truncate(user);
+        self.streaming = None;
+        self.reasoning = None;
+        self.turn_start = None;
+        self.activity = Activity::Idle;
+        self.subagents.clear();
+        self.took_message_back = true;
+        Some(text)
+    }
+
     /// Confirm a pending rewind.
     ///
     /// Separate from [`Session::approve`] because a rewind is not a tool call:
@@ -1275,6 +1325,75 @@ mod tests {
         s.apply(AgentMessage::AssistantToken { content: "parti".into() });
         s.apply(AgentMessage::AssistantDone { content: "partial then complete".into() });
         assert_eq!(last(&s).content, "partial then complete");
+    }
+
+    /// Sending a message and immediately thinking better of it, while the agent
+    /// has done nothing but think.
+    fn thinking_about(text: &str) -> (Session, usize) {
+        let mut s = session();
+        // `session()` already has the connection notice in it, so what counts
+        // as "back to where we started" is that length, not zero.
+        let before = s.entries().len();
+        s.push_user(text);
+        s.apply(AgentMessage::ReasoningToken { content: "considering…".into() });
+        (s, before)
+    }
+
+    #[test]
+    fn an_unanswered_message_can_be_taken_back() {
+        let (mut s, before) = thinking_about("wat is teh capitol of frnace");
+        assert_eq!(
+            s.reclaim_unanswered_message().as_deref(),
+            Some("wat is teh capitol of frnace"),
+        );
+        assert_eq!(s.entries().len(), before, "message and thinking both go: {:?}", kinds(&s));
+        assert_eq!(s.activity, Activity::Idle);
+    }
+
+    #[test]
+    fn taking_a_message_back_is_not_announced_as_a_cancellation() {
+        // The agent still has to be told to stop, and says so — but from the
+        // user's side the message was never sent, so "cancelled" would be a
+        // line about something that is no longer in the transcript.
+        let (mut s, before) = thinking_about("half a thought");
+        s.reclaim_unanswered_message().expect("taken back");
+        s.apply(AgentMessage::Cancelled);
+        assert_eq!(s.entries().len(), before, "unexpected: {:?}", kinds(&s));
+    }
+
+    #[test]
+    fn an_ordinary_interruption_still_says_it_was_cancelled() {
+        let (mut s, _) = thinking_about("go");
+        s.apply(AgentMessage::AssistantToken { content: "On it".into() });
+        assert_eq!(s.reclaim_unanswered_message(), None);
+        s.apply(AgentMessage::Cancelled);
+        assert_eq!(last(&s).content, "cancelled");
+    }
+
+    #[test]
+    fn a_message_that_has_been_answered_cannot_be_taken_back() {
+        let (mut s, before) = thinking_about("go");
+        s.apply(AgentMessage::AssistantToken { content: "Sure —".into() });
+        assert_eq!(s.reclaim_unanswered_message(), None);
+        assert_eq!(s.entries()[before].content, "go", "nothing may be removed either");
+    }
+
+    #[test]
+    fn a_message_that_has_been_acted_on_cannot_be_taken_back() {
+        // A tool call means work has happened. Removing the message that asked
+        // for it would leave the transcript describing work nobody requested.
+        let (mut s, _) = thinking_about("delete the temp files");
+        s.apply(tool_request("shell_exec", "t1", false));
+        assert_eq!(s.reclaim_unanswered_message(), None);
+    }
+
+    #[test]
+    fn there_is_nothing_to_take_back_when_the_agent_is_idle() {
+        let mut s = session();
+        s.push_user("done and answered");
+        s.apply(AgentMessage::AssistantDone { content: "yes".into() });
+        s.apply(AgentMessage::Done);
+        assert_eq!(s.reclaim_unanswered_message(), None);
     }
 
     /// An empty `assistant_done` must not blank out what was streamed.

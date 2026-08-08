@@ -1574,6 +1574,21 @@ fn paint_disclosure_triangle(ui: &mut egui::Ui, expanded: bool, color: egui::Col
 ///
 /// Measured against the widest glyph in the font, so the answer holds whatever
 /// the text turns out to be.
+/// Width of `text` at `size`, for reserving space before it is drawn.
+fn text_width(ui: &egui::Ui, text: &str, size: f32, monospace: bool) -> f32 {
+    let font = if monospace {
+        egui::FontId::monospace(size)
+    } else {
+        egui::FontId::proportional(size)
+    };
+    ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x)
+}
+
+/// Width a small button carrying `text` will take, including its padding.
+fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    text_width(ui, text, 12.0, false) + ui.spacing().button_padding.x * 2.0
+}
+
 fn wrap_run(ui: &egui::Ui, size: f32, monospace: bool) -> usize {
     let font = if monospace {
         egui::FontId::monospace(size)
@@ -2544,8 +2559,16 @@ fn draw_plan_card(
                         }
                         ui.label(egui::RichText::new("plan").size(11.5).color(accent));
                         if !plan_path.is_empty() {
-                            ui.label(egui::RichText::new(plan_path).monospace().size(10.0)
-                                .color(egui::Color32::from_gray(140)));
+                            // Shortened from the front, as on the tool cards, and
+                            // sized so the disclosure triangle keeps its place.
+                            let avail = (ui.available_width() - 18.0).max(24.0);
+                            let font = egui::FontId::monospace(10.0);
+                            let shown = elide_path_head(ui, plan_path, &font, avail);
+                            ui.add_sized(
+                                egui::vec2(avail, 16.0),
+                                egui::Label::new(egui::RichText::new(shown).monospace().size(10.0)
+                                    .color(egui::Color32::from_gray(140))).truncate(),
+                            );
                         }
                         if resolved {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2814,11 +2837,27 @@ fn draw_checkpoint_card(
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width() - pad_r);
                 ui.vertical(|ui| {
+                    // Below this the preview and the controls cannot share a
+                    // row without one of them losing: reserving space by
+                    // measuring buttons is never exact enough, and being a few
+                    // points short puts the text underneath them. Stacking is
+                    // the honest answer — the controls keep their full size and
+                    // move to their own line.
+                    let narrow = ui.available_width() < 300.0;
                     ui.horizontal(|ui| {
                         paint_dot(ui, egui::Color32::from_gray(140));
                         ui.label(egui::RichText::new("checkpoint").size(10.5).color(egui::Color32::from_gray(160)));
+                        // The controls are the only route to a rewind, so their
+                        // width is reserved and the preview takes what is left.
+                        // Added ahead of them it claimed the whole row and pushed
+                        // them off the edge of a narrow panel, unreachable.
                         let preview_short: String = preview.chars().take(60).collect();
-                        ui.label(egui::RichText::new(preview_short).size(10.5).color(egui::Color32::from_gray(190)));
+                        ui.add_sized(
+                            egui::vec2(ui.available_width(), 16.0),
+                            egui::Label::new(egui::RichText::new(preview_short).size(10.5)
+                                .color(egui::Color32::from_gray(190))).truncate(),
+                        );
+                        if narrow { return; }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if !confirming {
                                 if ui.small_button("Rewind here").clicked() {
@@ -2834,6 +2873,22 @@ fn draw_checkpoint_card(
                                 .color(egui::Color32::from_gray(120)));
                         });
                     });
+                    if narrow {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{message_count} msgs")).size(9.5)
+                                .color(egui::Color32::from_gray(120)));
+                            if !confirming {
+                                if !preview_loading && preview_result.is_none() {
+                                    if ui.small_button("Preview").clicked() {
+                                        *edit = Some(RewindEdit::Preview { item_idx });
+                                    }
+                                }
+                                if ui.small_button("Rewind here").clicked() {
+                                    *edit = Some(RewindEdit::Arm { item_idx });
+                                }
+                            }
+                        });
+                    }
                     if preview_loading {
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new("Loading preview…")
@@ -2960,8 +3015,23 @@ fn draw_subagent_strip_entry(
                     paint_dot(ui, egui::Color32::from_rgb(150, 170, 255));
                     ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
                         .color(egui::Color32::from_rgb(190, 180, 240)));
+                    // Same reservation as the checkpoint row: an approval count
+                    // must not be pushed off by the prompt it belongs to.
+                    let pending_now = items.iter()
+                        .filter(|i| matches!(i, ChatItem::ToolRequest { approval: ApprovalState::Pending, .. }))
+                        .count();
+                    let reserved = if pending_now > 0 {
+                        text_width(ui, &format!("{pending_now} awaiting approval"), 10.0, false)
+                            + ui.spacing().item_spacing.x * 2.0
+                    } else {
+                        0.0
+                    };
                     let preview: String = prompt.chars().take(50).collect();
-                    ui.label(egui::RichText::new(preview).size(10.5).color(egui::Color32::from_gray(150)));
+                    ui.add_sized(
+                        egui::vec2((ui.available_width() - reserved).max(16.0), 16.0),
+                        egui::Label::new(egui::RichText::new(preview).size(10.5)
+                            .color(egui::Color32::from_gray(150))).truncate(),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pending_count = items.iter()
                             .filter(|i| matches!(i, ChatItem::ToolRequest { approval: ApprovalState::Pending, .. }))
@@ -7228,6 +7298,7 @@ impl IdeApp {
                                     .rounding(4.0)
                                     .show(ui, |ui| {
                                         ui.set_max_width(ui.available_width() - pad_r);
+                                        let narrow_row = ui.available_width() < 300.0;
                                         ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             if *finished {
@@ -7237,13 +7308,22 @@ impl IdeApp {
                                             }
                                             ui.label(egui::RichText::new("subagent").size(11.5).color(egui::Color32::from_rgb(170,150,230)));
                                             ui.label(egui::RichText::new(agent_type.as_str()).monospace().size(11.5).strong().color(egui::Color32::from_rgb(190,180,240)));
-                                            if !*finished {
+                                            // See the checkpoint row: pinned to
+                                            // the right of a row this narrow it
+                                            // simply landed on top of the name
+                                            // beside it, so below a threshold it
+                                            // goes on its own line instead.
+                                            if !*finished && !narrow_row {
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     ui.label(egui::RichText::new("running — see below").size(10.0).italics()
                                                         .color(egui::Color32::from_gray(130)));
                                                 });
                                             }
                                         });
+                                        if !*finished && narrow_row {
+                                            ui.label(egui::RichText::new("running — see below").size(10.0).italics()
+                                                .color(egui::Color32::from_gray(130)));
+                                        }
                                         if *finished {
                                             let prompt_preview: String = prompt.chars().take(90).collect();
                                             ui.label(egui::RichText::new(soft_wrap(&prompt_preview, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(160)));

@@ -323,6 +323,19 @@ fn diff_summary_for_args(project_root: &Path, args: &[&str]) -> Result<RewindDif
 /// Returns `Ok(true)` if a new repo was just created (so the caller can let
 /// the user know), `Ok(false)` if one already existed.
 pub fn ensure_git_repo(project_root: &Path) -> Result<bool> {
+    // A project root that has gone missing is the common way this fails, and
+    // it is nothing to do with git: the agent holds the path it was opened
+    // with, so renaming or moving the folder underneath a running session
+    // leaves every `current_dir` pointing at nothing. Spawning git then fails
+    // before git runs at all, and the honest report is what actually happened
+    // rather than "failed to run git init".
+    if !project_root.is_dir() {
+        return Err(anyhow!(
+            "this project's folder no longer exists at {} — it was probably renamed or moved; \
+             reopen it at its new path to continue",
+            project_root.display()
+        ));
+    }
     if git_worktree_root_for_path(project_root).is_some() {
         return Ok(false);
     }
@@ -858,6 +871,28 @@ mod tests {
             err.to_string().contains("Another Forge session"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_project_folder_that_has_gone_missing_says_so() {
+        // Renaming the folder under a running session: the agent still holds
+        // the old path, so `git init` could not even be spawned there and the
+        // user was told "Failed to run git init", which points at git.
+        let temp = tempfile::tempdir().unwrap();
+        let gone = temp.path().join("renamed-away");
+        let err = ensure_git_repo(&gone).expect_err("a missing folder is an error");
+        let msg = err.to_string();
+        assert!(msg.contains("no longer exists"), "unhelpful: {msg}");
+        assert!(msg.contains("renamed-away"), "should name the path: {msg}");
+        assert!(!msg.contains("git init"), "not a git problem: {msg}");
+    }
+
+    #[test]
+    fn a_project_that_is_already_a_repo_is_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo, "r");
+        assert!(!ensure_git_repo(&repo).expect("existing repo"), "nothing to initialize");
     }
 
     #[test]

@@ -2329,8 +2329,12 @@ impl Agent {
             }
             Ok(false) => {}
             Err(e) => {
+                // `{:#}` so the chain comes with it. Formatted with `{}` the
+                // report stopped at the outermost context — "Failed to run git
+                // init" — and threw away the line saying why, which was the
+                // only part that identified the problem.
                 let _ = self.event_tx.send(AgentEvent::Error(format!(
-                    "Failed to initialize a git repository for this project: {}",
+                    "Failed to initialize a git repository for this project: {:#}",
                     e
                 )));
             }

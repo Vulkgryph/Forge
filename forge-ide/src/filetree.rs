@@ -329,7 +329,7 @@ impl FileTree {
                         p.line_segment(
                             [egui::pos2(gx, row_rect.top()),
                              egui::pos2(gx, row_rect.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(38)),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(38)),
                         );
                     }
 

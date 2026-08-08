@@ -539,7 +539,7 @@ fn walk_search(
 
 fn paint_explorer_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Two stacked document/file outlines
-    let s   = egui::Stroke::new(1.5, color);
+    let s   = egui::Stroke::new(1.5_f32, color);
     let w   = 10.0;
     let h   = 12.0;
     let fold = 3.0;
@@ -560,7 +560,7 @@ fn paint_explorer_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
 }
 
 fn paint_outline_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
-    let s = egui::Stroke::new(1.4, color);
+    let s = egui::Stroke::new(1.4_f32, color);
     // Bulleted list with indented sub-items
     for (i, (indent, w)) in [(0.0, 12.0), (5.0, 8.0), (5.0, 8.0), (0.0, 12.0)].iter().enumerate() {
         let y = c.y - 7.5 + i as f32 * 5.0;
@@ -589,14 +589,14 @@ fn running_binary_age() -> String {
 
 fn paint_gear_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     let r = 6.0;
-    p.circle_stroke(c, r * 0.5, egui::Stroke::new(1.4, color));
+    p.circle_stroke(c, r * 0.5, egui::Stroke::new(1.4_f32, color));
     // Eight teeth around the rim.
     for i in 0..8 {
         let a = i as f32 * std::f32::consts::TAU / 8.0;
         let (sin, cos) = a.sin_cos();
         let inner = c + egui::vec2(cos, sin) * (r * 0.8);
         let outer = c + egui::vec2(cos, sin) * r;
-        p.line_segment([inner, outer], egui::Stroke::new(1.6, color));
+        p.line_segment([inner, outer], egui::Stroke::new(1.6_f32, color));
     }
 }
 
@@ -611,7 +611,7 @@ fn paint_layout_diagram(
 ) {
     let border = if selected { egui::Color32::from_rgb(0, 120, 212) } else { egui::Color32::from_gray(75) };
     p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 30, 30));
-    p.rect_stroke(rect, 3.0, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, border));
+    p.rect_stroke(rect, 3.0, egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, border));
 
     let inner   = rect.shrink(4.0);
     let side_w  = inner.width() * 0.22;
@@ -644,10 +644,10 @@ fn paint_search_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Magnifying glass: circle + handle
     let center = c + egui::vec2(-2.0, -2.0);
     let r = 5.5;
-    p.circle_stroke(center, r, egui::Stroke::new(1.6, color));
+    p.circle_stroke(center, r, egui::Stroke::new(1.6_f32, color));
     let a = center + egui::vec2(r * 0.70, r * 0.70);
     let b = c + egui::vec2(5.0, 5.0);
-    p.line_segment([a, b], egui::Stroke::new(1.8, color));
+    p.line_segment([a, b], egui::Stroke::new(1.8_f32, color));
 }
 
 /// Maps anvil heat (0.0 cold → 1.0 white-hot) to a blacksmith-glow color,
@@ -720,7 +720,7 @@ fn paint_anvil(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
 
 fn paint_check_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Simple checkmark: short-left, long-right strokes meeting at the bottom.
-    let s = egui::Stroke::new(2.0, color);
+    let s = egui::Stroke::new(2.0_f32, color);
     p.line_segment([c + egui::vec2(-5.0, 0.5), c + egui::vec2(-1.5, 4.0)], s);
     p.line_segment([c + egui::vec2(-1.5, 4.0), c + egui::vec2( 5.0, -3.5)], s);
 }
@@ -863,13 +863,13 @@ fn sc_row(
         // Horizontal stroke (shared by + and −)
         ui.painter().line_segment(
             [bc + egui::vec2(-5.0, 0.0), bc + egui::vec2(5.0, 0.0)],
-            egui::Stroke::new(1.8, btn_color),
+            egui::Stroke::new(1.8_f32, btn_color),
         );
         if !is_staged {
             // Vertical stroke turns it into a +
             ui.painter().line_segment(
                 [bc + egui::vec2(0.0, -5.0), bc + egui::vec2(0.0, 5.0)],
-                egui::Stroke::new(1.8, btn_color),
+                egui::Stroke::new(1.8_f32, btn_color),
             );
         }
     }
@@ -885,7 +885,7 @@ fn sc_row(
 
 fn paint_branch_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Git branch glyph: two dots connected by a Y-shaped fork.
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     let main_x  = c.x - 2.0;
     let branch_x = c.x + 2.5;
     // Main line (vertical)
@@ -904,7 +904,7 @@ fn paint_branch_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
 
 /// Wavy underline squiggle between two x-coordinates at height y.
 fn paint_squiggle(p: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.2, color);
+    let stroke = egui::Stroke::new(1.2_f32, color);
     let amp    = 1.5;
     let step   = 4.0;
     let mut x  = x0;
@@ -1144,7 +1144,7 @@ fn char_index(text: &str, line: u32, col: u32) -> usize {
 }
 
 fn paint_ssh_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
-    let s = egui::Stroke::new(1.5, color);
+    let s = egui::Stroke::new(1.5_f32, color);
     // Terminal-prompt ">" chevron
     p.line_segment([c + egui::vec2(-4.0, -5.0), c + egui::vec2( 3.0,  0.0)], s);
     p.line_segment([c + egui::vec2( 3.0,  0.0), c + egui::vec2(-4.0,  5.0)], s);
@@ -1165,7 +1165,7 @@ fn comp_kind_glyph(kind: u8) -> &'static str {
 
 fn paint_send_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Up-arrow (modern chat-app style)
-    let s = egui::Stroke::new(2.2, color);
+    let s = egui::Stroke::new(2.2_f32, color);
     p.line_segment([c + egui::vec2(0.0,  6.0), c + egui::vec2(0.0, -5.0)], s);
     p.line_segment([c + egui::vec2(0.0, -5.0), c + egui::vec2(-4.0, -1.0)], s);
     p.line_segment([c + egui::vec2(0.0, -5.0), c + egui::vec2( 4.0, -1.0)], s);
@@ -1373,7 +1373,7 @@ fn reasoning_badge_label(ep: &serde_json::Value) -> String {
 /// `paint_disclosure_triangle` for why: not every glyph, including "✓", is
 /// guaranteed to exist in the loaded font).
 fn paint_checkmark_at(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     painter.line_segment([c + egui::vec2(-3.5, 0.0), c + egui::vec2(-1.0, 2.8)], stroke);
     painter.line_segment([c + egui::vec2(-1.0, 2.8), c + egui::vec2(4.0, -3.2)], stroke);
 }
@@ -1396,14 +1396,14 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
 /// `paint_dot` "running" state at a glance without relying on color alone).
 fn paint_ring(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-    ui.painter().circle_stroke(rect.center(), 3.2, egui::Stroke::new(1.3, color));
+    ui.painter().circle_stroke(rect.center(), 3.2, egui::Stroke::new(1.3_f32, color));
 }
 
 /// Small X — "denied"/"error", font-independent (see `paint_checkmark_at`).
 fn paint_cross(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
     let c = rect.center();
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     ui.painter().line_segment([c + egui::vec2(-3.2, -3.2), c + egui::vec2(3.2, 3.2)], stroke);
     ui.painter().line_segment([c + egui::vec2(-3.2, 3.2), c + egui::vec2(3.2, -3.2)], stroke);
 }
@@ -1869,7 +1869,7 @@ fn draw_read_group(ui: &mut egui::Ui, items: &[ChatItem], start: usize, end: usi
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(27, 29, 32))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 47, 52)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 47, 52)))
             .inner_margin(egui::Margin::symmetric(10.0, 7.0))
             .rounding(6.0)
             .show(ui, |ui| {
@@ -1973,7 +1973,7 @@ fn draw_write_card(
         ui.add_space(pad_l);
         let frame_resp = egui::Frame::none()
             .fill(egui::Color32::from_rgb(26, 28, 31))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 47, 52)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 47, 52)))
             .rounding(6.0)
             .inner_margin(egui::Margin { left: 12.0, right: 10.0, top: 7.0, bottom: 7.0 })
             .show(ui, |ui| {
@@ -2126,7 +2126,7 @@ fn draw_terminal_card(
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(14, 15, 17))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 47, 52)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 47, 52)))
             .rounding(6.0)
             .inner_margin(egui::Margin::symmetric(11.0, 8.0))
             .show(ui, |ui| {
@@ -2264,7 +2264,7 @@ fn draw_question_card(
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(26, 32, 42))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 105, 145)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 105, 145)))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
@@ -2322,7 +2322,7 @@ fn draw_question_card(
                                         if is_sel {
                                             ui.painter().circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(140, 180, 220));
                                         }
-                                        ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.0, egui::Color32::from_gray(140)));
+                                        ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)));
                                         ui.vertical(|ui| {
                                             ui.label(egui::RichText::new(&opt.label).size(11.5)
                                                 .color(if is_sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) }));
@@ -2424,7 +2424,7 @@ fn draw_plan_card(
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(26, 32, 42))
-            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.55)))
+            .stroke(egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.55)))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
@@ -2570,7 +2570,7 @@ fn draw_input_needed_card(
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(32, 28, 24))
-            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.55)))
+            .stroke(egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.55)))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
@@ -2702,7 +2702,7 @@ fn draw_checkpoint_card(
         ui.add_space(pad_l);
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(28, 28, 26))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .rounding(4.0)
             .show(ui, |ui| {
@@ -2844,7 +2844,7 @@ fn draw_subagent_strip_entry(
 ) {
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(28, 26, 40))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 60, 100)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 60, 100)))
         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
         .rounding(5.0)
         .show(ui, |ui| {
@@ -3674,7 +3674,7 @@ impl IdeApp {
                                             egui::pos2(rect.right()-18.0, rect.center().y-7.0), egui::vec2(14.0,14.0));
                                         let xresp = ui.interact(xr, ui.id().with(("term_close", i)), egui::Sense::click());
                                         let xcol = egui::Color32::from_gray(if xresp.hovered() { 220 } else { 110 });
-                                        let xs = egui::Stroke::new(1.2, xcol);
+                                        let xs = egui::Stroke::new(1.2_f32, xcol);
                                         let xc = xr.center();
                                         ui.painter().line_segment([xc-egui::vec2(4.0,4.0), xc+egui::vec2(4.0,4.0)], xs);
                                         ui.painter().line_segment([xc+egui::vec2(-4.0,4.0), xc+egui::vec2(4.0,-4.0)], xs);
@@ -3690,7 +3690,7 @@ impl IdeApp {
                                     if presp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
                                     let pc = pr.center();
                                     let pcol = egui::Color32::from_gray(if presp.hovered() { 220 } else { 150 });
-                                    let ps = egui::Stroke::new(1.4, pcol);
+                                    let ps = egui::Stroke::new(1.4_f32, pcol);
                                     ui.painter().line_segment([pc-egui::vec2(5.0,0.0), pc+egui::vec2(5.0,0.0)], ps);
                                     ui.painter().line_segment([pc-egui::vec2(0.0,5.0), pc+egui::vec2(0.0,5.0)], ps);
                                     let _ = presp.clone().on_hover_text("New Terminal");
@@ -5169,7 +5169,7 @@ impl IdeApp {
                 ui.painter().line_segment(
                     [egui::pos2(avail.left() + half, avail.top()),
                      egui::pos2(avail.left() + half, avail.bottom())],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)));
                 let mut rui = ui.new_child(egui::UiBuilder::new()
                     .max_rect(right).layout(egui::Layout::top_down(egui::Align::Min)));
                 self.draw_split_pane(&mut rui);
@@ -5824,9 +5824,9 @@ impl IdeApp {
                 if hist_active { ui.painter().rect_filled(hr, 3.0, egui::Color32::from_rgb(14,99,156)); }
                 let p = ui.painter(); let c = hr.center(); let r = 6.0;
                 let col = if hist_active { egui::Color32::WHITE } else { egui::Color32::from_gray(170) };
-                p.circle_stroke(c, r, egui::Stroke::new(1.3, col));
-                p.line_segment([c, c + egui::vec2(0.0, -r+1.0)], egui::Stroke::new(1.3, col));
-                p.line_segment([c, c + egui::vec2(3.0, 2.0)],    egui::Stroke::new(1.3, col));
+                p.circle_stroke(c, r, egui::Stroke::new(1.3_f32, col));
+                p.line_segment([c, c + egui::vec2(0.0, -r+1.0)], egui::Stroke::new(1.3_f32, col));
+                p.line_segment([c, c + egui::vec2(3.0, 2.0)],    egui::Stroke::new(1.3_f32, col));
                 let _ = hr_resp.clone().on_hover_text("Conversation history");
                 if hr_resp.clicked() {
                     self.agent_show_list = !self.agent_show_list;
@@ -5837,7 +5837,7 @@ impl IdeApp {
                 let (nr, nr_resp) = ui.allocate_exact_size(egui::vec2(20.0,20.0), egui::Sense::click());
                 if nr_resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
                 let col2 = if nr_resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_gray(170) };
-                let s2 = egui::Stroke::new(1.5, col2);
+                let s2 = egui::Stroke::new(1.5_f32, col2);
                 let c2 = nr.center();
                 ui.painter().line_segment([c2 - egui::vec2(5.0,0.0), c2 + egui::vec2(5.0,0.0)], s2);
                 ui.painter().line_segment([c2 - egui::vec2(0.0,5.0), c2 + egui::vec2(0.0,5.0)], s2);
@@ -5913,7 +5913,7 @@ impl IdeApp {
                             ui.painter().rect_filled(del_rect, 3.0,
                                 egui::Color32::from_rgba_premultiplied(255,60,60,30));
                         }
-                        let ds = egui::Stroke::new(1.3, egui::Color32::from_gray(if del_resp.hovered() { 220 } else { 130 }));
+                        let ds = egui::Stroke::new(1.3_f32, egui::Color32::from_gray(if del_resp.hovered() { 220 } else { 130 }));
                         let dc = del_rect.center();
                         ui.painter().line_segment([dc - egui::vec2(4.0,4.0), dc + egui::vec2(4.0,4.0)], ds);
                         ui.painter().line_segment([dc + egui::vec2(-4.0,4.0), dc + egui::vec2(4.0,-4.0)], ds);
@@ -5995,7 +5995,7 @@ impl IdeApp {
                     let xr2 = ui.interact(xr, xi, egui::Sense::click());
                     if xr2.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
                     let xc = egui::Color32::from_gray(if xr2.hovered() { 220 } else { 100 });
-                    let xs = egui::Stroke::new(1.2, xc);
+                    let xs = egui::Stroke::new(1.2_f32, xc);
                     let cc = xr.center();
                     ui.painter().line_segment([cc-egui::vec2(4.0,4.0), cc+egui::vec2(4.0,4.0)], xs);
                     ui.painter().line_segment([cc+egui::vec2(-4.0,4.0), cc+egui::vec2(4.0,-4.0)], xs);
@@ -6187,7 +6187,7 @@ impl IdeApp {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(37, 37, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                         .rounding(6.0)
                         .inner_margin(egui::Margin::symmetric(6.0, 8.0))
                         .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0,
@@ -6262,7 +6262,7 @@ impl IdeApp {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(37, 37, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                         .rounding(6.0)
                         .inner_margin(egui::Margin::symmetric(10.0, 10.0))
                         .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0,
@@ -6368,7 +6368,7 @@ impl IdeApp {
                     .show(ui.ctx(), |ui| {
                         egui::Frame::none()
                             .fill(egui::Color32::from_rgb(37, 37, 38))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                             .rounding(6.0)
                             .inner_margin(egui::Margin::symmetric(6.0, 8.0))
                             .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0,
@@ -6487,7 +6487,7 @@ impl IdeApp {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(37, 37, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                         .rounding(6.0)
                         .inner_margin(egui::Margin::symmetric(10.0, 10.0))
                         .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0,
@@ -6646,7 +6646,7 @@ impl IdeApp {
                             ui.add_space(outer_pad);
                             egui::Frame::none()
                                 .fill(egui::Color32::from_rgb(40,40,44))
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                                 .rounding(5.0)
                                 .inner_margin(egui::Margin::symmetric(8.0, 3.0))
                                 .show(ui, |ui| {
@@ -6680,7 +6680,7 @@ impl IdeApp {
                                                 ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(120,60,60));
                                             }
                                             let c = rect.center();
-                                            let s = egui::Stroke::new(1.2, egui::Color32::from_gray(210));
+                                            let s = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(210));
                                             ui.painter().line_segment([c - egui::vec2(4.0,4.0), c + egui::vec2(4.0,4.0)], s);
                                             ui.painter().line_segment([c + egui::vec2(-4.0,4.0), c + egui::vec2(4.0,-4.0)], s);
                                             let _ = resp.clone().on_hover_text("Remove from queue");
@@ -6739,7 +6739,7 @@ impl IdeApp {
                         |ui| {
                             egui::Frame::none()
                                 .fill(egui::Color32::from_rgb(35,35,38))
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)))
                                 .rounding(8.0)
                                 .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                 .show(ui, |ui| {
@@ -7032,7 +7032,7 @@ impl IdeApp {
                                 };
                                 egui::Frame::none()
                                     .fill(egui::Color32::from_rgb(24,26,24))
-                                    .stroke(egui::Stroke::new(1.0, border))
+                                    .stroke(egui::Stroke::new(1.0_f32, border))
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(4.0)
                                     .show(ui, |ui| {
@@ -7083,7 +7083,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 egui::Frame::none()
                                     .fill(egui::Color32::from_rgb(28,26,40))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(75,65,110)))
+                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(75,65,110)))
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(4.0)
                                     .show(ui, |ui| {
@@ -7770,7 +7770,7 @@ impl IdeApp {
             .fixed_size([w, 0.0])
             .frame(egui::Frame::popup(ctx.style().as_ref())
                 .fill(egui::Color32::from_rgb(37, 37, 38))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
                 .rounding(6.0))
             .show(ctx, |ui| {
                 ui.set_min_width(w);
@@ -7790,7 +7790,7 @@ impl IdeApp {
                             ui.painter().rect_filled(rect, 3.0,
                                 egui::Color32::from_rgba_premultiplied(255,255,255,15));
                         }
-                        let s = egui::Stroke::new(1.5, egui::Color32::from_gray(160));
+                        let s = egui::Stroke::new(1.5_f32, egui::Color32::from_gray(160));
                         let c = rect.center();
                         let d = 5.0;
                         ui.painter().line_segment([c + egui::vec2(-d,-d), c + egui::vec2(d,d)], s);
@@ -8220,7 +8220,7 @@ impl IdeApp {
             .default_width(w)   // width hint only, height is content-driven
             .frame(egui::Frame::popup(ctx.style().as_ref())
                 .fill(egui::Color32::from_rgb(37, 37, 38))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
                 .rounding(6.0))
             .show(ctx, |ui| {
                 ui.set_min_width(w);
@@ -8681,7 +8681,7 @@ impl IdeApp {
                         if entry.is_dir {
                             crate::icons::paint_key(ui.painter(), icon_rect, "folder");
                             // Chevron for dirs
-                            let s = egui::Stroke::new(1.2, egui::Color32::from_gray(120));
+                            let s = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(120));
                             let cx = rect.left() + 22.0;
                             let cy = rect.center().y;
                             ui.painter().line_segment(
@@ -9247,7 +9247,7 @@ impl IdeApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(37, 37, 38))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(80)))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)))
                     .rounding(4.0)
                     .show(ui, |ui| {
                         ui.set_width(w);
@@ -9366,7 +9366,7 @@ impl IdeApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(37, 37, 38))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(80)))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)))
                     .rounding(4.0)
                     .show(ui, |ui| {
                         ui.set_width(w);
@@ -10189,7 +10189,7 @@ impl IdeApp {
                             let top = gp + r.min.to_vec2();
                             ui.painter().line_segment(
                                 [top, egui::pos2(top.x, top.y + row_h)],
-                                egui::Stroke::new(1.6, cur_col));
+                                egui::Stroke::new(1.6_f32, cur_col));
                             if self.mc_sel_len > 0 && ci >= self.mc_sel_len {
                                 let s = te_out.galley.pos_from_ccursor(
                                     egui::text::CCursor::new(ci - self.mc_sel_len));
@@ -10236,7 +10236,7 @@ impl IdeApp {
                                 let x = gp.x + (lvl * tabw) as f32 * char_w;
                                 ui.painter().line_segment(
                                     [egui::pos2(x, y0), egui::pos2(x, y0 + row_h)],
-                                    egui::Stroke::new(1.0, guide));
+                                    egui::Stroke::new(1.0_f32, guide));
                             }
                         }
                     }
@@ -10246,7 +10246,7 @@ impl IdeApp {
                         let cur_ci = cr.primary.ccursor.index;
                         if let Some((a, b)) = find_matching_bracket(&text, cur_ci) {
                             let gp = te_out.galley_pos;
-                            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+                            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150));
                             for ci in [a, b] {
                                 let r = te_out.galley.pos_from_ccursor(
                                     egui::text::CCursor::new(ci));
@@ -10892,7 +10892,7 @@ impl IdeApp {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(37, 37, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(65)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
                         .rounding(4.0)
                         .inner_margin(egui::Margin::same(6.0))
                         .show(ui, |ui| {

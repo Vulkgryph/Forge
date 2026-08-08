@@ -154,7 +154,7 @@ fn paint_kind(p: &Painter, r: Rect, kind: &Kind, color: Color32) {
 
 fn paint_folder(p: &Painter, r: Rect, color: Color32) {
     // Classic folder: small tab on the upper-left, wider body underneath.
-    let s   = Stroke::new(1.4, color);
+    let s   = Stroke::new(1.4_f32, color);
     let w   = r.width();
     let h   = r.height();
     let tab_w = w * 0.35;
@@ -177,7 +177,7 @@ fn paint_folder(p: &Painter, r: Rect, color: Color32) {
 
 fn paint_doc(p: &Painter, r: Rect, label: &str, color: Color32) {
     // Document silhouette with a folded upper-right corner, label centered.
-    let s    = Stroke::new(1.4, color);
+    let s    = Stroke::new(1.4_f32, color);
     let fold = (r.height() * 0.28).min(5.0);
     let pad  = r.width() * 0.08;
     let tl   = pos2(r.min.x + pad,            r.min.y + pad);
@@ -210,7 +210,7 @@ fn paint_doc(p: &Painter, r: Rect, label: &str, color: Color32) {
 
 fn paint_image(p: &Painter, r: Rect, color: Color32) {
     // Outline frame + mountain + sun.
-    let s   = Stroke::new(1.4, color);
+    let s   = Stroke::new(1.4_f32, color);
     let pad = r.width() * 0.08;
     let inner = Rect::from_min_max(
         pos2(r.min.x + pad, r.min.y + pad),
@@ -235,10 +235,10 @@ fn paint_audio(p: &Painter, r: Rect, color: Color32) {
     // Quarter note: vertical stem with a filled head at the bottom-left.
     let stem_top = pos2(r.center().x + r.width() * 0.18,  r.min.y + r.height() * 0.18);
     let stem_bot = pos2(r.center().x + r.width() * 0.18,  r.max.y - r.height() * 0.28);
-    p.line_segment([stem_top, stem_bot], Stroke::new(1.8, color));
+    p.line_segment([stem_top, stem_bot], Stroke::new(1.8_f32, color));
     // Flag
     let flag_end = pos2(stem_top.x + r.width() * 0.18, stem_top.y + r.height() * 0.18);
-    p.line_segment([stem_top, flag_end], Stroke::new(1.8, color));
+    p.line_segment([stem_top, flag_end], Stroke::new(1.8_f32, color));
     // Note head (filled ellipse approximation via circle)
     let head_c = pos2(stem_bot.x - r.width() * 0.13, stem_bot.y);
     p.circle_filled(head_c, r.width() * 0.14, color);
@@ -246,7 +246,7 @@ fn paint_audio(p: &Painter, r: Rect, color: Color32) {
 
 fn paint_video(p: &Painter, r: Rect, color: Color32) {
     // Outline frame + filled play triangle.
-    let s   = Stroke::new(1.4, color);
+    let s   = Stroke::new(1.4_f32, color);
     let pad = r.width() * 0.08;
     let inner = Rect::from_min_max(
         pos2(r.min.x + pad, r.min.y + pad),
@@ -285,7 +285,7 @@ fn paint_archive(p: &Painter, r: Rect, color: Color32) {
 
 fn paint_lock(p: &Painter, r: Rect, color: Color32) {
     // U-shackle on top, solid body underneath.
-    let s    = Stroke::new(1.6, color);
+    let s    = Stroke::new(1.6_f32, color);
     let cx   = r.center().x;
     let w    = r.width();
     let h    = r.height();

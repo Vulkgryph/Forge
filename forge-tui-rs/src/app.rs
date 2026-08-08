@@ -778,6 +778,11 @@ impl App {
         } else {
             live_from.min(streaming)
         };
+        // Clear what is on screen once, then print: everything below happens in
+        // the space this frees, so a commit can never land underneath a live line
+        // that is still there.
+        inline.begin_frame(out)?;
+
         if settled > self.committed {
             let lines = self.lines_for(self.committed..settled, cols);
             inline.commit(out, &lines)?;
@@ -800,6 +805,7 @@ impl App {
         let total = self.session.entries().len();
         if total > self.committed {
             let lines = self.lines_for(self.committed..total, cols);
+            inline.begin_frame(out)?;
             inline.commit(out, &lines)?;
             self.committed = total;
         }

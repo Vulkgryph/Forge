@@ -125,14 +125,31 @@ impl Inline {
 
     /// Print lines permanently. They scroll into the terminal's scrollback and
     /// are never touched again.
+    /// Take the live region off the screen, once, before anything is printed.
+    ///
+    /// One erase per frame rather than one inside each of `commit` and
+    /// `draw_live`. Two of them share the row bookkeeping and have to agree about
+    /// what is on screen; when they disagreed — a commit erasing from a position
+    /// the live block no longer occupied — committed lines were printed *below*
+    /// chrome that was still there, stranding a copy of it in the scrollback. That
+    /// is the "Subagents · 1 running" repeated down the screen.
+    pub fn begin_frame(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let mut buf = String::new();
+        self.erase_live(&mut buf);
+        self.live_rows = 0;
+        self.cursor_row = 0;
+        self.drawn_widths.clear();
+        self.cursor_col = 0;
+        out.write_all(buf.as_bytes())?;
+        out.flush()
+    }
+
+    /// Print lines permanently, into the space `begin_frame` cleared.
     pub fn commit(&mut self, out: &mut impl Write, lines: &[Line]) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
         let mut buf = String::new();
-        // Clear the live region first, or committed output would be printed
-        // underneath it and the prompt would end up above the new text.
-        self.erase_live(&mut buf);
         for line in lines {
             encode(line, &mut buf, self.cols);
             buf.push_str("\r\n");
@@ -156,7 +173,8 @@ impl Inline {
     ) -> io::Result<()> {
         let mut buf = String::from(SYNC_BEGIN);
         buf.push_str(HIDE_CURSOR);
-        self.erase_live(&mut buf);
+        // No erase here: `begin_frame` has already cleared the region. See its
+        // doc comment for why there is exactly one.
 
         self.drawn_widths.clear();
         for (i, line) in lines.iter().enumerate() {
@@ -237,6 +255,19 @@ impl Inline {
     }
 }
 
+/// Text that cannot move the cursor.
+///
+/// Control characters are dropped rather than replaced: a replacement would have
+/// to be a space, and a run of them would then pad the line out to a width the
+/// caller never asked for. Dropping only ever makes a row narrower, which is
+/// always safe.
+fn sanitize(text: &str) -> String {
+    if !text.chars().any(|c| c.is_control()) {
+        return text.to_string();
+    }
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Encode one line as styled text, clipped to `cols`.
 ///
 /// Clipped rather than wrapped: the caller has already wrapped to this width,
@@ -249,10 +280,17 @@ fn encode(line: &Line, buf: &mut String, cols: usize) -> usize {
             break;
         }
         let room = cols - used;
-        let text = if str_width(&span.text) > room {
-            crate::widgets::clip(&span.text, room)
+        // A control character in the text would move the cursor: a newline drops
+        // the rest of the row one line down, and the row then occupies two while
+        // this counts one. Every erase after that climbs one row too few and
+        // strands the top of the block on screen — once per redraw, which is how
+        // "Subagents · 1 running" ended up printed down the whole screen. The text
+        // arrives from tool output and summaries, so it cannot be assumed clean.
+        let text = sanitize(&span.text);
+        let text = if str_width(&text) > room {
+            crate::widgets::clip(&text, room)
         } else {
-            span.text.clone()
+            text
         };
         if text.is_empty() {
             continue;
@@ -322,6 +360,7 @@ mod tests {
         inline.draw_live(&mut out, &[line("a"), line("b"), line("c")], None).unwrap();
         out.clear();
 
+        inline.begin_frame(&mut out).unwrap();
         inline.draw_live(&mut out, &[line("x")], None).unwrap();
         let got = text(&out);
         // Three rows were printed, so the cursor moves up two from the last.
@@ -426,6 +465,7 @@ mod tests {
         inline.draw_live(&mut out, &[line("prompt"), line("bar")], None).unwrap();
         out.clear();
 
+        inline.begin_frame(&mut out).unwrap();
         inline.commit(&mut out, &[line("settled output")]).unwrap();
         let got = text(&out);
         assert!(got.contains("\x1b[1A"), "moved up over the two-row block: {got:?}");
@@ -543,7 +583,7 @@ mod tests {
 
         // And the next erase climbs that far, rather than the old two.
         let mut out = sink();
-        inline.draw_live(&mut out, &lines, Some((2, 0))).unwrap();
+        inline.begin_frame(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[4A"), "expected a climb of 4 rows, got: {text:?}");
     }
@@ -564,7 +604,7 @@ mod tests {
         assert_eq!(inline.cursor_row, 3, "column 100 is on the fourth of them");
 
         let mut out = sink();
-        inline.draw_live(&mut out, &[line(&wide)], None).unwrap();
+        inline.begin_frame(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[3A"), "expected a climb of 3 rows, got {text:?}");
     }
@@ -610,6 +650,7 @@ mod tests {
 
         inline.resized(60, 20);
         out.clear();
+        inline.begin_frame(&mut out).unwrap();
         inline.draw_live(&mut out, &[line("after")], None).unwrap();
         let got = text(&out);
         assert!(got.contains("\x1b[2A"), "climbs the old three rows: {got:?}");
@@ -684,4 +725,50 @@ mod tests {
         inline.commit(&mut out, &[]).unwrap();
         assert!(out.is_empty());
     }
+    /// The reported bug: "Subagents · 1 running" printed down the whole screen.
+    ///
+    /// A newline inside a line makes that line occupy two rows while this counts
+    /// one, so every erase afterwards climbs one row too few and leaves the top of
+    /// the block behind — once per redraw. The text comes from tool output and
+    /// summaries, so it cannot be assumed free of control characters.
+    #[test]
+    fn a_line_containing_a_newline_still_occupies_one_row() {
+        let mut inline = Inline::new(60, 10);
+        let mut out = sink();
+        let dirty = Line {
+            spans: vec![Span {
+                text: "[ok] File: PRINCIPLES.md (279 lines)\nShowing lines 193".into(),
+                style: Style::default(),
+            }],
+        };
+        inline.draw_live(&mut out, &[line("above"), dirty], None).unwrap();
+        let got = text(&out);
+        // Exactly one row separator: between the two lines, and none from inside
+        // them. Two would mean the block occupies three rows while it counts two.
+        assert_eq!(got.matches('\n').count(), 1, "extra row breaks in {got:?}");
+        // The text either side of the dropped newline is now contiguous.
+        assert!(
+            got.contains("(279 lines)Showing lines 193"),
+            "the newline was dropped rather than emitted: {got:?}",
+        );
+    }
+
+    /// Carriage returns and tabs move the cursor too.
+    #[test]
+    fn other_cursor_moving_characters_are_dropped() {
+        assert_eq!(sanitize("a\rb"), "ab");
+        assert_eq!(sanitize("a\tb"), "ab");
+        assert_eq!(sanitize("a\u{1b}[31mb"), "a[31mb", "a stray escape cannot start a sequence");
+        assert_eq!(sanitize("plain text"), "plain text", "untouched when there is nothing to do");
+    }
+
+    /// Dropping rather than replacing: a run of control characters must not pad
+    /// the row out to a width nobody asked for.
+    #[test]
+    fn dropping_never_widens_a_row() {
+        let with = sanitize("a\n\n\n\nb");
+        assert_eq!(with, "ab");
+        assert!(crate::width::str_width(&with) <= crate::width::str_width("a\n\n\n\nb"));
+    }
+
 }

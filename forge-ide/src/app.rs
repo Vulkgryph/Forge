@@ -1831,6 +1831,49 @@ fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
 /// `ToolRequest`) using whichever card style fits, and returns the index
 /// just past everything it consumed — 1 or 2 items for a single call, more
 /// for a grouped run of read-only calls.
+/// Fit a tool summary — `Edited /a/long/path/file.md` — into `avail` points by
+/// dropping leading path components, so what survives is the end.
+///
+/// egui truncates from the tail, which on a path removes the only part that
+/// identifies which file it is; "Edited /Users/someone/Projects/some-pro…"
+/// tells you nothing. Dropping from the front instead gives ".../paper/note.md",
+/// which is how every editor renders a path it cannot fit.
+///
+/// Returns the text unchanged when it already fits, or when there is no path in
+/// it to shorten — the caller's `truncate()` is the backstop for that case.
+fn elide_path_head(ui: &egui::Ui, text: &str, font: &egui::FontId, avail: f32) -> String {
+    elide_path_head_by(text, avail, |s| {
+        ui.fonts(|f| {
+            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    })
+}
+
+/// `elide_path_head` with the text measurement supplied, so the rule can be
+/// tested without a live `Ui` and its fonts.
+fn elide_path_head_by(text: &str, avail: f32, width: impl Fn(&str) -> f32) -> String {
+    if avail <= 0.0 || width(text) <= avail {
+        return text.to_owned();
+    }
+    let Some(slash) = text.find('/') else { return text.to_owned() };
+    let (head, path) = text.split_at(slash);
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    for skip in 1..parts.len() {
+        let candidate = format!("{head}…/{}", parts[skip..].join("/"));
+        if width(&candidate) <= avail {
+            return candidate;
+        }
+    }
+    // Not even the file name on its own fits; hand the caller something whose
+    // tail is still the name, and let the label ellipsize what is left.
+    match parts.last() {
+        Some(name) => format!("{head}…/{name}"),
+        None => text.to_owned(),
+    }
+}
+
 fn draw_tool_run(
     ui: &mut egui::Ui,
     items: &[ChatItem],
@@ -1885,25 +1928,39 @@ fn draw_read_group(ui: &mut egui::Ui, items: &[ChatItem], start: usize, end: usi
                         if !first { ui.add_space(3.0); }
                         first = false;
 
-                        ui.horizontal(|ui| {
-                            match (approval, &result) {
-                                (ApprovalState::Denied, _) => paint_cross(ui, egui::Color32::from_rgb(224, 110, 95)),
-                                (_, None) => paint_dot(ui, egui::Color32::from_rgb(110, 150, 220)),
-                                (_, Some(ChatItem::ToolResult { success: false, .. })) =>
-                                    paint_cross(ui, egui::Color32::from_rgb(224, 110, 95)),
-                                _ => paint_checkmark(ui, egui::Color32::from_rgb(120, 190, 120)),
-                            }
-                            let desc = soft_wrap(&describe_tool_call(name, args), 44);
-                            ui.label(egui::RichText::new(desc).size(12.0).color(egui::Color32::from_gray(205)));
+                        // Right to left, so the row's trailing detail claims
+                        // its space first and the path gives way instead of
+                        // running off the edge of a narrowed panel.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let meta = result.and_then(|r| match r {
                                 ChatItem::ToolResult { content, .. } => read_group_meta(name, Some(content)),
                                 _ => None,
                             });
                             if let Some(meta) = meta {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(egui::RichText::new(meta).size(11.0).color(egui::Color32::from_gray(130)));
-                                });
+                                ui.label(egui::RichText::new(meta).size(11.0).color(egui::Color32::from_gray(130)));
                             }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                match (approval, &result) {
+                                    (ApprovalState::Denied, _) => paint_cross(ui, egui::Color32::from_rgb(224, 110, 95)),
+                                    (_, None) => paint_dot(ui, egui::Color32::from_rgb(110, 150, 220)),
+                                    (_, Some(ChatItem::ToolResult { success: false, .. })) =>
+                                        paint_cross(ui, egui::Color32::from_rgb(224, 110, 95)),
+                                    _ => paint_checkmark(ui, egui::Color32::from_rgb(120, 190, 120)),
+                                }
+                                let avail = ui.available_width();
+                                let font = egui::FontId::proportional(12.0);
+                                let desc = elide_path_head(
+                                    ui, &describe_tool_call(name, args), &font, avail,
+                                );
+                                ui.add_sized(
+                                    egui::vec2(avail, 16.0),
+                                    egui::Label::new(
+                                        egui::RichText::new(desc).size(12.0)
+                                            .color(egui::Color32::from_gray(205)),
+                                    )
+                                    .truncate(),
+                                );
+                            });
                         });
 
                         i += if has_result { 2 } else { 1 };
@@ -1979,31 +2036,46 @@ fn draw_write_card(
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width() - pad_r);
                 ui.vertical(|ui| {
-                    let header = ui.horizontal(|ui| {
-                        match (approval, result.is_some(), success) {
-                            (ApprovalState::Denied, ..)  => paint_cross(ui, rail),
-                            (ApprovalState::Pending, ..) => paint_ring(ui, rail),
-                            (_, false, _)                => paint_dot(ui, rail),
-                            (_, true, false)              => paint_cross(ui, rail),
-                            (_, true, true)                => paint_checkmark(ui, rail),
-                        }
-                        let desc = soft_wrap(&describe_tool_call(name, args), 44);
-                        ui.label(egui::RichText::new(desc).size(12.5).color(egui::Color32::from_gray(220)));
+                    // Right to left, so the diffstat and its button claim their
+                    // space before the path does: they are controls, and a
+                    // narrowed panel used to push them off the edge entirely
+                    // while the path it could not fit ran on past them.
+                    let header = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(d) = &diff {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new(format!("+{} \u{2212}{}", d.added, d.removed))
-                                    .size(11.0).monospace().color(egui::Color32::from_gray(150)));
-                                ui.add_space(6.0);
-                                let popup_id = ui.make_persistent_id(("tool_diff_popup", idx));
-                                let btn = ui.add(egui::Button::new(egui::RichText::new("Open diff").size(11.0))
-                                    .fill(egui::Color32::from_rgb(36, 39, 44)));
-                                if btn.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
-                                egui::popup_below_widget(
-                                    ui, popup_id, &btn, egui::PopupCloseBehavior::CloseOnClickOutside,
-                                    |ui| draw_diff_popup(ui, d),
-                                );
-                            });
+                            ui.label(egui::RichText::new(format!("+{} \u{2212}{}", d.added, d.removed))
+                                .size(11.0).monospace().color(egui::Color32::from_gray(150)));
+                            ui.add_space(6.0);
+                            let popup_id = ui.make_persistent_id(("tool_diff_popup", idx));
+                            let btn = ui.add(egui::Button::new(egui::RichText::new("Open diff").size(11.0))
+                                .fill(egui::Color32::from_rgb(36, 39, 44)));
+                            if btn.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+                            egui::popup_below_widget(
+                                ui, popup_id, &btn, egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| draw_diff_popup(ui, d),
+                            );
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            match (approval, result.is_some(), success) {
+                                (ApprovalState::Denied, ..)  => paint_cross(ui, rail),
+                                (ApprovalState::Pending, ..) => paint_ring(ui, rail),
+                                (_, false, _)                => paint_dot(ui, rail),
+                                (_, true, false)              => paint_cross(ui, rail),
+                                (_, true, true)                => paint_checkmark(ui, rail),
+                            }
+                            let avail = ui.available_width();
+                            let font = egui::FontId::proportional(12.5);
+                            let desc = elide_path_head(
+                                ui, &describe_tool_call(name, args), &font, avail,
+                            );
+                            ui.add_sized(
+                                egui::vec2(avail, 16.0),
+                                egui::Label::new(
+                                    egui::RichText::new(desc).size(12.5)
+                                        .color(egui::Color32::from_gray(220)),
+                                )
+                                .truncate(),
+                            );
+                        });
                     });
 
                     let mut click_target = header.response.clone();
@@ -12550,5 +12622,56 @@ mod selection_autoscroll_tests {
         // laptop waking up) would otherwise scroll 900 points in one go.
         let hitch = edge_scroll_step(200.0, 1.0).unwrap();
         assert!(hitch <= 90.0, "one hitched frame scrolled {hitch} points");
+    }
+}
+
+#[cfg(test)]
+mod elide_tests {
+    use super::elide_path_head_by;
+
+    /// A fixed-width stand-in for the real font: every character is one unit,
+    /// so an expected result can be written down rather than measured.
+    fn fits(limit: f32) -> impl Fn(&str) -> f32 {
+        let _ = limit;
+        |s: &str| s.chars().count() as f32
+    }
+
+    #[test]
+    fn something_that_already_fits_is_left_alone() {
+        let text = "Edited /a/b.md";
+        assert_eq!(elide_path_head_by(text, 100.0, fits(100.0)), text);
+    }
+
+    #[test]
+    fn the_file_name_survives_when_the_path_does_not() {
+        // The whole point: egui truncates the tail, which on a path throws away
+        // the only part that says which file it was.
+        let text = "Edited /Users/someone/CascadeProjects/NN-Revival/paper/note.md";
+        let out = elide_path_head_by(text, 30.0, fits(30.0));
+        assert!(out.starts_with("Edited …/"), "got {out:?}");
+        assert!(out.ends_with("note.md"), "the name must survive: {out:?}");
+        assert!(out.chars().count() as f32 <= 30.0, "still too wide: {out:?}");
+    }
+
+    #[test]
+    fn as_much_of_the_tail_as_fits_is_kept() {
+        let text = "Edited /one/two/three/four/five.md";
+        // Room for more than just the name, but not for the whole path.
+        let out = elide_path_head_by(text, 30.0, fits(30.0));
+        assert_eq!(out, "Edited …/three/four/five.md");
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_space_is_left_for_the_label_to_truncate() {
+        let text = "Edited /a/an-extremely-long-file-name-that-cannot-fit.md";
+        let out = elide_path_head_by(text, 12.0, fits(12.0));
+        assert_eq!(out, "Edited …/an-extremely-long-file-name-that-cannot-fit.md");
+    }
+
+    #[test]
+    fn text_with_no_path_in_it_is_untouched() {
+        // Nothing to shorten by dropping components; tail truncation is right.
+        let text = "Ran a command with a very long description indeed";
+        assert_eq!(elide_path_head_by(text, 5.0, fits(5.0)), text);
     }
 }

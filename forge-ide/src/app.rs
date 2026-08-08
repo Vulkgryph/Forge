@@ -1562,6 +1562,40 @@ fn paint_disclosure_triangle(ui: &mut egui::Ui, expanded: bool, color: egui::Col
 /// wrapping. Insert a zero-width space every `max_run` characters into any
 /// whitespace-free run longer than that, giving egui's existing wrap logic
 /// somewhere to break without changing what's visually displayed.
+/// How many characters `soft_wrap` should let run before it offers a break, for
+/// the width actually available here.
+///
+/// The break opportunities it inserts are only that — opportunities — so
+/// offering them too often costs nothing, while offering them too rarely means
+/// a line that cannot be broken where it needs to be. The constants these
+/// callers used (40, 44, 60) were each right for one panel width: 44 characters
+/// of monospace is about 280pt, so in a panel narrowed past that, every one of
+/// these lines ran off the edge instead of wrapping.
+///
+/// Measured against the widest glyph in the font, so the answer holds whatever
+/// the text turns out to be.
+fn wrap_run(ui: &egui::Ui, size: f32, monospace: bool) -> usize {
+    let font = if monospace {
+        egui::FontId::monospace(size)
+    } else {
+        egui::FontId::proportional(size)
+    };
+    let widest = ui.fonts(|f| f.glyph_width(&font, 'W')).max(1.0);
+    run_for_width(ui.available_width(), widest)
+}
+
+/// The arithmetic of [`wrap_run`], separated from the font it measures.
+///
+/// The floor of 8 matters: a panel dragged to its narrowest, or a deeply
+/// indented card, can leave almost no room, and a run of 0 would put a break
+/// between every character.
+fn run_for_width(avail: f32, widest_glyph: f32) -> usize {
+    if widest_glyph <= 0.0 {
+        return 8;
+    }
+    ((avail / widest_glyph).floor() as usize).max(8)
+}
+
 pub(crate) fn soft_wrap(text: &str, max_run: usize) -> String {
     let mut out = String::with_capacity(text.len());
     let mut run = 0usize;
@@ -2084,7 +2118,7 @@ fn draw_write_card(
                             if let Some(c) = content {
                                 let first_line: String = strip_ansi(c.trim()).lines().next().unwrap_or("").chars().take(70).collect();
                                 if !first_line.is_empty() {
-                                    let resp = ui.label(egui::RichText::new(soft_wrap(&first_line, 44))
+                                    let resp = ui.label(egui::RichText::new(soft_wrap(&first_line, wrap_run(ui, 10.5, true)))
                                         .monospace().size(10.5).color(egui::Color32::from_gray(140)));
                                     click_target = click_target.union(resp);
                                 }
@@ -2106,7 +2140,7 @@ fn draw_write_card(
                                 egui::ScrollArea::vertical().id_salt(("tool_card_body", idx))
                                     .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                     .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(soft_wrap(&full, 44))
+                                        ui.label(egui::RichText::new(soft_wrap(&full, wrap_run(ui, 10.5, true)))
                                             .monospace().size(10.5).color(egui::Color32::from_gray(150)));
                                     });
                             }
@@ -2216,7 +2250,7 @@ fn draw_terminal_card(
                     });
                     ui.add_space(2.0);
                     let cmd = describe_tool_call(name, args);
-                    ui.label(egui::RichText::new(format!("$ {}", soft_wrap(&cmd, 60)))
+                    ui.label(egui::RichText::new(format!("$ {}", soft_wrap(&cmd, wrap_run(ui, 11.5, true))))
                         .monospace().size(11.5).color(egui::Color32::from_gray(225)));
                     if let Some(c) = content {
                         let trimmed = strip_ansi(c.trim());
@@ -2228,7 +2262,7 @@ fn draw_terminal_card(
                             egui::ScrollArea::vertical().id_salt(("term_card_body", idx))
                                 .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new(soft_wrap(&trimmed, 60))
+                                    ui.label(egui::RichText::new(soft_wrap(&trimmed, wrap_run(ui, 11.0, true)))
                                         .monospace().size(11.0).color(egui::Color32::from_gray(165)));
                                 });
                         }
@@ -2353,11 +2387,11 @@ fn draw_question_card(
                     ui.add_space(3.0);
 
                     if items.is_empty() {
-                        ui.label(egui::RichText::new(soft_wrap(question, 44)).size(12.5).color(egui::Color32::from_gray(220)));
+                        ui.label(egui::RichText::new(soft_wrap(question, wrap_run(ui, 12.5, false))).size(12.5).color(egui::Color32::from_gray(220)));
                         if answered {
                             if !free_text.trim().is_empty() {
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new(soft_wrap(free_text, 44)).italics().size(11.0).color(egui::Color32::from_gray(160)));
+                                ui.label(egui::RichText::new(soft_wrap(free_text, wrap_run(ui, 11.0, false))).italics().size(11.0).color(egui::Color32::from_gray(160)));
                             }
                         } else {
                             ui.add_space(4.0);
@@ -2377,7 +2411,7 @@ fn draw_question_card(
                             if !q.header.is_empty() {
                                 ui.label(egui::RichText::new(&q.header).strong().size(11.5).color(egui::Color32::from_rgb(140, 180, 220)));
                             }
-                            ui.label(egui::RichText::new(soft_wrap(&q.question, 44)).size(12.0).color(egui::Color32::from_gray(220)));
+                            ui.label(egui::RichText::new(soft_wrap(&q.question, wrap_run(ui, 12.0, false))).size(12.0).color(egui::Color32::from_gray(220)));
                             ui.add_space(3.0);
                             let sel = selected.get(qi).cloned().unwrap_or_default();
                             if answered {
@@ -2399,7 +2433,7 @@ fn draw_question_card(
                                             ui.label(egui::RichText::new(&opt.label).size(11.5)
                                                 .color(if is_sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) }));
                                             if !opt.description.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, 44)).size(10.0).color(egui::Color32::from_gray(140)));
+                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, wrap_run(ui, 10.0, false))).size(10.0).color(egui::Color32::from_gray(140)));
                                             }
                                         });
                                     });
@@ -2545,7 +2579,7 @@ fn draw_plan_card(
                             .max_height(280.0)
                             .min_scrolled_height(220.0)
                             .show(ui, |ui| {
-                                crate::markdown::render(ui, content, 44);
+                                crate::markdown::render(ui, content, wrap_run(ui, 12.5, false));
                             });
                     }
 
@@ -2653,12 +2687,12 @@ fn draw_input_needed_card(
                         let label = if is_password { "password needed" } else { "input needed" };
                         ui.label(egui::RichText::new(label).size(11.5).color(accent));
                         if !command.is_empty() {
-                            ui.label(egui::RichText::new(soft_wrap(command, 40)).monospace().size(10.0)
+                            ui.label(egui::RichText::new(soft_wrap(command, wrap_run(ui, 10.0, true))).monospace().size(10.0)
                                 .color(egui::Color32::from_gray(140)));
                         }
                     });
                     ui.add_space(3.0);
-                    ui.label(egui::RichText::new(soft_wrap(prompt, 44)).size(11.5).color(egui::Color32::from_gray(210)));
+                    ui.label(egui::RichText::new(soft_wrap(prompt, wrap_run(ui, 11.5, false))).size(11.5).color(egui::Color32::from_gray(210)));
 
                     if resolved {
                         ui.add_space(3.0);
@@ -2807,7 +2841,7 @@ fn draw_checkpoint_card(
                     }
                     if let Some(result) = preview_result {
                         ui.add_space(3.0);
-                        ui.label(egui::RichText::new(soft_wrap(result, 60))
+                        ui.label(egui::RichText::new(soft_wrap(result, wrap_run(ui, 10.0, false)))
                             .size(10.0).color(egui::Color32::from_gray(190)));
                     }
                     if confirming {
@@ -2870,7 +2904,7 @@ fn draw_provider_busy_card(
         ui.add_space(pad_l);
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width() - pad_r);
-            ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), 40))
+            ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), wrap_run(ui, 12.5, false)))
                 .color(egui::Color32::from_rgb(255, 110, 100)));
             if resolved {
                 ui.label(egui::RichText::new(resolution).size(10.0).color(egui::Color32::from_gray(130)));
@@ -7091,7 +7125,7 @@ impl IdeApp {
                                         // left padding) — a label added directly to a horizontal
                                         // layout never wraps, regardless of set_max_width/soft_wrap.
                                         ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new(soft_wrap(text, 40)).color(egui::Color32::WHITE));
+                                            ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 12.5, false))).color(egui::Color32::WHITE));
                                         });
                                     });
                             }).response.rect;
@@ -7105,7 +7139,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(ui.available_width() - pad_r);
-                                    crate::markdown::render(ui, text, 40);
+                                    crate::markdown::render(ui, text, wrap_run(ui, 12.5, false));
                                 });
                             }).response.rect;
                             copy_message_button(
@@ -7118,7 +7152,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(ui.available_width() - pad_r);
-                                    ui.label(egui::RichText::new(soft_wrap(text, 40)).italics().size(11.0)
+                                    ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(11.0)
                                         .color(egui::Color32::from_gray(130)));
                                 });
                             });
@@ -7157,7 +7191,7 @@ impl IdeApp {
                                         let mut click_target = header.response.clone();
                                         if !*expanded && !first_line.is_empty() {
                                             let one_liner: String = first_line.chars().take(60).collect();
-                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, 40)).monospace().size(10.5).color(egui::Color32::from_gray(150)));
+                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, wrap_run(ui, 10.5, true))).monospace().size(10.5).color(egui::Color32::from_gray(150)));
                                             click_target = click_target.union(resp);
                                         }
                                         if click_target.interact(egui::Sense::click()).clicked() {
@@ -7166,7 +7200,7 @@ impl IdeApp {
                                         if *expanded {
                                             let preview: String = trimmed_full.chars().take(400).collect();
                                             if !preview.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&preview, 40)).monospace().size(10.5).color(egui::Color32::from_gray(150)));
+                                                ui.label(egui::RichText::new(soft_wrap(&preview, wrap_run(ui, 10.5, true))).monospace().size(10.5).color(egui::Color32::from_gray(150)));
                                                 if content.chars().count() > 400 {
                                                     ui.label(egui::RichText::new("...").color(egui::Color32::from_gray(110)));
                                                 }
@@ -7212,10 +7246,10 @@ impl IdeApp {
                                         });
                                         if *finished {
                                             let prompt_preview: String = prompt.chars().take(90).collect();
-                                            ui.label(egui::RichText::new(soft_wrap(&prompt_preview, 40)).size(10.5).color(egui::Color32::from_gray(160)));
+                                            ui.label(egui::RichText::new(soft_wrap(&prompt_preview, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(160)));
                                             if !summary.trim().is_empty() {
                                                 let s: String = summary.trim().chars().take(300).collect();
-                                                ui.label(egui::RichText::new(soft_wrap(&s, 40)).size(10.5).color(egui::Color32::from_gray(180)));
+                                                ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(180)));
                                             }
                                         }
                                         });
@@ -7264,7 +7298,7 @@ impl IdeApp {
                                 // words visible at the left edge.
                                 ui.vertical(|ui| {
                                     ui.set_max_width(ui.available_width() - pad_r);
-                                    ui.label(egui::RichText::new(soft_wrap(&format!("  {msg}"), 40)).color(egui::Color32::from_rgb(255,110,100)));
+                                    ui.label(egui::RichText::new(soft_wrap(&format!("  {msg}"), wrap_run(ui, 12.5, false))).color(egui::Color32::from_rgb(255,110,100)));
                                 });
                             });
                         }
@@ -7274,7 +7308,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(ui.available_width() - pad_r);
-                                    ui.label(egui::RichText::new(soft_wrap(msg, 40)).size(10.5).color(egui::Color32::from_gray(110)));
+                                    ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(110)));
                                 });
                             });
                         }
@@ -12673,5 +12707,32 @@ mod elide_tests {
         // Nothing to shorten by dropping components; tail truncation is right.
         let text = "Ran a command with a very long description indeed";
         assert_eq!(elide_path_head_by(text, 5.0, fits(5.0)), text);
+    }
+}
+
+#[cfg(test)]
+mod wrap_run_tests {
+    use super::run_for_width;
+
+    #[test]
+    fn a_run_fits_the_width_it_was_measured_for() {
+        // 224pt of panel, ~11pt per glyph at the size these cards use.
+        assert_eq!(run_for_width(224.0, 11.0), 20);
+        // The constant it replaced was 44 — over twice what fits, which is
+        // why every one of these lines ran off the edge of a narrow panel.
+        assert!(run_for_width(224.0, 11.0) < 44);
+    }
+
+    #[test]
+    fn a_wider_column_earns_a_longer_run() {
+        assert!(run_for_width(600.0, 11.0) > run_for_width(224.0, 11.0));
+    }
+
+    #[test]
+    fn there_is_always_room_for_something() {
+        // A break between every character is worse than overflowing.
+        assert_eq!(run_for_width(0.0, 11.0), 8);
+        assert_eq!(run_for_width(-5.0, 11.0), 8);
+        assert_eq!(run_for_width(224.0, 0.0), 8, "an unmeasurable font must not divide by zero");
     }
 }

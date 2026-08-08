@@ -30,6 +30,10 @@ pub fn bind(key: Key) -> Option<Input> {
         Key::Ctrl('o') => Input::Menu,
         Key::Ctrl('u') => Input::PageUp,
         Key::Ctrl('g') => Input::Home,
+        // Copy the last message. The terminal owns the real copy key — Cmd-C
+        // never reaches us — so this is the readline yank chord, which is
+        // otherwise unused here.
+        Key::Ctrl('y') => Input::CopyLast,
 
         Key::Char(c) => Input::Char(c),
         Key::Paste(text) => Input::Paste(text),
@@ -165,6 +169,7 @@ mod tests {
     #[test]
     fn bound_control_keys_scroll() {
         assert_eq!(bind(Key::Ctrl('u')), Some(Input::PageUp));
+        assert_eq!(bind(Key::Ctrl('y')), Some(Input::CopyLast));
         assert_eq!(bind(Key::Ctrl('g')), Some(Input::Home));
     }
 

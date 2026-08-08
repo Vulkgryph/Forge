@@ -29,6 +29,8 @@ pub enum Command {
     Restart,
     Clear,
     Compact,
+    /// Put the agent's last message on the system clipboard.
+    Copy,
     Usage,
     Plan,
     Login,
@@ -60,6 +62,7 @@ pub const TABLE: &[Entry] = &[
     Entry { command: "/restart",   description: "Restart the agent process", alias: false },
     Entry { command: "/clear",     description: "Start a fresh session", alias: false },
     Entry { command: "/compact",   description: "Compact conversation context", alias: false },
+    Entry { command: "/copy",      description: "Copy the agent's last message to the clipboard", alias: false },
     Entry { command: "/revert",    description: "Restore a previous user turn and code snapshot", alias: false },
     Entry { command: "/usage",     description: "Show token and context usage", alias: false },
     Entry { command: "/model",     description: "Open model selector", alias: false },
@@ -125,6 +128,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "/restart" | "/reconnect" => Command::Restart,
         "/clear" => Command::Clear,
         "/compact" => Command::Compact,
+        "/copy" => Command::Copy,
         "/usage" | "/tokens" | "/ctx" => Command::Usage,
         "/plan" => Command::Plan,
         "/login" => Command::Login,
@@ -200,6 +204,7 @@ mod tests {
         assert_eq!(parse("/think"), parse("/thinking"));
         assert_eq!(parse("/reasoning"), parse("/thinking"));
         assert_eq!(parse("/reconnect"), parse("/restart"));
+        assert_eq!(parse("/copy"), Some(Command::Copy));
         assert_eq!(parse("/exit"), parse("/quit"));
     }
 

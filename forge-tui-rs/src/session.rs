@@ -407,6 +407,20 @@ impl Session {
         self.entries.push(Entry::new(EntryKind::User, text));
     }
 
+    /// The text of the agent's most recent message — what "copy the last
+    /// message" means. Reasoning, tool output and system notes are skipped:
+    /// they are the machinery around the answer, not the answer.
+    ///
+    /// A message still being streamed counts. Waiting for it to finish would
+    /// mean the command does nothing during the very turn the user is reading.
+    pub fn last_agent_text(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, EntryKind::Assistant) && !e.content.trim().is_empty())
+            .map(|e| e.content.as_str())
+    }
+
     pub fn push_system(&mut self, text: impl Into<String>) {
         self.entries.push(Entry::new(EntryKind::System, text));
     }
@@ -1202,6 +1216,42 @@ mod tests {
     }
 
     // ── Streaming ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_last_agent_message_is_the_newest_assistant_entry() {
+        let mut s = Session::new();
+        s.apply(AgentMessage::AssistantDone { content: "first answer".into() });
+        s.push_user("and then?");
+        s.apply(AgentMessage::AssistantDone { content: "second answer".into() });
+        assert_eq!(s.last_agent_text(), Some("second answer"));
+    }
+
+    #[test]
+    fn the_last_agent_message_ignores_everything_that_is_not_the_answer() {
+        // What follows an answer is usually a system note — including the one
+        // this very command pushes to say it copied. Copying that instead
+        // would make a second press copy the receipt for the first.
+        let mut s = Session::new();
+        s.apply(AgentMessage::AssistantDone { content: "the answer".into() });
+        s.push_system("Copied the last message (1 line) using pbcopy.");
+        s.push_error("something went wrong");
+        assert_eq!(s.last_agent_text(), Some("the answer"));
+    }
+
+    #[test]
+    fn there_is_nothing_to_copy_before_the_agent_answers() {
+        let mut s = Session::new();
+        assert_eq!(s.last_agent_text(), None);
+        s.push_user("hello");
+        assert_eq!(s.last_agent_text(), None, "the user's own message is not the agent's");
+    }
+
+    #[test]
+    fn a_message_still_streaming_can_be_copied() {
+        let mut s = Session::new();
+        s.apply(AgentMessage::AssistantToken { content: "half a th".into() });
+        assert_eq!(s.last_agent_text(), Some("half a th"));
+    }
 
     #[test]
     fn assistant_tokens_accumulate_into_one_entry() {

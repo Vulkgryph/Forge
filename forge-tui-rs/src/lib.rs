@@ -26,6 +26,7 @@
 
 pub mod app;
 pub mod bridge;
+pub mod clipboard;
 pub mod commands;
 pub mod dialog;
 pub mod highlight;

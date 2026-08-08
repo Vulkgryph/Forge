@@ -60,6 +60,8 @@ pub enum Input {
     Escape,
     /// Insert a literal newline in the input.
     Newline,
+    /// Ctrl-Y: put the agent's last message on the system clipboard.
+    CopyLast,
     Quit,
     Resize(usize, usize),
 }
@@ -186,6 +188,29 @@ impl App {
         &self.session
     }
 
+    /// Put the agent's last message on the clipboard and say what happened.
+    ///
+    /// The result is reported in the transcript rather than silently: with no
+    /// selection to look at, "it copied" is otherwise indistinguishable from
+    /// "the key did nothing", and OSC 52 can fail at the far end.
+    fn copy_last_message(&mut self) {
+        let Some(text) = self.session.last_agent_text().map(str::to_string) else {
+            self.session_mut().push_system("Nothing to copy — the agent has not said anything yet.");
+            return;
+        };
+        let lines = text.lines().count();
+        let plural = if lines == 1 { "" } else { "s" };
+        match crate::clipboard::copy(&text) {
+            Ok(via) => self
+                .session_mut()
+                .push_system(format!("Copied the last message ({lines} line{plural}) using {via}.")),
+            Err(why) => self
+                .session_mut()
+                .push_system(format!("Could not copy the last message — {why}")),
+        }
+        self.cache = None;
+    }
+
     pub fn session_mut(&mut self) -> &mut Session {
         // Any change to the transcript invalidates the wrap.
         self.cache = None;
@@ -310,6 +335,8 @@ impl App {
                 self.insert_at_caret("\n");
                 self.suggestion = 0;
             }
+
+            Input::CopyLast => self.copy_last_message(),
 
             Input::ToggleReasoning => {
                 self.session.toggle_reasoning();
@@ -463,6 +490,10 @@ impl App {
             }
             Command::Clear => send(ClientMessage::ClearSession),
             Command::Compact => send(ClientMessage::Compact),
+            Command::Copy => {
+                self.copy_last_message();
+                (Outcome::Continue, Vec::new())
+            }
             Command::Usage => send(ClientMessage::RequestUsage),
             Command::Plan => send(ClientMessage::EnterPlanMode),
             Command::Login => send(ClientMessage::LoginChatgpt),

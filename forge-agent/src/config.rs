@@ -215,12 +215,26 @@ pub struct AgentConfig {
     /// what the model requests for that project.
     #[serde(default)]
     pub min_shell_timeout_secs: u64,
+    /// Absolute ceiling (seconds) after which **any** still-running top-level
+    /// `shell_exec` is force-moved to the background — including when the
+    /// model set `wait=true`, picked a huge `timeout_secs`, or the interactive
+    /// prompt heuristic paused the normal timer. The command keeps running as
+    /// `bg-N`; the agent can poll it with `background_id` / kill it with
+    /// `background_action=kill`, and gets a `BgDone` delivery when it finishes.
+    /// Default **300** (5 minutes). Set to `0` to disable the forced ceiling
+    /// (not recommended — a stuck wait=true shell can hold the turn again).
+    #[serde(default = "default_forced_shell_background_secs")]
+    pub forced_shell_background_secs: u64,
     /// When true, forces off every network touchpoint that isn't the model
     /// API call itself: `web_search`/`web_fetch` tools, ChatGPT Codex's
     /// periodic OAuth token refresh, and its weekly version self-check.
     /// Off by default — nothing changes unless a user opts in.
     #[serde(default)]
     pub offline_mode: bool,
+}
+
+fn default_forced_shell_background_secs() -> u64 {
+    300
 }
 
 fn default_thinking_mode() -> bool {
@@ -237,10 +251,19 @@ pub struct SubagentConfig {
     pub max_concurrent: usize,
     /// Default model endpoint name for subagents. None = inherit parent's model.
     pub default_model: Option<String>,
+    /// Wall-clock ceiling (seconds) for a single parent `delegate_task` batch.
+    /// When exceeded, unfinished subagents are aborted and the parent receives
+    /// a timeout summary instead of hanging forever. Default 1800s (30 min).
+    #[serde(default = "default_max_delegate_secs")]
+    pub max_delegate_secs: u64,
 }
 
 fn default_max_concurrent() -> usize {
     4
+}
+
+fn default_max_delegate_secs() -> u64 {
+    1800
 }
 
 impl Default for SubagentConfig {
@@ -250,6 +273,7 @@ impl Default for SubagentConfig {
             max_depth: 4,
             max_concurrent: 4,
             default_model: None,
+            max_delegate_secs: default_max_delegate_secs(),
         }
     }
 }
@@ -288,6 +312,7 @@ impl Default for AppConfig {
                 disabled_tools: vec![],
                 context_strategy: ContextStrategy::Compaction,
                 min_shell_timeout_secs: 0,
+                forced_shell_background_secs: default_forced_shell_background_secs(),
                 offline_mode: false,
             },
         }

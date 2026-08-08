@@ -14,6 +14,30 @@ pub struct SpawnedCommand {
     pub pty_master: Option<std::os::fd::OwnedFd>,
 }
 
+/// Default hard timeout for subagent/direct `shell_exec` fallback when the
+/// caller doesn't pass `timeout_secs`. Matches top-level `wait=true`.
+pub const DEFAULT_SHELL_WAIT_TIMEOUT_SECS: u64 = 300;
+
+/// Kill a spawned shell and any pipeline grandchildren.
+///
+/// Unix PTY/spawn paths call `setsid()`, so the direct child is a session and
+/// process-group leader. `Child::kill` only signals that one PID — `rg` in
+/// `rg | head`, nested `sh -c`, etc. can keep running and leave the parent
+/// turn blocked forever. Negative-PID `kill` targets the whole group first.
+pub async fn terminate_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pgid = pid as i32;
+        // SIGKILL the process group (negative pgid). Ignore errors — the
+        // group may already be gone, or kill may be denied in sandboxes.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 use super::custom::{load_custom_tools, CustomTool};
 use super::patch;
 use super::web;
@@ -132,7 +156,9 @@ impl ToolExecutor {
             "apply_patch" => self.apply_patch(args).await,
             "shell_exec" => {
                 // Shell exec is handled by the agent for streaming + cancellation.
-                // Fallback for direct calls (e.g. subagents):
+                // Fallback for direct calls (e.g. subagents) — must still enforce
+                // a hard timeout and process-group kill, or a stuck `rg | head`
+                // can freeze the whole parent `delegate_task` forever.
                 self.run_command(args).await
             }
             "glob_files" => self.glob_files(args).await,
@@ -523,6 +549,7 @@ impl ToolExecutor {
             cmd.arg("/C")
                 .arg(command)
                 .current_dir(&full_dir)
+                .kill_on_drop(true)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -535,14 +562,23 @@ impl ToolExecutor {
                 )
             })?
         } else {
-            tokio::process::Command::new("sh")
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
                 .arg(command)
                 .current_dir(&full_dir)
+                .kill_on_drop(true)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
+                .stderr(std::process::Stdio::piped());
+            // Own process group so terminate_child can reap pipeline members.
+            #[cfg(unix)]
+            unsafe {
+                cmd.pre_exec(|| {
+                    let _ = nix::unistd::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn()
                 .with_context(|| format!("Failed to spawn sh: {}", command))?
         };
 
@@ -589,6 +625,7 @@ impl ToolExecutor {
         cmd.arg("-c")
             .arg(command)
             .current_dir(full_dir)
+            .kill_on_drop(true)
             .stdin(stdin_s)
             .stdout(stdout_s)
             .stderr(stderr_s);
@@ -597,7 +634,8 @@ impl ToolExecutor {
         // slave_raw is accessible here (CLOEXEC only fires on exec, not fork).
         unsafe {
             cmd.pre_exec(move || {
-                // New session → slave becomes the controlling terminal.
+                // New session → slave becomes the controlling terminal, and
+                // the child is process-group leader (needed for group kill).
                 nix::unistd::setsid()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 // TIOCSCTTY: attach slave as controlling terminal.
@@ -620,6 +658,8 @@ impl ToolExecutor {
     }
 
     async fn run_command(&self, args: &serde_json::Value) -> Result<String> {
+        use tokio::io::AsyncReadExt;
+
         let command = args["command"]
             .as_str()
             .context("Missing 'command' argument")?;
@@ -631,35 +671,106 @@ impl ToolExecutor {
 
         let full_dir = self.resolve_path(working_dir)?;
 
-        let output = if std::env::consts::OS == "windows" {
+        // Subagent/direct path always waits (no streaming auto-background).
+        // Honor the same timeout_secs default as top-level wait=true so a
+        // hung pipeline cannot block delegate_task indefinitely.
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_SHELL_WAIT_TIMEOUT_SECS)
+            .max(1);
+
+        let mut child = if std::env::consts::OS == "windows" {
             let cmd_exe = std::env::var("COMSPEC")
                 .unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
             tokio::process::Command::new(&cmd_exe)
                 .arg("/C")
                 .arg(command)
                 .current_dir(&full_dir)
-                .output()
-                .await
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .with_context(|| format!("Failed to execute with {}: {}", cmd_exe, command))?
         } else {
-            tokio::process::Command::new("sh")
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
                 .arg(command)
                 .current_dir(&full_dir)
-                .output()
-                .await
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // Session leader so terminate_child can SIGKILL the whole pipeline
+            // (e.g. `rg … | head` grandchildren), not just the outer `sh`.
+            #[cfg(unix)]
+            unsafe {
+                cmd.pre_exec(|| {
+                    let _ = nix::unistd::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn()
                 .with_context(|| format!("Failed to execute: {}", command))?
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(ref mut out) = stdout_pipe {
+                let _ = out.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(ref mut err) = stderr_pipe {
+                let _ = err.read_to_end(&mut buf).await;
+            }
+            buf
+        });
 
-        let mut result = format!("$ {}\nExit code: {}\n", command, exit_code);
+        let wait_result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait(),
+        )
+        .await;
+
+        let (exit_code, timed_out) = match wait_result {
+            Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+            Ok(Err(e)) => {
+                return Err(e).with_context(|| format!("Failed to execute: {}", command));
+            }
+            Err(_) => {
+                terminate_child(&mut child).await;
+                (-1, true)
+            }
+        };
+
+        let stdout_bytes = stdout_task.await.unwrap_or_default();
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+
+        let mut result = if timed_out {
+            format!(
+                "$ {}\nTIMEOUT: Command exceeded {}s limit (subagent/direct shell_exec) and was killed.\n",
+                command, timeout_secs
+            )
+        } else {
+            format!("$ {}\nExit code: {}\n", command, exit_code)
+        };
         if !stdout.is_empty() {
             let truncated: String = stdout.chars().take(4000).collect();
-            result.push_str(&format!("--- stdout ---\n{}\n", truncated));
-            if stdout.len() > 4000 {
+            let label = if timed_out {
+                "--- stdout before timeout ---"
+            } else {
+                "--- stdout ---"
+            };
+            result.push_str(&format!("{}\n{}\n", label, truncated));
+            if stdout.chars().count() > 4000 {
                 result.push_str("... (truncated)\n");
             }
         }
@@ -1334,5 +1445,113 @@ mod tests {
             .expect("custom tool result");
 
         assert_eq!(result.trim(), "hello custom");
+    }
+
+    /// Regression: subagent/direct shell_exec used to block forever on
+    /// `.output().await` with no timeout — a hung `sleep`/`rg|head` froze
+    /// the parent `delegate_task`. Must return a TIMEOUT result promptly.
+    #[tokio::test]
+    async fn shell_exec_direct_path_times_out_instead_of_hanging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = ToolExecutor::new(dir.path().to_path_buf());
+        let started = std::time::Instant::now();
+        let result = executor
+            .execute(
+                "shell_exec",
+                &json!({
+                    "command": "sleep 120",
+                    "timeout_secs": 2
+                }),
+                None,
+            )
+            .await
+            .expect("shell_exec result");
+        let elapsed = started.elapsed();
+        assert!(
+            result.contains("TIMEOUT"),
+            "expected TIMEOUT marker, got: {result}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timed-out shell should return quickly, took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1),
+            "should have waited for the timeout, took {elapsed:?}"
+        );
+    }
+
+    /// Regression: killing only the outer `sh` left pipeline grandchildren
+    /// (`rg | head`, nested sleeps) running. terminate_child must reap the
+    /// whole process group — verify no `sleep 300` survivors after timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_exec_timeout_kills_pipeline_grandchildren() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tag = format!("forge-hang-pipe-{}", std::process::id());
+        let executor = ToolExecutor::new(dir.path().to_path_buf());
+
+        // Unique argv tag so we can find leaked sleeps without false positives.
+        // `sleep 300` is exec'd via env so the tag stays visible in ps.
+        let cmd = format!(
+            "env FORGE_HANG_TAG={tag} sleep 300 | env FORGE_HANG_TAG={tag} sleep 300"
+        );
+        let started = std::time::Instant::now();
+        let result = executor
+            .execute(
+                "shell_exec",
+                &json!({
+                    "command": cmd,
+                    "timeout_secs": 2
+                }),
+                None,
+            )
+            .await
+            .expect("shell_exec result");
+        let elapsed = started.elapsed();
+        assert!(
+            result.contains("TIMEOUT"),
+            "expected TIMEOUT, got: {result}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "should return quickly after timeout, took {elapsed:?}"
+        );
+
+        // Any leaked pipeline member would still show FORGE_HANG_TAG in ps.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let ps = std::process::Command::new("ps")
+            .args(["-ax", "-o", "pid=,command="])
+            .output()
+            .expect("ps");
+        let ps_txt = String::from_utf8_lossy(&ps.stdout);
+        let leaks: Vec<&str> = ps_txt
+            .lines()
+            .filter(|l| l.contains(&tag) && !l.contains("ps "))
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "pipeline grandchildren survived terminate_child: {leaks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_exec_direct_path_still_runs_quick_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = ToolExecutor::new(dir.path().to_path_buf());
+        let result = executor
+            .execute(
+                "shell_exec",
+                &json!({
+                    "command": "echo hang-fix-ok && exit 0",
+                    "timeout_secs": 30
+                }),
+                None,
+            )
+            .await
+            .expect("shell_exec result");
+        assert!(result.contains("hang-fix-ok"), "got: {result}");
+        assert!(result.contains("Exit code: 0"), "got: {result}");
+        assert!(!result.contains("TIMEOUT"), "got: {result}");
     }
 }

@@ -498,6 +498,9 @@ enum IncomingMessage {
         /// Set to true to clear default_model (set to inherit)
         #[serde(default)]
         clear_default_model: bool,
+        /// Wall-clock ceiling for a parent delegate_task batch (seconds).
+        #[serde(default)]
+        max_delegate_secs: Option<u64>,
     },
     UpdateWebModel {
         /// Endpoint name, or empty/"" to inherit
@@ -625,6 +628,7 @@ fn json_to_user_action(
             max_depth,
             default_model,
             clear_default_model,
+            max_delegate_secs,
         } => {
             if let Some(v) = enabled {
                 app_config.agent.subagents.enabled = v;
@@ -639,6 +643,9 @@ fn json_to_user_action(
                 app_config.agent.subagents.default_model = None;
             } else if let Some(v) = default_model {
                 app_config.agent.subagents.default_model = Some(v);
+            }
+            if let Some(v) = max_delegate_secs {
+                app_config.agent.subagents.max_delegate_secs = v.max(1);
             }
             let _ = app_config.save();
             let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));

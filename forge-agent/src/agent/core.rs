@@ -1749,11 +1749,40 @@ impl Agent {
                                 });
                             }
 
-                            // Phase 3: Select loop — wait for all runners, forward approvals
+                            // Phase 3: Select loop — wait for all runners, forward approvals.
+                            // Wall-clock deadline prevents a single stuck subagent
+                            // shell (historically: no timeout on executor.run_command)
+                            // from freezing the parent turn indefinitely.
                             let mut results: Vec<(usize, String)> = Vec::new(); // (meta_idx, result)
                             let total = metas.len();
+                            let delegate_timeout_secs = self
+                                .app_config
+                                .agent
+                                .subagents
+                                .max_delegate_secs
+                                .max(1);
+                            let delegate_deadline = tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(delegate_timeout_secs);
 
                             while results.len() < total {
+                                let until_deadline = delegate_deadline.saturating_duration_since(
+                                    tokio::time::Instant::now(),
+                                );
+                                if until_deadline.is_zero() {
+                                    runner_futs.abort_all();
+                                    for (idx, _) in metas.iter().enumerate() {
+                                        if !results.iter().any(|(i, _)| *i == idx) {
+                                            results.push((
+                                                idx,
+                                                format!(
+                                                    "Subagent timed out after {}s (agent.subagents.max_delegate_secs) and was aborted",
+                                                    delegate_timeout_secs
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    break;
+                                }
                                 tokio::select! {
                                     biased;
 
@@ -1819,6 +1848,22 @@ impl Agent {
                                                 }
                                             }
                                         }
+                                    }
+                                    _ = tokio::time::sleep(until_deadline) => {
+                                        // Wall-clock hit while still waiting — abort leftovers.
+                                        runner_futs.abort_all();
+                                        for (idx, _) in metas.iter().enumerate() {
+                                            if !results.iter().any(|(i, _)| *i == idx) {
+                                                results.push((
+                                                    idx,
+                                                    format!(
+                                                        "Subagent timed out after {}s (agent.subagents.max_delegate_secs) and was aborted",
+                                                        delegate_timeout_secs
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -3013,7 +3058,9 @@ impl Agent {
         // prompt is followed by silence, ordinary tool output isn't.
         let mut pending_prompt_check: Option<(tokio::time::Instant, String)> = None;
         const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
-        // wait=true: never auto-background; run until done or timeout_secs elapsed.
+        // wait=true: prefer waiting until done or timeout_secs — BUT a global
+        // forced-background ceiling (below) still applies so the model cannot
+        // pin the turn on a multi-hour shell forever.
         let wait_for_completion = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         // run_in_background=true: background immediately without waiting for output.
         let run_in_background_now = args
@@ -3021,8 +3068,9 @@ impl Agent {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         // timeout_secs: overrides auto-background threshold (default 120s).
-        // When wait=true, this is a hard cap — command is killed and error returned if exceeded.
-        // Default for wait=true: 300s. Default for auto-background: 120s.
+        // When wait=true, this is a hard cap — command is killed and error returned if exceeded
+        // *before* the forced-background ceiling. Default for wait=true: 300s.
+        // Default for auto-background: 120s.
         let mut timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -3037,6 +3085,10 @@ impl Agent {
         if wait_for_completion {
             timeout_secs = timeout_secs.max(self.app_config.agent.min_shell_timeout_secs);
         }
+        // Forced background ceiling — user/policy override that the model
+        // cannot disable via wait=true or a huge timeout_secs. 0 = off.
+        let forced_background_secs = self.app_config.agent.forced_shell_background_secs;
+        let mut forced_backgrounded = false;
 
         let event_tx = self.event_tx.clone();
         let tool_name = tc.function.name.clone();
@@ -3109,14 +3161,38 @@ impl Agent {
                 break;
             }
 
-            // Hard wall-clock check against timeout_secs.
-            if !input_waiting
-                && tokio::time::Instant::now() >= started_at + background_timeout
-                && !child_done
-            {
-                if wait_for_completion {
-                    // wait=true hit timeout — kill the command and return an error.
-                    let _ = child.kill().await;
+            // Wall-clock policy (checked every tick):
+            // 1) Forced background ceiling — ALWAYS backgrounds (never kills)
+            //    once elapsed, even for wait=true / huge timeout_secs /
+            //    input_waiting. Command keeps running as bg-N; agent can poll
+            //    or kill it. Default 300s via agent.forced_shell_background_secs.
+            // 2) Soft timeout from the model's timeout_secs / wait flag.
+            // 3) If forced-bg is disabled (0) and input_waiting stuck the soft
+            //    timer, fall back to a kill hard-cap so turns can't freeze forever.
+            let now = tokio::time::Instant::now();
+            let past_forced_bg = forced_background_secs > 0
+                && now >= started_at + std::time::Duration::from_secs(forced_background_secs);
+            if !child_done && past_forced_bg {
+                backgrounded = true;
+                forced_backgrounded = true;
+                break;
+            }
+
+            let past_soft_timeout = now >= started_at + background_timeout;
+            const INPUT_WAITING_HARD_CAP_MULTIPLIER: u32 = 3;
+            let kill_hard_cap = background_timeout
+                .saturating_mul(INPUT_WAITING_HARD_CAP_MULTIPLIER)
+                .max(std::time::Duration::from_secs(600));
+            // Only use the kill hard-cap when forced background is disabled —
+            // otherwise the forced-bg path above is the escape hatch and we
+            // must not kill a long wait=true job the user wanted kept alive.
+            let past_kill_hard_cap =
+                forced_background_secs == 0 && now >= started_at + kill_hard_cap;
+            if !child_done && ((past_soft_timeout && !input_waiting) || past_kill_hard_cap) {
+                if wait_for_completion || past_kill_hard_cap {
+                    // wait=true hit its own timeout (or kill hard-cap) — kill
+                    // the whole process group so pipeline grandchildren die too.
+                    crate::tools::terminate_child(&mut child).await;
                     timed_out = true;
                 } else {
                     backgrounded = true;
@@ -3159,12 +3235,12 @@ impl Agent {
                             self.queue_user_message(msg);
                         }
                         Some(UserAction::CancelRun) => {
-                            let _ = child.kill().await;
+                            crate::tools::terminate_child(&mut child).await;
                             cancelled = true;
                             break;
                         }
                         Some(UserAction::Quit) => {
-                            let _ = child.kill().await;
+                            crate::tools::terminate_child(&mut child).await;
                             cancelled = true;
                             break;
                         }
@@ -3389,7 +3465,7 @@ impl Agent {
                             if out_done { break; }
                         }
                         _ = kill_rx.recv() => {
-                            let _ = child.kill().await;
+                            crate::tools::terminate_child(&mut child).await;
                             break;
                         }
                     }
@@ -3418,6 +3494,11 @@ impl Agent {
 
             let bg_reason = if run_in_background_now {
                 "started in background as requested".to_string()
+            } else if forced_backgrounded {
+                format!(
+                    "still running after {}s, force-moved to background (agent.forced_shell_background_secs; applies even with wait=true)",
+                    forced_background_secs
+                )
             } else {
                 format!("still running after {}s, moved to background", timeout_secs)
             };

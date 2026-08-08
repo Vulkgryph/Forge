@@ -249,7 +249,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "shell_exec".to_string(),
-                description: "Execute a shell command in the project directory. Commands still running after 120s are automatically backgrounded unless wait=true. Forge emits progress heartbeats every 5 minutes while a foreground command is still running. Use background_id to check on or kill background commands. Set wait=true for commands that must complete before you continue (builds, tests, compilers, compliance audits); set a high timeout_secs for legitimate long audits. Set run_in_background=true for long-running services, watchers, daemons, or expensive audits you can check later. Do not run interactive/full-screen terminal apps inline (forge, vim, less, top, ssh, REPLs, etc.); run them manually or use non-interactive alternatives. Do not run `forge` or `./forge` from inside Forge; use `forge --version`, wrapper inspection commands, or `forge-agent --headless` for protocol tests.".to_string(),
+                description: "Execute a shell command in the project directory. Commands still running after 120s are automatically backgrounded unless wait=true. Regardless of wait/timeout_secs, any command still running after agent.forced_shell_background_secs (default 300s / 5 minutes) is force-moved to the background as bg-N so the turn cannot stay stuck — poll with background_id or stop with background_action=kill; completion is delivered automatically. Forge emits progress heartbeats every 5 minutes while a foreground command is still running. Set wait=true for commands that must complete before you continue (builds, tests, compilers); set a high timeout_secs for legitimate long audits (still subject to the forced-background ceiling). Set run_in_background=true for long-running services, watchers, daemons. Do not run interactive/full-screen terminal apps inline (forge, vim, less, top, ssh, REPLs, etc.); run them manually or use non-interactive alternatives. Do not run `forge` or `./forge` from inside Forge; use `forge --version`, wrapper inspection commands, or `forge-agent --headless` for protocol tests.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -263,7 +263,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "wait": {
                             "type": "boolean",
-                            "description": "If true, wait for the command to complete and never auto-background it. Use for builds, compilers, test runners, installs, and any command whose output you need before continuing. Set timeout_secs high enough for known long audits."
+                            "description": "If true, wait for the command to complete instead of the normal 120s auto-background. Still subject to agent.forced_shell_background_secs (default 300s), which force-backgrounds rather than killing. Use for builds, compilers, test runners, installs."
                         },
                         "run_in_background": {
                             "type": "boolean",
@@ -271,7 +271,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Timeout in seconds. With wait=true: kills the command and returns an error if exceeded (default 300s). Without wait: overrides the auto-background threshold (default 120s)."
+                            "description": "Timeout in seconds. With wait=true: kills the command if exceeded before the forced-background ceiling (default 300s). Without wait: overrides the auto-background threshold (default 120s). Cannot prevent force-background at agent.forced_shell_background_secs."
                         },
                         "background_id": {
                             "type": "string",
@@ -317,7 +317,9 @@ pub fn delegate_task_definition(available_agents: &[AgentDefinition]) -> ToolDef
             name: "delegate_task".to_string(),
             description: "Delegate a task to a specialized subagent that runs autonomously with its own context window. \
                 For complex multi-step work with independent subtasks, you can call this multiple times in one response \
-                to run subagents in parallel. The subagent runs to completion and returns its findings/results.".to_string(),
+                to run subagents in parallel. The subagent runs to completion and returns its findings/results. \
+                Parent waits are bounded by agent.subagents.max_delegate_secs (default 1800s); subagent shell_exec \
+                calls themselves hard-timeout (default 300s) so a stuck command cannot freeze the chat.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

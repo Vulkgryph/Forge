@@ -3897,7 +3897,24 @@ impl IdeApp {
                 .show(ctx, |ui| {
                     let rect = ui.max_rect();
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(21, 21, 21));
-                    self.draw_agent_view(ui);
+                    // Drawn into a child clipped to the panel, and the panel
+                    // then claims exactly its own rect. egui sizes a side panel
+                    // from what its contents ended up occupying, and the default
+                    // wrap mode for a label in a horizontal layout is `Extend` —
+                    // it grows the parent rather than clipping (there is a note
+                    // about this on the queued-message row too). One long path,
+                    // checkpoint preview, or a status bar with a few badges too
+                    // many therefore became a floor under the panel width that
+                    // dragging could not get past: it could be widened and
+                    // brought back, never made narrower than its widest line.
+                    let mut inner = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    inner.set_clip_rect(rect);
+                    self.draw_agent_view(&mut inner);
+                    ui.advance_cursor_after_rect(rect);
                 });
         }
     }
@@ -6073,16 +6090,22 @@ impl IdeApp {
         // bottom border), matching the tab-bar convention above, so it reads as
         // a persistent bar rather than blending into the chat scroll area.
         let status_bar_h = 24.0;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), status_bar_h)),
-            0.0, egui::Color32::from_rgb(30, 30, 30));
+        // The strip is painted after the row, once its real height is known:
+        // the badges wrap onto a second line in a narrow panel, and a fill of
+        // a fixed 24pt would then cover only the first of them. The shape is
+        // reserved here so it still ends up *behind* what wraps over it.
+        let status_bar_bg = ui.painter().add(egui::Shape::Noop);
+        let status_bar_top = ui.cursor().min.y;
         let mut model_badge_rect     = egui::Rect::NOTHING;
         let mut perm_badge_rect      = egui::Rect::NOTHING;
         let mut reasoning_badge_rect = egui::Rect::NOTHING;
         let mut context_badge_rect   = egui::Rect::NOTHING;
         let mut toggle_offline_mode  = false;
-        ui.horizontal(|ui| {
-            ui.set_height(status_bar_h);
+        // Wrapped, so a narrow panel reflows the badges instead of running them
+        // off the edge — and, since egui sizes a panel from its contents, so
+        // that this row cannot hold the panel open at its own width.
+        let status_bar = ui.horizontal_wrapped(|ui| {
+            ui.set_min_height(status_bar_h);
             ui.add_space(4.0);
             let model = if tab.session.model.is_empty() { "starting…".to_string() }
                         else { display_model_label(&tab.session.model, &tab.session.endpoints) };
@@ -6167,7 +6190,18 @@ impl IdeApp {
                 if badge.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
                 if badge.clicked() { toggle_offline_mode = true; }
             }
-        });
+        }).response.rect;
+        ui.painter().set(
+            status_bar_bg,
+            egui::Shape::rect_filled(
+                egui::Rect::from_x_y_ranges(
+                    ui.max_rect().x_range(),
+                    status_bar_top..=status_bar.bottom().max(status_bar_top + status_bar_h),
+                ),
+                0.0,
+                egui::Color32::from_rgb(30, 30, 30),
+            ),
+        );
         if toggle_offline_mode {
             let next = !tab.session.offline_mode;
             tab.session.update_offline_mode(next);

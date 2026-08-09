@@ -1872,6 +1872,18 @@ fn selection_autoscroll(ui: &egui::Ui) -> Option<f32> {
 /// `ToolResult` — forge's top-level agent runs one tool call at a time, so
 /// request/result always arrive as an adjacent pair once the call finishes;
 /// while it's still running, only the request has arrived yet.
+/// Where the minimap's viewport box starts and ends horizontally, given how
+/// far the editor is scrolled sideways.
+///
+/// `first_col` and `cols` are in characters — the minimap's own axis is a
+/// fixed number of points per character, so the conversion is one multiply.
+/// Everything is in the same unit deliberately: mixing points and columns is
+/// how the vertical indicator would have gone wrong too.
+fn minimap_span(left: f32, first_col: f32, cols: f32, points_per_col: f32) -> (f32, f32) {
+    let x0 = left + first_col.max(0.0) * points_per_col;
+    (x0, x0 + cols.max(1.0) * points_per_col)
+}
+
 fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
     i + 1 < items.len() && matches!(items[i + 1], ChatItem::ToolResult { .. })
 }
@@ -10788,6 +10800,12 @@ impl IdeApp {
                 bg.r(), bg.g(), bg.b(), 235));
             let n = buf.lines.len().max(1);
             let line_h = (mm_rect.height() / n as f32).clamp(1.0, 3.0);
+            // Points per character across the minimap. Named because the
+            // viewport box maps a scroll offset through the same scale, and
+            // two copies of it would drift apart the first time either moved.
+            const MM_CHAR_W: f32 = 0.7;
+            /// Left inset, so a line at column 0 is not flush against the edge.
+            const MM_PAD: f32 = 3.0;
             let fg = self.palette.default_fg_c();
             let line_col = egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90);
             for (i, line) in buf.lines.iter().enumerate() {
@@ -10796,10 +10814,10 @@ impl IdeApp {
                 let y = mm_rect.top() + i as f32 * line_h;
                 if y > mm_rect.bottom() { break; }
                 let indent = line.len() - line.trim_start().len();
-                let x0 = mm_rect.left() + 3.0 + (indent as f32 * 0.7).min(30.0);
-                let w  = (t.trim_start().len() as f32 * 0.7).min(mm_rect.width() - 6.0);
+                let x0 = mm_rect.left() + MM_PAD + (indent as f32 * MM_CHAR_W).min(30.0);
+                let w  = (t.trim_start().len() as f32 * MM_CHAR_W).min(mm_rect.width() - MM_PAD * 2.0);
                 p.line_segment(
-                    [egui::pos2(x0, y), egui::pos2((x0 + w).min(mm_rect.right() - 3.0), y)],
+                    [egui::pos2(x0, y), egui::pos2((x0 + w).min(mm_rect.right() - MM_PAD), y)],
                     egui::Stroke::new((line_h - 0.4).max(0.8), line_col));
             }
             // Viewport indicator + click/drag to scroll
@@ -10807,11 +10825,28 @@ impl IdeApp {
             let view_h    = scroll_out.inner_rect.height();
             let top_line  = y_to_line(scroll_out.state.offset.y) as f32;
             let vis_lines = view_h / row_h;
+            // Sideways too, when the file can scroll that way at all — with
+            // word wrap on it cannot, and the box stays full width rather than
+            // implying a horizontal position that has no meaning.
+            let char_w = ui.fonts(|f| f.glyph_width(&font_id, '0')).max(1.0);
+            let text_view_w = (scroll_out.inner_rect.width() - gutter_w).max(1.0);
+            let widest = buf.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+            let scrolls_sideways = !word_wrap && widest * char_w > text_view_w;
+            let (vx0, vx1) = if scrolls_sideways {
+                minimap_span(
+                    mm_rect.left() + MM_PAD,
+                    scroll_out.state.offset.x / char_w,
+                    text_view_w / char_w,
+                    MM_CHAR_W,
+                )
+            } else {
+                (mm_rect.left(), mm_rect.right())
+            };
             let vp = egui::Rect::from_min_max(
-                egui::pos2(mm_rect.left(),  mm_rect.top() + top_line * line_h),
-                egui::pos2(mm_rect.right(), mm_rect.top() + (top_line + vis_lines) * line_h),
+                egui::pos2(vx0, mm_rect.top() + top_line * line_h),
+                egui::pos2(vx1, mm_rect.top() + (top_line + vis_lines) * line_h),
             );
-            if content_h > view_h {
+            if content_h > view_h || scrolls_sideways {
                 p.rect_filled(vp.intersect(mm_rect), 0.0,
                     egui::Color32::from_rgba_unmultiplied(128, 128, 128, 30));
             }
@@ -12829,5 +12864,51 @@ mod wrap_run_tests {
         assert_eq!(run_for_width(0.0, 11.0), 8);
         assert_eq!(run_for_width(-5.0, 11.0), 8);
         assert_eq!(run_for_width(224.0, 0.0), 8, "an unmeasurable font must not divide by zero");
+    }
+}
+
+#[cfg(test)]
+mod minimap_tests {
+    use super::minimap_span;
+
+    /// The minimap's scale: points per character across it.
+    const SCALE: f32 = 0.7;
+
+    #[test]
+    fn unscrolled_the_box_starts_at_the_left_edge() {
+        let (x0, x1) = minimap_span(100.0, 0.0, 80.0, SCALE);
+        assert_eq!(x0, 100.0);
+        assert!((x1 - (100.0 + 80.0 * SCALE)).abs() < 0.01, "got {x1}");
+    }
+
+    #[test]
+    fn scrolling_right_moves_the_box_right_by_the_same_scale() {
+        let (a0, a1) = minimap_span(100.0, 0.0, 80.0, SCALE);
+        let (b0, b1) = minimap_span(100.0, 40.0, 80.0, SCALE);
+        assert!(b0 > a0, "the box should follow the view: {a0} → {b0}");
+        assert!((b0 - a0 - 40.0 * SCALE).abs() < 0.01, "moved {} points", b0 - a0);
+        assert!((b1 - b0 - (a1 - a0)).abs() < 0.01, "width should not change with position");
+    }
+
+    #[test]
+    fn a_wider_window_shows_a_wider_box() {
+        let (_, narrow) = minimap_span(0.0, 0.0, 40.0, SCALE);
+        let (_, wide) = minimap_span(0.0, 0.0, 120.0, SCALE);
+        assert!(wide > narrow);
+    }
+
+    #[test]
+    fn a_negative_offset_cannot_push_the_box_off_the_left() {
+        // egui can report a small negative offset mid-overscroll.
+        let (x0, _) = minimap_span(100.0, -25.0, 80.0, SCALE);
+        assert_eq!(x0, 100.0);
+    }
+
+    #[test]
+    fn the_box_is_never_invisible() {
+        // A viewport measured as zero columns (a pane dragged shut) should
+        // still leave something to see rather than a zero-width rectangle.
+        let (x0, x1) = minimap_span(0.0, 0.0, 0.0, SCALE);
+        assert!(x1 > x0);
     }
 }

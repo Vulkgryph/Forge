@@ -648,9 +648,23 @@ impl App {
                     } else {
                         "  (ctrl+t to expand)"
                     };
+                    // A block still being thought turns; a finished one is a
+                    // static mark. The frame is the same counter the status
+                    // line uses, driven by the event loop's timer, so this
+                    // costs nothing extra and stops dead when the turn ends.
+                    // Without it the only moving thing on screen during a long
+                    // think was the terminal's own cursor, sitting greyed out
+                    // in the prompt, which reads as a hang rather than work.
+                    let mark = if matches!(entry.kind, EntryKind::Reasoning)
+                        && self.session.activity.is_busy()
+                    {
+                        format!("{} ", SPINNER[self.spinner % SPINNER.len()])
+                    } else {
+                        "✻ ".to_string()
+                    };
                     out.push(Line {
                         spans: vec![
-                            Span { text: "✻ ".into(), style: Style::fg(palette::THINKING) },
+                            Span { text: mark, style: Style::fg(palette::THINKING) },
                             // Not dimmed: dimming a colour on a black background
                             // is what made this hard to read in the first place.
                             // The hint beside it stays dim, so the label still
@@ -2061,6 +2075,46 @@ mod tests {
     }
 
     // ── Spinner and reasoning label ───────────────────────────────────────
+
+    /// The transcript's own "Thinking…" line is what the user watches during a
+    /// long think, and it used to be a static mark — the only thing moving on
+    /// screen was the terminal cursor, which reads as a hang.
+    #[test]
+    fn the_thinking_line_turns_while_the_block_is_live() {
+        let mut app = app_with(0).0;
+        app.session_mut().apply(AgentMessage::ReasoningToken { content: "weighing it up".into() });
+        let first = live_text(&mut app);
+        assert!(first.contains("Thinking…"), "got {first:?}");
+        assert!(!first.contains('✻'), "a live block should not show the static mark: {first:?}");
+
+        app.tick();
+        let second = live_text(&mut app);
+        assert_ne!(first, second, "the mark should have advanced");
+        assert!(second.contains("Thinking…"), "and still say what it is: {second:?}");
+    }
+
+    #[test]
+    fn a_finished_thought_keeps_the_static_mark() {
+        // Nothing is happening any more, so nothing should appear to be.
+        let mut app = app_with(0).0;
+        app.session_mut().apply(AgentMessage::ReasoningToken { content: "done now".into() });
+        app.session_mut().apply(AgentMessage::AssistantDone { content: "answer".into() });
+        app.session_mut().apply(AgentMessage::Done);
+        let shown = rendered(&mut app);
+        assert!(shown.contains('✻'), "got {shown:?}");
+    }
+
+    #[test]
+    fn an_idle_thinking_line_does_not_turn() {
+        // A turn cancelled mid-think leaves the block behind; it must not go on
+        // spinning, and ticking while idle must not change it either.
+        let mut app = app_with(0).0;
+        app.session_mut().apply(AgentMessage::ReasoningToken { content: "interrupted".into() });
+        app.session_mut().apply(AgentMessage::Cancelled);
+        let before = live_text(&mut app);
+        app.tick();
+        assert_eq!(live_text(&mut app), before, "idle ticks change nothing");
+    }
 
     /// A long turn should look alive. The spinner must only turn while busy,
     /// because animating when idle is what would cost CPU.

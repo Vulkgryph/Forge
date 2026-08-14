@@ -528,6 +528,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Vec::new()
     };
+    // Kept inside the frame cap — see `fit_replay_entries`. Without this a long
+    // session's transcript was written uncapped and the client refused it, so
+    // the resume came back empty.
+    let replay_entries =
+        headless::fit_replay_entries(replay_entries, headless::REPLAY_BUDGET_BYTES);
 
     let rewind_checkpoints = if hl_resume_meta.is_some() {
         let replay_log = ConversationLog::open(&hl_log_path)?;

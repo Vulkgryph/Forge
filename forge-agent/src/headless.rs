@@ -168,7 +168,7 @@ enum OutgoingMessage {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ReplayEntryJson {
     pub kind: String,
     pub content: String,
@@ -176,6 +176,104 @@ pub struct ReplayEntryJson {
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
+}
+
+/// Budget for the replayed transcript inside a `session_loaded` frame.
+///
+/// The frame itself is capped at 10 MB on both sides; this leaves room for
+/// everything else it carries (endpoints, tools, rewind checkpoints) and for
+/// JSON escaping, which can nearly double a run of newlines.
+pub const REPLAY_BUDGET_BYTES: usize = 6 * 1024 * 1024;
+
+/// Serialized size of one entry, as it will appear in the frame.
+fn entry_bytes(entry: &ReplayEntryJson) -> usize {
+    serde_json::to_string(entry).map(|s| s.len()).unwrap_or(0)
+}
+
+/// Cut `text` to at most `max` bytes, on a character boundary.
+fn truncate_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Trim a replayed transcript so the `session_loaded` frame stays inside the
+/// protocol's cap.
+///
+/// Resuming a long-running session used to build one frame out of the entire
+/// post-compaction log and write it uncapped — the agent's own cap applies to
+/// what it reads, not what it writes. The client then refused the frame (it
+/// caps what *it* reads, correctly, or a peer's output would be an allocation
+/// budget), so the resumed session came back with no transcript at all and an
+/// error in its place. Seen at 15 MB; session logs here reach 43 MB.
+///
+/// Two ways a transcript gets too big, and both have to be handled: many
+/// entries, and one enormous one (a large file read is a single tool result).
+/// So oversized entries are truncated individually first, then the oldest are
+/// dropped until the rest fit — the newest is what a resumed session is for.
+///
+/// This is display only. The agent's own context comes from
+/// `load_from_last_compaction`, a separate path, and is not affected by
+/// anything here: what is dropped is the user's view of history, never the
+/// model's.
+pub fn fit_replay_entries(
+    mut entries: Vec<ReplayEntryJson>,
+    budget: usize,
+) -> Vec<ReplayEntryJson> {
+    // No single entry may take more than a quarter of the budget, so one huge
+    // tool result cannot evict the whole conversation around it.
+    let per_entry = (budget / 4).max(1024);
+    let mut truncated = 0usize;
+    for entry in &mut entries {
+        if entry_bytes(entry) > per_entry {
+            let kept = truncate_bytes(&entry.content, per_entry).to_string();
+            let dropped = entry.content.len() - kept.len();
+            entry.content = format!("{kept}\n… {dropped} more bytes not shown");
+            truncated += 1;
+        }
+    }
+
+    let mut total: usize = entries.iter().map(entry_bytes).sum();
+    let mut dropped = 0usize;
+    let mut first = 0usize;
+    while total > budget && first < entries.len() {
+        total -= entry_bytes(&entries[first]);
+        first += 1;
+        dropped += 1;
+    }
+    let mut entries: Vec<ReplayEntryJson> = entries.drain(first..).collect();
+
+    if dropped > 0 || truncated > 0 {
+        // An unrecognized kind renders as a system note in every client, so
+        // saying this needs no protocol change.
+        let mut what = Vec::new();
+        if dropped > 0 {
+            what.push(format!("{dropped} earlier messages are not shown"));
+        }
+        if truncated > 0 {
+            what.push(format!("{truncated} were shortened"));
+        }
+        entries.insert(
+            0,
+            ReplayEntryJson {
+                kind: "system".into(),
+                content: format!(
+                    "This conversation is too large to redisplay in full — {}. \
+                     The agent still has its own context; only this transcript \
+                     is abbreviated. The full log is on disk.",
+                    what.join(" and "),
+                ),
+                tool_name: None,
+                success: None,
+            },
+        );
+    }
+    entries
 }
 
 #[derive(Serialize, Clone)]
@@ -987,5 +1085,92 @@ impl HeadlessInit {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod replay_fit_tests {
+    use super::*;
+
+    fn entry(kind: &str, content: &str) -> ReplayEntryJson {
+        ReplayEntryJson {
+            kind: kind.into(),
+            content: content.into(),
+            tool_name: None,
+            success: None,
+        }
+    }
+
+    fn frame_bytes(entries: &[ReplayEntryJson]) -> usize {
+        serde_json::to_string(entries).unwrap().len()
+    }
+
+    #[test]
+    fn a_transcript_that_fits_is_left_exactly_as_it_was() {
+        let entries = vec![entry("user", "hello"), entry("assistant", "hi")];
+        let out = fit_replay_entries(entries.clone(), REPLAY_BUDGET_BYTES);
+        assert_eq!(out.len(), entries.len(), "no note should be added");
+        assert_eq!(out[0].content, "hello");
+    }
+
+    #[test]
+    fn many_entries_are_trimmed_from_the_oldest() {
+        // The newest is what a resumed session is for.
+        let budget = 20_000;
+        let entries: Vec<_> = (0..200)
+            .map(|i| entry("user", &format!("message {i} ").repeat(20)))
+            .collect();
+        let out = fit_replay_entries(entries, budget);
+        assert!(frame_bytes(&out) <= budget * 2, "still enormous: {}", frame_bytes(&out));
+        assert!(out.len() < 200, "nothing was dropped");
+        assert!(out[0].kind == "system", "the user should be told: {:?}", out[0].kind);
+        let last = out.last().unwrap();
+        assert!(last.content.contains("message 199"), "the newest must survive: {}", last.content);
+    }
+
+    #[test]
+    fn one_enormous_entry_does_not_evict_the_conversation_around_it() {
+        // A large file read is a single tool result. Dropping oldest alone
+        // would throw away everything else to make room for it.
+        let budget = 20_000;
+        let mut entries = vec![entry("user", "before")];
+        entries.push(entry("tool_result", &"x".repeat(500_000)));
+        entries.push(entry("assistant", "after"));
+        let out = fit_replay_entries(entries, budget);
+        assert!(
+            out.iter().any(|e| e.content == "after"),
+            "the newest entries should survive: {:?}",
+            out.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        let big = out.iter().find(|e| e.kind == "tool_result").expect("kept, shortened");
+        assert!(big.content.contains("not shown"), "and say it was shortened");
+        assert!(big.content.len() < 500_000);
+    }
+
+    #[test]
+    fn the_note_says_the_agent_still_remembers() {
+        // The transcript is display only; the model's context comes from a
+        // different path. Someone reading this must not think context was lost.
+        let out = fit_replay_entries(
+            (0..500).map(|i| entry("user", &format!("m{i} ").repeat(50))).collect(),
+            10_000,
+        );
+        assert!(out[0].content.contains("still has its own context"), "{:?}", out[0].content);
+    }
+
+    #[test]
+    fn truncation_does_not_split_a_character() {
+        // A multi-byte character cut down the middle is invalid UTF-8, and the
+        // frame is JSON — it would fail to serialize at all.
+        let budget = 5_000;
+        let out = fit_replay_entries(vec![entry("assistant", &"日本語".repeat(100_000))], budget);
+        let kept = &out.last().unwrap().content;
+        assert!(kept.starts_with('日'), "got {:?}", &kept[..12.min(kept.len())]);
+        assert!(serde_json::to_string(&out).is_ok());
+    }
+
+    #[test]
+    fn an_empty_transcript_stays_empty() {
+        assert!(fit_replay_entries(Vec::new(), REPLAY_BUDGET_BYTES).is_empty());
     }
 }

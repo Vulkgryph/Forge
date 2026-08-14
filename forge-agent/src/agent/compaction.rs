@@ -51,9 +51,11 @@ pub async fn perform_compaction(
     }
 
     let messages_after = new_history.len();
+    // The window is whatever came after the system prompt and the summary.
+    let rolling_window = messages_after.saturating_sub(2);
 
     // Write compaction_commit marker
-    log.log_compaction_commit(messages_after)?;
+    log.log_compaction_commit(messages_after, rolling_window)?;
 
     Ok(new_history)
 }

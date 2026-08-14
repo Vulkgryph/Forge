@@ -232,10 +232,15 @@ impl ConversationLog {
     }
 
     /// Log compaction commit marker (compaction is complete).
-    pub fn log_compaction_commit(&mut self, messages_after: usize) -> Result<()> {
+    pub fn log_compaction_commit(
+        &mut self,
+        messages_after: usize,
+        rolling_window: usize,
+    ) -> Result<()> {
         self.append(&LogRecord::CompactionCommit(CompactionCommitRecord {
             ts: Utc::now(),
             messages_after,
+            rolling_window,
         }))
     }
 
@@ -281,6 +286,33 @@ impl ConversationLog {
                     }
                 }
 
+                // The rolling window compaction kept lives *before* this
+                // marker — those messages were logged as they happened, and
+                // compaction chose to carry them forward rather than write
+                // them again. Reading forward alone therefore restored the
+                // summary and nothing else: a session compacted to 22 messages
+                // came back as 2, losing the recent context compaction had
+                // deliberately preserved.
+                let window = {
+                    let mut f = std::fs::File::open(&self.path)?;
+                    let mut line = String::new();
+                    file.seek(SeekFrom::Start(commit_off))?;
+                    let mut r = BufReader::new(&file);
+                    let mut want = 0usize;
+                    if r.read_line(&mut line)? > 0 {
+                        if let Ok(LogRecord::CompactionCommit(c)) =
+                            serde_json::from_str::<LogRecord>(line.trim())
+                        {
+                            want = c.rolling_window;
+                        }
+                    }
+                    if want == 0 {
+                        Vec::new()
+                    } else {
+                        messages_before(&mut f, commit_off, want)?
+                    }
+                };
+
                 // Read from commit line forward to get the rolling window
                 file.seek(SeekFrom::Start(commit_off))?;
                 let reader = BufReader::new(&file);
@@ -303,7 +335,12 @@ impl ConversationLog {
                     }
                 }
 
-                Ok(LoadedContext { summary, messages })
+                let mut all = window;
+                all.extend(messages);
+                Ok(LoadedContext {
+                    summary,
+                    messages: all,
+                })
             }
             None => {
                 // No compaction found — read entire file (small log)
@@ -688,6 +725,61 @@ fn message_record_to_api_message(mr: &MessageRecord) -> Message {
 
 /// Reverse-seek through a file to find the byte offset of the last line containing `marker`.
 /// Returns the byte offset of the start of that line, or None.
+/// The last `want` message records ending at `before`, in order.
+///
+/// Reads backward in bounded steps rather than scanning the file: this runs on
+/// every resume of a compacted session, and those logs reach tens of megabytes.
+/// Only whole lines are parsed, so a step landing mid-record costs that record
+/// and nothing else — the next step back picks it up.
+fn messages_before(
+    file: &mut std::fs::File,
+    before: u64,
+    want: usize,
+) -> Result<Vec<crate::api::Message>> {
+    const STEP: u64 = 512 * 1024;
+    /// However far back it reads, a fixed window of recent messages is all that
+    /// is wanted; without a stop it would walk a 44 MB log to its start looking
+    /// for messages that are not there.
+    const MAX_BACK: u64 = 8 * 1024 * 1024;
+
+    let mut start = before;
+    let mut found: Vec<crate::api::Message> = Vec::new();
+
+    while start > 0 && before - start < MAX_BACK && found.len() < want {
+        let next = start.saturating_sub(STEP);
+        file.seek(SeekFrom::Start(next))?;
+        let mut buf = vec![0u8; (start - next) as usize];
+        file.read_exact(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+
+        // The first line is almost certainly a fragment — a previous step read
+        // its beginning, or it starts before `next`. Dropped unless this is the
+        // top of the file, where nothing precedes it.
+        let mut lines: Vec<&str> = text.lines().collect();
+        if next > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let mut batch: Vec<crate::api::Message> = Vec::new();
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(LogRecord::Message(mr)) = serde_json::from_str::<LogRecord>(trimmed) {
+                batch.push(message_record_to_api_message(&mr));
+            }
+        }
+        batch.extend(found);
+        found = batch;
+        start = next;
+    }
+
+    if found.len() > want {
+        found.drain(..found.len() - want);
+    }
+    Ok(found)
+}
+
 fn reverse_find_record_offset(
     file: &mut std::fs::File,
     file_len: u64,

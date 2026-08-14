@@ -206,6 +206,15 @@ impl CompactionSummary {
 pub struct CompactionCommitRecord {
     pub ts: DateTime<Utc>,
     pub messages_after: usize,
+    /// How many of the messages *before* this marker compaction kept as its
+    /// rolling window. Recorded so a resume can restore them: they were
+    /// already in the log when compaction ran, so they sit before the marker,
+    /// and reading forward from it alone finds none of them.
+    ///
+    /// Defaulted for markers written before this was recorded — those resume
+    /// with the summary alone, as they always did.
+    #[serde(default)]
+    pub rolling_window: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

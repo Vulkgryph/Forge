@@ -1116,7 +1116,11 @@ impl Agent {
             }
 
             // Check if compaction should be triggered (context 99% full)
-            if should_compact(self.last_prompt_tokens, self.max_context_tokens) {
+            if should_compact(
+                self.last_prompt_tokens,
+                self.max_context_tokens,
+                self.app_config.agent.compact_at_percent,
+            ) {
                 self.compaction_pending = true;
                 // Already at a safe boundary, do it now.
                 self.do_compaction_with(true).await?;
@@ -1929,7 +1933,11 @@ impl Agent {
 
                 // Check if context is getting full during tool execution.
                 // Set pending — it will execute at the top of the next iteration.
-                if should_compact(self.last_prompt_tokens, self.max_context_tokens) {
+                if should_compact(
+                self.last_prompt_tokens,
+                self.max_context_tokens,
+                self.app_config.agent.compact_at_percent,
+            ) {
                     self.compaction_pending = true;
                 }
 

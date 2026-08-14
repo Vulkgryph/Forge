@@ -210,11 +210,23 @@ fn parse_summary_response(response: &str) -> Result<CompactionSummary> {
 /// Check if compaction should be triggered based on context saturation.
 /// Triggers when prompt tokens reach 100% of max context window.
 /// The user is warned at 85% and encouraged to manually /compact before this.
-pub fn should_compact(last_prompt_tokens: u32, max_context_tokens: usize) -> bool {
+/// Whether the conversation should be compacted before the next request.
+///
+/// `at_percent` is a fraction of the context window, not a ceiling. This used
+/// to be `>= max_context_tokens`, i.e. 100%, which is an overflow rather than
+/// a threshold: compaction only ran after a request had already been built
+/// oversized, and the summarizer call that follows — which needs context of
+/// its own — was made at the exact moment there was none left.
+pub fn should_compact(last_prompt_tokens: u32, max_context_tokens: usize, at_percent: u8) -> bool {
     if max_context_tokens == 0 {
         return false;
     }
-    last_prompt_tokens >= max_context_tokens as u32
+    // A nonsensical setting should not disable compaction entirely, so it is
+    // clamped rather than trusted: 0 would compact on every turn, and anything
+    // over 100 restores the overflow behaviour this replaced.
+    let pct = at_percent.clamp(10, 95) as u64;
+    let limit = (max_context_tokens as u64 * pct) / 100;
+    last_prompt_tokens as u64 >= limit
 }
 
 /// Emergency rolling window: drop oldest non-system messages until the estimated
@@ -568,4 +580,36 @@ mod tests {
         assert!(states[0].content.as_deref().unwrap().contains("Second"));
         assert!(!states[0].content.as_deref().unwrap().contains("First"));
     }
+
+    // ── When compaction triggers ──────────────────────────────────────────
+
+    #[test]
+    fn compaction_happens_with_headroom_left() {
+        // The point of a threshold: fire while a summarizer call still fits.
+        assert!(should_compact(80_000, 100_000, 80), "at the threshold");
+        assert!(should_compact(95_000, 100_000, 80), "past it");
+        assert!(!should_compact(79_999, 100_000, 80), "below it");
+    }
+
+    #[test]
+    fn the_old_behaviour_was_an_overflow_not_a_threshold() {
+        // 79% of a 500k window is nearly 400k tokens of conversation that the
+        // previous `>= max` test would have let through untouched.
+        assert!(should_compact(400_000, 500_000, 80));
+        assert!(!should_compact(400_000, 500_000, 100), "what it used to do");
+    }
+
+    #[test]
+    fn a_nonsensical_percentage_cannot_disable_or_thrash_compaction() {
+        // 0 would compact every turn; over 100 restores the overflow.
+        assert!(!should_compact(0, 100_000, 0), "clamped up, not compacting at zero");
+        assert!(should_compact(95_000, 100_000, 250), "clamped down to 95%");
+    }
+
+    #[test]
+    fn an_unknown_context_window_never_triggers_compaction() {
+        // Some endpoints report nothing; guessing would compact constantly.
+        assert!(!should_compact(1_000_000, 0, 80));
+    }
+
 }

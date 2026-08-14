@@ -197,7 +197,17 @@ pub struct AgentConfig {
     #[serde(default)]
     pub permission_mode: PermissionMode,
     pub max_history_messages: usize,
+    /// Dead since the trigger became token-based; kept only so existing config
+    /// files that name it still parse. `compact_at_percent` is the live knob.
     pub compaction_threshold: usize,
+    /// Fraction of the context window at which the conversation is compacted,
+    /// as a percentage. The trigger used to be `>= 100`, which is not a
+    /// threshold but an overflow: compaction only ran once a request had
+    /// already been built too large, so the turn that paid for it was the one
+    /// that had already gone wrong. Compacting with headroom left means the
+    /// summarizer call itself still fits.
+    #[serde(default = "default_compact_at_percent")]
+    pub compact_at_percent: u8,
     #[serde(default)]
     pub subagents: SubagentConfig,
     /// Tool names to exclude from every agent turn. Internal tools are never affected.
@@ -235,6 +245,10 @@ pub struct AgentConfig {
 
 fn default_forced_shell_background_secs() -> u64 {
     300
+}
+
+fn default_compact_at_percent() -> u8 {
+    80
 }
 
 fn default_thinking_mode() -> bool {
@@ -308,6 +322,7 @@ impl Default for AppConfig {
                 permission_mode: PermissionMode::Default,
                 max_history_messages: 200,
                 compaction_threshold: 150,
+                compact_at_percent: default_compact_at_percent(),
                 subagents: SubagentConfig::default(),
                 disabled_tools: vec![],
                 context_strategy: ContextStrategy::Compaction,

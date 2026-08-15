@@ -175,8 +175,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 description: "Manage your task list. Use to track progress on multi-step work. \
                     Mark an item done as soon as it is done, and call clear_done once a batch of \
                     work is finished — a list that is mostly completed items no longer shows what \
-                    is left, which is the only thing it is for. Ids are stable and are never \
-                    reused, so removing completed items does not renumber the rest.".to_string(),
+                    is left, which is the only thing it is for. A task is identified by its own \
+                    text, so pass the task text to update it; there are no numbers to track.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -187,11 +187,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "text": {
                             "type": "string",
-                            "description": "Task description (required for 'add')"
-                        },
-                        "index": {
-                            "type": "integer",
-                            "description": "Task id, as shown by add/list (required for 'update'). Ids are stable; they do not shift when items are removed."
+                            "description": "The task itself — required for both 'add' and 'update'. A task is identified by its text, so for 'update' pass the task's text as it appears in the list. Enough of it to be unambiguous is sufficient."
                         },
                         "status": {
                             "type": "string",

@@ -45,11 +45,10 @@ use crate::api::ApiClient;
 
 #[derive(Debug, Clone)]
 pub struct TodoItem {
-    /// Stable for the life of the list. Position was the identifier before,
-    /// which is why finished work could never be removed: dropping an item
-    /// renumbered every item after it, so an index the model was still holding
-    /// from an earlier turn would silently point at a different task.
-    pub id: usize,
+    /// The task's own text is its identifier. Nothing else is stable: a
+    /// position renumbers when an item is removed, and a separate id is a
+    /// second name for something that already has one — the model has to
+    /// carry it between turns, and it is one more thing to get wrong.
     pub text: String,
     pub status: String, // "pending", "in_progress", "done"
 }
@@ -58,9 +57,21 @@ pub struct ToolExecutor {
     project_root: PathBuf,
     custom_tools: Vec<CustomTool>,
     todos: Mutex<Vec<TodoItem>>,
-    /// Next id to hand out. Never reused, so a stale reference is an error
-    /// rather than a wrong task.
-    next_todo_id: Mutex<usize>,
+}
+
+/// Whether `candidate` is the todo the model meant by `wanted`.
+///
+/// Exact first, then case and surrounding space, then `wanted` as a substring —
+/// a model referring back to a task it wrote several turns ago will paraphrase
+/// the tail of it or drop a clause, and failing on that would make the list
+/// unusable. Substring matches are only accepted when exactly one item matches;
+/// the caller refuses an ambiguous reference rather than picking.
+fn todo_matches(candidate: &str, wanted: &str) -> bool {
+    let (c, w) = (candidate.trim(), wanted.trim());
+    if c.eq_ignore_ascii_case(w) {
+        return true;
+    }
+    !w.is_empty() && c.to_ascii_lowercase().contains(&w.to_ascii_lowercase())
 }
 
 impl ToolExecutor {
@@ -69,7 +80,6 @@ impl ToolExecutor {
             custom_tools: load_custom_tools(&project_root),
             project_root,
             todos: Mutex::new(Vec::new()),
-            next_todo_id: Mutex::new(0),
         }
     }
 
@@ -129,28 +139,15 @@ impl ToolExecutor {
         names
     }
 
-    pub fn ensure_todo_item(&self, text: &str) -> usize {
+    pub fn ensure_todo_item(&self, text: &str) {
         let mut todos = self.todos.lock().unwrap();
-        if let Some(item) = todos
-            .iter()
-            .find(|item| item.text.eq_ignore_ascii_case(text))
-        {
-            return item.id;
+        if todos.iter().any(|item| todo_matches(&item.text, text)) {
+            return;
         }
-        let id = self.take_todo_id();
         todos.push(TodoItem {
-            id,
             text: text.to_string(),
             status: "pending".to_string(),
         });
-        id
-    }
-
-    fn take_todo_id(&self) -> usize {
-        let mut next = self.next_todo_id.lock().unwrap();
-        let id = *next;
-        *next += 1;
-        id
     }
 
     /// Render the list the way the model reads it back.
@@ -166,14 +163,13 @@ impl ToolExecutor {
                 "in_progress" => "[~]",
                 _ => "[ ]",
             };
-            out.push_str(&format!("  {} {} {}\n", marker, item.id, item.text));
+            out.push_str(&format!("  {} {}\n", marker, item.text));
         }
         out
     }
 
     pub fn clear_todos(&self) {
         self.todos.lock().unwrap().clear();
-        *self.next_todo_id.lock().unwrap() = 0;
     }
 
     pub async fn execute(
@@ -1020,20 +1016,22 @@ impl ToolExecutor {
                 let text = args["text"]
                     .as_str()
                     .context("Missing 'text' for add action")?;
-                let id = self.take_todo_id();
                 let mut todos = self.todos.lock().unwrap();
+                // The text is the identifier, so adding the same task twice
+                // would make one of them unreachable.
+                if todos.iter().any(|t| todo_matches(&t.text, text)) {
+                    return Ok(format!("Already on the list: {}", text));
+                }
                 todos.push(TodoItem {
-                    id,
                     text: text.to_string(),
                     status: "pending".to_string(),
                 });
-                Ok(format!("Added todo [{}]: {}", id, text))
+                Ok(format!("Added todo: {}", text))
             }
             "update" => {
-                let index = args["index"]
-                    .as_u64()
-                    .context("Missing 'index' for update action")?
-                    as usize;
+                let text = args["text"]
+                    .as_str()
+                    .context("Missing 'text' for update action")?;
                 let status = args["status"]
                     .as_str()
                     .context("Missing 'status' for update action")?;
@@ -1046,11 +1044,37 @@ impl ToolExecutor {
                 }
 
                 let mut todos = self.todos.lock().unwrap();
-                let Some(item) = todos.iter_mut().find(|t| t.id == index) else {
-                    return Ok(format!("Error: No todo with id {}", index));
-                };
-                item.status = status.to_string();
-                Ok(format!("Updated todo [{}] → {}: {}", index, status, item.text))
+                let matched: Vec<usize> = todos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| todo_matches(&t.text, text))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Naming the wrong task is worse than failing to name one, so
+                // an ambiguous reference is refused rather than guessed at.
+                match matched.as_slice() {
+                    [] => Ok(format!(
+                        "Error: No todo matching \"{}\".\n{}",
+                        text,
+                        Self::render_todos(&todos)
+                    )),
+                    [i] => {
+                        let i = *i;
+                        todos[i].status = status.to_string();
+                        Ok(format!("Updated → {}: {}", status, todos[i].text))
+                    }
+                    several => Ok(format!(
+                        "Error: \"{}\" matches {} todos; say which one.\n{}",
+                        text,
+                        several.len(),
+                        several
+                            .iter()
+                            .map(|i| format!("  - {}", todos[*i].text))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )),
+                }
             }
             "list" => {
                 let todos = self.todos.lock().unwrap();
@@ -1612,52 +1636,76 @@ mod todo_tests {
         // long session's list became a record of what had been done rather than
         // a list of what was left.
         let ex = executor();
-        todo(&ex, json!({"action":"add","text":"first"})).await;
-        todo(&ex, json!({"action":"add","text":"second"})).await;
-        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        todo(&ex, json!({"action":"add","text":"write the tests"})).await;
+        todo(&ex, json!({"action":"update","text":"write the parser","status":"done"})).await;
 
         let out = todo(&ex, json!({"action":"clear_done"})).await;
         assert!(out.starts_with("Removed 1 completed todo."), "got {out:?}");
-        assert!(!out.contains("first"), "the finished item is gone");
-        assert!(out.contains("second"), "the unfinished one is not: {out:?}");
+        assert!(!out.contains("parser"), "the finished item is gone");
+        assert!(out.contains("write the tests"), "the unfinished one is not: {out:?}");
     }
 
     #[tokio::test]
-    async fn removing_an_item_does_not_renumber_the_others() {
-        // The reason removal did not exist. The model holds ids from earlier
-        // turns; if they shifted, marking "task 1" done would complete a
-        // different task than the one it meant.
+    async fn a_task_is_named_not_numbered() {
+        // Nothing to carry between turns: the task's own text is the handle.
         let ex = executor();
-        for t in ["a", "b", "c"] {
-            todo(&ex, json!({"action":"add","text":t})).await;
-        }
-        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
-        todo(&ex, json!({"action":"clear_done"})).await;
-
-        let out = todo(&ex, json!({"action":"update","index":2,"status":"done"})).await;
-        assert!(out.contains("[2] → done: c"), "id 2 must still be 'c', got {out:?}");
+        let added = todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        assert_eq!(added, "Added todo: write the parser");
+        let listed = todo(&ex, json!({"action":"list"})).await;
+        assert!(listed.contains("[ ] write the parser"), "no index in the list: {listed:?}");
     }
 
     #[tokio::test]
-    async fn a_stale_id_is_an_error_rather_than_the_wrong_task() {
+    async fn a_task_can_be_named_by_part_of_itself() {
+        // A model referring back several turns later paraphrases or drops a
+        // clause; requiring the exact string would make the list unusable.
         let ex = executor();
-        todo(&ex, json!({"action":"add","text":"only"})).await;
-        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
-        todo(&ex, json!({"action":"clear_done"})).await;
-        todo(&ex, json!({"action":"add","text":"new work"})).await;
+        todo(&ex, json!({"action":"add","text":"write the recursive descent parser for TOML"})).await;
+        let out = todo(&ex, json!({"action":"update","text":"recursive descent","status":"done"})).await;
+        assert!(out.starts_with("Updated → done:"), "got {out:?}");
+    }
 
-        // Ids are never reused, so the id of the removed item matches nothing.
-        let out = todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
-        assert!(out.starts_with("Error: No todo with id 0"), "got {out:?}");
+    #[tokio::test]
+    async fn an_ambiguous_name_is_refused_rather_than_guessed() {
+        // Marking the wrong task done is worse than failing to mark one.
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        todo(&ex, json!({"action":"add","text":"write the parser tests"})).await;
+        let out = todo(&ex, json!({"action":"update","text":"write the parser","status":"done"})).await;
+        assert!(out.starts_with("Error:") && out.contains("matches 2 todos"), "got {out:?}");
+        let listed = todo(&ex, json!({"action":"list"})).await;
+        assert!(!listed.contains("[x]"), "nothing may have been marked: {listed:?}");
+    }
+
+    #[tokio::test]
+    async fn naming_a_task_that_is_not_there_shows_the_ones_that_are() {
+        // So the model can correct itself in one step instead of guessing.
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        let out = todo(&ex, json!({"action":"update","text":"paint the shed","status":"done"})).await;
+        assert!(out.starts_with("Error: No todo matching"), "got {out:?}");
+        assert!(out.contains("write the parser"), "the real list is shown: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn the_same_task_is_not_added_twice() {
+        // The text is the identifier, so a duplicate would be unreachable.
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        let out = todo(&ex, json!({"action":"add","text":"Write The Parser"})).await;
+        assert!(out.starts_with("Already on the list:"), "got {out:?}");
+        let listed = todo(&ex, json!({"action":"list"})).await;
+        assert!(listed.starts_with("Todos (1 items"), "got {listed:?}");
     }
 
     #[tokio::test]
     async fn the_list_says_how_much_of_it_is_finished() {
         // So the agent can see when the list is worth pruning.
         let ex = executor();
-        todo(&ex, json!({"action":"add","text":"a"})).await;
-        todo(&ex, json!({"action":"add","text":"b"})).await;
-        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        todo(&ex, json!({"action":"add","text":"a task"})).await;
+        todo(&ex, json!({"action":"add","text":"b task"})).await;
+        todo(&ex, json!({"action":"update","text":"a task","status":"done"})).await;
         let out = todo(&ex, json!({"action":"list"})).await;
         assert!(out.starts_with("Todos (2 items, 1 done):"), "got {out:?}");
     }
@@ -1665,9 +1713,9 @@ mod todo_tests {
     #[tokio::test]
     async fn clearing_a_list_with_nothing_finished_removes_nothing() {
         let ex = executor();
-        todo(&ex, json!({"action":"add","text":"a"})).await;
+        todo(&ex, json!({"action":"add","text":"a task"})).await;
         let out = todo(&ex, json!({"action":"clear_done"})).await;
         assert!(out.starts_with("Removed 0 completed todos."), "got {out:?}");
-        assert!(out.contains("a"));
+        assert!(out.contains("a task"));
     }
 }

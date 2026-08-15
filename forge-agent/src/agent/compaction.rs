@@ -450,29 +450,18 @@ pub fn apply_rolling_window(
 /// Unlike the old heuristic working-state anchor, this preserves only the plan
 /// the model wrote and the user approved. Completed checklist/task lines are
 /// pruned so the retained plan stays focused as the transcript rolls forward.
-pub fn ensure_rolling_plan_context(
-    history: &mut Vec<Message>,
-    plan: &str,
-    plan_completed_todo_index: Option<usize>,
-) {
+pub fn ensure_rolling_plan_context(history: &mut Vec<Message>, plan: &str) {
     let plan = prune_completed_plan_lines(plan, history);
     if plan.trim().is_empty() {
         remove_rolling_plan_context(history);
         return;
     }
 
-    let completion_instruction = plan_completed_todo_index
-        .map(|idx| {
-            format!(
-                "When every remaining plan task is complete, call todo_write to update todo index {idx} to done. \
-                 That todo is named \"plan completed\" and marks this rolling-window session complete."
-            )
-        })
-        .unwrap_or_else(|| {
-            "When every remaining plan task is complete, mark the todo named \"plan completed\" as done. \
-             That marks this rolling-window session complete."
-                .to_string()
-        });
+    // Named, not numbered. A todo is identified by its own text now, so there
+    // is one way to refer to it and it is the way a person would.
+    let completion_instruction =
+        "When every remaining plan task is complete, mark the todo named \"plan completed\" as done. \
+         That marks this rolling-window session complete.";
 
     let state = format!(
         "{ROLLING_PLAN_MARKER}\n\
@@ -721,7 +710,7 @@ mod tests {
         ];
         let plan = "- [ ] Inspect state\n- [ ] Implement fix\n- [x] Update docs";
 
-        ensure_rolling_plan_context(&mut history, plan, Some(3));
+        ensure_rolling_plan_context(&mut history, plan);
 
         let state = history
             .iter()
@@ -729,7 +718,8 @@ mod tests {
             .and_then(|msg| msg.content.as_deref())
             .unwrap();
         assert!(state.contains(ROLLING_PLAN_MARKER));
-        assert!(state.contains("todo index 3"));
+        // Named, not numbered: the todo is identified by its own text now.
+        assert!(state.contains("\"plan completed\""), "got {state}");
         assert!(!state.contains("Inspect state"));
         assert!(state.contains("Implement fix"));
         assert!(!state.contains("Update docs"));
@@ -739,8 +729,8 @@ mod tests {
     fn rolling_plan_context_is_replaced_not_duplicated() {
         let mut history = vec![Message::system("system")];
 
-        ensure_rolling_plan_context(&mut history, "- [ ] First", None);
-        ensure_rolling_plan_context(&mut history, "- [ ] Second", None);
+        ensure_rolling_plan_context(&mut history, "- [ ] First");
+        ensure_rolling_plan_context(&mut history, "- [ ] Second");
 
         let states: Vec<_> = history
             .iter()

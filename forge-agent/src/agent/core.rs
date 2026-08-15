@@ -537,7 +537,6 @@ pub struct Agent {
     plan_mode: bool,
     plan_file_path: Option<String>,
     rolling_window_plan_content: Option<String>,
-    rolling_window_plan_completed_todo_index: Option<usize>,
     rolling_window_completion_notice_sent: bool,
     // Subagent support
     depth: usize,
@@ -624,7 +623,6 @@ impl Agent {
             plan_mode: false,
             plan_file_path: None,
             rolling_window_plan_content: None,
-            rolling_window_plan_completed_todo_index: None,
             rolling_window_completion_notice_sent: false,
             depth: 0,
             subagent_counter: 0,
@@ -702,7 +700,7 @@ impl Agent {
             .or_else(|| extract_rolling_plan_context(&history));
         let rolling_window_plan_approved = rolling_window_plan_content.is_some();
         if let Some(plan) = rolling_window_plan_content.as_deref() {
-            ensure_rolling_plan_context(&mut history, plan, None);
+            ensure_rolling_plan_context(&mut history, plan);
         }
 
         let estimated_prompt_tokens = estimate_prompt_tokens_from_history(&history);
@@ -732,7 +730,6 @@ impl Agent {
             plan_mode: false,
             plan_file_path: None,
             rolling_window_plan_content,
-            rolling_window_plan_completed_todo_index: None,
             rolling_window_completion_notice_sent: false,
             depth: 0,
             subagent_counter: 0,
@@ -2047,21 +2044,14 @@ impl Agent {
             return;
         }
         if let Some(plan) = self.rolling_window_plan_content.as_deref() {
-            ensure_rolling_plan_context(
-                &mut self.history,
-                plan,
-                self.rolling_window_plan_completed_todo_index,
-            );
+            ensure_rolling_plan_context(&mut self.history, plan);
         } else {
             remove_rolling_plan_context(&mut self.history);
         }
     }
 
     fn ensure_plan_completed_todo(&mut self) {
-        if self.rolling_window_plan_completed_todo_index.is_none() {
-            self.rolling_window_plan_completed_todo_index =
-                Some(self.executor.ensure_todo_item("plan completed"));
-        }
+        self.executor.ensure_todo_item("plan completed");
     }
 
     fn maybe_notice_plan_completed(&mut self, tool_name: &str, result: &str) {
@@ -2073,7 +2063,6 @@ impl Agent {
             self.rolling_window_completion_notice_sent = true;
             self.rolling_window_plan_approved = false;
             self.rolling_window_plan_content = None;
-            self.rolling_window_plan_completed_todo_index = None;
             remove_rolling_plan_context(&mut self.history);
             self.update_meta();
             let _ = self.event_tx.send(AgentEvent::AssistantMessage(
@@ -2453,7 +2442,6 @@ impl Agent {
         self.token_snapshots.clear();
         self.rolling_window_plan_content = extract_rolling_plan_context(&self.history);
         self.rolling_window_plan_approved = self.rolling_window_plan_content.is_some();
-        self.rolling_window_plan_completed_todo_index = None;
         self.rolling_window_completion_notice_sent = false;
 
         self.last_prompt_tokens = estimate_prompt_tokens_from_history(&self.history);
@@ -2568,7 +2556,6 @@ impl Agent {
         self.plan_mode = false;
         self.plan_file_path = None;
         self.rolling_window_plan_content = None;
-        self.rolling_window_plan_completed_todo_index = None;
         self.rolling_window_completion_notice_sent = false;
         self.rolling_window_plan_approved = false;
         self.message_count = 0;
@@ -3854,7 +3841,6 @@ impl Agent {
         self.plan_mode = true;
         self.rolling_window_plan_approved = false;
         self.rolling_window_plan_content = None;
-        self.rolling_window_plan_completed_todo_index = None;
         self.rolling_window_completion_notice_sent = false;
         remove_rolling_plan_context(&mut self.history);
         self.update_meta();
@@ -4119,7 +4105,6 @@ impl Agent {
                         self.plan_mode = false;
                         self.rolling_window_plan_approved = false;
                         self.rolling_window_plan_content = None;
-                        self.rolling_window_plan_completed_todo_index = None;
                         self.rolling_window_completion_notice_sent = false;
                         remove_rolling_plan_context(&mut self.history);
                         self.update_meta();

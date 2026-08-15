@@ -13,7 +13,7 @@ use crate::markdown::{self, Line, Span};
 use crate::commands::{self, Command};
 use crate::menu::{self, Menu, Page};
 use crate::screen::{Screen, Style};
-use crate::session::{Effect, EntryKind, Pending, PermissionMode, Session};
+use crate::session::{Activity, Effect, EntryKind, Pending, PermissionMode, Session};
 use crate::widgets::{self, Rect};
 use crate::width::str_width;
 
@@ -1574,7 +1574,18 @@ impl App {
             }
         }
 
-        if let Some(label) = self.session.activity.label() {
+        // While a reasoning block is live the transcript is already showing it,
+        // with its own turning mark, directly above this line. Repeating it here
+        // put two spinners on screen giving the same state two different names —
+        // "Thinking…" above, "reasoning" below. The transcript's is the one to
+        // keep: it is where the eye already is, and it says what is being
+        // thought about rather than only that something is.
+        //
+        // Every other state has no line of its own — nothing has been emitted
+        // yet, a tool is running, a reply is streaming — so the spinner stays
+        // here, which is the only place it could be.
+        let doubled = self.session.activity == Activity::Reasoning;
+        if let Some(label) = self.session.activity.label().filter(|_| !doubled) {
             // A turning spinner beside it, so a long turn looks alive rather than
             // stuck. Only while busy — an idle session animates nothing, which is
             // what keeps it at no CPU.
@@ -1774,6 +1785,16 @@ mod tests {
     ///
     /// Syncs the dialog first, as rendering does — a prompt the agent is blocked
     /// on has to be reflected before the block is built.
+    /// The live block rendered wide enough that the status line is not
+    /// clipped — at COLS it is cut after the model name, so a test asserting on
+    /// what the status line says would pass whatever it said.
+    fn wide_live_text(app: &mut App) -> String {
+        app.sync_dialog();
+        let inline = crate::inline::Inline::new(200, ROWS);
+        let block = app.live_lines(&inline, 200);
+        block.lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n")
+    }
+
     fn live_text(app: &mut App) -> String {
         app.sync_dialog();
         let inline = crate::inline::Inline::new(COLS, ROWS);
@@ -2253,6 +2274,36 @@ mod tests {
         let body: String = (0..30).map(|i| format!("  [ ] {i} task {i}\n")).collect();
         let shown = tool_result(&mut app, &format!("Todos (30 items):\n{body}"));
         assert!(shown.contains("task 29"), "the last item must be there: {shown:?}");
+    }
+
+    #[test]
+    fn only_one_thing_on_screen_spins_at_a_time() {
+        // Two spinners appeared during reasoning, giving one state two names:
+        // "Thinking…" in the transcript and "reasoning" in the status line.
+        let mut app = app_with(0).0;
+        app.session_mut()
+            .apply(AgentMessage::ReasoningToken { content: "weighing it".into() });
+        let shown = wide_live_text(&mut app);
+        assert!(shown.contains("Thinking…"), "the transcript still says it: {shown:?}");
+        assert!(!shown.contains("reasoning"), "the status line must not repeat it: {shown:?}");
+    }
+
+    #[test]
+    fn a_state_with_no_line_of_its_own_keeps_the_status_spinner() {
+        // Nothing has been emitted yet, so the status line is the only place
+        // that can show anything is happening.
+        let mut app = app_with(0).0;
+        app.session_mut().apply(AgentMessage::Thinking);
+        let shown = wide_live_text(&mut app);
+        assert!(shown.contains("thinking"), "got {shown:?}");
+    }
+
+    #[test]
+    fn a_running_tool_still_reports_itself_in_the_status_line() {
+        let mut app = app_with(0).0;
+        app.session_mut().apply(tool_request("shell_exec", "t1"));
+        let shown = wide_live_text(&mut app);
+        assert!(shown.contains("running shell_exec"), "got {shown:?}");
     }
 
     /// A long turn should look alive. The spinner must only turn while busy,

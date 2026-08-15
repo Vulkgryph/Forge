@@ -731,8 +731,45 @@ impl App {
                             });
                         }
                     }
-                    for line in lines {
-                        out.extend(diff_lines(line, cols, dim));
+                    // The head line is drawn above; what follows is the body.
+                    let rest: Vec<&str> = lines.collect();
+                    let head = entry.content.lines().next().unwrap_or("");
+                    let joined = rest.join("\n");
+
+                    if is_file_listing(head, joined.trim_start()) {
+                        // Nothing follows: "File: x (1204 lines total)" has
+                        // already said it, and printing the file says it 1204
+                        // times.
+                    } else if rest.iter().any(|l| todo_line(l).is_some()) {
+                        for line in rest {
+                            match todo_line(line) {
+                                Some((text, style)) => out.push(Line {
+                                    spans: vec![
+                                        Span { text: " ".repeat(6), style: dim },
+                                        Span { text: text.trim_end().to_string(), style },
+                                    ],
+                                }),
+                                None => out.extend(diff_lines(line, cols, dim)),
+                            }
+                        }
+                    } else {
+                        let shown = rest.len().min(RESULT_BODY_LINES);
+                        for line in &rest[..shown] {
+                            out.extend(diff_lines(line, cols, dim));
+                        }
+                        if rest.len() > shown {
+                            let hidden = rest.len() - shown;
+                            let plural = if hidden == 1 { "" } else { "s" };
+                            out.push(Line {
+                                spans: vec![
+                                    Span { text: " ".repeat(6), style: dim },
+                                    Span {
+                                        text: format!("… {hidden} more line{plural}"),
+                                        style: dim,
+                                    },
+                                ],
+                            });
+                        }
                     }
                 }
 
@@ -1632,6 +1669,43 @@ fn wrap_at(line: &str, cols: usize, used: usize) -> Vec<String> {
 /// diff reads as blocks at a glance — the same treatment the TypeScript client
 /// gave them. Every row of a wrapped diff line carries the tint, or a long change
 /// would appear to stop being a change halfway through.
+/// Body lines of a tool result shown before the rest is summarised.
+///
+/// A result is a receipt, not the work. The agent read the file; the person
+/// watching needs to know that it did, not to have the file printed at them —
+/// and a `read_file` of a few thousand lines pushed the entire conversation
+/// off the screen. The TypeScript client cut results at 200 characters for the
+/// same reason; this keeps whole lines and says what it left out.
+const RESULT_BODY_LINES: usize = 6;
+
+/// Whether a tool result is a file listing whose head line already says
+/// everything: `read_file` opens with "File: <path> (N lines total)" and then
+/// prints the file. There is nothing to summarise — the head *is* the summary.
+fn is_file_listing(first: &str, rest: &str) -> bool {
+    first.starts_with("File: ") && first.ends_with("lines total)") && rest.starts_with("---")
+}
+
+/// The marker and style for one todo line: `  [x] 0 text`.
+///
+/// Rendered rather than printed so the state of the list reads at a glance —
+/// what is done, what is being worked on now, what is waiting. Flat dim text
+/// made a checklist look like output.
+fn todo_line(line: &str) -> Option<(String, Style)> {
+    let t = line.trim_start();
+    let (marker, style) = if let Some(rest) = t.strip_prefix("[x]") {
+        (format!("✔{rest}"), Style::fg(palette::GREEN))
+    } else if let Some(rest) = t.strip_prefix("[~]") {
+        // The one in flight is the line worth finding, so it is the only one
+        // that is not dimmed.
+        (format!("▸{rest}"), Style::fg(palette::THINKING))
+    } else if let Some(rest) = t.strip_prefix("[ ]") {
+        (format!("○{rest}"), Style::fg(palette::GRAY))
+    } else {
+        return None;
+    };
+    Some((marker, style))
+}
+
 fn diff_lines(line: &str, cols: usize, dim: Style) -> Vec<Line> {
     let trimmed = line.trim_start();
     let style = match trimmed.chars().next() {
@@ -2114,6 +2188,71 @@ mod tests {
         let before = live_text(&mut app);
         app.tick();
         assert_eq!(live_text(&mut app), before, "idle ticks change nothing");
+    }
+
+    // ── Tool results are receipts, not the work ───────────────────────────
+
+    fn tool_result(app: &mut App, content: &str) -> String {
+        app.session_mut().apply(AgentMessage::ToolResult {
+            tool_name: "t".into(),
+            result: content.into(),
+            success: true,
+            subagent_id: None,
+        });
+        live_text(app)
+    }
+
+    #[test]
+    fn a_read_file_result_shows_the_summary_not_the_file() {
+        // read_file's own first line already says how big the file is; printing
+        // the file after it pushed the conversation off the screen.
+        let mut app = app_with(0).0;
+        let body: String = (1..=400).map(|i| format!("{i:>5} | line {i}\n")).collect();
+        let shown = tool_result(&mut app, &format!("File: src/app.rs (400 lines total)\n---\n{body}"));
+        assert!(shown.contains("File: src/app.rs (400 lines total)"), "the head stays");
+        assert!(!shown.contains("line 200"), "the file itself should not be printed");
+        assert!(!shown.contains("line 7"), "nor any of it: {shown:?}");
+    }
+
+    #[test]
+    fn a_long_result_says_how_much_it_is_not_showing() {
+        // Silence about the rest would read as "that was all of it".
+        let mut app = app_with(0).0;
+        let body: String = (1..=50).map(|i| format!("out {i}\n")).collect();
+        let shown = tool_result(&mut app, &format!("done\n{body}"));
+        assert!(shown.contains("out 1"), "the first lines are shown");
+        assert!(shown.contains("more lines"), "and the rest is counted: {shown:?}");
+        assert!(!shown.contains("out 50"), "but not printed");
+    }
+
+    #[test]
+    fn a_short_result_is_shown_whole() {
+        let mut app = app_with(0).0;
+        let shown = tool_result(&mut app, "done\nfirst\nsecond");
+        assert!(shown.contains("first") && shown.contains("second"));
+        assert!(!shown.contains("more lines"), "nothing was hidden: {shown:?}");
+    }
+
+    #[test]
+    fn a_todo_list_is_drawn_as_a_checklist() {
+        let mut app = app_with(0).0;
+        let shown = tool_result(
+            &mut app,
+            "Todos (3 items):\n  [x] 0 done thing\n  [~] 1 current thing\n  [ ] 2 later thing",
+        );
+        assert!(shown.contains('✔'), "finished items get a tick: {shown:?}");
+        assert!(shown.contains('▸'), "the one in flight is marked");
+        assert!(shown.contains('○'), "and the waiting ones");
+        assert!(shown.contains("later thing"), "the whole list stays — it is short by nature");
+    }
+
+    #[test]
+    fn a_long_todo_list_is_not_cut_off_like_ordinary_output() {
+        // A checklist is a state, not a stream: half of it is not useful.
+        let mut app = app_with(0).0;
+        let body: String = (0..30).map(|i| format!("  [ ] {i} task {i}\n")).collect();
+        let shown = tool_result(&mut app, &format!("Todos (30 items):\n{body}"));
+        assert!(shown.contains("task 29"), "the last item must be there: {shown:?}");
     }
 
     /// A long turn should look alive. The spinner must only turn while busy,

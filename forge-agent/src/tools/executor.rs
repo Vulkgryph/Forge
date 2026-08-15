@@ -45,6 +45,11 @@ use crate::api::ApiClient;
 
 #[derive(Debug, Clone)]
 pub struct TodoItem {
+    /// Stable for the life of the list. Position was the identifier before,
+    /// which is why finished work could never be removed: dropping an item
+    /// renumbered every item after it, so an index the model was still holding
+    /// from an earlier turn would silently point at a different task.
+    pub id: usize,
     pub text: String,
     pub status: String, // "pending", "in_progress", "done"
 }
@@ -53,6 +58,9 @@ pub struct ToolExecutor {
     project_root: PathBuf,
     custom_tools: Vec<CustomTool>,
     todos: Mutex<Vec<TodoItem>>,
+    /// Next id to hand out. Never reused, so a stale reference is an error
+    /// rather than a wrong task.
+    next_todo_id: Mutex<usize>,
 }
 
 impl ToolExecutor {
@@ -61,6 +69,7 @@ impl ToolExecutor {
             custom_tools: load_custom_tools(&project_root),
             project_root,
             todos: Mutex::new(Vec::new()),
+            next_todo_id: Mutex::new(0),
         }
     }
 
@@ -122,23 +131,49 @@ impl ToolExecutor {
 
     pub fn ensure_todo_item(&self, text: &str) -> usize {
         let mut todos = self.todos.lock().unwrap();
-        if let Some((idx, _)) = todos
+        if let Some(item) = todos
             .iter()
-            .enumerate()
-            .find(|(_, item)| item.text.eq_ignore_ascii_case(text))
+            .find(|item| item.text.eq_ignore_ascii_case(text))
         {
-            return idx;
+            return item.id;
         }
-        let index = todos.len();
+        let id = self.take_todo_id();
         todos.push(TodoItem {
+            id,
             text: text.to_string(),
             status: "pending".to_string(),
         });
-        index
+        id
+    }
+
+    fn take_todo_id(&self) -> usize {
+        let mut next = self.next_todo_id.lock().unwrap();
+        let id = *next;
+        *next += 1;
+        id
+    }
+
+    /// Render the list the way the model reads it back.
+    fn render_todos(todos: &[TodoItem]) -> String {
+        if todos.is_empty() {
+            return "No todos yet.".to_string();
+        }
+        let done = todos.iter().filter(|t| t.status == "done").count();
+        let mut out = format!("Todos ({} items, {} done):\n", todos.len(), done);
+        for item in todos {
+            let marker = match item.status.as_str() {
+                "done" => "[x]",
+                "in_progress" => "[~]",
+                _ => "[ ]",
+            };
+            out.push_str(&format!("  {} {} {}\n", marker, item.id, item.text));
+        }
+        out
     }
 
     pub fn clear_todos(&self) {
         self.todos.lock().unwrap().clear();
+        *self.next_todo_id.lock().unwrap() = 0;
     }
 
     pub async fn execute(
@@ -985,13 +1020,14 @@ impl ToolExecutor {
                 let text = args["text"]
                     .as_str()
                     .context("Missing 'text' for add action")?;
+                let id = self.take_todo_id();
                 let mut todos = self.todos.lock().unwrap();
-                let index = todos.len();
                 todos.push(TodoItem {
+                    id,
                     text: text.to_string(),
                     status: "pending".to_string(),
                 });
-                Ok(format!("Added todo [{}]: {}", index, text))
+                Ok(format!("Added todo [{}]: {}", id, text))
             }
             "update" => {
                 let index = args["index"]
@@ -1010,33 +1046,34 @@ impl ToolExecutor {
                 }
 
                 let mut todos = self.todos.lock().unwrap();
-                if index >= todos.len() {
-                    return Ok(format!("Error: No todo at index {}", index));
-                }
-                todos[index].status = status.to_string();
-                Ok(format!(
-                    "Updated todo [{}] → {}: {}",
-                    index, status, todos[index].text
-                ))
+                let Some(item) = todos.iter_mut().find(|t| t.id == index) else {
+                    return Ok(format!("Error: No todo with id {}", index));
+                };
+                item.status = status.to_string();
+                Ok(format!("Updated todo [{}] → {}: {}", index, status, item.text))
             }
             "list" => {
                 let todos = self.todos.lock().unwrap();
-                if todos.is_empty() {
-                    return Ok("No todos yet.".to_string());
-                }
-                let mut output = format!("Todos ({} items):\n", todos.len());
-                for (i, item) in todos.iter().enumerate() {
-                    let marker = match item.status.as_str() {
-                        "done" => "[x]",
-                        "in_progress" => "[~]",
-                        _ => "[ ]",
-                    };
-                    output.push_str(&format!("  {} {} {}\n", marker, i, item.text));
-                }
-                Ok(output)
+                Ok(Self::render_todos(&todos))
+            }
+            // Finished work had no way out of the list: it grew for the whole
+            // session and was only ever emptied by clearing the session. A list
+            // that is mostly things already done stops being a list of what is
+            // left, which is the only thing it is for.
+            "clear_done" => {
+                let mut todos = self.todos.lock().unwrap();
+                let before = todos.len();
+                todos.retain(|t| t.status != "done");
+                let removed = before - todos.len();
+                Ok(format!(
+                    "Removed {} completed todo{}.\n{}",
+                    removed,
+                    if removed == 1 { "" } else { "s" },
+                    Self::render_todos(&todos)
+                ))
             }
             _ => Ok(format!(
-                "Error: Unknown action '{}'. Use add, update, or list.",
+                "Error: Unknown action '{}'. Use add, update, list, or clear_done.",
                 action
             )),
         }
@@ -1553,5 +1590,84 @@ mod tests {
         assert!(result.contains("hang-fix-ok"), "got: {result}");
         assert!(result.contains("Exit code: 0"), "got: {result}");
         assert!(!result.contains("TIMEOUT"), "got: {result}");
+    }
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn executor() -> ToolExecutor {
+        ToolExecutor::new(std::env::temp_dir())
+    }
+
+    async fn todo(ex: &ToolExecutor, args: serde_json::Value) -> String {
+        ex.execute("todo_write", &args, None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn completed_work_can_leave_the_list() {
+        // It could not before: the only way out was clearing the session, so a
+        // long session's list became a record of what had been done rather than
+        // a list of what was left.
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"first"})).await;
+        todo(&ex, json!({"action":"add","text":"second"})).await;
+        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+
+        let out = todo(&ex, json!({"action":"clear_done"})).await;
+        assert!(out.starts_with("Removed 1 completed todo."), "got {out:?}");
+        assert!(!out.contains("first"), "the finished item is gone");
+        assert!(out.contains("second"), "the unfinished one is not: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_an_item_does_not_renumber_the_others() {
+        // The reason removal did not exist. The model holds ids from earlier
+        // turns; if they shifted, marking "task 1" done would complete a
+        // different task than the one it meant.
+        let ex = executor();
+        for t in ["a", "b", "c"] {
+            todo(&ex, json!({"action":"add","text":t})).await;
+        }
+        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        todo(&ex, json!({"action":"clear_done"})).await;
+
+        let out = todo(&ex, json!({"action":"update","index":2,"status":"done"})).await;
+        assert!(out.contains("[2] → done: c"), "id 2 must still be 'c', got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_id_is_an_error_rather_than_the_wrong_task() {
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"only"})).await;
+        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        todo(&ex, json!({"action":"clear_done"})).await;
+        todo(&ex, json!({"action":"add","text":"new work"})).await;
+
+        // Ids are never reused, so the id of the removed item matches nothing.
+        let out = todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        assert!(out.starts_with("Error: No todo with id 0"), "got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn the_list_says_how_much_of_it_is_finished() {
+        // So the agent can see when the list is worth pruning.
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"a"})).await;
+        todo(&ex, json!({"action":"add","text":"b"})).await;
+        todo(&ex, json!({"action":"update","index":0,"status":"done"})).await;
+        let out = todo(&ex, json!({"action":"list"})).await;
+        assert!(out.starts_with("Todos (2 items, 1 done):"), "got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn clearing_a_list_with_nothing_finished_removes_nothing() {
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"a"})).await;
+        let out = todo(&ex, json!({"action":"clear_done"})).await;
+        assert!(out.starts_with("Removed 0 completed todos."), "got {out:?}");
+        assert!(out.contains("a"));
     }
 }

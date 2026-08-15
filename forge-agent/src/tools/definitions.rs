@@ -172,14 +172,18 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "todo_write".to_string(),
-                description: "Manage your task list. Use to track progress on multi-step work.".to_string(),
+                description: "Manage your task list. Use to track progress on multi-step work. \
+                    Mark an item done as soon as it is done, and call clear_done once a batch of \
+                    work is finished — a list that is mostly completed items no longer shows what \
+                    is left, which is the only thing it is for. Ids are stable and are never \
+                    reused, so removing completed items does not renumber the rest.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["add", "update", "list"],
-                            "description": "Action to perform: add a task, update a task's status, or list all tasks"
+                            "enum": ["add", "update", "list", "clear_done"],
+                            "description": "Action to perform: add a task, update a task's status, list all tasks, or clear_done to remove the completed ones"
                         },
                         "text": {
                             "type": "string",
@@ -187,7 +191,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "index": {
                             "type": "integer",
-                            "description": "Task index (required for 'update')"
+                            "description": "Task id, as shown by add/list (required for 'update'). Ids are stable; they do not shift when items are removed."
                         },
                         "status": {
                             "type": "string",

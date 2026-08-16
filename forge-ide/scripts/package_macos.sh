@@ -30,6 +30,26 @@ cargo build --release -p forge-agent
 echo "==> Building forge-server (local pty-host daemon; also the SSH remote agent)"
 cargo build --release -p forge-server
 
+# The remote half of SSH workspaces. forge-ide uploads this to the machine you
+# connect to, so it has to be a Linux binary and it has to travel inside the
+# app — a launched .app has / for a working directory, so nothing relative to
+# the checkout is reachable, and remote development simply could not work from
+# an installed build without it.
+#
+# Not fatal when the cross-compiler is absent: the rest of the app is
+# unaffected, CI has no musl toolchain, and a bundle built without it says so
+# when a remote workspace is attempted rather than failing to build here.
+REMOTE_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+for target in $REMOTE_TARGETS; do
+  arch="${target%%-*}"
+  if cargo build --release -p forge-server --target "$target" 2>/dev/null; then
+    echo "==> Built remote forge-server for $arch"
+  else
+    echo "!!! No Linux/$arch forge-server — remote development will be unavailable"
+    echo "    in this bundle. Needs the musl cross-linker: brew install FiloSottile/musl-cross/musl-cross"
+  fi
+done
+
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -37,6 +57,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD_DIR/forge-ide" "$APP/Contents/MacOS/forge-ide"
 cp "$BUILD_DIR/forge-agent" "$APP/Contents/MacOS/forge-agent"
 cp "$BUILD_DIR/forge-server" "$APP/Contents/MacOS/forge-server"
+# Resources, not MacOS: these are Linux ELF binaries for another machine, not
+# executables of this app. `local_server_binary` looks for them by this name.
+for target in $REMOTE_TARGETS; do
+  arch="${target%%-*}"
+  remote="../target/$target/release/forge-server"
+  if [ -f "$remote" ]; then
+    cp "$remote" "$APP/Contents/Resources/forge-server-$arch"
+  fi
+done
 # No third-party runtime is bundled. The default renderer uses wgpu, which
 # targets Apple's own Metal framework — already present on every Mac. The
 # optional `vulkan-renderer` build needs MoltenVK installed on the host

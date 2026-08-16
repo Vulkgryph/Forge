@@ -520,6 +520,15 @@ fn local_server_binary(arch: &str) -> Result<Vec<u8>, String> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let candidates = [
+        // Inside the .app, which is the only path that exists for someone who
+        // installed the .dmg. Both other forms are development layouts: a
+        // launched .app has `/` for a working directory, so the relative ones
+        // resolve to `/target/...`, and `Contents/<triple>/` is not something
+        // the bundle has ever contained. Remote development was therefore
+        // impossible from a packaged build — it reported the cargo command to
+        // build the binary, to someone who had installed an application.
+        exe_dir.parent().map(|p| p.join("Resources").join(format!("forge-server-{arch}")))
+            .unwrap_or_default(),
         // Workspace target/ relative to current dir (most common dev path)
         Path::new("target").join(target).join("release").join("forge-server"),
         Path::new("target").join(target).join("debug").join("forge-server"),
@@ -539,6 +548,18 @@ fn local_server_binary(arch: &str) -> Result<Vec<u8>, String> {
         }
     }
 
+    // Two different audiences, so two different messages: someone running a
+    // packaged build cannot act on a cargo command, and telling them to is how
+    // this failure read for its whole life.
+    let packaged = exe_dir.ends_with("MacOS");
+    if packaged {
+        return Err(format!(
+            "This build of Forge IDE has no Linux/{arch} forge-server bundled, so it \
+             cannot set up a remote workspace. That binary is built by \
+             scripts/package_macos.sh and lives in the app's Resources; a bundle \
+             without it was built on a machine without the musl cross-compiler."
+        ));
+    }
     Err(format!(
         "forge-server Linux/{arch} binary not found.\n\
          Build with: cargo build -p forge-server --target {target} --release\n\

@@ -68,7 +68,7 @@ pub enum Input {
 
 /// Palette, matched to the TypeScript client's ink colours.
 ///
-/// ink names map onto the terminal's first sixteen: blue is 12, magenta 13,
+/// ink names map onto the terminal's first sixteen: blue is 12, cyan 14,
 /// yellow 11, red 9, green 10, gray 8. Using the same indices means the TUI
 /// picks up the user's terminal theme — which is the right default, since it is
 /// the user's own choice of palette.
@@ -91,9 +91,18 @@ mod palette {
     /// Warm, so it reads as distinct from the blue chrome without competing with
     /// the assistant's own text, and bright enough to be read rather than merely
     /// noticed. Was magenta, which it shared with subagents and plan content.
+    ///
+    /// Magenta itself is gone from this palette; nothing here is pink.
     pub const THINKING: u8 = 179;
-    /// Subagents and plan content: magenta.
-    pub const MAGENTA:  u8 = 13;
+    /// Tool calls. Cyan, which is what the TypeScript client used for them —
+    /// and the colour magenta occupied here has been removed from the palette
+    /// entirely at the user's request.
+    pub const TOOL:     u8 = 14;
+    /// Subagents and plan content. A calmer relative of the tool-call cyan,
+    /// since a subagent is a nested agent making tool calls of its own; near
+    /// enough to read as the same family, far enough not to be mistaken for a
+    /// top-level call.
+    pub const SUBAGENT: u8 = 73;
     /// Plan status and the pause indicator: yellow.
     pub const YELLOW:   u8 = 11;
     pub const RED:      u8 = 9;
@@ -692,7 +701,7 @@ impl App {
                     // a category of its own.)
                     let mut spans = vec![
                         Span { text: "    ".into(), style: dim },
-                        Span { text: "⏺ ".into(), style: Style::fg(palette::MAGENTA) },
+                        Span { text: "⏺ ".into(), style: Style::fg(palette::TOOL) },
                     ];
                     spans.push(Span { text: entry.content.clone(), style: Style::default() });
                     out.push(Line { spans });
@@ -822,7 +831,7 @@ impl App {
                             Span { text: "  ⎿ ".into(), style: dim },
                             Span {
                                 text: entry.content.clone(),
-                                style: Style::fg(palette::MAGENTA),
+                                style: Style::fg(palette::SUBAGENT),
                             },
                         ],
                     });
@@ -1276,14 +1285,14 @@ impl App {
         let mut out = vec![Line {
             spans: vec![Span {
                 text: widgets::clip(&heading, cols),
-                style: Style::fg(palette::MAGENTA),
+                style: Style::fg(palette::SUBAGENT),
             }],
         }];
         for sub in subs {
             let detail = if sub.detail.is_empty() { "starting" } else { &sub.detail };
             out.push(Line {
                 spans: vec![
-                    Span { text: "  ◆ ".into(), style: Style::fg(palette::MAGENTA) },
+                    Span { text: "  ◆ ".into(), style: Style::fg(palette::SUBAGENT) },
                     Span { text: sub.agent_type.clone(), style: Style::default() },
                     Span {
                         text: format!(" · {}", widgets::clip(detail, cols.saturating_sub(20))),
@@ -2304,6 +2313,31 @@ mod tests {
         app.session_mut().apply(tool_request("shell_exec", "t1"));
         let shown = wide_live_text(&mut app);
         assert!(shown.contains("running shell_exec"), "got {shown:?}");
+    }
+
+    /// Nothing in Forge is pink. 13 is the terminal's magenta and 5 its dim
+    /// twin; a future palette entry reaching for either would put it back
+    /// without anyone noticing, since colour is the one thing a render test
+    /// does not otherwise check.
+    #[test]
+    fn the_palette_holds_no_magenta() {
+        use palette::*;
+        for (name, code) in [
+            ("USER", USER), ("THINKING", THINKING), ("TOOL", TOOL), ("SUBAGENT", SUBAGENT),
+            ("YELLOW", YELLOW), ("RED", RED), ("GREEN", GREEN), ("GRAY", GRAY),
+            ("DIFF_ADD_BG", DIFF_ADD_BG), ("DIFF_DEL_BG", DIFF_DEL_BG), ("PROMPT", PROMPT),
+        ] {
+            assert!(code != 5 && code != 13, "{name} is magenta ({code})");
+            // The 256-colour cube's magenta/pink corner: r high, g low, b high.
+            if code >= 16 && code < 232 {
+                let c = code - 16;
+                let (r, g, b) = (c / 36, (c % 36) / 6, c % 6);
+                assert!(
+                    !(r >= 3 && b >= 3 && g + 1 < r.min(b)),
+                    "{name} ({code}) sits in the pink corner: r={r} g={g} b={b}",
+                );
+            }
+        }
     }
 
     /// A long turn should look alive. The spinner must only turn while busy,

@@ -39,7 +39,9 @@ impl Token {
     pub fn style(self) -> Style {
         match self {
             Token::Plain => Style::default(),
-            Token::Keyword => Style::fg(13), // magenta
+            // Blue, not magenta: nothing in Forge is pink. Distinct from the
+            // green strings, yellow numbers and cyan meta around it.
+            Token::Keyword => Style::fg(12), // blue
             Token::Str => Style::fg(10),     // green
             Token::Number => Style::fg(11),  // yellow
             Token::Comment => Style::fg(244),

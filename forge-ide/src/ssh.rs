@@ -122,9 +122,13 @@ impl Drop for SshConnection {
 impl SshConnection {
     /// Connect, upload forge-server if needed, start it, return a ready client.
     /// `log` receives progress messages to display in the Output panel.
+    /// `trust_new_host_key` is the user's answer to having been shown an
+    /// unknown host's fingerprint. It is passed per attempt rather than stored,
+    /// so accepting one host never quietly accepts the next.
     pub fn connect(
         host:     &SshHost,
         password: Option<&str>,
+        trust_new_host_key: bool,
         log:      &dyn Fn(&str, crate::OutputLevel),
     ) -> Result<Self, String> {
         use crate::OutputLevel::*;
@@ -134,8 +138,15 @@ impl SshConnection {
 
         // 1. Authenticate SSH session
         log(&format!("Authenticating {}@{}:{}", h.user, h.host, h.port), Info);
-        let session = rt.block_on(ssh_authenticate(&h, pw.as_deref()))
-            .map_err(|e| { log(&format!("Authentication failed: {e}"), Error); e })?;
+        let session = rt.block_on(ssh_authenticate(&h, pw.as_deref(), trust_new_host_key))
+            .map_err(|e| {
+                // A host-key refusal is not an authentication failure, and
+                // calling it one sends the user off checking their key.
+                if !e.starts_with(UNKNOWN_HOST_PREFIX) && !e.starts_with(CHANGED_HOST_PREFIX) {
+                    log(&format!("Authentication failed: {e}"), Error);
+                }
+                e
+            })?;
         log("Authentication successful", Success);
 
         // 2. Check if forge-server is present; upload via SFTP if not
@@ -355,23 +366,126 @@ impl SshConnection {
 
 // ── SSH auth + exec channel (tokio) ──────────────────────────────────────────
 
-struct ClientHandler;
+/// Prefixes marking the two host-key outcomes in an error string, so the UI
+/// can tell "ask the user" from "refuse and explain" without parsing prose.
+pub const UNKNOWN_HOST_PREFIX: &str = "forge:unknown-host:";
+pub const CHANGED_HOST_PREFIX: &str = "forge:changed-host:";
+
+/// What checking a server's key against `~/.ssh/known_hosts` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKey {
+    /// Listed, and it matches.
+    Known,
+    /// Not listed. The user is shown the fingerprint and asked, once, the way
+    /// `ssh` asks.
+    Unknown { fingerprint: String },
+    /// Listed, and it does *not* match. Either the host was rebuilt or someone
+    /// is between you and it, and nothing here can tell which — so this is
+    /// never accepted, and never offered as a button.
+    Changed { fingerprint: String, line: usize },
+}
+
+/// Verifies the server's host key, and records what it found.
+///
+/// This used to return `Ok(true)` unconditionally, with a `TODO: known_hosts`
+/// beside it. Every server was trusted on sight: anyone able to answer for the
+/// address — a hijacked node on the tailnet, a spoofed DNS reply, a hostile
+/// network — could present their own key, and Forge would authenticate to them
+/// and then hand over the file tree, the terminal and everything typed into it.
+/// `ssh` itself refuses to connect in that situation.
+struct ClientHandler {
+    host:      String,
+    port:      u16,
+    /// Set once the user has been shown a fingerprint and accepted it. Only
+    /// ever applies to a host that is *absent* from known_hosts, never to one
+    /// whose key has changed.
+    trust_new: bool,
+    /// What the check found, for the caller to report or ask about.
+    found:     Arc<Mutex<Option<HostKey>>>,
+}
+
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
     fn check_server_key(
-        &mut self, _: &ssh_key::PublicKey,
+        &mut self, key: &ssh_key::PublicKey,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(true) } // TODO: known_hosts
+        let host = self.host.clone();
+        let port = self.port;
+        let trust_new = self.trust_new;
+        let found = Arc::clone(&self.found);
+        let key = key.clone();
+        async move {
+            let fingerprint = key.fingerprint(Default::default()).to_string();
+            let verdict = match russh::keys::check_known_hosts(&host, port, &key) {
+                Ok(true) => HostKey::Known,
+                Ok(false) if trust_new => {
+                    // Remembered only now, after the user said so — writing it
+                    // at first sight is what "trust on first use" degenerates
+                    // into when nobody is asked.
+                    //
+                    // Written without its comment. russh's own writer includes
+                    // one and its own reader then reports that same key as
+                    // *changed*, which would greet the user with a security
+                    // warning about a host they had just trusted. A key off the
+                    // wire carries no comment, so this only matters if that
+                    // ever stops being true — but the failure it prevents is
+                    // one nobody would think to look for.
+                    let mut to_learn = key.clone();
+                    to_learn.set_comment("");
+                    let _ = russh::keys::known_hosts::learn_known_hosts(&host, port, &to_learn);
+                    HostKey::Known
+                }
+                Ok(false) => HostKey::Unknown { fingerprint },
+                Err(russh::keys::Error::KeyChanged { line }) => {
+                    HostKey::Changed { fingerprint, line }
+                }
+                // Anything else — an unreadable known_hosts, a malformed line —
+                // is not a reason to trust the key. Failing open here would
+                // undo the whole check for anyone with a broken file.
+                Err(_) => HostKey::Unknown { fingerprint },
+            };
+            let accept = verdict == HostKey::Known;
+            *found.lock().unwrap() = Some(verdict);
+            Ok(accept)
+        }
     }
 }
 
 async fn ssh_authenticate(
-    host: &SshHost, password: Option<&str>,
+    host: &SshHost, password: Option<&str>, trust_new: bool,
 ) -> Result<Handle<ClientHandler>, String> {
     let config = Arc::new(client::Config::default());
     let addr   = format!("{}:{}", host.host, host.port);
-    let mut session = client::connect(config, addr, ClientHandler).await
-        .map_err(|e| e.to_string())?;
+    let found  = Arc::new(Mutex::new(None));
+    let handler = ClientHandler {
+        host: host.host.clone(),
+        port: host.port,
+        trust_new,
+        found: Arc::clone(&found),
+    };
+    let session = match client::connect(config, addr, handler).await {
+        Ok(s) => s,
+        Err(e) => {
+            // A rejected host key surfaces as an ordinary connection failure,
+            // so the verdict is what actually explains it.
+            return Err(match found.lock().unwrap().clone() {
+                Some(HostKey::Unknown { fingerprint }) => {
+                    format!("{UNKNOWN_HOST_PREFIX}{fingerprint}")
+                }
+                Some(HostKey::Changed { fingerprint, line }) => format!(
+                    "{CHANGED_HOST_PREFIX}The host key for {} has changed.\n\n\
+                     It now presents {fingerprint}, which does not match line {line} of \
+                     ~/.ssh/known_hosts. Either that machine was rebuilt, or something is \
+                     answering for it that is not it.\n\n\
+                     Forge will not connect. If you know the host was rebuilt, remove line \
+                     {line} from ~/.ssh/known_hosts and connect again.",
+                    host.host,
+                ),
+                _ => e.to_string(),
+            });
+        }
+    };
+    let mut session = session;
 
     let authed = if !host.key_path.is_empty() {
         let expanded = expand_tilde(&host.key_path);
@@ -876,8 +990,10 @@ mod upload_tests {
                 h
             });
 
+        // The host is in known_hosts for this to run at all; the test does not
+        // get to bypass verification.
         let conn = super::SshConnection::connect(
-            &cfg, None, &|m, _| eprintln!("  ssh: {m}"),
+            &cfg, None, false, &|m, _| eprintln!("  ssh: {m}"),
         ).expect("connect");
 
         let remote_dir = format!("/home/{user}/.forge-dnd-test");
@@ -902,6 +1018,104 @@ mod upload_tests {
         assert!(listing.iter().any(|e| e.name == "my notes.txt"));
 
         eprintln!("  verified {} bytes for shot.png", png.size);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod host_key_tests {
+    /// A host key must be checked against `~/.ssh/known_hosts`, not accepted on
+    /// sight. This runs the same three-way decision the handler makes, against
+    /// a temporary known_hosts file, so the behaviour is pinned without needing
+    /// a server to connect to.
+    ///
+    /// The keys are generated rather than fixed: what matters is that a
+    /// matching key is accepted, a different one for the same host is reported
+    /// as changed, and an unlisted host is neither.
+    /// russh writes a learned key with its comment attached and then reads that
+    /// same key back as *changed*. A host the user had just chosen to trust
+    /// would greet them with a host-key warning on the next connection, which
+    /// is the one warning that must never cry wolf. Keys off the wire carry no
+    /// comment, so the handler strips it before learning; this pins the reason.
+    #[test]
+    fn a_learned_key_is_stored_without_its_comment() {
+        use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+        use super::ssh_key;
+        let raw = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH5e7H/fBAeIxruobJyFnyjKPabP8ngjkQcfH01DgDsX";
+        let dir = std::env::temp_dir().join(format!("forge-kh-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let commented = <ssh_key::PublicKey as std::str::FromStr>::from_str(
+            &format!("{raw} someone@somewhere"),
+        )
+        .unwrap();
+
+        // As russh would do it, for the record: its own round trip fails.
+        let naive = dir.join("naive");
+        learn_known_hosts_path("host.example", 22, &commented, &naive).unwrap();
+        assert!(
+            matches!(
+                check_known_hosts_path("host.example", 22, &commented, &naive),
+                Err(russh::keys::Error::KeyChanged { .. })
+            ),
+            "russh has fixed this; the strip below can go",
+        );
+
+        // As the handler does it. Both sides are the comment-free form: what
+        // is learned is stripped, and what is later checked is the key off the
+        // wire, which never had one.
+        let ours = dir.join("ours");
+        let mut stripped = commented.clone();
+        stripped.set_comment("");
+        learn_known_hosts_path("host.example", 22, &stripped, &ours).unwrap();
+        assert_eq!(
+            check_known_hosts_path("host.example", 22, &stripped, &ours).unwrap(),
+            true,
+            "a key the user just trusted must still match",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_is_matched_changed_or_unknown() {
+        use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+
+        let dir = std::env::temp_dir().join(format!("forge-kh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kh = dir.join("known_hosts");
+
+        use super::ssh_key;
+        // Fixed throwaway keys rather than generated ones: what is being tested
+        // is the decision, and a literal keeps the test free of an RNG.
+        let parse = |line: &str| {
+            <ssh_key::PublicKey as std::str::FromStr>::from_str(line).unwrap()
+        };
+        let real = parse(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH5e7H/fBAeIxruobJyFnyjKPabP8ngjkQcfH01DgDsX",
+        );
+        let impostor = parse(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEmtgCItjIw2iTAE3+X6twVlRgNw7uUCWDp9BT+TRG/W",
+        );
+
+        // Unknown until it is learned — the case that must ask, not assume.
+        assert_eq!(check_known_hosts_path("host.example", 22, &real, &kh).unwrap(), false);
+
+        learn_known_hosts_path("host.example", 22, &real, &kh).unwrap();
+        eprintln!("known_hosts now:
+{}", std::fs::read_to_string(&kh).unwrap());
+        assert!(
+            check_known_hosts_path("host.example", 22, &real, &kh).unwrap(),
+            "the learned key should now match",
+        );
+
+        // The attack: same host, different key. This must be distinguishable
+        // from "unknown", because one is a question and the other is a refusal.
+        let verdict = check_known_hosts_path("host.example", 22, &impostor, &kh);
+        assert!(
+            matches!(verdict, Err(russh::keys::Error::KeyChanged { .. })),
+            "a substituted key must be reported as changed, got {verdict:?}",
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

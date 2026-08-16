@@ -3326,6 +3326,12 @@ pub struct IdeApp {
     /// user has not yet said what to do about it. Holds the plan so the dialog
     /// can show exactly what would be sent before anything is.
     ssh_setup_prompt: Option<RemoteSetupPrompt>,
+    /// Fingerprint of a host not in known_hosts, awaiting the user's answer.
+    ssh_host_key_prompt: Option<String>,
+    /// A host whose key no longer matches known_hosts. Shown, never offered as
+    /// a choice — nothing here can distinguish a rebuilt machine from an
+    /// interception, so it is not Forge's decision to make.
+    ssh_host_key_changed: Option<String>,
     /// Size the remote pty and the grid were last told about.
     ssh_term_size: (u16, u16),
     /// A size seen but not yet held long enough to act on — see the resize
@@ -3581,6 +3587,8 @@ impl IdeApp {
                                    crate::terminal::Grid::with_size(50, 220))),
             ssh_term_focused: false,
             ssh_setup_prompt: None,
+            ssh_host_key_prompt: None,
+            ssh_host_key_changed: None,
             ssh_term_size: (0, 0),
             ssh_term_pending_size: None,
             ssh_term_cached_galley: None,
@@ -4683,9 +4691,23 @@ impl IdeApp {
                     self.ssh_connecting = false;
                     self.ssh_connect_rx = None;
                     self.ssh_log_rx     = None;
-                    self.output_log(format!("Error: {e}"), OutputLevel::Error);
-                    self.status    = format!("SSH error: {e}");
-                    self.ssh_error = Some(e);
+                    // A host-key outcome is a question or a warning, not an
+                    // error line to scroll past.
+                    if let Some(fp) = e.strip_prefix(crate::ssh::UNKNOWN_HOST_PREFIX) {
+                        self.ssh_host_key_prompt = Some(fp.to_string());
+                        self.status = "Unknown host key".to_string();
+                    } else if let Some(detail) = e.strip_prefix(crate::ssh::CHANGED_HOST_PREFIX) {
+                        self.ssh_host_key_changed = Some(detail.to_string());
+                        self.output_log(
+                            "REFUSED: the host key has changed — see the warning".to_string(),
+                            OutputLevel::Error,
+                        );
+                        self.status = "Host key changed — refused".to_string();
+                    } else {
+                        self.output_log(format!("Error: {e}"), OutputLevel::Error);
+                        self.status    = format!("SSH error: {e}");
+                        self.ssh_error = Some(e);
+                    }
                     ctx.request_repaint();
 }
                 Err(mpsc::TryRecvError::Empty)        => {}
@@ -5310,6 +5332,7 @@ impl IdeApp {
         // ── Settings overlay ─────────────────────────────────────────────────
         if self.settings_open { self.draw_settings(ctx); }
         self.draw_remote_setup_prompt(ctx);
+        self.draw_host_key_dialogs(ctx);
 
         // ── SSH quick-pick overlay ────────────────────────────────────────────
         if self.ssh_overlay {
@@ -11739,7 +11762,11 @@ impl IdeApp {
         self.show_term = true;
     }
 
-    fn ssh_connect(&mut self) {
+    fn ssh_connect(&mut self) { self.ssh_connect_inner(false) }
+
+    /// `trust_new_host_key` is set only by the fingerprint dialog, for one
+    /// attempt against one host.
+    fn ssh_connect_inner(&mut self, trust_new_host_key: bool) {
         let host = self.ssh_form.clone();
         let pw   = if self.ssh_password.is_empty() { None }
                    else { Some(self.ssh_password.clone()) };
@@ -11757,7 +11784,7 @@ impl IdeApp {
             let log = |msg: &str, level: OutputLevel| { let _ = log_tx.send((msg.to_string(), level)); };
             let result = (|| {
                 let conn = std::panic::catch_unwind(|| {
-                    crate::ssh::SshConnection::connect(&host, pw.as_deref(), &log)
+                    crate::ssh::SshConnection::connect(&host, pw.as_deref(), trust_new_host_key, &log)
                 }).unwrap_or_else(|e| {
                     let msg = e.downcast_ref::<String>().map(|s| s.as_str())
                         .or_else(|| e.downcast_ref::<&str>().copied())
@@ -11852,6 +11879,89 @@ impl IdeApp {
             })();
             let _ = tx.send(result);
         });
+    }
+
+    /// The two host-key conversations: an unknown host, and a changed one.
+    ///
+    /// Deliberately different shapes. An unknown host is a question, asked once
+    /// with the fingerprint to check against — the same bargain `ssh` offers. A
+    /// changed key is not a question: nothing here can tell a rebuilt machine
+    /// from someone answering in its place, so there is no button that
+    /// proceeds, and getting past it means editing known_hosts by hand, which
+    /// is a deliberate enough act to be worth the friction.
+    fn draw_host_key_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(fingerprint) = self.ssh_host_key_prompt.clone() {
+            let host = self.ssh_form.host.clone();
+            let mut answer: Option<bool> = None;
+            egui::Window::new("host_key_unknown")
+                .title_bar(false).collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([540.0, 0.0])
+                .frame(egui::Frame::popup(ctx.style().as_ref())
+                    .fill(egui::Color32::from_rgb(37, 37, 38))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
+                    .rounding(6.0))
+                .show(ctx, |ui| {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(format!("{host} is not in your known_hosts"))
+                        .size(15.0).strong().color(egui::Color32::from_gray(230)));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(
+                        "Check this fingerprint against the machine itself before trusting it — \
+                         run `ssh-keyscan` on it, or read it from its console. If it does not \
+                         match, something is answering in its place."
+                    ).size(12.0).color(egui::Color32::from_gray(190)));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&fingerprint).monospace().size(12.5)
+                        .color(egui::Color32::from_rgb(150, 205, 210)));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Trust and connect").clicked() { answer = Some(true); }
+                        if ui.button("Cancel").clicked() { answer = Some(false); }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(
+                        "Trusting it adds the key to ~/.ssh/known_hosts, and Forge will refuse \
+                         to connect if it ever changes."
+                    ).size(10.5).color(egui::Color32::from_gray(140)));
+                    ui.add_space(8.0);
+                });
+            match answer {
+                Some(true) => {
+                    self.ssh_host_key_prompt = None;
+                    self.ssh_connect_inner(true);
+                }
+                Some(false) => {
+                    self.ssh_host_key_prompt = None;
+                    self.status = "Cancelled — host key not trusted".to_string();
+                }
+                None => {}
+            }
+        }
+
+        if let Some(detail) = self.ssh_host_key_changed.clone() {
+            let mut close = false;
+            egui::Window::new("host_key_changed")
+                .title_bar(false).collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([560.0, 0.0])
+                .frame(egui::Frame::popup(ctx.style().as_ref())
+                    .fill(egui::Color32::from_rgb(44, 30, 30))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 90, 80)))
+                    .rounding(6.0))
+                .show(ctx, |ui| {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Host key changed — connection refused")
+                        .size(15.0).strong().color(egui::Color32::from_rgb(255, 150, 140)));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&detail).size(12.0)
+                        .color(egui::Color32::from_gray(210)));
+                    ui.add_space(10.0);
+                    if ui.button("Close").clicked() { close = true; }
+                    ui.add_space(8.0);
+                });
+            if close { self.ssh_host_key_changed = None; }
+        }
     }
 
     /// Copy the credential files that live beside the config.

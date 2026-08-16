@@ -3322,10 +3322,6 @@ pub struct IdeApp {
     /// Dedicated terminal grid for the remote shell (separate from local PTY).
     ssh_term:        std::sync::Arc<std::sync::Mutex<crate::terminal::Grid>>,
     ssh_term_focused: bool,
-    /// Set when a freshly connected machine has no Forge configuration and the
-    /// user has not yet said what to do about it. Holds the plan so the dialog
-    /// can show exactly what would be sent before anything is.
-    ssh_setup_prompt: Option<RemoteSetupPrompt>,
     /// Fingerprint of a host not in known_hosts, awaiting the user's answer.
     ssh_host_key_prompt: Option<String>,
     /// A host whose key no longer matches known_hosts. Shown, never offered as
@@ -3445,14 +3441,6 @@ pub struct IdeApp {
     pub pending_reload: bool,
     /// SSH host to connect on the first draw (set by new_with_spec).
     pending_ssh_connect: Option<crate::ssh::SshHost>,
-}
-
-/// The two plans for setting Forge up on a freshly connected machine, held
-/// while the user decides between them. Both are computed before either is
-/// offered, so the dialog can state what each one actually sends.
-struct RemoteSetupPrompt {
-    with:    crate::remote_setup::ConfigPlan,
-    without: crate::remote_setup::ConfigPlan,
 }
 
 impl IdeApp {
@@ -3586,7 +3574,6 @@ impl IdeApp {
             ssh_term:         std::sync::Arc::new(std::sync::Mutex::new(
                                    crate::terminal::Grid::with_size(50, 220))),
             ssh_term_focused: false,
-            ssh_setup_prompt: None,
             ssh_host_key_prompt: None,
             ssh_host_key_changed: None,
             ssh_term_size: (0, 0),
@@ -4683,8 +4670,6 @@ impl IdeApp {
                     self.ssh_term_focused = false;
                     self.bottom_tab = BottomTab::Terminal; // switch to terminal tab
                     self.ssh = Some(ready.conn);
-                    // After `self.ssh` is set, since the scan talks over it.
-                    self.ssh_check_forge_setup();
                     ctx.request_repaint();
 }
                 Ok(Err(e)) => {
@@ -5331,7 +5316,6 @@ impl IdeApp {
 
         // ── Settings overlay ─────────────────────────────────────────────────
         if self.settings_open { self.draw_settings(ctx); }
-        self.draw_remote_setup_prompt(ctx);
         self.draw_host_key_dialogs(ctx);
 
         // ── SSH quick-pick overlay ────────────────────────────────────────────
@@ -11961,212 +11945,6 @@ impl IdeApp {
                     ui.add_space(8.0);
                 });
             if close { self.ssh_host_key_changed = None; }
-        }
-    }
-
-    /// Copy the credential files that live beside the config.
-    ///
-    /// A ChatGPT Codex login is an OAuth token in its own file, not an API key
-    /// in the config, so a setup that copied only the config would look
-    /// complete and then fail to authenticate. These are copied verbatim —
-    /// a token is not something to rewrite in transit — and only when the user
-    /// has already agreed to send credentials.
-    fn ssh_copy_credential_files(&mut self) {
-        let Some(dir) = dirs::config_dir().map(|d| d.join("forge")) else { return };
-        for name in crate::remote_setup::CREDENTIAL_FILES {
-            let local = dir.join(name);
-            let Ok(text) = std::fs::read_to_string(&local) else { continue };
-            let remote = format!("~/{}/{name}", crate::remote_setup::REMOTE_CONFIG_DIR);
-            let Some(ssh) = &self.ssh else { return };
-            // Locked down before it holds anything, as with the config itself.
-            let _ = ssh.run_command(&format!("touch {remote} && chmod 600 {remote}"));
-            match ssh.fs_write(&remote, &text) {
-                // The name only. What is in these is the point of not logging.
-                Ok(()) => self.output_log(format!("  copied {name}"), OutputLevel::Info),
-                Err(e) => self.output_log(format!("  could not copy {name}: {e}"), OutputLevel::Warn),
-            }
-        }
-    }
-
-    /// Ask whether to mirror this machine's Forge setup onto the remote, and
-    /// whether credentials go with it.
-    ///
-    /// The question is asked once, on a machine that has no configuration of
-    /// its own, and nothing is sent until it is answered. What each choice
-    /// sends is stated rather than described: the endpoints that travel, the
-    /// ones that cannot and why, and whether keys are included.
-    fn draw_remote_setup_prompt(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &self.ssh_setup_prompt else { return };
-        let (kept, dropped, warnings) = (
-            prompt.with.kept.clone(),
-            prompt.with.dropped.clone(),
-            prompt.with.warnings.clone(),
-        );
-        let host = self.ssh.as_ref().map(|s| s.host.host.clone()).unwrap_or_default();
-        let mut choice: Option<bool> = None;
-        let mut dismissed = false;
-
-        egui::Window::new("remote_forge_setup")
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([520.0, 0.0])
-            .frame(egui::Frame::popup(ctx.style().as_ref())
-                .fill(egui::Color32::from_rgb(37, 37, 38))
-                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
-                .rounding(6.0))
-            .show(ctx, |ui| {
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("Set up Forge on this machine?")
-                    .size(15.0).strong().color(egui::Color32::from_gray(230)));
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(format!(
-                    "{host} has no Forge configuration. Running the agent there — rather than \
-                     tunnelling every command back to this machine — needs one."
-                )).size(12.0).color(egui::Color32::from_gray(190)));
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                ui.label(egui::RichText::new(format!("{} endpoints would be copied", kept.len()))
-                    .size(12.0).color(egui::Color32::from_gray(210)));
-                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                    for (name, why) in &dropped {
-                        ui.label(egui::RichText::new(format!("• {name} stays here — {why}"))
-                            .size(10.5).color(egui::Color32::from_gray(150)));
-                    }
-                    for w in &warnings {
-                        ui.label(egui::RichText::new(format!("• {w}"))
-                            .size(10.5).color(egui::Color32::from_rgb(220, 190, 120)));
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Copy with my API keys").clicked() { choice = Some(true); }
-                    if ui.button("Copy without credentials").clicked() { choice = Some(false); }
-                    if ui.button("Not now").clicked() { dismissed = true; }
-                });
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(
-                    "Keys travel over the SSH connection you are already using, and are written \
-                     to a file only you can read. Without them, Forge installs there but will \
-                     ask for a key before it can run."
-                ).size(10.5).color(egui::Color32::from_gray(140)));
-                ui.add_space(8.0);
-            });
-
-        if dismissed {
-            self.ssh_setup_prompt = None;
-            self.output_log(
-                "Skipped remote Forge setup — the agent will keep running on this machine".to_string(),
-                OutputLevel::Info,
-            );
-        } else if let Some(with_credentials) = choice {
-            self.ssh_install_forge(with_credentials);
-        }
-    }
-
-    /// Look for Forge on the machine just connected to, and offer to set it up.
-    ///
-    /// Only ever offers. An existing configuration on the remote is that
-    /// machine's own — it may hold keys chosen for it, or endpoints that only
-    /// make sense there — so it is never overwritten and the user is not asked
-    /// about it.
-    fn ssh_check_forge_setup(&mut self) {
-        let Some(ssh) = &self.ssh else { return };
-        let home = ssh.host.remote_dir.clone();
-        // A listing, not a read: deciding whether Forge is there must not
-        // involve asking the far side for the contents of a credentials file.
-        let listing = ssh
-            .fs_list(&format!("~/{}", crate::remote_setup::REMOTE_CONFIG_DIR))
-            .map(|entries| entries.into_iter().map(|e| e.name).collect::<Vec<_>>());
-        let _ = home;
-
-        if crate::remote_setup::remote_state(listing) == crate::remote_setup::RemoteState::Configured {
-            self.output_log(
-                "Remote machine already has a Forge configuration — leaving it alone".to_string(),
-                OutputLevel::Info,
-            );
-            return;
-        }
-
-        let local_path = dirs::config_dir()
-            .map(|d| d.join("forge").join("config.toml"))
-            .unwrap_or_default();
-        let Ok(local) = std::fs::read_to_string(&local_path) else {
-            self.output_log(
-                "Remote machine has no Forge configuration, and this one has none to copy".to_string(),
-                OutputLevel::Warn,
-            );
-            return;
-        };
-        // Both plans are built now, so the dialog can say what each choice
-        // actually sends rather than describing it in the abstract.
-        match (
-            crate::remote_setup::plan_config(&local, true),
-            crate::remote_setup::plan_config(&local, false),
-        ) {
-            (Ok(with), Ok(without)) => {
-                self.ssh_setup_prompt = Some(RemoteSetupPrompt { with, without });
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                self.output_log(format!("Cannot set up Forge remotely: {e}"), OutputLevel::Warn);
-            }
-        }
-    }
-
-    /// Carry out the choice made in the setup dialog.
-    fn ssh_install_forge(&mut self, with_credentials: bool) {
-        let Some(prompt) = self.ssh_setup_prompt.take() else { return };
-        let plan = if with_credentials { prompt.with } else { prompt.without };
-        let Some(ssh) = &self.ssh else { return };
-
-        let dir = format!("~/{}", crate::remote_setup::REMOTE_CONFIG_DIR);
-        let path = format!("~/{}", crate::remote_setup::REMOTE_CONFIG_FILE);
-        // 0700/0600 before anything is written into it: a config carrying keys
-        // must not exist, even briefly, readable by every account on a shared
-        // machine. The local copy of this file is 0644, which is its own
-        // problem, but it is not one to reproduce somewhere else.
-        let sh = format!("mkdir -p {dir} && chmod 700 {dir} && touch {path} && chmod 600 {path}");
-        if let Err(e) = ssh.run_command(&sh) {
-            self.output_log(format!("Could not prepare the remote config directory: {e}"),
-                            OutputLevel::Error);
-            return;
-        }
-        match ssh.fs_write(&path, &plan.toml) {
-            Ok(()) => {
-                // `carries_credentials`, not the user's answer: agreeing to
-                // send keys does not mean there were any to send, and saying
-                // "with your API keys" when none travelled would be a lie in
-                // the direction that matters.
-                let what = if plan.carries_credentials {
-                    "with your API keys"
-                } else if with_credentials {
-                    "— no endpoint that travels had a key to copy"
-                } else {
-                    "without credentials — add them on that machine before use"
-                };
-                self.output_log(
-                    format!("Installed Forge configuration on the remote machine {what}: \
-                             {} endpoints", plan.kept.len()),
-                    OutputLevel::Success,
-                );
-                for (name, why) in &plan.dropped {
-                    self.output_log(format!("  not copied — {name}: {why}"), OutputLevel::Info);
-                }
-                for w in &plan.warnings {
-                    self.output_log(format!("  {w}"), OutputLevel::Warn);
-                }
-                if with_credentials {
-                    self.ssh_copy_credential_files();
-                }
-            }
-            Err(e) => self.output_log(format!("Could not write the remote configuration: {e}"),
-                                      OutputLevel::Error),
         }
     }
 

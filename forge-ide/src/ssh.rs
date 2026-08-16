@@ -239,36 +239,6 @@ impl SshConnection {
         }).collect())
     }
 
-    /// Run a command on the remote machine and wait for it to finish.
-    ///
-    /// Its own SSH channel rather than the forge-server RPC: this is used to
-    /// create and lock down the config directory *before* anything is written
-    /// into it, and a file carrying keys must not exist even briefly with the
-    /// permissions it would otherwise inherit.
-    ///
-    /// Nothing here interpolates anything a user typed — the caller passes a
-    /// fixed command built from constants.
-    pub fn run_command(&self, command: &str) -> Result<(), String> {
-        let (Some(rt), Some(session)) = (self._rt.as_ref(), self._session.as_ref()) else {
-            return Err("connection is closing".into());
-        };
-        let command = command.to_string();
-        rt.block_on(async {
-            let mut ch = session.channel_open_session().await.map_err(|e| e.to_string())?;
-            ch.exec(true, command).await.map_err(|e| e.to_string())?;
-            let mut status = None;
-            while let Some(msg) = ch.wait().await {
-                if let russh::ChannelMsg::ExitStatus { exit_status } = msg {
-                    status = Some(exit_status);
-                }
-            }
-            match status {
-                Some(0) | None => Ok(()),
-                Some(code) => Err(format!("remote command exited with {code}")),
-            }
-        })
-    }
-
     pub fn fs_write(&self, path: &str, text: &str) -> Result<(), String> {
         self.call("fs/write", serde_json::json!({ "path": path, "text": text }))?;
         Ok(())

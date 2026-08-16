@@ -3326,6 +3326,11 @@ pub struct IdeApp {
     /// Dedicated terminal grid for the remote shell (separate from local PTY).
     ssh_term:        std::sync::Arc<std::sync::Mutex<crate::terminal::Grid>>,
     ssh_term_focused: bool,
+    /// Size the remote pty and the grid were last told about.
+    ssh_term_size: (u16, u16),
+    /// A size seen but not yet held long enough to act on — see the resize
+    /// debounce in `draw_ssh_terminal`.
+    ssh_term_pending_size: Option<((u16, u16), std::time::Instant)>,
     /// Cached *viewport* Galley for `draw_ssh_terminal`, keyed by
     /// `Grid::version` — see the equivalent field on `Terminal` for why this
     /// matters (skips rebuilding + re-shaping on every frame).
@@ -3567,6 +3572,8 @@ impl IdeApp {
             ssh_term:         std::sync::Arc::new(std::sync::Mutex::new(
                                    crate::terminal::Grid::with_size(50, 220))),
             ssh_term_focused: false,
+            ssh_term_size: (0, 0),
+            ssh_term_pending_size: None,
             ssh_term_cached_galley: None,
             ssh_term_cached_scrollback_galley: None,
             ssh_term_last_output: None,
@@ -4652,6 +4659,10 @@ impl IdeApp {
                     self.ssh_shell = ready.shell;
                     // Clear the SSH terminal grid for the new connection
                     if let Ok(mut g) = self.ssh_term.lock() { *g = crate::terminal::Grid::with_size(50, 220); }
+                    // Unset, so the next frame fits it to the panel rather than
+                    // leaving the opening size in place.
+                    self.ssh_term_size = (0, 0);
+                    self.ssh_term_pending_size = None;
                     self.ssh_term_focused = false;
                     self.bottom_tab = BottomTab::Terminal; // switch to terminal tab
                     self.ssh = Some(ready.conn);
@@ -8757,6 +8768,45 @@ impl IdeApp {
         let char_w   = ui.fonts(|f| f.glyph_width(&font_id, ' '));
         let focus_id = ui.id().with("ssh_term_focus");
 
+        // Fit the grid to the panel, as the local terminal does.
+        //
+        // The remote pty and the grid were both opened at a fixed 50x220 and
+        // never resized, so the viewport was taller than the space it was drawn
+        // in. The scroll area sticks to the bottom, as a terminal should, and
+        // the bottom of a 50-row viewport holding one line of prompt is blank —
+        // so a freshly opened remote terminal showed nothing at all, with the
+        // prompt scrolled off the top. 220 columns wide with the panel narrower
+        // than that also meant the remote wrapped its lines somewhere off the
+        // right-hand edge.
+        let visible_rows = ((panel_rect.height() / row_h.max(1.0)).floor() as u16).max(1);
+        let visible_cols = ((panel_rect.width() - 8.0) / char_w.max(1.0)).floor().max(1.0) as u16;
+        if (visible_rows, visible_cols) != self.ssh_term_size {
+            // Same debounce as the local terminal: a drag across the splitter
+            // is a stream of sizes, and telling the far end about every one of
+            // them is a round trip each.
+            const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+            let candidate = (visible_rows, visible_cols);
+            let settled = match self.ssh_term_pending_size {
+                Some((c, since)) if c == candidate => since.elapsed() >= RESIZE_SETTLE,
+                _ => {
+                    self.ssh_term_pending_size = Some((candidate, std::time::Instant::now()));
+                    false
+                }
+            };
+            if settled {
+                if let Ok(mut g) = self.ssh_term.lock() {
+                    g.resize(visible_rows as usize, visible_cols as usize);
+                }
+                self.ssh_resize_pty(visible_cols, visible_rows);
+                self.ssh_term_size = candidate;
+                self.ssh_term_pending_size = None;
+            } else {
+                // Nothing else is animating, so without this the debounce timer
+                // is never looked at again and the size never settles.
+                ui.ctx().request_repaint_after(RESIZE_SETTLE);
+            }
+        }
+
         // Click to focus / click outside to blur
         let click = ui.interact(panel_rect, focus_id.with("click"), egui::Sense::click());
         if click.clicked() { self.ssh_term_focused = true; }
@@ -11740,6 +11790,13 @@ impl IdeApp {
         let next_id = std::sync::Arc::clone(&ssh.next_id);
         let pty_pushes = std::sync::Arc::clone(&ssh.pty_pushes);
         let cwd = ssh.host.remote_dir.clone();
+        // Opened at the size the panel is now, so the first prompt is drawn
+        // where it will be read. A fixed size here meant the very first frame
+        // was already wrong, and nothing corrected it.
+        let (rows, cols) = match self.ssh_term_size {
+            (0, _) | (_, 0) => (24u16, 80u16),
+            (r, c) => (r, c),
+        };
 
         let (tx, rx) = mpsc::channel();
         self.ssh_pty_rx = Some(rx);
@@ -11749,7 +11806,7 @@ impl IdeApp {
                 // Send pty/open request
                 let id = { let mut n = next_id.lock().unwrap(); let i = *n; *n += 1; i };
                 let msg = forge_proto::Rpc::request(id, "pty/open",
-                    serde_json::json!({ "id": 0u32, "cols": 220u16, "rows": 50u16, "cwd": cwd }));
+                    serde_json::json!({ "id": 0u32, "cols": cols, "rows": rows, "cwd": cwd }));
                 let (resp_tx, resp_rx) = mpsc::sync_channel(1);
                 pending.lock().unwrap().insert(id, resp_tx);
                 if let Ok(mut w) = stdin.lock() {
@@ -11783,6 +11840,28 @@ impl IdeApp {
             })();
             let _ = tx.send(result);
         });
+    }
+
+    /// Tell the remote pty its new size.
+    ///
+    /// Fire-and-forget: the reply carries nothing worth waiting for, and the
+    /// alternative is blocking a frame on a network round trip. A dropped
+    /// resize costs a mis-wrapped line until the next one, which is what
+    /// happened permanently before any were sent at all.
+    fn ssh_resize_pty(&mut self, cols: u16, rows: u16) {
+        let Some(ssh) = &self.ssh else { return };
+        if self.ssh_shell.is_none() {
+            return; // no pty open yet; it will be opened at the right size
+        }
+        let id = { let mut n = ssh.next_id.lock().unwrap(); let i = *n; *n += 1; i };
+        let msg = forge_proto::Rpc::request(
+            id,
+            "pty/resize",
+            serde_json::json!({ "id": 0u32, "cols": cols, "rows": rows }),
+        );
+        if let Ok(mut w) = ssh.stdin.lock() {
+            let _ = forge_proto::write_rpc(&mut *w, &msg);
+        }
     }
 
     /// Navigate to a remote directory — non-blocking; result arrives via ssh_nav_rx.

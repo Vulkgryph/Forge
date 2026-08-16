@@ -20,6 +20,7 @@ mod onboarding;
 mod plugin;
 mod fmt;
 mod ptyhost;
+mod remote_setup;
 mod session;
 mod settings;
 mod ssh;

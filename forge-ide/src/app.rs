@@ -3017,7 +3017,7 @@ fn draw_subagent_strip_entry(
 ) {
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(28, 26, 40))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 60, 100)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 84, 92)))
         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
         .rounding(5.0)
         .show(ui, |ui| {
@@ -3026,7 +3026,7 @@ fn draw_subagent_strip_entry(
                     paint_disclosure_triangle(ui, expanded, egui::Color32::from_gray(150));
                     paint_dot(ui, egui::Color32::from_rgb(150, 170, 255));
                     ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
-                        .color(egui::Color32::from_rgb(190, 180, 240)));
+                        .color(egui::Color32::from_rgb(150, 205, 210)));
                     // Same reservation as the checkpoint row: an approval count
                     // must not be pushed off by the prompt it belongs to.
                     let pending_now = items.iter()
@@ -3105,7 +3105,7 @@ fn draw_subagent_strip_entry(
                                         ui.horizontal(|ui| {
                                             paint_checkmark(ui, egui::Color32::from_rgb(150, 170, 255));
                                             ui.label(egui::RichText::new(cat.as_str()).monospace().size(10.5)
-                                                .color(egui::Color32::from_rgb(190, 180, 240)));
+                                                .color(egui::Color32::from_rgb(150, 205, 210)));
                                             let s: String = summary.trim().chars().take(60).collect();
                                             ui.label(egui::RichText::new(s).size(10.0).color(egui::Color32::from_gray(150)));
                                         });
@@ -7305,7 +7305,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 egui::Frame::none()
                                     .fill(egui::Color32::from_rgb(28,26,40))
-                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(75,65,110)))
+                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(56, 90, 98)))
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(4.0)
                                     .show(ui, |ui| {
@@ -7318,8 +7318,8 @@ impl IdeApp {
                                             } else {
                                                 paint_dot(ui, egui::Color32::from_rgb(150,170,255));
                                             }
-                                            ui.label(egui::RichText::new("subagent").size(11.5).color(egui::Color32::from_rgb(170,150,230)));
-                                            ui.label(egui::RichText::new(agent_type.as_str()).monospace().size(11.5).strong().color(egui::Color32::from_rgb(190,180,240)));
+                                            ui.label(egui::RichText::new("subagent").size(11.5).color(egui::Color32::from_rgb(120, 180, 190)));
+                                            ui.label(egui::RichText::new(agent_type.as_str()).monospace().size(11.5).strong().color(egui::Color32::from_rgb(150, 205, 210)));
                                             // See the checkpoint row: pinned to
                                             // the right of a row this narrow it
                                             // simply landed on top of the name
@@ -12171,7 +12171,10 @@ fn symbol_kind_glyph(kind: u8) -> (&'static str, egui::Color32) {
         23        => ("S", egui::Color32::from_rgb(238, 156,  71)), // Struct
         10        => ("E", egui::Color32::from_rgb(238, 156,  71)), // Enum
         11        => ("I", egui::Color32::from_rgb(110, 168, 220)), // Interface/trait
-        6 | 12    => ("ƒ", egui::Color32::from_rgb(178, 140, 220)), // Method/Function
+        // Gold rather than the violet convention: nothing in Forge is purple,
+        // and this is the one symbol kind that had no relative in the palette
+        // already — classes are orange, everything nominal is blue.
+        6 | 12    => ("ƒ", egui::Color32::from_rgb(220, 190, 110)), // Method/Function
         7 | 8     => ("p", egui::Color32::from_rgb(110, 168, 220)), // Property/Field
         13 | 14   => ("v", egui::Color32::from_rgb(110, 168, 220)), // Variable/Constant
         2         => ("m", egui::Color32::from_rgb(150, 150, 150)), // Module

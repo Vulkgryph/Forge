@@ -58,7 +58,9 @@ impl FileStatus {
             FileStatus::Added      => egui::Color32::from_rgb(129, 184, 117),
             FileStatus::Untracked  => egui::Color32::from_rgb(129, 184, 117),
             FileStatus::Deleted    => egui::Color32::from_rgb(220, 120, 120),
-            FileStatus::Renamed    => egui::Color32::from_rgb(180, 140, 210),
+            // Teal, not the usual violet: a rename is a move, and it reads as
+            // its own thing beside the orange/green/red without being purple.
+            FileStatus::Renamed    => egui::Color32::from_rgb(120, 190, 195),
             FileStatus::Conflicted => egui::Color32::from_rgb(255,  90,  90),
         }
     }
@@ -993,5 +995,32 @@ mod home_repo_bench {
         assert!(elapsed < std::time::Duration::from_secs(5),
                 "scan took {elapsed:?} — the bound is not holding");
         assert!(scan.statuses.len() <= super::MAX_STATUS_ENTRIES);
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    use super::FileStatus;
+
+    /// Nothing in Forge is purple. A status colour is easy to pick without
+    /// thinking — violet for "renamed" is the convention everywhere else — so
+    /// this states the rule where the next person changing it will see it.
+    #[test]
+    fn no_status_colour_is_purple() {
+        for status in [
+            FileStatus::Modified,
+            FileStatus::Added,
+            FileStatus::Untracked,
+            FileStatus::Deleted,
+            FileStatus::Renamed,
+            FileStatus::Conflicted,
+        ] {
+            let c = status.color();
+            let (r, g, b) = (c.r() as i32, c.g() as i32, c.b() as i32);
+            assert!(
+                !(b > g + 25 && r >= g - 10),
+                "{status:?} is purple: rgb({r}, {g}, {b})",
+            );
+        }
     }
 }

@@ -334,6 +334,18 @@ impl Default for AppConfig {
     }
 }
 
+/// Narrow `path` to its owner. Best effort: a filesystem that cannot express
+/// this is not a reason to refuse to save, and Windows has its own ACL model
+/// where the user profile is already private.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path, _mode: u32) {}
+
 impl AppConfig {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
@@ -379,9 +391,18 @@ impl AppConfig {
         let config_path = Self::config_path()?;
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // The directory too: a 0755 directory holding a 0600 file still
+            // tells every account on the machine that the file is there.
+            restrict_to_owner(parent, 0o700);
         }
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(&config_path, contents)?;
+        // This file holds API keys. Written with the process umask it lands at
+        // 0644 on a stock machine — readable by every account on it — which on
+        // a shared or multi-user box means the keys are, too. Set after the
+        // write rather than before, so it applies to a file that already
+        // existed as well as one just created.
+        restrict_to_owner(&config_path, 0o600);
         Ok(())
     }
 
@@ -396,5 +417,31 @@ impl AppConfig {
 
     pub fn default_endpoint(&self) -> Option<&ModelEndpoint> {
         self.get_endpoint(&self.models.default)
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    /// The config holds API keys, so it must not be readable by other accounts
+    /// on the machine. Written with the process umask it lands at 0644 on a
+    /// stock box — which is how a key ended up world-readable on a remote host
+    /// during testing.
+    #[test]
+    #[cfg(unix)]
+    fn a_saved_config_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("forge-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // As `save` does it: write, then narrow.
+        std::fs::write(&path, "key = \"secret\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::restrict_to_owner(&path, 0o600);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

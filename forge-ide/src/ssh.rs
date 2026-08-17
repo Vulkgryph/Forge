@@ -355,6 +355,16 @@ pub enum HostKey {
     Changed { fingerprint: String, line: usize },
 }
 
+/// Whether this exact key is among those recorded for the host.
+///
+/// Compares key material rather than whole `PublicKey`s: the derived equality
+/// includes the comment, and a key parsed from a file carries one where a key
+/// off the wire does not, so two records of the same key can compare unequal.
+/// Identity here means the key, and nothing else.
+fn key_is_recorded(recorded: &[(usize, ssh_key::PublicKey)], key: &ssh_key::PublicKey) -> bool {
+    recorded.iter().any(|(_, k)| k.key_data() == key.key_data())
+}
+
 /// Verifies the server's host key, and records what it found.
 ///
 /// This used to return `Ok(true)` unconditionally, with a `TODO: known_hosts`
@@ -407,7 +417,22 @@ impl client::Handler for ClientHandler {
                 }
                 Ok(false) => HostKey::Unknown { fingerprint },
                 Err(russh::keys::Error::KeyChanged { line }) => {
-                    HostKey::Changed { fingerprint, line }
+                    // Not taken at face value. russh stops at the first
+                    // recorded entry of the same algorithm that does not
+                    // match, so a stale line left beside the current one
+                    // reports a changed key even when the right one is in the
+                    // same file — and it does so whichever order they are in,
+                    // including when the match is found first. Refusing on
+                    // that would raise the loudest warning Forge has over a
+                    // host that is exactly who it says it is.
+                    let recorded =
+                        russh::keys::known_hosts::known_host_keys(&host, port)
+                            .unwrap_or_default();
+                    if key_is_recorded(&recorded, &key) {
+                        HostKey::Known
+                    } else {
+                        HostKey::Changed { fingerprint, line }
+                    }
                 }
                 // Anything else — an unreadable known_hosts, a malformed line —
                 // is not a reason to trust the key. Failing open here would
@@ -1002,6 +1027,92 @@ mod host_key_tests {
     /// The keys are generated rather than fixed: what matters is that a
     /// matching key is accepted, a different one for the same host is reported
     /// as changed, and an unlisted host is neither.
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH5e7H/fBAeIxruobJyFnyjKPabP8ngjkQcfH01DgDsX";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEmtgCItjIw2iTAE3+X6twVlRgNw7uUCWDp9BT+TRG/W";
+
+    fn key(line: &str) -> super::ssh_key::PublicKey {
+        <super::ssh_key::PublicKey as std::str::FromStr>::from_str(line).unwrap()
+    }
+
+    /// A stale entry beside the current one must not read as an attack.
+    ///
+    /// russh returns `KeyChanged` here whichever order the two lines are in —
+    /// it stops at the first same-algorithm entry that does not match, and even
+    /// when the matching one is found first the error still aborts the whole
+    /// check. Taking that at face value would show the user Forge's loudest
+    /// warning about a host that is exactly who it claims to be, and there is
+    /// no way past that dialog by design.
+    #[test]
+    fn a_stale_entry_beside_the_current_one_is_not_a_changed_key() {
+        use russh::keys::known_hosts::{check_known_hosts_path, known_host_keys_path};
+
+        let dir = std::env::temp_dir().join(format!("forge-kh-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = key(KEY_B);
+
+        for (name, body) in [
+            ("stale first",   format!("h.example {KEY_A}\nh.example {KEY_B}\n")),
+            ("current first", format!("h.example {KEY_B}\nh.example {KEY_A}\n")),
+        ] {
+            let p = dir.join(name.replace(' ', "-"));
+            std::fs::write(&p, body).unwrap();
+
+            // What russh says, and what this works around.
+            assert!(
+                matches!(
+                    check_known_hosts_path("h.example", 22, &current, &p),
+                    Err(russh::keys::Error::KeyChanged { .. })
+                ),
+                "{name}: russh has fixed this; the fallback can go",
+            );
+
+            // What the handler concludes instead.
+            let recorded = known_host_keys_path("h.example", 22, &p).unwrap();
+            assert!(
+                super::key_is_recorded(&recorded, &current),
+                "{name}: the current key is recorded and must be accepted",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check must still hold when the key really is not there — the
+    /// fallback exists to stop false alarms, not to stop alarms.
+    #[test]
+    fn a_key_that_is_recorded_nowhere_is_still_refused() {
+        use russh::keys::known_hosts::known_host_keys_path;
+        let dir = std::env::temp_dir().join(format!("forge-kh-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("kh");
+        std::fs::write(&p, format!("h.example {KEY_A}\n")).unwrap();
+
+        let recorded = known_host_keys_path("h.example", 22, &p).unwrap();
+        assert!(
+            !super::key_is_recorded(&recorded, &key(KEY_B)),
+            "an unrecorded key must not be accepted by the fallback",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Identity is the key, not the label attached to it.
+    #[test]
+    fn a_comment_does_not_change_a_key_s_identity() {
+        use russh::keys::known_hosts::known_host_keys_path;
+        let dir = std::env::temp_dir().join(format!("forge-kh-cmt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("kh");
+        std::fs::write(&p, format!("h.example {KEY_A}\n")).unwrap();
+
+        let recorded = known_host_keys_path("h.example", 22, &p).unwrap();
+        assert!(
+            super::key_is_recorded(&recorded, &key(&format!("{KEY_A} someone@somewhere"))),
+            "the same key with a comment is the same key",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// russh writes a learned key with its comment attached and then reads that
     /// same key back as *changed*. A host the user had just chosen to trust
     /// would greet them with a host-key warning on the next connection, which

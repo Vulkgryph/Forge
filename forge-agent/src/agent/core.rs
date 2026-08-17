@@ -294,6 +294,15 @@ pub enum ToolKindEvent {
     Execute,
 }
 
+/// Whether a switched-to endpoint belongs in this machine's config file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistEndpoint {
+    /// Remember it, as a local session does.
+    Yes,
+    /// Use it and forget it. For credentials that belong to another machine.
+    No,
+}
+
 #[derive(Debug, Clone)]
 pub enum UserAction {
     SendMessage(String),
@@ -303,7 +312,16 @@ pub enum UserAction {
         reason: String,
     },
     ToggleAutoMode,
-    SwitchModel(crate::config::ModelEndpoint),
+    /// Switch the active endpoint. The flag says whether it may be written to
+    /// this machine's configuration.
+    ///
+    /// It may not when the key came from the client — an agent running on a
+    /// machine that is not its user's is given credentials for the session it
+    /// is in, and persisting them would leave them on a disk nobody asked to
+    /// put them on. Verified the hard way: this used to save unconditionally,
+    /// so an injected key landed in `~/.config/forge/config.toml` on the remote
+    /// host, group- and world-readable.
+    SwitchModel(crate::config::ModelEndpoint, PersistEndpoint),
     UpdateConfig(crate::config::AppConfig),
     Compact,
     RequestUsage,
@@ -878,7 +896,7 @@ impl Agent {
                         status
                     )));
                 }
-                UserAction::SwitchModel(endpoint) => {
+                UserAction::SwitchModel(endpoint, persist) => {
                     let name = endpoint.name.clone();
                     let new_model_id = endpoint.model_id.clone();
                     let config_max_ctx = endpoint.max_context_tokens;
@@ -958,10 +976,21 @@ impl Agent {
                         .iter()
                         .any(|e| e.name == endpoint.name)
                     {
-                        self.app_config.models.endpoints.push(endpoint.clone());
+                        // Kept in the endpoint list so the model can be named
+                        // and its limits respected, but without the key when it
+                        // is not ours to keep: the live client already has it,
+                        // and anything that writes this config later would
+                        // otherwise write the key with it.
+                        let mut remembered = endpoint.clone();
+                        if persist == PersistEndpoint::No {
+                            remembered.api_key = None;
+                        }
+                        self.app_config.models.endpoints.push(remembered);
                     }
                     self.app_config.models.default = endpoint.name.clone();
-                    let _ = self.app_config.save();
+                    if persist == PersistEndpoint::Yes {
+                        let _ = self.app_config.save();
+                    }
                     let _ = self.event_tx.send(AgentEvent::ModelSwitched {
                         name,
                         model_id: new_model_id,

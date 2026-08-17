@@ -6,6 +6,49 @@
 
 use std::path::PathBuf;
 
+/// This machine's default endpoint, as a `switch_model` payload including its
+/// key.
+///
+/// For an agent running on another machine. That machine has no reason to hold
+/// these credentials — and on a box you do not administer, every reason not to
+/// — so the client keeps them and hands one over when it picks an endpoint.
+/// `switch_model` is applied in memory by the agent and written nowhere, so the
+/// key lives only in that process for as long as it runs.
+pub fn local_default_endpoint() -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(forge_config_path()?).ok()?;
+    let doc: toml::Value = text.parse().ok()?;
+    let models = doc.get("models")?;
+    let endpoints = models.get("endpoints")?.as_array()?;
+    let default = models.get("default").and_then(|v| v.as_str());
+
+    // The configured default, or the first endpoint that could work at all.
+    // An endpoint on this machine's own localhost is skipped: over there it
+    // names a service on *that* machine, where there is nothing listening.
+    let usable = |ep: &toml::Value| {
+        ep.get("base_url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+    };
+    let chosen = endpoints
+        .iter()
+        .find(|ep| {
+            default.is_some_and(|d| ep.get("name").and_then(|v| v.as_str()) == Some(d)) && usable(ep)
+        })
+        .or_else(|| endpoints.iter().find(|ep| usable(ep)))?;
+
+    let get = |k: &str| chosen.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let num = |k: &str, d: u64| chosen.get(k).and_then(|v| v.as_integer()).unwrap_or(d as i64);
+    Some(serde_json::json!({
+        "name":               get("name"),
+        "base_url":           get("base_url"),
+        "model_id":           get("model_id"),
+        "max_context_tokens": num("max_context_tokens", 200_000),
+        "max_output_tokens":  num("max_output_tokens", 16_384),
+        "endpoint_type":      get("endpoint_type"),
+        "api_key":            chosen.get("api_key").and_then(|v| v.as_str()).unwrap_or(""),
+    }))
+}
+
 fn forge_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config").join("forge").join("config.toml"))
 }

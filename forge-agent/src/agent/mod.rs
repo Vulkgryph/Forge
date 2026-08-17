@@ -8,5 +8,6 @@ pub mod rewind;
 pub mod subagent;
 
 pub use core::{
+    PersistEndpoint,
     Agent, AgentEvent, QuestionItem, QuestionOption, TokenUsageSnapshot, ToolKindEvent, UserAction,
 };

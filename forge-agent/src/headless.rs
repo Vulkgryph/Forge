@@ -583,6 +583,19 @@ enum IncomingMessage {
         endpoint_type: String,
         #[serde(default)]
         reasoning: crate::config::EndpointReasoningConfig,
+        /// A key supplied by the client for this switch alone.
+        ///
+        /// For an agent running somewhere its user's credentials are not, and
+        /// should not be: the client holds them, hands one over when it selects
+        /// an endpoint, and this process keeps it in memory for as long as it
+        /// runs. `switch_model` writes nothing to disk — see the handler in
+        /// `agent/core.rs`, which builds a new client and stops there — so
+        /// nothing here leaves a key behind on that machine.
+        ///
+        /// Omitted, the key comes from this machine's own configuration as
+        /// before, which is what a local agent wants.
+        #[serde(default)]
+        api_key: Option<String>,
     },
     UpdateSubagentConfig {
         #[serde(default)]
@@ -689,6 +702,7 @@ fn json_to_user_action(
             max_output_tokens,
             endpoint_type,
             reasoning,
+            api_key,
         } => {
             let ep_type = match endpoint_type.as_str() {
                 "anthropic" => crate::config::EndpointType::Anthropic,
@@ -702,11 +716,23 @@ fn json_to_user_action(
             // an authenticated endpoint silently dropped its key for the
             // rest of the session.
             let existing = app_config.models.endpoints.iter().find(|e| e.name == name);
-            let api_key = existing.and_then(|e| e.api_key.clone());
+            // The client's key wins when it sent one: it is the machine that
+            // has them. Falling back to the stored key keeps a local agent, and
+            // a remote one whose host is already configured, working unchanged.
+            let client_key = api_key.as_deref().is_some_and(|k| !k.is_empty());
+            let api_key = api_key
+                .filter(|k| !k.is_empty())
+                .or_else(|| existing.and_then(|e| e.api_key.clone()));
             // Same reasoning as `api_key` above — not part of what the client
             // sends in `switch_model`, so carried over from our own stored
             // config instead of defaulting to off on every switch.
             let xai_priority_tier = existing.map(|e| e.xai_priority_tier).unwrap_or(false);
+            // A key the client supplied is the client's, not this machine's.
+            let persist = if client_key {
+                crate::agent::PersistEndpoint::No
+            } else {
+                crate::agent::PersistEndpoint::Yes
+            };
             Some(UserAction::SwitchModel(ModelEndpoint {
                 name,
                 base_url,
@@ -718,7 +744,7 @@ fn json_to_user_action(
                 endpoint_type: ep_type,
                 reasoning,
                 xai_priority_tier,
-            }))
+            }, persist))
         }
         IncomingMessage::UpdateSubagentConfig {
             enabled,

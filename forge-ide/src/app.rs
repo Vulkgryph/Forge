@@ -11951,7 +11951,23 @@ impl IdeApp {
             let allow_all = mode == AgentPermissionMode::DangerouslySkipAll;
             return match ssh.spawn_agent(&cwd, resume, allow_all) {
                 Ok((stdout, stdin)) => {
-                    crate::agent_panel::AgentSession::over_channel(stdout, stdin, resume)
+                    let mut session =
+                        crate::agent_panel::AgentSession::over_channel(stdout, stdin, resume);
+                    // Hand over one endpoint, with its key, for this process
+                    // only. That machine has no reason to hold these — and on a
+                    // box you do not administer, every reason not to — so they
+                    // stay here and travel per session. The agent applies a
+                    // switch in memory and writes nothing, so nothing is left
+                    // behind when it exits.
+                    //
+                    // Sent unconditionally rather than only when the remote
+                    // looks unconfigured: a key it already has is simply
+                    // replaced by the same one, and guessing wrong the other
+                    // way means an agent that cannot reach a model at all.
+                    if let Some(ep) = crate::onboarding::local_default_endpoint() {
+                        session.switch_model(ep);
+                    }
+                    session
                 }
                 Err(e) => crate::agent_panel::AgentSession::failed(format!(
                     "Could not start the agent on {}: {e}",

@@ -39,15 +39,20 @@ cargo build --release -p forge-server
 # Not fatal when the cross-compiler is absent: the rest of the app is
 # unaffected, CI has no musl toolchain, and a bundle built without it says so
 # when a remote workspace is attempted rather than failing to build here.
+# forge-agent goes too: the agent runs on the machine you are working on, so
+# every tool call is local to it rather than a round trip back here.
 REMOTE_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+REMOTE_CRATES="forge-server forge-agent"
 for target in $REMOTE_TARGETS; do
   arch="${target%%-*}"
-  if cargo build --release -p forge-server --target "$target" 2>/dev/null; then
-    echo "==> Built remote forge-server for $arch"
-  else
-    echo "!!! No Linux/$arch forge-server — remote development will be unavailable"
-    echo "    in this bundle. Needs the musl cross-linker: brew install FiloSottile/musl-cross/musl-cross"
-  fi
+  for crate in $REMOTE_CRATES; do
+    if cargo build --release -p "$crate" --target "$target" 2>/dev/null; then
+      echo "==> Built remote $crate for $arch"
+    else
+      echo "!!! No Linux/$arch $crate — remote development will be limited in this"
+      echo "    bundle. Needs the musl cross-linker: brew install FiloSottile/musl-cross/musl-cross"
+    fi
+  done
 done
 
 echo "==> Assembling $APP"
@@ -61,10 +66,12 @@ cp "$BUILD_DIR/forge-server" "$APP/Contents/MacOS/forge-server"
 # executables of this app. `local_server_binary` looks for them by this name.
 for target in $REMOTE_TARGETS; do
   arch="${target%%-*}"
-  remote="../target/$target/release/forge-server"
-  if [ -f "$remote" ]; then
-    cp "$remote" "$APP/Contents/Resources/forge-server-$arch"
-  fi
+  for crate in $REMOTE_CRATES; do
+    remote="../target/$target/release/$crate"
+    if [ -f "$remote" ]; then
+      cp "$remote" "$APP/Contents/Resources/$crate-$arch"
+    fi
+  done
 done
 # No third-party runtime is bundled. The default renderer uses wgpu, which
 # targets Apple's own Metal framework — already present on every Mac. The

@@ -498,7 +498,11 @@ fn find_subagent_items_mut<'a>(items: &'a mut [ChatItem], id: &str) -> Option<&'
 
 pub struct AgentSession {
     child:        Option<Child>,
-    stdin:        Option<ChildStdin>,
+    /// Where messages to the agent go. Boxed rather than a `ChildStdin`: the
+    /// agent is a local subprocess when the workspace is local and an SSH exec
+    /// channel when it is remote, and everything above this line is the same
+    /// either way.
+    stdin:        Option<Box<dyn Write + Send>>,
     rx:           mpsc::Receiver<SessionEvent>,
     pub items:    Vec<ChatItem>,
     pub model:    String,
@@ -625,6 +629,122 @@ impl AgentSession {
     /// `--resume-session` so the subprocess reconstructs its *real* prior
     /// conversation history for the model, not just whatever transcript the
     /// caller separately replays into `items` for display.
+    /// A session that never started, carrying the reason.
+    ///
+    /// Used when a remote agent cannot be started. Falling back to a local one
+    /// would be worse than failing: the agent would run on the wrong machine
+    /// and edit files that merely happen to share a path, which is exactly the
+    /// confusion this feature exists to end.
+    pub fn failed(reason: String) -> Self {
+        let (_tx, rx) = mpsc::channel::<SessionEvent>();
+        Self {
+                child: None, stdin: None, rx,
+                items: Vec::new(), model: String::new(),
+                thinking: false, input: String::new(),
+                spawn_err: Some(reason),
+                exited:   false,
+                activity:    String::new(),
+                turn_tokens: 0,
+                turn_active: false,
+                queued:      Vec::new(),
+                tool_pulses: 0,
+                changed_files: Vec::new(),
+                shell_events:  Vec::new(),
+                git_just_initialized: false,
+                last_write:    None,
+                endpoints: Vec::new(),
+                context_strategy: String::new(),
+                offline_mode: false,
+                forge_session_id: String::new(),
+                resume_attempted: false,
+                needs_resume_fallback: false,
+                usage:     UsageSnapshot::default(),
+                auto_mode:   false,
+                request_input_focus: false,
+            }
+    }
+
+    /// A session driven over an already-open channel, for an agent running on
+    /// another machine.
+    ///
+    /// There is no child to hold: the agent is a process on the remote, and the
+    /// SSH channel closing is what ends it. `resume` is recorded the same way
+    /// as for a local spawn so a failed resume still reports itself, but the
+    /// flag that actually asks for it went into the command that opened this
+    /// channel.
+    pub fn over_channel(
+        stdout: Box<dyn std::io::Read + Send>,
+        stdin: Box<dyn Write + Send>,
+        resume: Option<&str>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<SessionEvent>();
+        Self::pump(stdout, None, tx);
+        Self {
+            child: None,
+            stdin: Some(stdin),
+                rx,
+                items:    Vec::new(),
+                model:    String::new(),
+                thinking: false,
+                input:    String::new(),
+                spawn_err: None,
+                exited:   false,
+                activity:    String::new(),
+                turn_tokens: 0,
+                changed_files: Vec::new(),
+                shell_events:  Vec::new(),
+                git_just_initialized: false,
+                last_write:    None,
+                endpoints: Vec::new(),
+                context_strategy: String::new(),
+                offline_mode: false,
+                forge_session_id: String::new(),
+                resume_attempted: resume.is_some(),
+                needs_resume_fallback: false,
+                usage:     UsageSnapshot::default(),
+                turn_active: false,
+                queued:      Vec::new(),
+                tool_pulses: 0,
+                auto_mode:   false,
+                request_input_focus: false,
+        }
+    }
+
+    /// Read the agent's protocol off `stdout` and its complaints off `stderr`,
+    /// forwarding both to the session. Shared by the local and remote
+    /// transports — the protocol does not care what it arrived over.
+    fn pump(
+        stdout: Box<dyn std::io::Read + Send>,
+        stderr: Option<Box<dyn std::io::Read + Send>>,
+        tx: mpsc::Sender<SessionEvent>,
+    ) {
+        let tx_out = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() { continue; }
+                if let Ok(msg) = serde_json::from_str::<AgentMsg>(&line) {
+                    if tx_out.send(SessionEvent::Msg(msg)).is_err() { break; }
+                }
+            }
+            let _ = tx_out.send(SessionEvent::Exited);
+        });
+
+        // A remote agent has no separate stderr: SSH gives one stream unless a
+        // second is asked for, and its diagnostics arrive interleaved. Nothing
+        // to pump in that case.
+        if let Some(stderr) = stderr {
+            let tx_err = tx;
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if line.trim().is_empty() { continue; }
+                    if tx_err.send(SessionEvent::Stderr(line)).is_err() { break; }
+                }
+            });
+        }
+    }
+
     pub fn spawn(cwd: &Path, mode: crate::settings::AgentPermissionMode, resume: Option<&str>) -> Self {
         let (tx, rx) = mpsc::channel::<SessionEvent>();
 
@@ -647,34 +767,14 @@ impl AgentSession {
             let stdout = child.stdout.take().ok_or_else(|| "no stdout pipe".to_string())?;
             let stderr = child.stderr.take().ok_or_else(|| "no stderr pipe".to_string())?;
 
-            let tx_out = tx.clone();
-            thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    if line.trim().is_empty() { continue; }
-                    if let Ok(msg) = serde_json::from_str::<AgentMsg>(&line) {
-                        if tx_out.send(SessionEvent::Msg(msg)).is_err() { break; }
-                    }
-                }
-                let _ = tx_out.send(SessionEvent::Exited);
-            });
-
-            let tx_err = tx.clone();
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    if line.trim().is_empty() { continue; }
-                    if tx_err.send(SessionEvent::Stderr(line)).is_err() { break; }
-                }
-            });
-
+            Self::pump(Box::new(stdout), Some(Box::new(stderr)), tx.clone());
             Ok((child, stdin))
         })();
 
         let mut session = match result {
             Ok((child, stdin)) => Self {
                 child:    Some(child),
-                stdin:    Some(stdin),
+                stdin:    Some(Box::new(stdin)),
                 rx,
                 items:    Vec::new(),
                 model:    String::new(),

@@ -3,11 +3,28 @@ use std::fs;
 fn main() {
     // Always needed, regardless of renderer.
     emit_forge_server_version();
+    emit_forge_agent_version();
 
     // SPIR-V is only consumed by the optional Vulkan renderer (`egui_pass.rs`).
     // The default wgpu backend carries its own WGSL, so shaderc — a heavy build
     // dependency that compiles glslang — is skipped entirely by default.
-    #[cfg(feature = "vulkan-renderer")]
+    /// The same reasoning as `emit_forge_server_version`, for the agent. The IDE
+/// uploads a Linux build of forge-agent to a remote host so the agent can run
+/// where the work is, and needs its version to know whether the copy already
+/// there is current. forge-agent is a sibling crate this one deliberately does
+/// not link against, so its Cargo.toml is where the number lives.
+fn emit_forge_agent_version() {
+    let path = "../forge-agent/Cargo.toml";
+    println!("cargo:rerun-if-changed={path}");
+    let text = fs::read_to_string(path).expect("failed to read forge-agent/Cargo.toml");
+    let value: toml::Value = text.parse().expect("failed to parse forge-agent/Cargo.toml");
+    let version = value["package"]["version"]
+        .as_str()
+        .expect("forge-agent/Cargo.toml missing package.version");
+    println!("cargo:rustc-env=FORGE_AGENT_VERSION={version}");
+}
+
+#[cfg(feature = "vulkan-renderer")]
     compile_vulkan_shaders();
 }
 

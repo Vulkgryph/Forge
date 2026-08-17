@@ -86,6 +86,10 @@ type PendMap = Arc<Mutex<HashMap<i64, mpsc::SyncSender<Result<serde_json::Value,
 
 pub struct SshConnection {
     pub host:    SshHost,
+    /// The remote account's home directory, resolved once at connect. Forge's
+    /// own binaries live under it, and asking again per call would be a round
+    /// trip for something that cannot change while the session is open.
+    pub remote_home: String,
     pub next_id: Arc<Mutex<i64>>,
     pub pending: PendMap,
     /// Channel stdin (server → client notifications arrive via push callbacks)
@@ -169,7 +173,11 @@ impl SshConnection {
         if needs_up {
             log(&format!("Uploading forge-server {} (1.2 MB)…", SERVER_VERSION), Info);
         }
-        ensure_server_uploaded(&rt, &session, &server_path)
+        let arch = remote_arch(&rt, &session)?;
+        ensure_binary_uploaded(
+            &rt, &session, &server_path, SERVER_VERSION,
+            local_server_binary(&arch)?,
+        )
             .map_err(|e| { log(&format!("Server upload failed: {e}"), Error); e })?;
         log(&format!("forge-server ready at {server_path}"), Success);
 
@@ -177,7 +185,8 @@ impl SshConnection {
         // We bridge the async channel to sync mpsc channels here so the tokio
         // runtime (and session) can be shut down after connect() returns.
         let server_path2 = server_path.clone();
-        let (reader, writer) = rt.block_on(open_exec_channel_bridged(&session, &server_path2))
+        let (reader, writer) = rt.block_on(open_exec_channel_bridged(
+            &session, &format!("{server_path2} --stdio")))
             .map_err(|e| e.to_string())?;
 
         // 4. Wire up response routing
@@ -218,6 +227,7 @@ impl SshConnection {
 
         Ok(Self {
             host: host.clone(),
+            remote_home: home.clone(),
             next_id,
             pending,
             stdin:    Arc::new(Mutex::new(Box::new(writer) as Box<dyn Write + Send>)),
@@ -237,6 +247,60 @@ impl SshConnection {
         Ok(entries.into_iter().map(|e| RemoteEntry {
             name: e.name, path: e.path, is_dir: e.is_dir, size: e.size
         }).collect())
+    }
+
+    /// Put the agent on the remote machine, and answer where it is.
+    ///
+    /// Uploaded on demand rather than at connect: a session that never opens
+    /// the agent panel should not pay six megabytes for it. Replaced when this
+    /// client's version moves on, by the same marker forge-server uses.
+    pub fn ensure_agent(&self) -> Result<String, String> {
+        let (Some(rt), Some(session)) = (self._rt.as_ref(), self._session.as_ref()) else {
+            return Err("connection is closing".into());
+        };
+        let arch = remote_arch(rt, session)?;
+        let bytes = local_agent_binary(&arch)?;
+        let path = format!("{}/.forge/forge-agent", self.remote_home.trim_end_matches('/'));
+        ensure_binary_uploaded(rt, session, &path, AGENT_VERSION, bytes)?;
+        Ok(path)
+    }
+
+    /// Start the agent on the remote machine and return its stdio.
+    ///
+    /// Its own SSH exec channel rather than anything routed through
+    /// forge-server: the agent speaks a line-oriented protocol over stdin and
+    /// stdout, which is exactly what an exec channel is, and a pty would
+    /// corrupt it with echo and newline translation.
+    ///
+    /// Every tool the agent runs is then local to that machine — the point of
+    /// the exercise. What does *not* travel is credentials: those are handed
+    /// over the channel after it opens, or proxied back here, and never written
+    /// to that machine's disk.
+    pub fn spawn_agent(
+        &self,
+        cwd: &str,
+        resume: Option<&str>,
+        allow_all: bool,
+    ) -> Result<(Box<dyn std::io::Read + Send>, Box<dyn std::io::Write + Send>), String> {
+        let agent = self.ensure_agent()?;
+        let (Some(rt), Some(session)) = (self._rt.as_ref(), self._session.as_ref()) else {
+            return Err("connection is closing".into());
+        };
+
+        // `cd` first so the agent's project root is the remote workspace. Its
+        // own default would be whatever directory the SSH session started in.
+        let mut command = format!("cd {} && {agent} --headless", shell_quote(cwd));
+        if let Some(id) = resume {
+            command.push_str(&format!(" --resume-session {}", shell_quote(id)));
+        }
+        if allow_all {
+            command.push_str(" --dangerously-allow-all");
+        }
+
+        let (reader, writer) = rt
+            .block_on(open_exec_channel_bridged(session, &command))
+            .map_err(|e| e.to_string())?;
+        Ok((Box::new(reader), Box::new(writer)))
     }
 
     pub fn fs_write(&self, path: &str, text: &str) -> Result<(), String> {
@@ -548,12 +612,27 @@ fn remote_home(rt: &Runtime, session: &Handle<ClientHandler>) -> Result<String, 
 /// Read from forge-server/Cargo.toml's own `version` at build time (see
 /// build.rs) rather than hand-copied here, so the two can't silently drift —
 /// bumping forge-server's version alone is enough to force a re-upload.
+/// Where the remote agent lives, and which build it is.
+///
+/// Beside forge-server, since both are Forge's own binaries on that machine and
+/// both are managed the same way — uploaded on demand, replaced when the local
+/// version moves on.
+pub const AGENT_VERSION: &str = concat!("forge-agent-", env!("FORGE_AGENT_VERSION"));
+
 const SERVER_VERSION: &str = concat!("forge-server-", env!("FORGE_SERVER_VERSION"));
 
-fn ensure_server_uploaded(
+/// Put `bytes` at `server_path` on the remote unless a marker beside it already
+/// names `version`.
+///
+/// Shared by forge-server and forge-agent: both are Linux builds of a sibling
+/// crate that this client ships and uploads, and both need the same "is the
+/// copy over there current" question answered the same way.
+fn ensure_binary_uploaded(
     rt:          &Runtime,
     session:     &Handle<ClientHandler>,
     server_path: &str,
+    version:     &str,
+    bytes:       Vec<u8>,
 ) -> Result<(), String> {
     // Use a plain text marker file next to the binary.  Avoids running the
     // binary for version checks (unreliable: old binary blocks on stdin).
@@ -567,18 +646,15 @@ fn ensure_server_uploaded(
                 out.push_str(&String::from_utf8_lossy(&data));
             }
         }
-        Ok::<bool, russh::Error>(out.trim() != SERVER_VERSION)
+        Ok::<bool, russh::Error>(out.trim() != version)
     }).map_err(|e: russh::Error| e.to_string())?;
 
     if !needs_upload { return Ok(()); }
 
-    // Choose the right binary based on remote arch.
-    let arch = remote_arch(rt, session)?;
-    let local_binary = local_server_binary(&arch)?;
-
-    eprintln!("forge-server: uploading v{} ({} bytes) to {server_path}…",
-        SERVER_VERSION, local_binary.len());
+    let local_binary = bytes;
+    eprintln!("uploading v{version} ({} bytes) to {server_path}…", local_binary.len());
     let marker2 = marker.clone();
+    let version = version.to_string();
 
     // ONE block: mkdir + SFTP upload of binary + marker + chmod.
     // Consolidated to minimise channel count and round-trips over slow VPNs.
@@ -612,7 +688,7 @@ fn ensure_server_uploaded(
 
         // Write version marker
         let mut vf = sftp.create(&marker2).await.map_err(|e| e.to_string())?;
-        vf.write_all(SERVER_VERSION.as_bytes()).await.map_err(|e| e.to_string())?;
+        vf.write_all(version.as_bytes()).await.map_err(|e| e.to_string())?;
         vf.flush().await.map_err(|e| e.to_string())?;
         drop(vf);
         drop(sftp);
@@ -643,6 +719,53 @@ fn remote_arch(rt: &Runtime, session: &Handle<ClientHandler>) -> Result<String, 
         }
         Ok(out.trim().to_string())
     })
+}
+
+/// Wrap a value for a remote shell.
+///
+/// Single quotes with embedded quotes escaped: a workspace path can contain
+/// spaces, and while a session id is generated rather than typed, neither is
+/// worth interpolating into a command line unquoted.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The Linux forge-agent to upload, for the remote's architecture.
+///
+/// Same search as `local_server_binary` and for the same reason: inside the
+/// .app first, since that is the only path that exists for someone who
+/// installed the .dmg, then the development layouts.
+fn local_agent_binary(arch: &str) -> Result<Vec<u8>, String> {
+    let target = match arch {
+        "x86_64"  => "x86_64-unknown-linux-musl",
+        "aarch64" => "aarch64-unknown-linux-musl",
+        other     => return Err(format!("unsupported remote arch: {other}")),
+    };
+    let exe_dir = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let candidates = [
+        exe_dir.parent().map(|p| p.join("Resources").join(format!("forge-agent-{arch}")))
+            .unwrap_or_default(),
+        Path::new("target").join(target).join("release").join("forge-agent"),
+        Path::new("target").join(target).join("debug").join("forge-agent"),
+    ];
+    for path in &candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            // Must be a Linux binary. A Mach-O here means a build that picked
+            // up the host binary, which the remote cannot execute and whose
+            // failure over there would be baffling.
+            if bytes.starts_with(b"\x7fELF") {
+                return Ok(bytes);
+            }
+        }
+    }
+    Err(format!(
+        "This build of Forge IDE has no Linux/{arch} forge-agent bundled, so the agent \
+         cannot run on the remote machine. It is built by scripts/package_macos.sh and \
+         lives in the app's Resources."
+    ))
 }
 
 fn local_server_binary(arch: &str) -> Result<Vec<u8>, String> {
@@ -710,11 +833,11 @@ fn local_server_binary(arch: &str) -> Result<Vec<u8>, String> {
 /// to sync mpsc so the returned (reader, writer) are `'static + Send` and the
 /// caller's Handle reference can be dropped immediately after this returns.
 async fn open_exec_channel_bridged(
-    session:     &Handle<ClientHandler>,
-    server_path: &str,
+    session: &Handle<ClientHandler>,
+    command: &str,
 ) -> Result<(ChannelReader, ChannelWriter2), russh::Error> {
     let channel = session.channel_open_session().await?;
-    channel.exec(true, format!("{server_path} --stdio")).await?;
+    channel.exec(true, command.to_string()).await?;
 
     let (read_half, write_half) = channel.split();
 
@@ -1198,5 +1321,30 @@ mod host_key_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn a_path_with_spaces_survives() {
+        // Remote workspaces are chosen by the user, not by us.
+        assert_eq!(shell_quote("/home/me/My Project"), "'/home/me/My Project'");
+    }
+
+    #[test]
+    fn a_quote_cannot_end_the_argument_early() {
+        // The whole reason to quote: without this, everything after the quote
+        // would be read by the remote shell as further command.
+        let out = shell_quote("/tmp/it's; rm -rf ~");
+        assert_eq!(out, r#"'/tmp/it'\''s; rm -rf ~'"#);
+        assert!(out.starts_with('\'') && out.ends_with('\''));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_merely_wrapped() {
+        assert_eq!(shell_quote("/home/me/code"), "'/home/me/code'");
     }
 }

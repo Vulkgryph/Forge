@@ -1017,9 +1017,14 @@ fn shell_name() -> String {
 }
 
 impl AgentTab {
-    fn new(cwd: &std::path::Path, mode: crate::settings::AgentPermissionMode) -> Self {
+    /// `session` is supplied rather than started here: whether the agent runs
+    /// locally or on the machine being worked on is the app's decision, and it
+    /// is the only thing holding the SSH connection. See
+    /// `IdeApp::start_agent_session`.
+    fn new(session: crate::agent_panel::AgentSession,
+           mode: crate::settings::AgentPermissionMode) -> Self {
         Self {
-            session: crate::agent_panel::AgentSession::spawn(cwd, mode, None),
+            session,
             conv_id: new_conv_id(),
             permission_mode: mode,
             session_password: None,
@@ -1039,11 +1044,11 @@ impl AgentTab {
     /// it does. `items`/`model` are still applied on top so the chat view
     /// has something to show immediately, before the resumed process's own
     /// (context-free) `init` message would otherwise arrive.
-    fn reopen(cwd: &std::path::Path, mode: crate::settings::AgentPermissionMode,
+    fn reopen(session: crate::agent_panel::AgentSession,
+              mode: crate::settings::AgentPermissionMode,
               conv: &crate::agent_panel::SavedConversation) -> Self {
-        let resume = if conv.forge_session_id.is_empty() { None } else { Some(conv.forge_session_id.as_str()) };
         let mut tab = Self {
-            session: crate::agent_panel::AgentSession::spawn(cwd, mode, resume),
+            session,
             conv_id: conv.id.clone(),
             permission_mode: mode,
             session_password: None,
@@ -1094,17 +1099,30 @@ impl AgentTab {
     /// replaying the current transcript into it exactly like reopening a
     /// saved conversation from history already does. Call only when the
     /// current turn isn't active — respawning mid-turn would drop it.
-    fn set_permission_mode(&mut self, mode: crate::settings::AgentPermissionMode, cwd: &std::path::Path) {
+    /// Whether changing to `mode` needs a new agent process.
+    ///
+    /// `--dangerously-allow-all` is only settable as a flag at spawn time, so
+    /// crossing into or out of it cannot be done live.
+    fn mode_change_needs_respawn(&self, mode: crate::settings::AgentPermissionMode) -> bool {
         use crate::settings::AgentPermissionMode as Mode;
+        self.permission_mode != mode
+            && (self.permission_mode == Mode::DangerouslySkipAll || mode == Mode::DangerouslySkipAll)
+    }
+
+    /// `replacement` is supplied by the caller when `mode_change_needs_respawn`
+    /// said one was needed. Spawning it here would always produce a *local*
+    /// agent, which on a remote workspace would quietly move the agent back
+    /// onto this machine the first time the permission mode changed.
+    fn set_permission_mode(
+        &mut self,
+        mode: crate::settings::AgentPermissionMode,
+        replacement: Option<crate::agent_panel::AgentSession>,
+    ) {
         if self.permission_mode == mode { return; }
-        let needs_respawn = self.permission_mode == Mode::DangerouslySkipAll
-            || mode == Mode::DangerouslySkipAll;
-        if needs_respawn {
+        if let Some(replacement) = replacement {
             let items = std::mem::take(&mut self.session.items);
             let model = self.session.model.clone();
-            let resume_id = self.session.forge_session_id.clone();
-            let resume = if resume_id.is_empty() { None } else { Some(resume_id.as_str()) };
-            self.session = crate::agent_panel::AgentSession::spawn(cwd, mode, resume);
+            self.session = replacement;
             self.session.items = items;
             self.session.model = model;
         } else {
@@ -3692,7 +3710,15 @@ impl IdeApp {
                     let saved = crate::agent_panel::load_conversations(&app.cwd);
                     app.agent_tabs = state.agent_tabs.iter()
                         .filter_map(|id| saved.iter().find(|c| &c.id == id))
-                        .map(|conv| AgentTab::reopen(&app.cwd, app.settings.default_agent_permission_mode, conv))
+                        .map(|conv| {
+                            // Restoring at startup, before any SSH connection
+                            // exists, so these are necessarily local.
+                            let mode = app.settings.default_agent_permission_mode;
+                            let resume = (!conv.forge_session_id.is_empty())
+                                .then_some(conv.forge_session_id.as_str());
+                            let session = app.start_agent_session(mode, resume);
+                            AgentTab::reopen(session, mode, conv)
+                        })
                         .collect();
                     if !app.agent_tabs.is_empty() {
                         app.agent_active = state.agent_active.min(app.agent_tabs.len() - 1);
@@ -6040,7 +6066,9 @@ impl IdeApp {
     fn draw_agent_view(&mut self, ui: &mut egui::Ui) {
         // Ensure at least one tab exists
         if self.agent_tabs.is_empty() {
-            self.agent_tabs.push(AgentTab::new(&self.cwd, self.settings.default_agent_permission_mode));
+            let mode = self.settings.default_agent_permission_mode;
+            let session = self.start_agent_session(mode, None);
+            self.agent_tabs.push(AgentTab::new(session, mode));
             self.agent_active = 0;
         }
 
@@ -6090,7 +6118,9 @@ impl IdeApp {
                     if let Some(idx) = self.agent_tabs.iter().position(|t| t.session.is_unused()) {
                         self.agent_active = idx;
                     } else {
-                        self.agent_tabs.push(AgentTab::new(&self.cwd, self.settings.default_agent_permission_mode));
+                        let mode = self.settings.default_agent_permission_mode;
+            let session = self.start_agent_session(mode, None);
+            self.agent_tabs.push(AgentTab::new(session, mode));
                         self.agent_active = self.agent_tabs.len() - 1;
                     }
                     self.agent_show_list = false;
@@ -6169,7 +6199,11 @@ impl IdeApp {
                             {
                                 self.agent_active = idx;
                             } else {
-                                let new_tab = AgentTab::reopen(&self.cwd, self.settings.default_agent_permission_mode, conv);
+                                let mode = self.settings.default_agent_permission_mode;
+                                let resume = (!conv.forge_session_id.is_empty())
+                                    .then_some(conv.forge_session_id.as_str());
+                                let session = self.start_agent_session(mode, resume);
+                                let new_tab = AgentTab::reopen(session, mode, conv);
                                 self.agent_tabs.push(new_tab);
                                 self.agent_active = self.agent_tabs.len() - 1;
                             }
@@ -6248,7 +6282,9 @@ impl IdeApp {
                 }
                 self.agent_tabs.remove(ci);
                 if self.agent_tabs.is_empty() {
-                    self.agent_tabs.push(AgentTab::new(&self.cwd, self.settings.default_agent_permission_mode));
+                    let mode = self.settings.default_agent_permission_mode;
+            let session = self.start_agent_session(mode, None);
+            self.agent_tabs.push(AgentTab::new(session, mode));
                 }
                 self.agent_active = self.agent_active.min(self.agent_tabs.len() - 1);
             }
@@ -6270,11 +6306,18 @@ impl IdeApp {
         // `needs_resume_fallback`'s doc comment) reports an error and exits
         // immediately, with no `init` ever coming — respawn fresh in place
         // so the tab keeps working, instead of leaving it permanently dead.
-        if std::mem::take(&mut tab.session.needs_resume_fallback) {
-            let items = std::mem::take(&mut tab.session.items);
-            tab.session = crate::agent_panel::AgentSession::spawn(&self.cwd, tab.permission_mode, None);
+        // Taken from the tab and then released, because starting a replacement
+        // needs the app itself — that is where the SSH connection lives — and
+        // the tab above is held mutably.
+        let fallback = std::mem::take(&mut tab.session.needs_resume_fallback)
+            .then(|| (std::mem::take(&mut tab.session.items), tab.permission_mode));
+        if let Some((items, mode)) = fallback {
+            let replacement = self.start_agent_session(mode, None);
+            let tab = &mut self.agent_tabs[self.agent_active];
+            tab.session = replacement;
             tab.session.items = items;
         }
+        let tab = &mut self.agent_tabs[self.agent_active];
 
         // Esc interrupts an in-flight turn — there was previously no way to
         // stop a run mid-flight at all short of killing the whole tab.
@@ -6319,6 +6362,10 @@ impl IdeApp {
         let mut reasoning_badge_rect = egui::Rect::NOTHING;
         let mut context_badge_rect   = egui::Rect::NOTHING;
         let mut toggle_offline_mode  = false;
+        // Applied after the panel is drawn: a respawn needs the app (for the
+        // SSH connection, so a remote workspace gets a remote agent), and the
+        // tab is borrowed mutably throughout the drawing below.
+        let mut perm_change: Option<crate::settings::AgentPermissionMode> = None;
         // Wrapped, so a narrow panel reflows the badges instead of running them
         // off the edge — and, since egui sizes a panel from its contents, so
         // that this row cannot hold the panel open at its own width.
@@ -6424,6 +6471,13 @@ impl IdeApp {
             let next = !tab.session.offline_mode;
             tab.session.update_offline_mode(next);
         }
+        // Read what the respawn needs, then let go of the tab: starting the
+        // replacement borrows the app for its SSH connection.
+        let respawn = perm_change.map(|mode| {
+            let needs = tab.mode_change_needs_respawn(mode);
+            let resume = tab.session.forge_session_id.clone();
+            (mode, needs, resume)
+        });
         ui.separator();
         ui.add_space(2.0);
 
@@ -6563,8 +6617,7 @@ impl IdeApp {
                 if needs_confirm {
                     self.agent_pending_perm_mode = Some(mode);
                 } else if !tab.session.is_active() {
-                    let cwd = self.cwd.clone();
-                    tab.set_permission_mode(mode, &cwd);
+                    perm_change = Some(mode);
                 }
             }
             if dismissed { self.agent_perm_picker_open = false; }
@@ -6588,8 +6641,7 @@ impl IdeApp {
                 ui.add_space(10.0);
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui.button("Confirm").clicked() {
-                        let cwd = self.cwd.clone();
-                        tab.set_permission_mode(mode, &cwd);
+                        perm_change = Some(mode);
                         self.agent_pending_perm_mode = None;
                     }
                 });
@@ -7459,6 +7511,17 @@ impl IdeApp {
                     tab.session.deny(tool_id, "User denied in Forge IDE".into());
                 }
             }
+        }
+
+        // The permission change, now that nothing holds the tab. A respawn is
+        // built through `start_agent_session`, so a remote workspace keeps its
+        // remote agent instead of quietly getting a local one.
+        if let Some((mode, needs_respawn, resume_id)) = respawn {
+            let replacement = needs_respawn.then(|| {
+                let resume = (!resume_id.is_empty()).then_some(resume_id.as_str());
+                self.start_agent_session(mode, resume)
+            });
+            self.agent_tabs[self.agent_active].set_permission_mode(mode, replacement);
         }
 
         if let Some(idx) = toggle_expand {
@@ -11863,6 +11926,40 @@ impl IdeApp {
             })();
             let _ = tx.send(result);
         });
+    }
+
+    /// Start an agent for the workspace in front of the user.
+    ///
+    /// On a remote workspace the agent runs *there*, so every file it reads and
+    /// every command it runs is on the machine being worked on. It used to be
+    /// spawned locally whatever was open, which meant a remote session showed a
+    /// remote file tree and a remote terminal beside an agent quietly working
+    /// on this Mac.
+    ///
+    /// A remote agent that cannot be started is reported as a failed session
+    /// rather than silently replaced by a local one — an agent on the wrong
+    /// machine, editing files that merely share a path, is worse than an agent
+    /// that says it could not start.
+    fn start_agent_session(
+        &self,
+        mode: crate::settings::AgentPermissionMode,
+        resume: Option<&str>,
+    ) -> crate::agent_panel::AgentSession {
+        use crate::settings::AgentPermissionMode;
+        if let Some(ssh) = &self.ssh {
+            let cwd = ssh.host.remote_dir.clone();
+            let allow_all = mode == AgentPermissionMode::DangerouslySkipAll;
+            return match ssh.spawn_agent(&cwd, resume, allow_all) {
+                Ok((stdout, stdin)) => {
+                    crate::agent_panel::AgentSession::over_channel(stdout, stdin, resume)
+                }
+                Err(e) => crate::agent_panel::AgentSession::failed(format!(
+                    "Could not start the agent on {}: {e}",
+                    ssh.host.host,
+                )),
+            };
+        }
+        crate::agent_panel::AgentSession::spawn(&self.cwd, mode, resume)
     }
 
     /// The two host-key conversations: an unknown host, and a changed one.

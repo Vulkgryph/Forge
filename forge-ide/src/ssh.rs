@@ -1012,6 +1012,14 @@ fn bridge_channel(
                 _ => break,
             }
         }
+        // Tell the far end there is no more. The writer being dropped ends this
+        // loop but says nothing on the wire, and a proxied model response is
+        // delimited by the connection closing — no content-length, since the
+        // body is streamed as it arrives. Without this the agent had its whole
+        // answer and went on waiting for an end that never came, which is what
+        // "stuck on sending" was.
+        let _ = write_half.eof().await;
+        let _ = write_half.close().await;
     });
 
     (ChannelReader::new(out_rx), ChannelWriter2(in_tx))

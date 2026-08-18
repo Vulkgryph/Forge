@@ -596,6 +596,18 @@ enum IncomingMessage {
         /// before, which is what a local agent wants.
         #[serde(default)]
         api_key: Option<String>,
+        /// Use this endpoint, do not remember it.
+        ///
+        /// For an address that is only meaningful for this session: a client
+        /// proxying model calls for an agent that has no credentials sends a
+        /// tunnel address, and a tunnel is a different port every time. Written
+        /// to the config it would be an endpoint that no longer answers.
+        ///
+        /// A key supplied by the client implies this too — it is not this
+        /// machine's to keep — but the reverse does not hold, since a proxied
+        /// endpoint carries no key at all.
+        #[serde(default)]
+        ephemeral: bool,
     },
     UpdateSubagentConfig {
         #[serde(default)]
@@ -703,6 +715,7 @@ fn json_to_user_action(
             endpoint_type,
             reasoning,
             api_key,
+            ephemeral,
         } => {
             let ep_type = match endpoint_type.as_str() {
                 "anthropic" => crate::config::EndpointType::Anthropic,
@@ -728,7 +741,7 @@ fn json_to_user_action(
             // config instead of defaulting to off on every switch.
             let xai_priority_tier = existing.map(|e| e.xai_priority_tier).unwrap_or(false);
             // A key the client supplied is the client's, not this machine's.
-            let persist = if client_key {
+            let persist = if client_key || ephemeral {
                 crate::agent::PersistEndpoint::No
             } else {
                 crate::agent::PersistEndpoint::Yes

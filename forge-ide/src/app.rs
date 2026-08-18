@@ -12019,6 +12019,10 @@ impl IdeApp {
                                     let prefix = ep["base_url"].as_str().unwrap_or("").to_string();
                                     ep["base_url"] =
                                         serde_json::json!(format!("http://127.0.0.1:{port}{prefix}"));
+                                    // A tunnel address is good for this session
+                                    // only, so the agent must not write it to
+                                    // its machine's config.
+                                    ep["ephemeral"] = serde_json::json!(true);
                                 }
                                 session.set_lent_endpoints(lent.clone());
                                 // Start on this machine's default where it is

@@ -969,23 +969,31 @@ impl Agent {
                     self.max_context_tokens = new_max_ctx;
                     // Persist as global default. If the endpoint isn't in the static
                     // config (e.g. dynamically discovered Anthropic model), add it first.
-                    if !self
+                    // Kept in the endpoint list so the model can be named and
+                    // its limits respected, but without the key when it is not
+                    // ours to keep: the live client already has it, and
+                    // anything that writes this config later would otherwise
+                    // write the key with it.
+                    let mut remembered = endpoint.clone();
+                    if persist == PersistEndpoint::No {
+                        remembered.api_key = None;
+                    }
+                    // Replaced, not skipped when the name is already known. An
+                    // endpoint can be the same model at a different address —
+                    // a client proxying for an agent that has no credentials
+                    // sends one whose address is a tunnel, and a tunnel is a
+                    // different port every session. Leaving the old entry in
+                    // place meant the config kept an address that no longer
+                    // answered.
+                    match self
                         .app_config
                         .models
                         .endpoints
-                        .iter()
-                        .any(|e| e.name == endpoint.name)
+                        .iter_mut()
+                        .find(|e| e.name == remembered.name)
                     {
-                        // Kept in the endpoint list so the model can be named
-                        // and its limits respected, but without the key when it
-                        // is not ours to keep: the live client already has it,
-                        // and anything that writes this config later would
-                        // otherwise write the key with it.
-                        let mut remembered = endpoint.clone();
-                        if persist == PersistEndpoint::No {
-                            remembered.api_key = None;
-                        }
-                        self.app_config.models.endpoints.push(remembered);
+                        Some(existing) => *existing = remembered,
+                        None => self.app_config.models.endpoints.push(remembered),
                     }
                     self.app_config.models.default = endpoint.name.clone();
                     if persist == PersistEndpoint::Yes {

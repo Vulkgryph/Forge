@@ -194,6 +194,51 @@ pub struct Upstream {
     pub extra_headers: Vec<(String, String)>,
 }
 
+/// Every endpoint this machine is lending, keyed by the path prefix the remote
+/// reaches it through.
+///
+/// One tunnel rather than one per endpoint. The remote is given a distinct
+/// prefix per endpoint — `/e0`, `/e1` — so switching models over there is a
+/// different path on the same forwarded port, and the model picker can offer
+/// everything this machine has instead of the single endpoint it was started
+/// with.
+#[derive(Debug, Clone, Default)]
+pub struct Routes(Vec<(String, Upstream)>);
+
+impl Routes {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Add an endpoint and return the prefix the remote should use for it.
+    pub fn add(&mut self, upstream: Upstream) -> String {
+        let prefix = format!("/e{}", self.0.len());
+        self.0.push((prefix.clone(), upstream));
+        prefix
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The endpoint a request is for, and the path with its prefix removed.
+    ///
+    /// An unrecognised prefix is not served. Guessing — falling back to the
+    /// first endpoint, say — would send a request to the wrong provider with
+    /// the wrong credential, which is worse than a refusal.
+    pub fn route(&self, path: &str) -> Option<(&Upstream, String)> {
+        self.0.iter().find_map(|(prefix, up)| {
+            let rest = path.strip_prefix(prefix.as_str())?;
+            // `/e1` must not match a request for `/e10`.
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return None;
+            }
+            let rest = if rest.is_empty() { "/" } else { rest };
+            Some((up, rest.to_string()))
+        })
+    }
+}
+
 /// Read one request from `client`, forward it upstream with the credential
 /// attached, and stream the answer back.
 ///
@@ -207,7 +252,7 @@ pub struct Upstream {
 /// means tracking its framing; the agent's client opens what it needs.
 pub fn serve_one<S: std::io::Read + std::io::Write>(
     client: &mut S,
-    upstream: &Upstream,
+    routes: &Routes,
 ) -> Result<(), String> {
     use std::io::Read;
 
@@ -236,7 +281,10 @@ pub fn serve_one<S: std::io::Read + std::io::Write>(
         client.read_exact(&mut body).map_err(|e| format!("reading body: {e}"))?;
     }
 
-    let url = upstream_url(&upstream.base_url, &head.path);
+    let (upstream, path) = routes
+        .route(&head.path)
+        .ok_or_else(|| format!("no endpoint is lent at {}", head.path))?;
+    let url = upstream_url(&upstream.base_url, &path);
     let mut req = ureq::request(&head.method, &url);
     for (name, value) in upstream_headers(&head, upstream.style, &upstream.credential) {
         req = req.set(&name, &value);
@@ -381,6 +429,63 @@ mod tests {
         }
     }
 
+    fn two_endpoints() -> Routes {
+        let mut r = Routes::new();
+        for (n, url) in [("a", "https://api.one.test/v1"), ("b", "https://api.two.test/v1")] {
+            r.add(Upstream {
+                base_url: url.into(),
+                style: AuthStyle::Bearer,
+                credential: format!("key-{n}"),
+                extra_headers: Vec::new(),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn each_endpoint_is_reached_at_its_own_path() {
+        // One tunnel, several endpoints — so the model picker on the remote can
+        // offer everything this machine has, not just the one it started with.
+        let r = two_endpoints();
+        let (up, rest) = r.route("/e0/chat/completions").expect("first");
+        assert_eq!(up.credential, "key-a");
+        assert_eq!(rest, "/chat/completions", "the prefix is stripped before forwarding");
+
+        let (up, _) = r.route("/e1/chat/completions").expect("second");
+        assert_eq!(up.credential, "key-b", "and they do not get each other's key");
+    }
+
+    #[test]
+    fn an_unknown_prefix_is_refused_rather_than_guessed() {
+        // Falling back to the first endpoint would send a request to the wrong
+        // provider with the wrong credential.
+        assert!(two_endpoints().route("/e7/chat/completions").is_none());
+        assert!(two_endpoints().route("/chat/completions").is_none());
+    }
+
+    #[test]
+    fn a_prefix_is_not_a_prefix_of_a_longer_one() {
+        // /e1 must not answer for /e10, which it would with a plain
+        // starts_with.
+        let mut r = Routes::new();
+        for i in 0..11 {
+            r.add(Upstream {
+                base_url: format!("https://{i}.test"),
+                style: AuthStyle::Bearer,
+                credential: format!("k{i}"),
+                extra_headers: Vec::new(),
+            });
+        }
+        let (up, _) = r.route("/e10/x").expect("e10");
+        assert_eq!(up.credential, "k10");
+    }
+
+    #[test]
+    fn an_endpoint_reached_at_its_bare_prefix_still_has_a_path() {
+        let (_, rest) = two_endpoints().route("/e0").expect("bare");
+        assert_eq!(rest, "/");
+    }
+
     #[test]
     fn the_upstream_url_joins_without_doubling_the_slash() {
         assert_eq!(
@@ -472,21 +577,20 @@ mod io_tests {
         let (base_url, server) = upstream_that_echoes_its_auth();
         let mut pipe = Pipe {
             input: std::io::Cursor::new(
-                b"POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1:1\r\ncontent-length: 2\r\n\r\n{}"
+                b"POST /e0/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1:1\r\ncontent-length: 2\r\n\r\n{}"
                     .to_vec(),
             ),
             output: Vec::new(),
         };
-        serve_one(
-            &mut pipe,
-            &Upstream {
-                base_url,
-                style: AuthStyle::Bearer,
-                credential: "sk-lent".into(),
-                extra_headers: Vec::new(),
-            },
-        )
-        .expect("proxied");
+        let mut routes = Routes::new();
+        let prefix = routes.add(Upstream {
+            base_url,
+            style: AuthStyle::Bearer,
+            credential: "sk-lent".into(),
+            extra_headers: Vec::new(),
+        });
+        assert_eq!(prefix, "/e0");
+        serve_one(&mut pipe, &routes).expect("proxied");
         server.join().unwrap();
 
         let out = String::from_utf8_lossy(&pipe.output);
@@ -512,19 +616,17 @@ mod io_tests {
             );
         });
         let mut pipe = Pipe {
-            input: std::io::Cursor::new(b"POST /v1/x HTTP/1.1\r\ncontent-length: 0\r\n\r\n".to_vec()),
+            input: std::io::Cursor::new(b"POST /e0/v1/x HTTP/1.1\r\ncontent-length: 0\r\n\r\n".to_vec()),
             output: Vec::new(),
         };
-        serve_one(
-            &mut pipe,
-            &Upstream {
-                base_url: format!("http://127.0.0.1:{port}"),
-                style: AuthStyle::Bearer,
-                credential: "k".into(),
-                extra_headers: Vec::new(),
-            },
-        )
-        .expect("a 429 is a response, not a failure");
+        let mut routes = Routes::new();
+        routes.add(Upstream {
+            base_url: format!("http://127.0.0.1:{port}"),
+            style: AuthStyle::Bearer,
+            credential: "k".into(),
+            extra_headers: Vec::new(),
+        });
+        serve_one(&mut pipe, &routes).expect("a 429 is a response, not a failure");
         server.join().unwrap();
         let out = String::from_utf8_lossy(&pipe.output);
         assert!(out.starts_with("HTTP/1.1 429"), "got {out:?}");

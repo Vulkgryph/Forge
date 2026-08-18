@@ -11965,44 +11965,69 @@ impl IdeApp {
                     // looks unconfigured: a key it already has is simply
                     // replaced by the same one, and guessing wrong the other
                     // way means an agent that cannot reach a model at all.
-                    if let Some(mut ep) = crate::onboarding::local_default_endpoint() {
+                    // Every endpoint this machine can lend, on one tunnel,
+                    // each reachable at its own path. The remote agent starts
+                    // with only whatever config it has — a wiped machine has
+                    // none — so without this the model picker over there offers
+                    // exactly the one endpoint it was handed, which is what it
+                    // did on the first real test.
+                    let locals = crate::onboarding::local_endpoints();
+                    let mut routes = crate::model_proxy::Routes::new();
+                    let mut lent: Vec<serde_json::Value> = Vec::new();
+                    for ep in locals {
                         let kind = ep["endpoint_type"].as_str().unwrap_or("").to_string();
                         let key = ep["api_key"].as_str().unwrap_or("").to_string();
-                        match crate::onboarding::credential_for(&kind, &key) {
-                            Some((credential, extra_headers)) => {
-                                // Proxied: the agent is pointed at a port on its
-                                // own loopback, this machine answers it, and the
-                                // credential never crosses. The only way ChatGPT
-                                // can work at all remotely — its token is a file
-                                // on whichever machine the agent runs on, and
-                                // that machine does not have one.
-                                let upstream = crate::model_proxy::Upstream {
-                                    base_url: ep["base_url"].as_str().unwrap_or("").to_string(),
-                                    style: crate::model_proxy::AuthStyle::from_endpoint_type(&kind),
-                                    credential,
-                                    extra_headers,
-                                };
-                                match ssh.open_model_proxy(upstream) {
-                                    Ok(port) => {
-                                        ep["base_url"] =
-                                            serde_json::json!(format!("http://127.0.0.1:{port}"));
-                                        // Nothing to send: the far end has no
-                                        // use for a key it never authenticates
-                                        // with.
-                                        ep["api_key"] = serde_json::json!("");
-                                        session.switch_model(ep);
-                                    }
-                                    Err(e) => {
-                                        session.spawn_err = Some(format!(
-                                            "Could not open the model tunnel to {}: {e}",
-                                            ssh.host.host,
-                                        ));
-                                    }
+                        let Some((credential, extra_headers)) =
+                            crate::onboarding::credential_for(&kind, &key)
+                        else {
+                            // No credential here for it, so lending it would
+                            // offer a model that cannot answer.
+                            continue;
+                        };
+                        let prefix = routes.add(crate::model_proxy::Upstream {
+                            base_url: ep["base_url"].as_str().unwrap_or("").to_string(),
+                            style: crate::model_proxy::AuthStyle::from_endpoint_type(&kind),
+                            credential,
+                            extra_headers,
+                        });
+                        let mut lent_ep = ep.clone();
+                        lent_ep["api_key"] = serde_json::json!("");
+                        lent_ep["base_url"] = serde_json::json!(prefix);
+                        lent.push(lent_ep);
+                    }
+
+                    if !routes.is_empty() {
+                        match ssh.open_model_proxy(routes) {
+                            Ok(port) => {
+                                // The prefix stored above becomes a whole URL
+                                // now that the port is known.
+                                for ep in &mut lent {
+                                    let prefix = ep["base_url"].as_str().unwrap_or("").to_string();
+                                    ep["base_url"] =
+                                        serde_json::json!(format!("http://127.0.0.1:{port}{prefix}"));
+                                }
+                                session.set_lent_endpoints(lent.clone());
+                                // Start on this machine's default where it is
+                                // among them, so a remote session opens on the
+                                // model the user already chose.
+                                let default = crate::onboarding::local_default_name();
+                                let start_on = default
+                                    .and_then(|d| {
+                                        lent.iter()
+                                            .find(|e| e["name"].as_str() == Some(d.as_str()))
+                                            .cloned()
+                                    })
+                                    .or_else(|| lent.first().cloned());
+                                if let Some(ep) = start_on {
+                                    session.switch_model(ep);
                                 }
                             }
-                            // No credential here either — the remote is on its
-                            // own, and says so if it has none.
-                            None => session.switch_model(ep),
+                            Err(e) => {
+                                session.spawn_err = Some(format!(
+                                    "Could not open the model tunnel to {}: {e}",
+                                    ssh.host.host,
+                                ));
+                            }
                         }
                     }
                     session

@@ -96,7 +96,7 @@ pub struct SshConnection {
     /// Read only through the handler's own clone of this `Arc`, which is why
     /// the field itself looks unused.
     #[allow(dead_code)]
-    upstream: Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
+    upstream: Arc<Mutex<Option<crate::model_proxy::Routes>>>,
     pub next_id: Arc<Mutex<i64>>,
     pub pending: PendMap,
     /// Channel stdin (server → client notifications arrive via push callbacks)
@@ -146,7 +146,7 @@ impl SshConnection {
         let rt  = Runtime::new().map_err(|e| e.to_string())?;
         // Shared with the handler, which serves whatever the remote sends to
         // its forwarded port. Empty until a proxied agent is started.
-        let upstream: Arc<Mutex<Option<crate::model_proxy::Upstream>>> =
+        let upstream: Arc<Mutex<Option<crate::model_proxy::Routes>>> =
             Arc::new(Mutex::new(None));
         let h   = host.clone();
         let pw  = password.map(|s| s.to_string());
@@ -312,7 +312,7 @@ impl SshConnection {
     #[allow(dead_code)]
     pub fn open_model_proxy(
         &self,
-        upstream: crate::model_proxy::Upstream,
+        routes: crate::model_proxy::Routes,
     ) -> Result<u16, String> {
         let (Some(rt), Some(session)) = (self._rt.as_ref(), self._session.as_ref()) else {
             return Err("connection is closing".into());
@@ -320,7 +320,7 @@ impl SshConnection {
         // Set before the forward is requested: a connection can arrive as soon
         // as the remote is listening, and one that finds no upstream is
         // silently dropped.
-        *self.upstream.lock().unwrap() = Some(upstream);
+        *self.upstream.lock().unwrap() = Some(routes);
         let port = rt
             .block_on(session.tcpip_forward("127.0.0.1", 0))
             .map_err(|e| format!("could not open the model tunnel: {e}"))?;
@@ -506,7 +506,7 @@ struct ClientHandler {
     /// remote opens to its forwarded port arrives here and is served against
     /// this — which is how the credential reaches the model API without ever
     /// reaching the machine the agent runs on.
-    upstream:  Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
+    upstream:  Arc<Mutex<Option<crate::model_proxy::Routes>>>,
     /// Set once the user has been shown a fingerprint and accepted it. Only
     /// ever applies to a host that is *absent* from known_hosts, never to one
     /// whose key has changed.
@@ -591,16 +591,16 @@ impl client::Handler for ClientHandler {
         _originator_port: u32,
         _session: &mut russh::client::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let upstream = self.upstream.lock().unwrap().clone();
+        let routes = self.upstream.lock().unwrap().clone();
         async move {
-            let Some(upstream) = upstream else {
+            let Some(routes) = routes else {
                 // Nothing is proxying, so this port is not ours to answer.
                 return Ok(());
             };
             let (reader, writer) = bridge_channel(channel);
             std::thread::spawn(move || {
                 let mut stream = BridgedStream { reader, writer };
-                if let Err(e) = crate::model_proxy::serve_one(&mut stream, &upstream) {
+                if let Err(e) = crate::model_proxy::serve_one(&mut stream, &routes) {
                     // Named, never with the credential in it.
                     eprintln!("model proxy: {e}");
                 }
@@ -627,7 +627,7 @@ async fn ssh_authenticate(
     host: &SshHost,
     password: Option<&str>,
     trust_new: bool,
-    upstream: &Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
+    upstream: &Arc<Mutex<Option<crate::model_proxy::Routes>>>,
 ) -> Result<Handle<ClientHandler>, String> {
     let config = Arc::new(client::Config::default());
     let addr   = format!("{}:{}", host.host, host.port);

@@ -540,6 +540,9 @@ pub struct AgentSession {
     last_write:   Option<(String, String)>, // (tool_name, path) awaiting its tool_result
     /// Available model endpoints, as reported by `init`/`endpoints_updated`.
     pub endpoints: Vec<serde_json::Value>,
+    /// Set when `endpoints` describes what this machine lends over a tunnel
+    /// rather than what the agent found in its own config.
+    lent_endpoints: bool,
     /// "compaction" or "rolling_window" — mirrors `app_config.agent.context_strategy`,
     /// as reported by `init`. Updated optimistically by `update_context_strategy`
     /// (no ack broadcast for a runtime change, same as `auto_mode`).
@@ -653,6 +656,7 @@ impl AgentSession {
                 git_just_initialized: false,
                 last_write:    None,
                 endpoints: Vec::new(),
+                lent_endpoints: false,
                 context_strategy: String::new(),
                 offline_mode: false,
                 forge_session_id: String::new(),
@@ -696,6 +700,7 @@ impl AgentSession {
                 git_just_initialized: false,
                 last_write:    None,
                 endpoints: Vec::new(),
+                lent_endpoints: false,
                 context_strategy: String::new(),
                 offline_mode: false,
                 forge_session_id: String::new(),
@@ -789,6 +794,7 @@ impl AgentSession {
                 git_just_initialized: false,
                 last_write:    None,
                 endpoints: Vec::new(),
+                lent_endpoints: false,
                 context_strategy: String::new(),
                 offline_mode: false,
                 forge_session_id: String::new(),
@@ -817,6 +823,7 @@ impl AgentSession {
                 git_just_initialized: false,
                 last_write:    None,
                 endpoints: Vec::new(),
+                lent_endpoints: false,
                 context_strategy: String::new(),
                 offline_mode: false,
                 forge_session_id: String::new(),
@@ -855,7 +862,12 @@ impl AgentSession {
     fn handle(&mut self, msg: AgentMsg, policy: SessionPolicy) {
         match msg {
             AgentMsg::Init { model_name, endpoints, context_strategy, offline_mode, session_id, .. } => {
-                self.endpoints = endpoints;
+                // Same reasoning as `EndpointsUpdated`: a lent list outranks the
+                // remote's own. `init` can arrive after the lending, since one
+                // is a reply and the other is sent at startup.
+                if !self.lent_endpoints {
+                    self.endpoints = endpoints;
+                }
                 self.model = if model_name.is_empty() { "unknown".into() } else { model_name };
                 self.context_strategy = if context_strategy.is_empty() { "compaction".into() } else { context_strategy };
                 self.offline_mode = offline_mode;
@@ -1142,8 +1154,14 @@ impl AgentSession {
                     "Login {}: {message}", if success { "succeeded" } else { "failed" })));
             }
             AgentMsg::EndpointsUpdated { endpoints } => {
-                self.endpoints = endpoints;
-                self.items.push(ChatItem::Status("Available endpoints updated.".into()));
+                // Ignored when this machine is lending its own: the agent is
+                // describing endpoints on its machine, which it has no
+                // credentials for, and adopting them would replace a working
+                // list with an unusable one.
+                if !self.lent_endpoints {
+                    self.endpoints = endpoints;
+                    self.items.push(ChatItem::Status("Available endpoints updated.".into()));
+                }
             }
             AgentMsg::TurnDiscarded => {
                 self.items.push(ChatItem::Status("Turn discarded.".into()));
@@ -1354,6 +1372,19 @@ impl AgentSession {
     /// Ask the agent to switch to a different model/endpoint. `endpoint` should
     /// be one of the objects from `self.endpoints`, sent back verbatim so we
     /// never have to reconstruct its (possibly provider-specific) fields.
+    /// The endpoints this machine is lending to a remote agent.
+    ///
+    /// The model picker reads `endpoints`, which normally comes from the agent's
+    /// own `init` — its machine's config. A remote agent's config is not the
+    /// user's and may be empty, so the picker showed one model, or none.
+    /// Overwritten here, once, with what is actually reachable through the
+    /// tunnel; a later `EndpointsUpdated` from the agent would be about
+    /// endpoints it cannot authenticate with, so this stands.
+    pub fn set_lent_endpoints(&mut self, endpoints: Vec<serde_json::Value>) {
+        self.endpoints = endpoints;
+        self.lent_endpoints = true;
+    }
+
     pub fn switch_model(&mut self, endpoint: serde_json::Value) {
         let _ = self.write(&OutgoingMsg::SwitchModel(endpoint));
     }

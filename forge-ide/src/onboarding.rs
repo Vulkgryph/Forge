@@ -37,47 +37,54 @@ pub fn credential_for(endpoint_type: &str, api_key: &str) -> Option<(String, Vec
     Some((token, extra))
 }
 
-/// This machine's default endpoint, as a `switch_model` payload including its
-/// key.
+
+/// Every endpoint on this machine that could work from somewhere else, with its
+/// key, in config order.
 ///
-/// For an agent running on another machine. That machine has no reason to hold
-/// these credentials — and on a box you do not administer, every reason not to
-/// — so the client keeps them and hands one over when it picks an endpoint.
-/// `switch_model` is applied in memory by the agent and written nowhere, so the
-/// key lives only in that process for as long as it runs.
-pub fn local_default_endpoint() -> Option<serde_json::Value> {
+/// An endpoint on this machine's own localhost is skipped: over there it names a
+/// service on *that* machine, where there is nothing listening, so lending it
+/// would offer a model that cannot answer.
+pub fn local_endpoints() -> Vec<serde_json::Value> {
+    let Some(text) = forge_config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else { return Vec::new() };
+    let Some(endpoints) = doc
+        .get("models")
+        .and_then(|m| m.get("endpoints"))
+        .and_then(|e| e.as_array())
+    else {
+        return Vec::new();
+    };
+    endpoints
+        .iter()
+        .filter(|ep| {
+            ep.get("base_url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        })
+        .map(|ep| {
+            let get = |k: &str| ep.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let num = |k: &str, d: i64| ep.get(k).and_then(|v| v.as_integer()).unwrap_or(d);
+            serde_json::json!({
+                "name":               get("name"),
+                "base_url":           get("base_url"),
+                "model_id":           get("model_id"),
+                "max_context_tokens": num("max_context_tokens", 200_000),
+                "max_output_tokens":  num("max_output_tokens", 16_384),
+                "endpoint_type":      get("endpoint_type"),
+                "api_key":            get("api_key"),
+            })
+        })
+        .collect()
+}
+
+/// This machine's default endpoint, by name, so a remote session opens on the
+/// model the user already chose.
+pub fn local_default_name() -> Option<String> {
     let text = std::fs::read_to_string(forge_config_path()?).ok()?;
     let doc: toml::Value = text.parse().ok()?;
-    let models = doc.get("models")?;
-    let endpoints = models.get("endpoints")?.as_array()?;
-    let default = models.get("default").and_then(|v| v.as_str());
-
-    // The configured default, or the first endpoint that could work at all.
-    // An endpoint on this machine's own localhost is skipped: over there it
-    // names a service on *that* machine, where there is nothing listening.
-    let usable = |ep: &toml::Value| {
-        ep.get("base_url")
-            .and_then(|v| v.as_str())
-            .is_some_and(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
-    };
-    let chosen = endpoints
-        .iter()
-        .find(|ep| {
-            default.is_some_and(|d| ep.get("name").and_then(|v| v.as_str()) == Some(d)) && usable(ep)
-        })
-        .or_else(|| endpoints.iter().find(|ep| usable(ep)))?;
-
-    let get = |k: &str| chosen.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let num = |k: &str, d: u64| chosen.get(k).and_then(|v| v.as_integer()).unwrap_or(d as i64);
-    Some(serde_json::json!({
-        "name":               get("name"),
-        "base_url":           get("base_url"),
-        "model_id":           get("model_id"),
-        "max_context_tokens": num("max_context_tokens", 200_000),
-        "max_output_tokens":  num("max_output_tokens", 16_384),
-        "endpoint_type":      get("endpoint_type"),
-        "api_key":            chosen.get("api_key").and_then(|v| v.as_str()).unwrap_or(""),
-    }))
+    doc.get("models")?.get("default")?.as_str().map(str::to_string)
 }
 
 fn forge_config_path() -> Option<PathBuf> {

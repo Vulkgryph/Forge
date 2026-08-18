@@ -1016,6 +1016,19 @@ fn shell_name() -> String {
         .unwrap_or_else(|| "shell".into())
 }
 
+/// Whether moving from `from` to `to` needs a new agent process.
+///
+/// `--dangerously-allow-all` is only settable as a flag at spawn time, so
+/// crossing into or out of it cannot be done live; every other transition is a
+/// message to the running agent.
+fn mode_change_needs_respawn(
+    from: crate::settings::AgentPermissionMode,
+    to: crate::settings::AgentPermissionMode,
+) -> bool {
+    use crate::settings::AgentPermissionMode as Mode;
+    from != to && (from == Mode::DangerouslySkipAll || to == Mode::DangerouslySkipAll)
+}
+
 impl AgentTab {
     /// `session` is supplied rather than started here: whether the agent runs
     /// locally or on the machine being worked on is the app's decision, and it
@@ -1104,9 +1117,7 @@ impl AgentTab {
     /// `--dangerously-allow-all` is only settable as a flag at spawn time, so
     /// crossing into or out of it cannot be done live.
     fn mode_change_needs_respawn(&self, mode: crate::settings::AgentPermissionMode) -> bool {
-        use crate::settings::AgentPermissionMode as Mode;
-        self.permission_mode != mode
-            && (self.permission_mode == Mode::DangerouslySkipAll || mode == Mode::DangerouslySkipAll)
+        mode_change_needs_respawn(self.permission_mode, mode)
     }
 
     /// `replacement` is supplied by the caller when `mode_change_needs_respawn`
@@ -6471,13 +6482,6 @@ impl IdeApp {
             let next = !tab.session.offline_mode;
             tab.session.update_offline_mode(next);
         }
-        // Read what the respawn needs, then let go of the tab: starting the
-        // replacement borrows the app for its SSH connection.
-        let respawn = perm_change.map(|mode| {
-            let needs = tab.mode_change_needs_respawn(mode);
-            let resume = tab.session.forge_session_id.clone();
-            (mode, needs, resume)
-        });
         ui.separator();
         ui.add_space(2.0);
 
@@ -7516,7 +7520,17 @@ impl IdeApp {
         // The permission change, now that nothing holds the tab. A respawn is
         // built through `start_agent_session`, so a remote workspace keeps its
         // remote agent instead of quietly getting a local one.
-        if let Some((mode, needs_respawn, resume_id)) = respawn {
+        // Applied here, after the panel is drawn: the picker that sets
+        // `perm_change` is drawn above, and starting a replacement agent needs
+        // the app itself — the tab is borrowed throughout the drawing.
+        //
+        // Read here too, not earlier. Reading it before the picker ran meant
+        // reading a `perm_change` nothing had set yet, so it was always None and
+        // no permission change ever took effect at all.
+        if let Some(mode) = perm_change {
+            let tab = &self.agent_tabs[self.agent_active];
+            let needs_respawn = tab.mode_change_needs_respawn(mode);
+            let resume_id = tab.session.forge_session_id.clone();
             let replacement = needs_respawn.then(|| {
                 let resume = (!resume_id.is_empty()).then_some(resume_id.as_str());
                 self.start_agent_session(mode, resume)
@@ -13274,5 +13288,28 @@ mod minimap_tests {
         // still leave something to see rather than a zero-width rectangle.
         let (x0, x1) = minimap_span(0.0, 0.0, 0.0, SCALE);
         assert!(x1 > x0);
+    }
+}
+
+#[cfg(test)]
+mod permission_mode_tests {
+    use super::mode_change_needs_respawn as needs;
+    use crate::settings::AgentPermissionMode as M;
+
+    /// Only the `--dangerously-allow-all` boundary needs a new process, because
+    /// that one is a spawn-time flag. Everything else is a live message.
+    #[test]
+    fn only_the_allow_all_boundary_restarts_the_agent() {
+        assert!(needs(M::AlwaysAsk, M::DangerouslySkipAll), "into allow-all");
+        assert!(needs(M::DangerouslySkipAll, M::AlwaysAsk), "and back out of it");
+        assert!(needs(M::AutoApprove, M::DangerouslySkipAll));
+        assert!(!needs(M::AlwaysAsk, M::AutoApprove), "a live change, no restart");
+    }
+
+    #[test]
+    fn changing_to_the_mode_already_set_does_nothing() {
+        for m in [M::AlwaysAsk, M::AutoApprove, M::DangerouslySkipAll] {
+            assert!(!needs(m, m), "{m:?} to itself");
+        }
     }
 }

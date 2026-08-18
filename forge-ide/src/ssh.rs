@@ -192,6 +192,26 @@ impl SshConnection {
             .map_err(|e| { log(&format!("Server upload failed: {e}"), Error); e })?;
         log(&format!("forge-server ready at {server_path}"), Success);
 
+        // The agent too, here rather than when the panel first opens: this runs
+        // on a background thread with progress in the Output panel, where the
+        // panel-open path is a frame the user is waiting on — uploading six
+        // megabytes there froze the window for the length of the transfer.
+        //
+        // Not fatal if it fails. A connection whose file tree and terminal work
+        // is worth having even if the agent cannot run, and the failure is
+        // reported again, in full, if the panel is then opened.
+        log("Checking remote forge-agent…", Info);
+        match remote_arch(&rt, &session).and_then(|arch| local_agent_binary(&arch)) {
+            Ok(bytes) => {
+                let agent_path = format!("{home}/.forge/forge-agent");
+                match ensure_binary_uploaded(&rt, &session, &agent_path, AGENT_VERSION, bytes) {
+                    Ok(()) => log(&format!("forge-agent ready at {agent_path}"), Success),
+                    Err(e) => log(&format!("forge-agent unavailable: {e}"), Warn),
+                }
+            }
+            Err(e) => log(&format!("forge-agent unavailable: {e}"), Warn),
+        }
+
         log("Starting forge-server…", Info);
         // We bridge the async channel to sync mpsc channels here so the tokio
         // runtime (and session) can be shut down after connect() returns.
@@ -331,7 +351,7 @@ impl SshConnection {
 
         // `cd` first so the agent's project root is the remote workspace. Its
         // own default would be whatever directory the SSH session started in.
-        let mut command = format!("cd {} && {agent} --headless", shell_quote(cwd));
+        let mut command = format!("cd {} && {agent} --headless", shell_quote_path(cwd));
         if let Some(id) = resume {
             command.push_str(&format!(" --resume-session {}", shell_quote(id)));
         }
@@ -825,6 +845,25 @@ fn remote_arch(rt: &Runtime, session: &Handle<ClientHandler>) -> Result<String, 
 /// worth interpolating into a command line unquoted.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote a path for a remote shell, but let a leading `~` still mean home.
+///
+/// `remote_dir` defaults to the literal string `~`, and quoting it whole gives
+/// `cd '~'`, which fails — there is no directory of that name. That took the
+/// remote agent down at startup: it exited before printing anything, and the
+/// panel reported only that the process had gone.
+///
+/// The tilde is left outside the quotes so the shell expands it; everything
+/// after it is quoted as usual, so a path with spaces still survives.
+fn shell_quote_path(s: &str) -> String {
+    if s == "~" {
+        return "~".to_string();
+    }
+    match s.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(s),
+    }
 }
 
 /// The Linux forge-agent to upload, for the remote's architecture.
@@ -1453,5 +1492,34 @@ mod quoting_tests {
     #[test]
     fn an_ordinary_path_is_merely_wrapped() {
         assert_eq!(shell_quote("/home/me/code"), "'/home/me/code'");
+    }
+}
+
+#[cfg(test)]
+mod path_quoting_tests {
+    use super::shell_quote_path;
+
+    /// `remote_dir` is the literal string `~` until the user opens a folder, and
+    /// `cd '~'` is an error — which is what killed the remote agent on startup.
+    #[test]
+    fn a_bare_tilde_still_means_home() {
+        assert_eq!(shell_quote_path("~"), "~");
+    }
+
+    #[test]
+    fn a_path_under_home_expands_and_stays_quoted() {
+        assert_eq!(shell_quote_path("~/My Project"), "~/'My Project'");
+    }
+
+    #[test]
+    fn an_absolute_path_is_quoted_whole() {
+        assert_eq!(shell_quote_path("/home/me/My Project"), "'/home/me/My Project'");
+    }
+
+    #[test]
+    fn a_quote_still_cannot_end_the_argument_early() {
+        // The tilde exception must not open a hole in the quoting.
+        let out = shell_quote_path("~/it's; rm -rf /");
+        assert_eq!(out, r#"~/'it'\''s; rm -rf /'"#);
     }
 }

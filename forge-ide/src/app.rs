@@ -11947,6 +11947,7 @@ impl IdeApp {
     ) -> crate::agent_panel::AgentSession {
         use crate::settings::AgentPermissionMode;
         if let Some(ssh) = &self.ssh {
+
             let cwd = ssh.host.remote_dir.clone();
             let allow_all = mode == AgentPermissionMode::DangerouslySkipAll;
             return match ssh.spawn_agent(&cwd, resume, allow_all) {

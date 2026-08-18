@@ -90,6 +90,13 @@ pub struct SshConnection {
     /// own binaries live under it, and asking again per call would be a round
     /// trip for something that cannot change while the session is open.
     pub remote_home: String,
+    /// The endpoint the remote agent's model requests are served against, when
+    /// it is running in proxied mode. Shared with the connection's handler.
+    ///
+    /// Read only through the handler's own clone of this `Arc`, which is why
+    /// the field itself looks unused.
+    #[allow(dead_code)]
+    upstream: Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
     pub next_id: Arc<Mutex<i64>>,
     pub pending: PendMap,
     /// Channel stdin (server → client notifications arrive via push callbacks)
@@ -137,12 +144,16 @@ impl SshConnection {
     ) -> Result<Self, String> {
         use crate::OutputLevel::*;
         let rt  = Runtime::new().map_err(|e| e.to_string())?;
+        // Shared with the handler, which serves whatever the remote sends to
+        // its forwarded port. Empty until a proxied agent is started.
+        let upstream: Arc<Mutex<Option<crate::model_proxy::Upstream>>> =
+            Arc::new(Mutex::new(None));
         let h   = host.clone();
         let pw  = password.map(|s| s.to_string());
 
         // 1. Authenticate SSH session
         log(&format!("Authenticating {}@{}:{}", h.user, h.host, h.port), Info);
-        let session = rt.block_on(ssh_authenticate(&h, pw.as_deref(), trust_new_host_key))
+        let session = rt.block_on(ssh_authenticate(&h, pw.as_deref(), trust_new_host_key, &upstream))
             .map_err(|e| {
                 // A host-key refusal is not an authentication failure, and
                 // calling it one sends the user off checking their key.
@@ -228,6 +239,7 @@ impl SshConnection {
         Ok(Self {
             host: host.clone(),
             remote_home: home.clone(),
+            upstream,
             next_id,
             pending,
             stdin:    Arc::new(Mutex::new(Box::new(writer) as Box<dyn Write + Send>)),
@@ -263,6 +275,36 @@ impl SshConnection {
         let path = format!("{}/.forge/forge-agent", self.remote_home.trim_end_matches('/'));
         ensure_binary_uploaded(rt, session, &path, AGENT_VERSION, bytes)?;
         Ok(path)
+    }
+
+    /// Ask the remote to listen on a loopback port and forward it back here,
+    /// serving whatever arrives against `upstream`.
+    ///
+    /// Returns the port the remote should send to. Loopback on that machine, so
+    /// nothing off it can reach the tunnel — the port answers only to processes
+    /// on the remote itself, and everything it answers with came from here.
+    ///
+    /// Port 0 asks the remote's sshd to choose, avoiding a fixed number that
+    /// two sessions to the same host would fight over.
+    /// Not yet called: the agent needs a way to be told its credentials are
+    /// proxied before this can be turned on for a session. See the note in
+    /// `model_proxy`.
+    #[allow(dead_code)]
+    pub fn open_model_proxy(
+        &self,
+        upstream: crate::model_proxy::Upstream,
+    ) -> Result<u16, String> {
+        let (Some(rt), Some(session)) = (self._rt.as_ref(), self._session.as_ref()) else {
+            return Err("connection is closing".into());
+        };
+        // Set before the forward is requested: a connection can arrive as soon
+        // as the remote is listening, and one that finds no upstream is
+        // silently dropped.
+        *self.upstream.lock().unwrap() = Some(upstream);
+        let port = rt
+            .block_on(session.tcpip_forward("127.0.0.1", 0))
+            .map_err(|e| format!("could not open the model tunnel: {e}"))?;
+        Ok(port as u16)
     }
 
     /// Start the agent on the remote machine and return its stdio.
@@ -440,6 +482,11 @@ fn key_is_recorded(recorded: &[(usize, ssh_key::PublicKey)], key: &ssh_key::Publ
 struct ClientHandler {
     host:      String,
     port:      u16,
+    /// Set once a remote agent is started in proxied mode. Every connection the
+    /// remote opens to its forwarded port arrives here and is served against
+    /// this — which is how the credential reaches the model API without ever
+    /// reaching the machine the agent runs on.
+    upstream:  Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
     /// Set once the user has been shown a fingerprint and accepted it. Only
     /// ever applies to a host that is *absent* from known_hosts, never to one
     /// whose key has changed.
@@ -508,10 +555,59 @@ impl client::Handler for ClientHandler {
             Ok(accept)
         }
     }
+
+    /// A connection the remote made to its forwarded port — the agent asking
+    /// for a model.
+    ///
+    /// Served on its own thread: `serve_one` is blocking, and a completion
+    /// streams for as long as the model takes to write it, which is far too
+    /// long to hold the SSH event loop.
+    fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let upstream = self.upstream.lock().unwrap().clone();
+        async move {
+            let Some(upstream) = upstream else {
+                // Nothing is proxying, so this port is not ours to answer.
+                return Ok(());
+            };
+            let (reader, writer) = bridge_channel(channel);
+            std::thread::spawn(move || {
+                let mut stream = BridgedStream { reader, writer };
+                if let Err(e) = crate::model_proxy::serve_one(&mut stream, &upstream) {
+                    // Named, never with the credential in it.
+                    eprintln!("model proxy: {e}");
+                }
+            });
+            Ok(())
+        }
+    }
+}
+
+/// The two halves of a bridged channel as one stream, for `serve_one`.
+struct BridgedStream {
+    reader: ChannelReader,
+    writer: ChannelWriter2,
+}
+impl std::io::Read for BridgedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> { self.reader.read(buf) }
+}
+impl Write for BridgedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.writer.write(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.writer.flush() }
 }
 
 async fn ssh_authenticate(
-    host: &SshHost, password: Option<&str>, trust_new: bool,
+    host: &SshHost,
+    password: Option<&str>,
+    trust_new: bool,
+    upstream: &Arc<Mutex<Option<crate::model_proxy::Upstream>>>,
 ) -> Result<Handle<ClientHandler>, String> {
     let config = Arc::new(client::Config::default());
     let addr   = format!("{}:{}", host.host, host.port);
@@ -521,6 +617,7 @@ async fn ssh_authenticate(
         port: host.port,
         trust_new,
         found: Arc::clone(&found),
+        upstream: Arc::clone(upstream),
     };
     let session = match client::connect(config, addr, handler).await {
         Ok(s) => s,
@@ -838,7 +935,17 @@ async fn open_exec_channel_bridged(
 ) -> Result<(ChannelReader, ChannelWriter2), russh::Error> {
     let channel = session.channel_open_session().await?;
     channel.exec(true, command.to_string()).await?;
+    Ok(bridge_channel(channel))
+}
 
+/// Present an async SSH channel as a blocking reader and writer.
+///
+/// Shared by the agent's stdio channel and by each forwarded model-proxy
+/// connection: both want to be read and written from ordinary threads, and
+/// neither wants to know that tokio is underneath.
+fn bridge_channel(
+    channel: russh::Channel<russh::client::Msg>,
+) -> (ChannelReader, ChannelWriter2) {
     let (read_half, write_half) = channel.split();
 
     // stdout: async channel → sync mpsc
@@ -868,7 +975,7 @@ async fn open_exec_channel_bridged(
         }
     });
 
-    Ok((ChannelReader::new(out_rx), ChannelWriter2(in_tx)))
+    (ChannelReader::new(out_rx), ChannelWriter2(in_tx))
 }
 
 // ── Channel I/O adapters ─────────────────────────────────────────────────────

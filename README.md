@@ -2,21 +2,23 @@
 
 Created by **Vulkgryph LLC**.
 
-Forge is an autonomous AI coding agent, plus two independent clients that drive it: a terminal UI and a full Vulkan-based code editor. This repository hosts all three as one monorepo.
+Forge is an autonomous AI coding agent, plus two independent clients that drive it: a terminal UI and a native code editor. This repository hosts them as one monorepo.
 
-## The three projects
+## The projects
 
 | Project | What it is | Docs |
 |---|---|---|
 | [`forge-agent/`](forge-agent/) | The headless Rust agent — the actual model loop, tool execution, and safety gating. Everything else talks to this. | [README](forge-agent/README.md) · [Architecture](forge-agent/ARCHITECTURE.md) |
-| [`forge-tui/`](forge-tui/) | The reference terminal client (Bun/React/Ink). Spawns `forge-agent --headless` and drives it over its JSON protocol. | [README](forge-tui/README.md) |
-| [`forge-ide/`](forge-ide/) | A Rust/Vulkan code editor with an integrated agent panel — spawns the same `forge-agent --headless` process independently, alongside its own editor, git, LSP, and SSH-remote features. | [README](forge-ide/README.md) |
+| [`forge-tui-rs/`](forge-tui-rs/) | The terminal client, installed as `forge`. Spawns `forge-agent --headless` and drives it over its JSON protocol. | [README](forge-tui-rs/README.md) |
+| [`forge-ide/`](forge-ide/) | A native code editor with an integrated agent panel — spawns the same `forge-agent --headless` process independently, alongside its own editor, git, LSP, and SSH-remote features. | [README](forge-ide/README.md) |
+| [`forge-agent-proto/`](forge-agent-proto/) | The wire protocol shared by the agent and the terminal client. | — |
+| [`forge-tui/`](forge-tui/) | **Retired.** The original terminal client, in TypeScript. Not part of the workspace and not built; `forge-tui-rs` replaced it. | [README](forge-tui/README.md) |
 
 ## How they fit together
 
-`forge-agent` is the only piece that talks to an LLM or touches tools directly. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other, and neither reimplements any agent logic. This means the agent's actual behavior (tool execution, model calls, safety gating) can never diverge between the two clients, since it's the literal same compiled binary in both cases.
+`forge-agent` is the only piece that talks to an LLM or touches tools directly. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui-rs` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other, and neither reimplements any agent logic. This means the agent's actual behavior (tool execution, model calls, safety gating) can never diverge between the two clients, since it's the literal same compiled binary in both cases.
 
-What *can* diverge is each client's own hand-maintained mirror of the wire protocol's shape (`forge-tui`'s `protocol.ts` zod schemas vs. `forge-ide`'s Rust structs) — there's no shared schema generating both, so a protocol change has to be applied by hand in each client that needs it.
+What *can* diverge is each client's own view of the wire protocol's shape. The terminal client shares [`forge-agent-proto`](forge-agent-proto/) with the agent, so those two cannot drift; `forge-ide` keeps its own hand-maintained Rust structs, so a protocol change has to be applied there by hand.
 
 ```text
                     ┌───────────────────────┐
@@ -29,10 +31,10 @@ What *can* diverge is each client's own hand-maintained mirror of the wire proto
                 ┌───────────────┴───────────────┐
                 │                                │
       ┌─────────┴─────────┐          ┌───────────┴───────────┐
-      │     forge-tui       │          │       forge-ide        │
-      │  terminal client    │          │  Vulkan code editor    │
-      │  (Bun/React/Ink)    │          │  (Rust/egui), with its │
-      │                     │          │  own editor/git/LSP/   │
+      │    forge-tui-rs     │          │       forge-ide        │
+      │  terminal client    │          │  native code editor    │
+      │  (Rust), installed  │          │  (Rust/egui), with its │
+      │  as `forge`         │          │  own editor/git/LSP/   │
       │                     │          │  SSH-remote features   │
       └─────────────────────┘          └─────────────────────┘
 ```

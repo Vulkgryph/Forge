@@ -23,9 +23,18 @@ pub fn spawn_check() -> mpsc::Receiver<Option<UpdateAvailable>> {
     rx
 }
 
+/// The repository releases are published from.
+///
+/// One constant, because there were two spellings of it and they were both the
+/// retired standalone checkout — `windingcreek/Forge-IDE`, which the top-level
+/// README describes as superseded by this monorepo. Every installed copy asked
+/// that repository for its updates, which at best answers nothing forever and
+/// at worst answers with releases from before the merge.
+const RELEASES_REPO: &str = "Vulkgryph/Forge";
+
 fn check_once(current_version: &str) -> Option<UpdateAvailable> {
     let body: serde_json::Value = ureq::get(
-        "https://api.github.com/repos/windingcreek/Forge-IDE/releases/latest",
+        &format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest"),
     )
     .set("User-Agent", "forge-ide-update-check")
     .timeout(std::time::Duration::from_secs(8))
@@ -39,8 +48,8 @@ fn check_once(current_version: &str) -> Option<UpdateAvailable> {
     let url = body
         .get("html_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("https://github.com/windingcreek/Forge-IDE/releases/latest")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{RELEASES_REPO}/releases/latest"));
 
     if is_newer(latest, current_version) {
         Some(UpdateAvailable { latest_version: latest.to_string(), url })
@@ -67,6 +76,14 @@ fn is_newer(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_newer;
+
+    /// The repository has to be the live one. Every installed copy asks it for
+    /// updates on startup, and the retired standalone checkout would answer
+    /// nothing forever — or, worse, with releases from before the merge.
+    #[test]
+    fn updates_are_checked_against_the_monorepo() {
+        assert_eq!(super::RELEASES_REPO, "Vulkgryph/Forge");
+    }
 
     #[test]
     fn compares_versions() {

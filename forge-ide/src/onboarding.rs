@@ -6,6 +6,37 @@
 
 use std::path::PathBuf;
 
+/// The credential for an endpoint, held here and lent over the tunnel rather
+/// than sent to the agent.
+///
+/// ChatGPT Codex is the case this exists for: its credential is an OAuth access
+/// token in a file beside the config, not a key in it, so there has never been
+/// anything for a config copy or a `switch_model` to carry. Reading it here
+/// means the token stays on this machine — and, in time, that this is also
+/// where it gets refreshed, which a copy on another machine could never do.
+pub fn credential_for(endpoint_type: &str, api_key: &str) -> Option<(String, Vec<(String, String)>)> {
+    if endpoint_type != "chatgpt_codex" {
+        return (!api_key.is_empty()).then(|| (api_key.to_string(), Vec::new()));
+    }
+    let path = dirs::home_dir()?
+        .join(".config")
+        .join("forge")
+        .join("chatgpt_auth.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let token = doc.get("access_token")?.as_str()?.to_string();
+    if token.is_empty() {
+        return None;
+    }
+    let mut extra = Vec::new();
+    if let Some(account) = doc.get("account_id").and_then(|v| v.as_str()) {
+        // Both spellings, as forge-agent sends them.
+        extra.push(("ChatGPT-Account-ID".to_string(), account.to_string()));
+        extra.push(("chatgpt-account-id".to_string(), account.to_string()));
+    }
+    Some((token, extra))
+}
+
 /// This machine's default endpoint, as a `switch_model` payload including its
 /// key.
 ///

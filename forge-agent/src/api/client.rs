@@ -227,7 +227,17 @@ impl ApiClient {
                     tokens.access_token = access_token;
                 }
                 Backend::ChatGptCodex {
-                    base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+                    // The configured URL, not the constant. It is normally the
+                    // real one and this changes nothing — but an agent running
+                    // on someone else's machine is pointed at a tunnel back to
+                    // the machine that holds the credentials, and hardcoding
+                    // the destination made that impossible. Empty falls back,
+                    // so a config that never named one still works.
+                    base_url: if endpoint.base_url.trim().is_empty() {
+                        CHATGPT_CODEX_BASE_URL.to_string()
+                    } else {
+                        endpoint.base_url.clone()
+                    },
                     access_token: tokens.access_token,
                     account_id: tokens.account_id,
                 }

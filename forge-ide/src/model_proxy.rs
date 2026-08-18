@@ -187,6 +187,11 @@ pub struct Upstream {
     /// The key or access token. Held here, on this machine, and sent to the
     /// endpoint — never to the agent.
     pub credential: String,
+    /// Headers only this machine can supply. ChatGPT Codex identifies the
+    /// account with `chatgpt-account-id`, which the agent reads from the same
+    /// token file it does not have — so the proxy adds it, or the request is
+    /// authenticated as nobody in particular.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Read one request from `client`, forward it upstream with the credential
@@ -235,6 +240,9 @@ pub fn serve_one<S: std::io::Read + std::io::Write>(
     let mut req = ureq::request(&head.method, &url);
     for (name, value) in upstream_headers(&head, upstream.style, &upstream.credential) {
         req = req.set(&name, &value);
+    }
+    for (name, value) in &upstream.extra_headers {
+        req = req.set(name, value);
     }
 
     // An error response is a response: an upstream 401 or 429 is something the
@@ -475,6 +483,7 @@ mod io_tests {
                 base_url,
                 style: AuthStyle::Bearer,
                 credential: "sk-lent".into(),
+                extra_headers: Vec::new(),
             },
         )
         .expect("proxied");
@@ -512,6 +521,7 @@ mod io_tests {
                 base_url: format!("http://127.0.0.1:{port}"),
                 style: AuthStyle::Bearer,
                 credential: "k".into(),
+                extra_headers: Vec::new(),
             },
         )
         .expect("a 429 is a response, not a failure");

@@ -11964,8 +11964,45 @@ impl IdeApp {
                     // looks unconfigured: a key it already has is simply
                     // replaced by the same one, and guessing wrong the other
                     // way means an agent that cannot reach a model at all.
-                    if let Some(ep) = crate::onboarding::local_default_endpoint() {
-                        session.switch_model(ep);
+                    if let Some(mut ep) = crate::onboarding::local_default_endpoint() {
+                        let kind = ep["endpoint_type"].as_str().unwrap_or("").to_string();
+                        let key = ep["api_key"].as_str().unwrap_or("").to_string();
+                        match crate::onboarding::credential_for(&kind, &key) {
+                            Some((credential, extra_headers)) => {
+                                // Proxied: the agent is pointed at a port on its
+                                // own loopback, this machine answers it, and the
+                                // credential never crosses. The only way ChatGPT
+                                // can work at all remotely — its token is a file
+                                // on whichever machine the agent runs on, and
+                                // that machine does not have one.
+                                let upstream = crate::model_proxy::Upstream {
+                                    base_url: ep["base_url"].as_str().unwrap_or("").to_string(),
+                                    style: crate::model_proxy::AuthStyle::from_endpoint_type(&kind),
+                                    credential,
+                                    extra_headers,
+                                };
+                                match ssh.open_model_proxy(upstream) {
+                                    Ok(port) => {
+                                        ep["base_url"] =
+                                            serde_json::json!(format!("http://127.0.0.1:{port}"));
+                                        // Nothing to send: the far end has no
+                                        // use for a key it never authenticates
+                                        // with.
+                                        ep["api_key"] = serde_json::json!("");
+                                        session.switch_model(ep);
+                                    }
+                                    Err(e) => {
+                                        session.spawn_err = Some(format!(
+                                            "Could not open the model tunnel to {}: {e}",
+                                            ssh.host.host,
+                                        ));
+                                    }
+                                }
+                            }
+                            // No credential here either — the remote is on its
+                            // own, and says so if it has none.
+                            None => session.switch_model(ep),
+                        }
                     }
                     session
                 }

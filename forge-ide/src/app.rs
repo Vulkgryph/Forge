@@ -5750,7 +5750,7 @@ impl IdeApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
-                    if ui.button("✕").clicked() { dismissed = true; }
+                    if ui.button("×").clicked() { dismissed = true; }
                 });
             });
         });
@@ -5781,10 +5781,15 @@ impl IdeApp {
                     if ui.button("⬆").on_hover_text("Step Out (Shift+F11)").clicked() {
                         if let Some(d) = &mut self.dap { d.step_out(); }
                     }
-                    if ui.button("⏸").on_hover_text("Pause").clicked() {
+                    // `×`, `‖` and `■` rather than the dedicated symbols
+                    // (`✕`, `⏸`, `⏹`): those live in ranges Apple Symbols does
+                    // not cover, and Apple Symbols is loaded ahead of Arial
+                    // Unicode on purpose — 877 KB against 22 MB resident. They
+                    // rendered as an empty box.
+                    if ui.button("‖").on_hover_text("Pause").clicked() {
                         if let Some(d) = &mut self.dap { d.pause(); }
                     }
-                    if ui.button("⏹").on_hover_text("Stop (Shift+F5)").clicked() {
+                    if ui.button("■").on_hover_text("Stop (Shift+F5)").clicked() {
                         self.dap = None;
                         self.dap_stopped = None;
                         self.dap_stack.clear();
@@ -5863,7 +5868,7 @@ impl IdeApp {
                     }
                 });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Close split").clicked() {
+                if ui.small_button("×").on_hover_text("Close split").clicked() {
                     close_split = true;
                 }
             });
@@ -9341,7 +9346,7 @@ impl IdeApp {
                     {
                         self.ssh_form = self.ssh_hosts[i].clone();
     }
-                    if ui.add(egui::Button::new(egui::RichText::new("✕").size(10.0))
+                    if ui.add(egui::Button::new(egui::RichText::new("×").size(10.0))
                         .rounding(3.0)).clicked()
                     {
                         self.ssh_hosts.remove(i);
@@ -11263,7 +11268,7 @@ impl IdeApp {
                             ui.label(egui::RichText::new(
                                 format!("{} references", refs.len())).strong().size(11.5));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("✕").clicked() { close = true; }
+                                if ui.small_button("×").clicked() { close = true; }
                             });
                         });
                         ui.separator();
@@ -13315,5 +13320,123 @@ mod permission_mode_tests {
         for m in [M::AlwaysAsk, M::AutoApprove, M::DangerouslySkipAll] {
             assert!(!needs(m, m), "{m:?} to itself");
         }
+    }
+}
+
+#[cfg(test)]
+mod glyph_coverage {
+    /// Every glyph the UI draws must exist in a font that is actually loaded.
+    ///
+    /// The symbol fallback is Apple Symbols, chosen ahead of Arial Unicode
+    /// because it is 877 KB against 22 MB resident — see `install_fonts`. The
+    /// cost is narrower coverage, and three glyphs were outside it: `✕` on
+    /// every close button, and `⏸`/`⏹` on the debugger. They rendered as an
+    /// empty box, which is indistinguishable from a missing button.
+    ///
+    /// Reads the fonts this machine has, so it is macOS-only and skips itself
+    /// where they are absent rather than failing for the wrong reason.
+    #[test]
+    fn no_ui_glyph_falls_outside_the_loaded_fonts() {
+        let fonts = ["/System/Library/Fonts/Apple Symbols.ttf", "/System/Library/Fonts/SFNS.ttf"];
+        let mut covered: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for path in fonts {
+            match std::fs::read(path) {
+                Ok(bytes) => covered.extend(codepoints(&bytes)),
+                Err(_) => return, // not this platform; nothing to check against
+            }
+        }
+
+        let source = include_str!("app.rs");
+        let mut missing: Vec<(char, usize)> = Vec::new();
+        for (n, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Comments describe the problem and name the glyphs; only what is
+            // drawn matters.
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            for ch in string_literal_chars(line) {
+                if ch as u32 > 0x2000 && !covered.contains(&(ch as u32)) {
+                    missing.push((ch, n + 1));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "glyphs with no loaded font: {:?}",
+            missing.iter().map(|(c, l)| format!("{c:?} U+{:04X} at app.rs:{l}", *c as u32))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Characters inside double-quoted literals on a line. Crude on purpose:
+    /// over-reporting would be caught by eye, under-reporting would let a tofu
+    /// glyph through.
+    fn string_literal_chars(line: &str) -> Vec<char> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        let mut prev_escape = false;
+        for ch in line.chars() {
+            if ch == '"' && !prev_escape {
+                inside = !inside;
+                continue;
+            }
+            prev_escape = ch == '\\' && !prev_escape;
+            if inside {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Every codepoint a TrueType font's cmap maps, from formats 4 and 12.
+    fn codepoints(d: &[u8]) -> Vec<u32> {
+        let be16 = |at: usize| -> u32 {
+            if at + 2 > d.len() { return 0 }
+            u32::from(d[at]) << 8 | u32::from(d[at + 1])
+        };
+        let be32 = |at: usize| -> u32 {
+            if at + 4 > d.len() { return 0 }
+            (be16(at) << 16) | be16(at + 2)
+        };
+        let mut out = Vec::new();
+        let tables = be16(4) as usize;
+        let mut cmap = None;
+        for i in 0..tables {
+            let rec = 12 + i * 16;
+            if d.get(rec..rec + 4) == Some(b"cmap") {
+                cmap = Some(be32(rec + 8) as usize);
+                break;
+            }
+        }
+        let Some(cmap) = cmap else { return out };
+        for i in 0..be16(cmap + 2) as usize {
+            let sub = cmap + be32(cmap + 4 + i * 8 + 4) as usize;
+            match be16(sub) {
+                4 => {
+                    let seg2 = be16(sub + 6) as usize;
+                    for j in 0..seg2 / 2 {
+                        let end = be16(sub + 14 + j * 2);
+                        let start = be16(sub + 16 + seg2 + j * 2);
+                        // 0xFFFF terminates the table.
+                        if start <= end && end != 0xFFFF {
+                            out.extend(start..=end);
+                        }
+                    }
+                }
+                12 => {
+                    for j in 0..be32(sub + 12) as usize {
+                        let g = sub + 16 + j * 12;
+                        let (start, end) = (be32(g), be32(g + 4));
+                        // Guard against a malformed group claiming the plane.
+                        if start <= end && end - start < 0x10000 {
+                            out.extend(start..=end);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 }

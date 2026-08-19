@@ -10,9 +10,6 @@
 .opencode/
 
 # TUI (Bun/TypeScript)
-forge-tui/node_modules/
-forge-tui/bun.lockb
-forge-tui/dist/
 
 # Local scratch screenshots
 Screenshot*.png

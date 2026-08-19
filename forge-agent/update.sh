@@ -33,7 +33,7 @@ while [ -h "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
-# forge-agent lives inside the monorepo now (forge-agent/, forge-tui/,
+# forge-agent lives inside the monorepo now (forge-agent/, forge-tui-rs/,
 # forge-ide/ as siblings) — the actual git root is one level up, resolved
 # via git itself rather than assumed, so this still works if the monorepo's
 # own directory ever gets renamed.

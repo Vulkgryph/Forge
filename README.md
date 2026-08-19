@@ -12,7 +12,6 @@ Forge is an autonomous AI coding agent, plus two independent clients that drive 
 | [`forge-tui-rs/`](forge-tui-rs/) | The terminal client, installed as `forge`. Spawns `forge-agent --headless` and drives it over its JSON protocol. | [README](forge-tui-rs/README.md) |
 | [`forge-ide/`](forge-ide/) | A native code editor with an integrated agent panel — spawns the same `forge-agent --headless` process independently, alongside its own editor, git, LSP, and SSH-remote features. | [README](forge-ide/README.md) |
 | [`forge-agent-proto/`](forge-agent-proto/) | The wire protocol shared by the agent and the terminal client. | — |
-| [`forge-tui/`](forge-tui/) | **Retired.** The original terminal client, in TypeScript. Not part of the workspace and not built; `forge-tui-rs` replaced it. | [README](forge-tui/README.md) |
 
 ## How they fit together
 

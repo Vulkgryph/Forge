@@ -144,7 +144,7 @@ fi
 # 3. Build
 # -------------------------------------------------------------------
 # forge-agent is a member of the monorepo's shared workspace (forge-agent/,
-# forge-tui/, forge-ide/ all live as siblings under one repo root) — build
+# forge-tui-rs/, forge-ide/ all live as siblings under one repo root) — build
 # output lands in the shared workspace root's target/, not a local
 # forge-agent/target/, and the TUI is a sibling directory now, not a nested
 # ui/ subdirectory.

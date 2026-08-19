@@ -2874,58 +2874,37 @@ fn draw_checkpoint_card(
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width() - pad_r);
                 ui.vertical(|ui| {
-                    // Below this the preview and the controls cannot share a
-                    // row without one of them losing: reserving space by
-                    // measuring buttons is never exact enough, and being a few
-                    // points short puts the text underneath them. Stacking is
-                    // the honest answer — the controls keep their full size and
-                    // move to their own line.
-                    let narrow = ui.available_width() < 300.0;
+                    // Two lines, always. The preview and the controls cannot
+                    // share one: reserving space by measuring buttons is never
+                    // exact enough — padding and style both get a say — and
+                    // being a few points short draws the text *under* them,
+                    // which is what it did. Stacking needs no measurement and
+                    // is right at every width; a checkpoint is one row in a
+                    // conversation, not a dense list, so the line costs little.
                     ui.horizontal(|ui| {
                         paint_dot(ui, egui::Color32::from_gray(140));
                         ui.label(egui::RichText::new("checkpoint").size(10.5).color(egui::Color32::from_gray(160)));
-                        // The controls are the only route to a rewind, so their
-                        // width is reserved and the preview takes what is left.
-                        // Added ahead of them it claimed the whole row and pushed
-                        // them off the edge of a narrow panel, unreachable.
                         let preview_short: String = preview.chars().take(60).collect();
                         ui.add_sized(
                             egui::vec2(ui.available_width(), 16.0),
                             egui::Label::new(egui::RichText::new(preview_short).size(10.5)
                                 .color(egui::Color32::from_gray(190))).truncate(),
                         );
-                        if narrow { return; }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !confirming {
-                                if ui.small_button("Rewind here").clicked() {
-                                    *edit = Some(RewindEdit::Arm { item_idx });
-                                }
-                                if !preview_loading && preview_result.is_none() {
-                                    if ui.small_button("Preview").clicked() {
-                                        *edit = Some(RewindEdit::Preview { item_idx });
-                                    }
-                                }
-                            }
-                            ui.label(egui::RichText::new(format!("{message_count} msgs")).size(9.5)
-                                .color(egui::Color32::from_gray(120)));
-                        });
                     });
-                    if narrow {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{message_count} msgs")).size(9.5)
-                                .color(egui::Color32::from_gray(120)));
-                            if !confirming {
-                                if !preview_loading && preview_result.is_none() {
-                                    if ui.small_button("Preview").clicked() {
-                                        *edit = Some(RewindEdit::Preview { item_idx });
-                                    }
-                                }
-                                if ui.small_button("Rewind here").clicked() {
-                                    *edit = Some(RewindEdit::Arm { item_idx });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{message_count} msgs")).size(9.5)
+                            .color(egui::Color32::from_gray(120)));
+                        if !confirming {
+                            if !preview_loading && preview_result.is_none() {
+                                if ui.small_button("Preview").clicked() {
+                                    *edit = Some(RewindEdit::Preview { item_idx });
                                 }
                             }
-                        });
-                    }
+                            if ui.small_button("Rewind here").clicked() {
+                                *edit = Some(RewindEdit::Arm { item_idx });
+                            }
+                        }
+                    });
                     if preview_loading {
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new("Loading preview…")
@@ -8112,12 +8091,24 @@ impl IdeApp {
         let mut enable_updates_now = false;
         let mut open_onboarding = false;
 
+        // Resizable, with a real default height. It was `fixed_size([w, 0.0])`
+        // and not resizable, which worked only while the window grew to its
+        // contents — once those contents went inside a scroll area (so the list
+        // could be reached at all) that zero became the height, and the dialog
+        // collapsed to two visible settings with no way to enlarge it.
+        //
+        // Two thirds of the screen, so it is usable on a laptop and not absurd
+        // on a large display, and bounded so a very short screen still leaves
+        // the title bar and buttons reachable.
+        let h = (ctx.screen_rect().height() * 0.66).clamp(320.0, 900.0);
         egui::Window::new("settings_window")
             .title_bar(false)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([w, 0.0])
+            .default_size([w, h])
+            .min_width(w)
+            .min_height(240.0)
             .frame(egui::Frame::popup(ctx.style().as_ref())
                 .fill(egui::Color32::from_rgb(37, 37, 38))
                 .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
@@ -8158,11 +8149,15 @@ impl IdeApp {
                 // a shorter display that is most of the list. Bounded to the
                 // screen with the title bar kept out of the scroll, so what is
                 // being scrolled is always identifiable.
-                let body_max = (ctx.screen_rect().height() - 160.0).max(200.0);
+                // Fills what the window has, rather than measuring the screen:
+                // the window is resizable now, so its own height is the answer,
+                // and `auto_shrink` false on both axes makes the area take it.
+                // Room is left for the title row and the footer above and below.
+                let body_max = (ui.available_height() - 52.0).max(120.0);
                 egui::ScrollArea::vertical()
                     .id_salt("settings_body")
                     .max_height(body_max)
-                    .auto_shrink([false, true])
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
 
                 let s = &mut self.settings;

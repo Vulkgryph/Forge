@@ -1,6 +1,6 @@
 [package]
 name        = "forge-ide"
-version     = "0.1.0"
+version     = "0.3.0"
 edition     = "2024"
 license     = "Apache-2.0"
 description = "A fast, Rust/Vulkan-based code editor with built-in Git, LSP, and SSH remote development"

@@ -59,9 +59,54 @@ That installs:
 
 `forge-ide` is optional and built separately (`cargo build -p forge-ide`) when you want the editor; it is not part of the default PATH install.
 
+## Platforms
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| `forge-agent` | yes | yes | untested |
+| `forge-tui-rs` (`forge`) | yes | yes | untested |
+| `forge-ide` | yes | untested | untested |
+
+What "yes" means: CI builds and tests it there on every push — the agent and
+terminal client on Linux and macOS, the editor on macOS — and it is used daily
+on macOS.
+
+What "untested" means literally that. The editor's rendering goes through wgpu,
+which targets D3D12 on Windows and Vulkan on Linux, and its windowing goes
+through winit, so there is no known reason it cannot work; nobody has tried.
+Windows support is intended. Until someone has actually run it, a report that
+it does not build is expected rather than surprising.
+
+The macOS app bundle, its signing, and the "add to Dock" option are macOS-only
+by nature. Remote development is tested from a macOS host to a Linux remote.
+
+## Model providers
+
+Forge talks to any OpenAI-compatible endpoint, to Anthropic, and to a local
+model server, in each case with an API key you supply. It also supports signing
+in to a **ChatGPT Codex** subscription, which is worth understanding before you
+rely on it:
+
+- The flow is OAuth against OpenAI's own endpoints (`forge-agent
+  --login-chatgpt`, or the wizard in the editor). The token it returns is
+  stored at `~/.config/forge/chatgpt_auth.json`, readable only by you, and
+  refreshed automatically.
+- OpenAI does not publish an OAuth integration for third-party clients, so this
+  drives a consumer subscription through an interface documented for OpenAI's
+  own tools. It works today. It is not a sanctioned integration, and it could
+  stop working, or be objected to, at any point — in which case this project
+  will comply and remove it.
+- If that matters to you, use an API key. Every other provider path is a
+  documented, sanctioned one.
+
+xAI has OAuth of the same shape for SuperGrok and X Premium+ subscriptions, and
+Forge deliberately does **not** implement it: xAI's consumer terms prohibit
+programmatic access and reverse engineering, and route developer use to their
+Enterprise terms with an API key. Grok works here through an API key.
+
 ## License
 
-All three projects are licensed under the [Apache License, Version 2.0](LICENSE), copyright © 2026 Vulkgryph LLC. See each project's own `LICENSE`/`NOTICE` for its own copy, and `SECURITY.md` for how to report a vulnerability in that specific project.
+Everything here is licensed under the [Apache License, Version 2.0](LICENSE), copyright © 2026 Vulkgryph LLC. See each project's own `LICENSE`/`NOTICE` for its own copy, and `SECURITY.md` for how to report a vulnerability in that specific project.
 
 ## Contributing
 

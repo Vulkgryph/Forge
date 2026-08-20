@@ -203,7 +203,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_search".to_string(),
-                description: "Search the web using DuckDuckGo. Returns titles, URLs, and snippets for each result.".to_string(),
+                description: "Search the web using DuckDuckGo. Returns titles, URLs, and snippets for each result. \
+                    UNRELIABLE: DuckDuckGo challenges automated queries and refuses most of them, so this \
+                    frequently returns an error saying the search was blocked. That is not a transient \
+                    failure and retrying the same query will not help — say so and carry on without it, or \
+                    use web_fetch on a URL you already know. Do not spend turns retrying.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

@@ -104,6 +104,25 @@ Forge deliberately does **not** implement it: xAI's consumer terms prohibit
 programmatic access and reverse engineering, and route developer use to their
 Enterprise terms with an API key. Grok works here through an API key.
 
+## Web search does not really work
+
+`web_search` scrapes DuckDuckGo, and DuckDuckGo challenges automated queries.
+In practice most searches come back refused. There is a fallback through a
+public mirror, and that is blocked by network reputation for entire ISP ranges
+— including, on the machine this was written on, the whole of AS7018.
+
+So treat it as absent. The tool exists, reports honestly when it is refused,
+and tells the agent not to retry, because retrying does not help. Everything
+else — reading files, running commands, git, the editor, remote work — does not
+depend on it, and coding tasks rarely need it.
+
+The intended fix is a real search API behind a key you supply (Brave, Tavily,
+a self-hosted SearxNG), with the scrape kept as a fallback. That is a plan, not
+a promise, and no date is attached to it. If web search matters to you, treat
+this as a gap rather than something about to close.
+
+`web_fetch` is unaffected: give it a URL and it fetches that page.
+
 ## License
 
 Everything here is licensed under the [Apache License, Version 2.0](LICENSE), copyright © 2026 Vulkgryph LLC. See each project's own `LICENSE`/`NOTICE` for its own copy, and `SECURITY.md` for how to report a vulnerability in that specific project.

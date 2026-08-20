@@ -287,7 +287,14 @@ fn classify_ddg_empty_response(query: &str, page_text: &str) -> String {
         || page_text.contains("anomaly")
     {
         format!(
-            "Error: DuckDuckGo search appears to have been blocked or challenged for query: {}",
+            // Says it is not worth retrying, because it is not: the challenge
+            // is per-query and persistent, and the mirror fallback is blocked
+            // for whole ISP ranges. An agent told only "blocked" will try
+            // again, and again.
+            "Error: DuckDuckGo refused this search (bot challenge): {}\n\
+             This is expected rather than transient — DuckDuckGo challenges automated queries and \
+             Forge has no search API configured. Retrying will not help. Continue without it, or use \
+             web_fetch on a URL you already know.",
             query
         )
     } else {

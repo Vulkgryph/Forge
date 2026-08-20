@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn the_entry_matches_the_form_the_dock_uses() {
         let entry = tile_entry(Path::new("/Applications/Forge IDE.app"), "Forge IDE",
-                               Some("com.windingcreek.forge-ide"));
+                               Some("com.vulkgryph.forge-ide"));
         assert!(
             entry.contains("<string>file:///Applications/Forge%20IDE.app/</string>"),
             "got {entry}",
@@ -381,7 +381,7 @@ mod tests {
         assert!(entry.contains("<key>tile-type</key><string>file-tile</string>"), "got {entry}");
         assert!(entry.contains("<key>file-label</key><string>Forge IDE</string>"), "got {entry}");
         assert!(
-            entry.contains("<string>com.windingcreek.forge-ide</string>"),
+            entry.contains("<string>com.vulkgryph.forge-ide</string>"),
             "the bundle identifier: {entry}",
         );
         assert!(!entry.contains("<key>book</key>"),
@@ -415,12 +415,12 @@ mod tests {
         std::fs::write(dir.join("Contents/Info.plist"), r#"<?xml version="1.0"?>
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Forge IDE</string>
-  <key>CFBundleIdentifier</key><string>com.windingcreek.forge-ide</string>
+  <key>CFBundleIdentifier</key><string>com.vulkgryph.forge-ide</string>
 </dict></plist>"#).unwrap();
 
         let (label, id) = bundle_identity(&dir);
         assert_eq!(label, "Forge IDE");
-        assert_eq!(id.as_deref(), Some("com.windingcreek.forge-ide"));
+        assert_eq!(id.as_deref(), Some("com.vulkgryph.forge-ide"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

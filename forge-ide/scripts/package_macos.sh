@@ -6,7 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP_NAME="Forge IDE"
-BUNDLE_ID="com.windingcreek.forge-ide"
+# Reverse-DNS from vulkgryph.com, matching the Developer ID this is signed
+# with. It was com.windingcreek.forge-ide, which no longer names anything.
+#
+# Changing it is not free and this is the last cheap moment to do it: macOS
+# ties a folder-access grant to the signed identity, so every installation
+# re-asks for the folders it already had, and a Dock entry pinned under the old
+# identifier stops resolving. Both cost one re-approval, once, before anyone
+# else has installed this.
+BUNDLE_ID="com.vulkgryph.forge-ide"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
 # forge-ide is a member of the monorepo's shared workspace, not its own
 # workspace root - build output lands one level up, at the workspace root's

@@ -1,3 +1,13 @@
+// Modified by Vulkgryph LLC in 2026 for the Forge project.
+//
+// Change: added `ActiveEventLoopExtMacOS::set_dock_menu`, so an application can
+// supply the menu shown when its Dock icon is right-clicked. AppKit asks only
+// the application delegate for that menu (`applicationDockMenu:`) and winit
+// owns the delegate, so upstream provides no way to offer one. The patch
+// carries a menu through the event loop to the delegate and returns it there.
+//
+// This notice is required by the Apache License 2.0, section 4(b), which the
+// original carries; the original licence is at ../../../LICENSE.
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;

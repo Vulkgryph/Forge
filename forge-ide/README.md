@@ -8,7 +8,11 @@ A fast, native code editor built in Rust on Vulkan and [egui](https://github.com
 
 Forge IDE is built for engineers who want to see and understand the tool they use all day. The rendering pipeline is Vulkan because almost everything runs Vulkan — there's no browser, no Electron, no JavaScript runtime underneath. What you see in the source is what runs on your GPU.
 
-**Dependencies are kept deliberately low.** Every crate in `Cargo.toml` is there because it does real, hard-to-replace work — a Vulkan binding, a windowing layer, an SSH implementation. Where a dependency was only doing something trivial (tilde expansion, an unused trait), it's been replaced with a few lines of our own code instead. This will continue over time: expect dependencies to keep shrinking, not grow, as the project matures.
+**Dependencies are kept deliberately low.** Every crate in `Cargo.toml` is there because it does real, hard-to-replace work — a graphics binding, a windowing layer, an SSH implementation. Where a dependency was only doing something trivial (tilde expansion, an unused trait), it's been replaced with a few lines of our own code instead. This will continue over time: expect dependencies to keep shrinking, not grow, as the project matures.
+
+**winit is first in line to go.** It is the only third-party source this repository redistributes rather than fetching at build time, because it is vendored at [`vendor/winit-0.30.13/`](vendor/) with two macOS patches — drag-and-drop accepting the pasteboard type Apple has recommended since 10.13, and a way to supply the Dock icon's right-click menu, which upstream cannot express because winit owns the application delegate. Both patches exist only because that delegate is not ours.
+
+The plan, in order of preference: offer both changes upstream, so the vendored copy can be deleted; failing that, own the `NSApplicationDelegate` ourselves while winit still handles windows and events, which is the small piece that is actually blocked today. Replacing winit outright is a larger undertaking — its macOS backend is ~6,500 lines and the `egui-winit` input translation another ~2,300 — and is not a near-term plan. See [NOTICE](../NOTICE) for the attribution this arrangement requires.
 
 **Inspection is the point.** The source is here. If something looks wrong, file an issue. If you want to take it in a different direction, fork it.
 

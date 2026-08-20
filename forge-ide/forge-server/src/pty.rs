@@ -59,6 +59,14 @@ impl PtySession {
         };
 
         let mut cmd = CommandBuilder::new(&shell);
+        // A login shell, as every other remote-development tool starts. The
+        // profile is where a PATH usually gets set — `~/.profile` on Debian and
+        // Ubuntu — and it is read only by a login shell. Without `-l` an
+        // interactive shell here sources `.bashrc` and nothing else, so tools
+        // the user installed under `~/.local/bin` were simply not found: the
+        // terminal worked and `claude` did not exist, which looks like a broken
+        // remote rather than an unread profile.
+        cmd.arg("-l");
         cmd.cwd(&resolved_cwd);
         cmd.env("TERM", "xterm-256color");
         pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;

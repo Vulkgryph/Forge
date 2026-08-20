@@ -248,6 +248,15 @@ impl SshConnection {
                                 if let Some(tx) = pp2.lock().unwrap().get(&push.id) {
                                     let _ = tx.send(push.data);
                                 }
+                                // Wake the loop, as every other producer does.
+                                // It sleeps between frames and the draw side
+                                // only `try_recv`s this channel, so without
+                                // this the remote's output sat in the queue
+                                // until something else caused a frame — the
+                                // next keystroke, usually. Typing therefore
+                                // echoed one character behind, which reads as
+                                // the network being slow when it is not.
+                                crate::wake::wake();
                             }
                         }
                         _ => {}

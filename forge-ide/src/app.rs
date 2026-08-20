@@ -3364,6 +3364,13 @@ pub struct IdeApp {
     ssh_log_rx:      Option<mpsc::Receiver<(String, OutputLevel)>>,
     /// In-flight directory listing (drilling into subdirs from the file tree).
     ssh_nav_rx:      Option<mpsc::Receiver<Result<(String, Vec<crate::ssh::RemoteEntry>), String>>>,
+    /// The remote folder chooser, when open. "Open Folder" cannot use the
+    /// native dialog on a remote workspace — that browses this machine, which
+    /// is the one the user is not working on.
+    remote_picker:   Option<RemotePicker>,
+    /// Listing in flight for the picker, kept separate from `ssh_nav_rx` so
+    /// browsing in the dialog does not disturb the explorer's own position.
+    picker_rx:       Option<mpsc::Receiver<Result<(String, Vec<crate::ssh::RemoteEntry>), String>>>,
     /// In-flight remote file read.
     ssh_open_rx:     Option<mpsc::Receiver<Result<(String, String), String>>>, // (path, text)
     /// In-flight remote uploads (dropped files); one result per file.
@@ -3449,6 +3456,18 @@ pub struct IdeApp {
     pub pending_reload: bool,
     /// SSH host to connect on the first draw (set by new_with_spec).
     pending_ssh_connect: Option<crate::ssh::SshHost>,
+}
+
+/// State of the remote folder chooser.
+struct RemotePicker {
+    /// Directory being shown. Absolute on the remote, or `~` before the first
+    /// listing resolves it.
+    path:    String,
+    entries: Vec<crate::ssh::RemoteEntry>,
+    /// Set while a listing is in flight, so the dialog can say so rather than
+    /// looking frozen on a slow link.
+    loading: bool,
+    error:   Option<String>,
 }
 
 impl IdeApp {
@@ -3594,6 +3613,8 @@ impl IdeApp {
             ssh_pty_rx:       None,
             ssh_log_rx:       None,
             ssh_nav_rx:      None,
+            remote_picker:   None,
+            picker_rx:       None,
             ssh_open_rx:     None,
             ssh_upload_rx:   None,
             ssh_upload_dir:  None,
@@ -4660,6 +4681,34 @@ impl IdeApp {
             }
         }
 
+        // Poll the folder chooser's listing
+        if let Some(rx) = &self.picker_rx {
+            match rx.try_recv() {
+                Ok(Ok((path, entries))) => {
+                    if let Some(p) = &mut self.remote_picker {
+                        p.path = path;
+                        // Directories only: this chooses a workspace, and a
+                        // file in the list is something to mis-click.
+                        p.entries = entries.into_iter().filter(|e| e.is_dir).collect();
+                        p.entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        p.loading = false;
+                        p.error = None;
+                    }
+                    self.picker_rx = None;
+                    ctx.request_repaint();
+                }
+                Ok(Err(e)) => {
+                    if let Some(p) = &mut self.remote_picker {
+                        p.loading = false;
+                        p.error = Some(e);
+                    }
+                    self.picker_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => { self.picker_rx = None; }
+            }
+        }
+
         // Poll SSH connect result
         if let Some(rx) = &self.ssh_connect_rx {
             match rx.try_recv() {
@@ -5333,6 +5382,7 @@ impl IdeApp {
         // ── Settings overlay ─────────────────────────────────────────────────
         if self.settings_open { self.draw_settings(ctx); }
         self.draw_host_key_dialogs(ctx);
+        self.draw_remote_folder_picker(ctx);
 
         // ── SSH quick-pick overlay ────────────────────────────────────────────
         if self.ssh_overlay {
@@ -9854,11 +9904,231 @@ impl IdeApp {
     }
 
     fn open_folder_dialog(&mut self) {
+        // The native dialog browses *this* machine. On a remote workspace that
+        // is the wrong filesystem — it opened a Mac folder while the user was
+        // working on a Linux host — so the remote gets its own chooser.
+        if self.ssh.is_some() {
+            // Resolved here, not sent as `~`: fs/list answers with entries and
+            // no path, so the dialog would have nothing to show above the list
+            // and no parent to compute. The home directory is already known
+            // from connect.
+            let home = self
+                .ssh
+                .as_ref()
+                .map(|s| s.remote_home.clone())
+                .unwrap_or_else(|| "/".to_string());
+            let configured = self
+                .ssh
+                .as_ref()
+                .map(|s| s.host.remote_dir.clone())
+                .unwrap_or_default();
+            let start = match configured.as_str() {
+                "" | "~" => home.clone(),
+                p if p.starts_with("~/") => {
+                    format!("{}/{}", home.trim_end_matches('/'), &p[2..])
+                }
+                p => p.to_string(),
+            };
+            self.remote_picker = Some(RemotePicker {
+                path: start.clone(),
+                entries: Vec::new(),
+                loading: true,
+                error: None,
+            });
+            self.picker_list(start);
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         self.folder_rx = Some(rx);
         std::thread::spawn(move || {
             let result = rfd::FileDialog::new().pick_folder();
             let _ = tx.send(result);
+        });
+    }
+
+    /// The remote folder chooser.
+    ///
+    /// Directories only, since it is choosing a workspace. Navigation is a
+    /// listing per step rather than a cached tree: a remote filesystem changes
+    /// under you, and this is opened rarely enough that a round trip per click
+    /// is cheaper than keeping a tree honest.
+    fn draw_remote_folder_picker(&mut self, ctx: &egui::Context) {
+        let Some(picker) = &self.remote_picker else { return };
+        let (path, loading, error) = (picker.path.clone(), picker.loading, picker.error.clone());
+        let entries: Vec<(String, String)> = picker
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.path.clone()))
+            .collect();
+        let host = self.ssh.as_ref().map(|s| s.host.host.clone()).unwrap_or_default();
+
+        let mut go: Option<String> = None;
+        let mut choose = false;
+        let mut cancel = false;
+
+        egui::Window::new("remote_folder_picker")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_size([560.0, (ctx.screen_rect().height() * 0.6).clamp(320.0, 720.0)])
+            .min_height(260.0)
+            .frame(egui::Frame::popup(ctx.style().as_ref())
+                .fill(egui::Color32::from_rgb(37, 37, 38))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
+                .rounding(6.0))
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(format!("Open folder on {host}"))
+                    .size(14.0).strong().color(egui::Color32::from_gray(230)));
+                ui.add_space(4.0);
+                // The path is the thing being chosen, so it is shown in full
+                // and monospaced rather than abbreviated.
+                ui.label(egui::RichText::new(&path).monospace().size(11.5)
+                    .color(egui::Color32::from_rgb(150, 205, 210)));
+                ui.add_space(6.0);
+                ui.separator();
+
+                let body = (ui.available_height() - 46.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("remote_picker_list")
+                    .max_height(body)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Up first, and absent at the root, where there is
+                        // nowhere above to go.
+                        if path != "/" {
+                            if ui.button("↑  ..").clicked() {
+                                let parent = match path.trim_end_matches('/').rsplit_once('/') {
+                                    Some(("", _)) | None => "/".to_string(),
+                                    Some((head, _)) => head.to_string(),
+                                };
+                                go = Some(parent);
+                            }
+                        }
+                        if loading {
+                            ui.label(egui::RichText::new("Listing…").size(11.0)
+                                .color(egui::Color32::from_gray(150)));
+                        }
+                        if let Some(e) = &error {
+                            ui.label(egui::RichText::new(e).size(11.0)
+                                .color(egui::Color32::from_rgb(255, 130, 110)));
+                        }
+                        for (name, full) in &entries {
+                            if ui.button(format!("▸  {name}")).clicked() {
+                                go = Some(full.clone());
+                            }
+                        }
+                        if !loading && error.is_none() && entries.is_empty() {
+                            ui.label(egui::RichText::new("No subdirectories here.").size(11.0)
+                                .color(egui::Color32::from_gray(140)));
+                        }
+                    });
+
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open this folder").clicked() { choose = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+                ui.add_space(6.0);
+            });
+
+        if cancel {
+            self.remote_picker = None;
+            self.picker_rx = None;
+        } else if let Some(next) = go {
+            if let Some(p) = &mut self.remote_picker {
+                p.loading = true;
+            }
+            self.picker_list(next);
+        } else if choose {
+            self.remote_picker = None;
+            self.picker_rx = None;
+            self.open_remote_workspace(path);
+        }
+    }
+
+    /// Make `path` the remote workspace root.
+    ///
+    /// The agent is restarted there, because its project root is fixed at spawn
+    /// — it is `cd`-ed into the workspace when the process starts, so nothing
+    /// short of a new process moves it. The transcript is carried across, as it
+    /// is for a permission-mode change, which restarts for the same reason.
+    fn open_remote_workspace(&mut self, path: String) {
+        if let Some(ssh) = &mut self.ssh {
+            ssh.host.remote_dir = path.clone();
+        }
+        self.ssh_form.remote_dir = path.clone();
+        // The explorer starts again at the new root rather than keeping a trail
+        // that leads somewhere else.
+        self.ssh_tree.clear();
+        self.ssh_navigate(path.clone());
+        self.output_log(format!("Remote workspace is now {path}"), OutputLevel::Info);
+
+        let idx = self.agent_active;
+        if idx < self.agent_tabs.len() {
+            let mode = self.agent_tabs[idx].permission_mode;
+            let items = std::mem::take(&mut self.agent_tabs[idx].session.items);
+            let replacement = self.start_agent_session(mode, None);
+            self.agent_tabs[idx].session = replacement;
+            self.agent_tabs[idx].session.items = items;
+        }
+    }
+
+    /// List `path` on the remote for the picker.
+    ///
+    /// Its own request rather than `ssh_navigate`'s, so opening the dialog does
+    /// not move the explorer's position underneath the user.
+    fn picker_list(&mut self, path: String) {
+        let (Some(stdin), Some(pending), Some(next_id)) = (
+            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.stdin)),
+            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.pending)),
+            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.next_id)),
+        ) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.picker_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = { let mut n = next_id.lock().unwrap(); let i = *n; *n += 1; i };
+                let msg = forge_proto::Rpc::request(
+                    id,
+                    "fs/list",
+                    serde_json::json!({ "path": path }),
+                );
+                let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+                pending.lock().unwrap().insert(id, resp_tx);
+                if let Ok(mut w) = stdin.lock() {
+                    forge_proto::write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
+                }
+                let value = resp_rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .map_err(|_| "listing timed out".to_string())??;
+                // fs/list answers with entries only, so the path shown is the
+                // one asked for — which is why the caller resolves `~` before
+                // asking rather than after.
+                let resolved = path;
+                let entries: Vec<forge_proto::FsEntry> = serde_json::from_value(
+                    value.get("entries").cloned().unwrap_or_default(),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok((
+                    resolved,
+                    entries
+                        .into_iter()
+                        .map(|e| crate::ssh::RemoteEntry {
+                            name: e.name,
+                            path: e.path,
+                            is_dir: e.is_dir,
+                            size: e.size,
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            })();
+            let _ = tx.send(result);
+            crate::wake::wake();
         });
     }
 
@@ -13433,5 +13703,51 @@ mod glyph_coverage {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod remote_picker_tests {
+    /// Walking up from a remote path. The picker computes this itself, since
+    /// `fs/list` answers with entries and no path of its own.
+    fn parent_of(path: &str) -> String {
+        match path.trim_end_matches('/').rsplit_once('/') {
+            Some(("", _)) | None => "/".to_string(),
+            Some((head, _)) => head.to_string(),
+        }
+    }
+
+    #[test]
+    fn walking_up_stops_at_the_root() {
+        // Not above it, and not into an empty string that would list nothing.
+        assert_eq!(parent_of("/home/sysadmin/code"), "/home/sysadmin");
+        assert_eq!(parent_of("/home/sysadmin"), "/home");
+        assert_eq!(parent_of("/home"), "/");
+        assert_eq!(parent_of("/"), "/");
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_cost_a_level() {
+        assert_eq!(parent_of("/home/sysadmin/"), "/home");
+    }
+
+    /// `~` is expanded before asking, using the home directory learned at
+    /// connect — the server would list it correctly but answer with no path,
+    /// leaving the dialog unable to show where it is or compute a parent.
+    fn resolve(configured: &str, home: &str) -> String {
+        match configured {
+            "" | "~" => home.to_string(),
+            p if p.starts_with("~/") => format!("{}/{}", home.trim_end_matches('/'), &p[2..]),
+            p => p.to_string(),
+        }
+    }
+
+    #[test]
+    fn home_is_resolved_before_the_listing_is_asked_for() {
+        assert_eq!(resolve("~", "/home/sysadmin"), "/home/sysadmin");
+        assert_eq!(resolve("", "/home/sysadmin"), "/home/sysadmin");
+        assert_eq!(resolve("~/code", "/home/sysadmin"), "/home/sysadmin/code");
+        assert_eq!(resolve("~/code", "/home/sysadmin/"), "/home/sysadmin/code");
+        assert_eq!(resolve("/opt/thing", "/home/sysadmin"), "/opt/thing");
     }
 }

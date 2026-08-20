@@ -543,14 +543,41 @@ mod io_tests {
     /// A local HTTP server standing in for the model API, so the round trip is
     /// real — head parsed, credential attached, response streamed back — while
     /// staying offline and costing nothing.
+    /// Read a whole request, head and declared body, rather than whatever one
+    /// `read` happened to return.
+    ///
+    /// A single read is a race, not a shortcut: a proxied request can arrive as
+    /// head-then-body, and a server that answers after the first segment and
+    /// returns — closing the socket — makes the *client's* remaining write fail.
+    /// That was an intermittent failure in these tests (about one run in four),
+    /// and it looked like a proxy bug rather than a test bug.
+    fn read_request(sock: &mut std::net::TcpStream) -> String {
+        let mut req: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            req.extend_from_slice(&buf[..n]);
+            let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+            let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if req.len() >= end + 4 + len { break; }
+        }
+        String::from_utf8_lossy(&req).into_owned()
+    }
+
     fn upstream_that_echoes_its_auth() -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let req = read_request(&mut sock);
             let auth = req
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
@@ -609,8 +636,7 @@ mod io_tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 2048];
-            let _ = sock.read(&mut buf);
+            let _ = read_request(&mut sock);
             let _ = sock.write_all(
                 b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 5\r\n\r\nslow!",
             );

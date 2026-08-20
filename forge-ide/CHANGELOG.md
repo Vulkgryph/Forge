@@ -4,6 +4,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed ("Reload Window" reloads a window, not the whole process)
+
+- **`Ctrl+Shift+R` used to replace the entire process**, taking every other window's conversations, language servers and SSH connections down with it — for a reason that was almost always local to one window. It now rebuilds that window's app in place, keeping the OS window, the swapchain and the egui context. Teardown is by drop (the agent child and language servers are killed by their own `Drop`), and shells are untouched: they live in the pty daemon, so the rebuilt window reattaches to the same running ones by id. The window keeps its position and its files, and every other window keeps working.
+- **The process restart is still there, as File → Restart Forge (All Windows).** Two things only it can do: pick up a newly built binary, and re-establish an SSH session — a reloaded remote window comes back local, because the connection belongs to the app being dropped. It is deliberately not on a keyboard chord; it is not a stronger reload, it is a different blast radius.
+- Unsaved editor changes are not preserved across either one, unchanged from before — the session records which files were open, not their unsaved contents.
+
 ### Fixed (two dialogs browsed the Mac while the workspace was on a remote host)
 
 - **"Open Folder" and "Go to File…" both listed the local filesystem regardless of where the workspace was.** On a remote session that is the wrong machine: the folder dialog offered Mac folders, and `Ctrl+P` offered Mac files — which, if one happened to be there under the same path, opens a *different file* than the one intended. Both now branch on whether the session is remote, and the local behaviour is unchanged. Quick Open names the host in its header, since the whole failure was not being able to tell which machine you were looking at, and a listing that is refused or times out says so rather than reporting an empty folder.

@@ -352,6 +352,20 @@ fn quick_open_entries(
     (out, truncated)
 }
 
+/// Whether a window opening should reopen what it had.
+///
+/// A reload restores unconditionally: it is one session continuing, not a fresh
+/// start, and a window that came back empty from `Reload Window` would be a
+/// worse version of closing it. The `restore_session` setting governs the other
+/// case — a genuine quit and relaunch later.
+///
+/// Its own function so both halves can be tested; as an inline `||` the reload
+/// half was untestable on a machine with the setting turned on, which is to say
+/// it was not tested at all.
+fn should_restore_session(setting: bool, is_reload: bool) -> bool {
+    setting || is_reload
+}
+
 // ── Remote paths ──────────────────────────────────────────────────────────────
 
 /// A remote workspace path, absolute.
@@ -3573,6 +3587,9 @@ pub struct IdeApp {
     /// not just this one's — which is why this only needs to be a flag: the
     /// full cwd list is gathered from `Ide::windows` at the point of exec.
     pub pending_reload: bool,
+    /// Rebuild this one window in place, leaving the process and every other
+    /// window alone. See `reload_window`.
+    pub pending_window_reload: bool,
     /// SSH host to connect on the first draw (set by new_with_spec).
     pending_ssh_connect: Option<crate::ssh::SshHost>,
 }
@@ -3772,6 +3789,7 @@ impl IdeApp {
             folder_add_root:     false,
             pending_new_window:  None,
             pending_reload:      false,
+            pending_window_reload: false,
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
             update_check_rx: None,
@@ -3788,14 +3806,8 @@ impl IdeApp {
             app.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker);
         }
 
-        // Restore the previous session for this workspace: either the
-        // `restore_session` setting is on (opt-in across a real quit and
-        // relaunch), or this process was just launched by Reload Window,
-        // which always continues the same session it just saved —
-        // matching VS Code's Reload Window regardless of that setting.
-        // Either way, skip it if we're opening a remote (SSH) workspace
-        // instead.
-        if (app.settings.restore_session || is_reload)
+        // Skip it if we're opening a remote (SSH) workspace instead.
+        if should_restore_session(app.settings.restore_session, is_reload)
             && app.pending_ssh_connect.is_none()
         {
             let root = app.workspace_root();
@@ -3939,9 +3951,54 @@ impl IdeApp {
     /// calling it synchronously from here (mid-`draw()`, with the GPU/window
     /// state still very much alive further up the call stack) would leave
     /// all of it orphaned instead of cleanly torn down.
-    pub fn reload_window(&mut self) {
+    pub fn restart_process(&mut self) {
         self.save_session_for_reload();
         self.pending_reload = true;
+    }
+
+    /// Rebuild *this* window and nothing else.
+    ///
+    /// What a reload is actually wanted for — settings, plugins, language
+    /// servers, an agent that has got itself into a state, files changed
+    /// underneath the editor — is all per-window, and taking every other
+    /// window's conversations and terminals down with it was collateral damage.
+    /// It is also what "Reload Window" means everywhere else.
+    ///
+    /// Done by rebuilding the `IdeApp` from the session it just saved, keeping
+    /// the OS window, the swapchain and the egui context. Teardown is by drop:
+    /// the agent child and the language servers are killed by their own `Drop`,
+    /// and the shells are not affected at all — they live in the pty daemon, so
+    /// the new app reattaches to the same running ones by id.
+    ///
+    /// Deferred to the event loop for the same reason the process restart is:
+    /// this is called mid-`draw`, from inside the very value that is about to be
+    /// replaced.
+    ///
+    /// Two things this cannot do, both of which need `Restart Forge`: pick up a
+    /// newly built `forge-ide` binary, and keep an SSH session — the connection
+    /// belongs to the app being dropped, so a remote window comes back local.
+    pub fn reload_window(&mut self) {
+        self.save_session_for_reload();
+        self.pending_window_reload = true;
+    }
+
+    /// How the window comes back: same workspace, same session identity,
+    /// restoring unconditionally.
+    ///
+    /// Every field here is load-bearing. A fresh `window_id` would look up
+    /// nobody's session and the window would return empty; `is_reload` false
+    /// would leave restoring to a user setting; and `frame`/`maximized` are for
+    /// placing a *new* OS window, which this is not — the window stays exactly
+    /// where it is.
+    pub fn reload_spec(&self) -> NewWindowSpec {
+        NewWindowSpec {
+            cwd:       self.workspace_root(),
+            window_id: self.window_id,
+            is_reload: true,
+            ssh_host:  None,
+            frame:     None,
+            maximized: false,
+        }
     }
 
     /// Unconditional version of `save_session` — ignores the
@@ -5186,8 +5243,10 @@ impl IdeApp {
         if ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::N)) {
             self.pending_new_window = Some(NewWindowSpec::default());
         }
-        // Ctrl+Shift+R: reload window (restart in-place, same workspace —
-        // matches VS Code's binding for the same action).
+        // Ctrl+Shift+R: rebuild this window in place, same workspace. Only this
+        // one — the whole-process restart is File → Restart Forge, which is
+        // deliberately not on a chord: it is not a stronger reload, it takes
+        // every other window down with it.
         if ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::R)) {
             self.reload_window();
         }
@@ -10272,6 +10331,15 @@ impl IdeApp {
                         self.reload_window();
                         ui.close_menu();
     }
+                    // Separate because it is a different blast radius, not a
+                    // stronger version of the same thing: every window's
+                    // conversations and language servers go down with it. The
+                    // reasons to want it are a newly built binary and an SSH
+                    // session that needs re-establishing.
+                    if ui.button("Restart Forge (All Windows)").clicked() {
+                        self.restart_process();
+                        ui.close_menu();
+    }
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_tree, "File Tree");
@@ -13933,5 +14001,106 @@ mod remote_quick_open_tests {
         let (entries, truncated) = quick_open_entries(raw, &AtomicBool::new(false));
         assert_eq!(entries.len(), QUICK_OPEN_MAX_ENTRIES);
         assert!(truncated, "the dialog must be able to say it is showing a prefix");
+    }
+}
+
+#[cfg(test)]
+mod window_reload_tests {
+    use super::{IdeApp, NewWindowSpec};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-reload-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The two commands must not be the same button wearing two labels: one
+    /// rebuilds this window, the other replaces the process and takes every
+    /// other window's conversations and language servers with it.
+    #[test]
+    fn reloading_a_window_does_not_ask_for_a_new_process() {
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("flags")), ..Default::default()
+        });
+        app.reload_window();
+        assert!(app.pending_window_reload, "this window should be rebuilt");
+        assert!(!app.pending_reload, "the process must be left alone");
+
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("flags2")), ..Default::default()
+        });
+        app.restart_process();
+        assert!(app.pending_reload);
+        assert!(!app.pending_window_reload);
+    }
+
+    /// What makes an in-place rebuild acceptable: the window comes back with the
+    /// files it had. A reload that reopened empty would be a worse version of
+    /// closing the window.
+    #[test]
+    fn a_rebuilt_window_comes_back_with_its_files() {
+        let dir = scratch("restore");
+        let file = dir.join("kept.rs");
+        std::fs::write(&file, "fn kept() {}\n").unwrap();
+
+        // What `reload_window` writes, written where a window with no state of
+        // its own still finds it — so this test never touches the real config
+        // directory.
+        crate::session::save(&dir, &crate::session::SessionState {
+            open_files:  vec![file.clone()],
+            active_file: 0,
+            ..Default::default()
+        });
+
+        // The rebuild: same spec the event loop passes, `is_reload` and all.
+        let app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir.clone()), is_reload: true, ..Default::default()
+        });
+        let open: Vec<_> = app.buffers.iter().filter_map(|b| b.path.clone()).collect();
+        // The stored path is reopened as written, not re-derived.
+        assert_eq!(open, vec![file]);
+    }
+
+    /// The window must come back as *itself*: same workspace, same session
+    /// identity. A fresh id looks up nobody's state and the window returns
+    /// empty, which is the failure mode a reload cannot have.
+    #[test]
+    fn a_reload_keeps_the_window_it_is_reloading() {
+        let dir = scratch("spec");
+        let app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir.clone()), ..Default::default()
+        });
+        let spec = app.reload_spec();
+        assert_eq!(spec.window_id, app.window_id, "a new id would lose the session");
+        assert_eq!(spec.cwd, Some(dir.canonicalize().unwrap_or(dir)));
+        assert!(spec.is_reload, "without this, restoring is left to a setting");
+        // Placement is for creating an OS window. This one is not being created.
+        assert!(spec.frame.is_none() && !spec.maximized);
+    }
+
+    /// A window with no folder open must come back with no folder open — not
+    /// rooted at `$HOME`, which is what its `cwd` reports and what an earlier
+    /// version of the process restart got wrong.
+    #[test]
+    fn a_folderless_window_reloads_folderless() {
+        let app = IdeApp::new_with_spec(NewWindowSpec::default());
+        assert_eq!(app.reload_spec().cwd, None);
+    }
+
+    /// Restoring is unconditional on a reload. Asserted on the decision itself
+    /// rather than through a constructed window, because `restore_session` is a
+    /// user setting: on a machine with it turned on, an end-to-end test passes
+    /// whether or not the reload half works.
+    #[test]
+    fn a_reload_restores_whatever_the_setting_says() {
+        use super::should_restore_session;
+        assert!(should_restore_session(false, true), "a reload must restore");
+        assert!(should_restore_session(true, true));
+        // And the setting still decides for a window that was merely opened.
+        assert!(should_restore_session(true, false));
+        assert!(!should_restore_session(false, false));
     }
 }

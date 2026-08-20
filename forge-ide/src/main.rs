@@ -672,6 +672,18 @@ impl ApplicationHandler for Ide {
             if std::mem::take(&mut win.app.pending_reload) {
                 reload_requested = true;
             }
+            // Rebuild just this window's app, keeping its OS window, swapchain
+            // and egui context — everything the process restart below has to
+            // tear down and rebuild for every window, and the reason that one
+            // takes the other windows' sessions with it.
+            //
+            // Safe to do here, mid-loop, because nothing outside `win.app`
+            // refers to it: the old value's `Drop` kills its agent child and
+            // language servers, and the shells it was showing are the pty
+            // daemon's, so the new app reattaches to the same ones by id.
+            if std::mem::take(&mut win.app.pending_window_reload) {
+                win.app = IdeApp::new_with_spec(win.app.reload_spec());
+            }
         }
         self.pending.extend(new_specs);
 

@@ -1,3 +1,14 @@
+// Modified by Vulkgryph LLC in 2026 for the Forge project.
+//
+// Change: macOS drag-and-drop accepted only `NSFilenamesPboardType`, the legacy
+// pasteboard format, and rejected a drop outright when it was absent. Newer
+// system UI — the floating thumbnail after a Cmd+Shift+4 screenshot, notably —
+// offers only `NSPasteboardTypeFileURL`, so those drops were refused. This file
+// now falls back to the modern format. See the search for
+// `NSPasteboardTypeFileURL` below.
+//
+// This notice is required by the Apache License 2.0, section 4(b), which the
+// original carries; the original licence is at ../../../../LICENSE.
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

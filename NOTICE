@@ -1,4 +1,4 @@
-Forge (forge-agent, forge-tui, forge-ide)
+Forge (forge-agent, forge-tui-rs, forge-ide)
 Copyright 2026 Vulkgryph LLC
 
 This product is developed and maintained by Vulkgryph LLC.
@@ -43,3 +43,23 @@ affiliated with The Khronos Group Inc.
 Metal and macOS are trademarks of Apple Inc.
 
 All other trademarks are the property of their respective owners.
+
+---
+
+Third-party code redistributed with this project
+------------------------------------------------
+
+winit 0.30.13 — https://github.com/rust-windowing/winit
+Copyright the winit contributors, licensed under the Apache License 2.0.
+
+A patched copy is vendored at forge-ide/vendor/winit-0.30.13/ and built in
+place of the published crate. One file is modified —
+src/platform_impl/macos/window_delegate.rs — so that macOS drag-and-drop
+accepts the modern `NSPasteboardTypeFileURL` pasteboard format and not only
+the legacy `NSFilenamesPboardType`; without it, dragging the thumbnail macOS
+shows after a screenshot is refused. That file carries the modification notice
+Apache 2.0 section 4(b) requires, and winit's own LICENSE is retained beside
+the source it covers.
+
+No other third-party source is redistributed here. Everything else is fetched
+by Cargo at build time under its own licence.

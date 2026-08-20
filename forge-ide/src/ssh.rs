@@ -84,6 +84,126 @@ pub struct ShellChannel {
 
 type PendMap = Arc<Mutex<HashMap<i64, mpsc::SyncSender<Result<serde_json::Value, String>>>>>;
 
+/// A detached ticket for talking to an open connection, cheap to clone and safe
+/// to hand to a thread. See `SshConnection::fs_handles`.
+#[derive(Clone)]
+pub struct FsHandles {
+    next_id: Arc<Mutex<i64>>,
+    pending: PendMap,
+    stdin:   Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+/// An open connection's request path with nothing on the far end but a canned
+/// answer, so callers of `fs_list_with` can be tested without a machine.
+///
+/// Answers on the writing thread the moment a request is framed. That is not
+/// how a real connection behaves, but what is under test here is what gets
+/// asked and what is made of the reply — not concurrency.
+#[cfg(test)]
+pub struct FakeFs {
+    pub handles:  FsHandles,
+    /// Every request the code under test sent, in order.
+    pub requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[cfg(test)]
+pub fn fake_fs(reply: Result<serde_json::Value, String>, answer: bool) -> FakeFs {
+    struct W {
+        buf:      Vec<u8>,
+        pending:  PendMap,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        reply:    Result<serde_json::Value, String>,
+        answer:   bool,
+    }
+    impl Write for W {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(bytes);
+            while let Some(req) = take_frame(&mut self.buf) {
+                self.requests.lock().unwrap().push(req.clone());
+                if !self.answer { continue; }
+                let id = req.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
+                if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+                    let _ = tx.send(self.reply.clone());
+                }
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// One complete `Content-Length`-framed message, removed from `buf`.
+    fn take_frame(buf: &mut Vec<u8>) -> Option<serde_json::Value> {
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&buf[..sep]).ok()?;
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))?
+            .trim()
+            .parse()
+            .ok()?;
+        let start = sep + 4;
+        if buf.len() < start + len { return None; }
+        let value = serde_json::from_slice(&buf[start..start + len]).ok();
+        buf.drain(..start + len);
+        value
+    }
+
+    let pending: PendMap = Arc::new(Mutex::new(HashMap::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let writer = W {
+        buf: Vec::new(),
+        pending: Arc::clone(&pending),
+        requests: Arc::clone(&requests),
+        reply,
+        answer,
+    };
+    FakeFs {
+        handles: FsHandles {
+            next_id: Arc::new(Mutex::new(1)),
+            pending,
+            stdin: Arc::new(Mutex::new(Box::new(writer))),
+        },
+        requests,
+    }
+}
+
+/// `fs/list` over shared handles rather than `&SshConnection`.
+///
+/// One implementation, because the explorer, the folder chooser and Quick Open
+/// all list remote directories, and three hand-rolled copies of this request
+/// would be three chances to disagree about what a listing means.
+pub fn fs_list_with(
+    handles: &FsHandles,
+    path:    &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<RemoteEntry>, String> {
+    let id = {
+        let mut n = handles.next_id.lock().unwrap();
+        let i = *n;
+        *n += 1;
+        i
+    };
+    let msg = Rpc::request(id, "fs/list", serde_json::json!({ "path": path }));
+    let (tx, rx) = mpsc::sync_channel(1);
+    handles.pending.lock().unwrap().insert(id, tx);
+    if let Ok(mut w) = handles.stdin.lock() {
+        write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
+    }
+    let value = rx
+        .recv_timeout(timeout)
+        .map_err(|_| "listing timed out".to_string())??;
+    // The reply carries entries and no path of its own, so a caller that needs
+    // to display where it is, or to walk up from it, must resolve the path it
+    // asked with — it will not be told it back.
+    let entries: Vec<FsEntry> =
+        serde_json::from_value(value.get("entries").cloned().unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+    Ok(entries
+        .into_iter()
+        .map(|e| RemoteEntry { name: e.name, path: e.path, is_dir: e.is_dir, size: e.size })
+        .collect())
+}
+
 pub struct SshConnection {
     pub host:    SshHost,
     /// The remote account's home directory, resolved once at connect. Forge's
@@ -281,13 +401,19 @@ impl SshConnection {
     // ── fs ────────────────────────────────────────────────────────────────────
 
     pub fn fs_list(&self, path: &str) -> Result<Vec<RemoteEntry>, String> {
-        let r = self.call("fs/list", serde_json::json!({ "path": path }))?;
-        let entries: Vec<FsEntry> = serde_json::from_value(
-            r.get("entries").cloned().unwrap_or_default()
-        ).map_err(|e| e.to_string())?;
-        Ok(entries.into_iter().map(|e| RemoteEntry {
-            name: e.name, path: e.path, is_dir: e.is_dir, size: e.size
-        }).collect())
+        fs_list_with(&self.fs_handles(), path, std::time::Duration::from_secs(30))
+    }
+
+    /// The pieces of this connection a background thread needs to make its own
+    /// requests. The connection itself cannot cross a thread boundary — it owns
+    /// the runtime and the session — but these three are shared handles, and a
+    /// listing must run off the render thread or a slow link freezes the window.
+    pub fn fs_handles(&self) -> FsHandles {
+        FsHandles {
+            next_id: Arc::clone(&self.next_id),
+            pending: Arc::clone(&self.pending),
+            stdin:   Arc::clone(&self.stdin),
+        }
     }
 
     /// Put the agent on the remote machine, and answer where it is.

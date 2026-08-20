@@ -41,7 +41,34 @@ struct QuickOpenEntry {
     is_dir:     bool,
 }
 
+/// A finished listing, on its way back to the render thread.
+struct Listing {
+    /// Which directory this answers for. Compared on arrival, so a slow listing
+    /// that lands after the user navigated on is dropped rather than shown.
+    dir:       PathBuf,
+    entries:   Vec<QuickOpenEntry>,
+    truncated: bool,
+    error:     Option<String>,
+}
+
+/// Which filesystem Quick Open is looking at.
+///
+/// Remote paths live in `PathBuf` here too. Both ends are Unix, and everything
+/// done to a path in this module — `parent`, `strip_prefix`, `file_name` — is
+/// string work with no filesystem behind it; the only calls that touch a disk
+/// are in the listing, which this enum is what selects.
+#[derive(Clone)]
+enum QuickOpenSource {
+    Local,
+    Remote(crate::ssh::FsHandles),
+}
+
+impl QuickOpenSource {
+    fn is_remote(&self) -> bool { matches!(self, Self::Remote(_)) }
+}
+
 struct QuickOpen {
+    source:   QuickOpenSource,
     /// Directory being listed. Starts at `root` and moves as you navigate.
     dir:      PathBuf,
     /// Project root. `..` stops here, so navigation can't wander off into the
@@ -53,8 +80,11 @@ struct QuickOpen {
     cursor:   usize,
     /// Set when this directory's listing stopped at `QUICK_OPEN_MAX_ENTRIES`.
     truncated: bool,
+    /// Why the last listing came back with nothing. A remote one can time out
+    /// or be refused, and reporting that as "Empty folder" would be a lie.
+    error:    Option<String>,
     /// `Some` while a directory listing is in flight.
-    rx:       Option<mpsc::Receiver<(PathBuf, Vec<QuickOpenEntry>, bool)>>,
+    rx:       Option<mpsc::Receiver<Listing>>,
     /// Tells an in-flight listing its result is unwanted; tripped by `Drop`
     /// and on every navigation, so a stalled network mount can't pile up.
     cancel:   Arc<AtomicBool>,
@@ -65,20 +95,22 @@ impl Drop for QuickOpen {
 }
 
 impl QuickOpen {
-    fn new(root: &Path) -> Self {
+    fn new(root: &Path, source: QuickOpenSource) -> Self {
         let mut qo = Self {
+            source,
             dir: root.to_path_buf(), root: root.to_path_buf(),
             query: String::new(), entries: Vec::new(), filtered: Vec::new(),
-            cursor: 0, truncated: false, rx: None,
+            cursor: 0, truncated: false, error: None, rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
         };
         qo.load(root.to_path_buf());
         qo
     }
 
-    /// Kick off a listing of `dir`. Off-thread even though it is a single
-    /// `read_dir`: on a stalled network mount that one call can block for
-    /// seconds, and blocking the render thread is what froze the window.
+    /// Kick off a listing of `dir`. Off-thread even though a local one is a
+    /// single `read_dir`: on a stalled network mount that one call can block for
+    /// seconds, and blocking the render thread is what froze the window. A
+    /// remote listing is a round trip, so it has no other option.
     fn load(&mut self, dir: PathBuf) {
         // Abandon any listing already running — its result is stale now.
         self.cancel.store(true, Ordering::Relaxed);
@@ -91,13 +123,29 @@ impl QuickOpen {
         self.filtered.clear();
         self.cursor    = 0;
         self.truncated = false;
+        self.error     = None;
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
+        let source = self.source.clone();
         std::thread::spawn(move || {
-            let (entries, truncated) = list_dir(&dir, &flag);
+            let listing = match &source {
+                QuickOpenSource::Local => {
+                    let (entries, truncated) = list_dir(&dir, &flag);
+                    Listing { dir, entries, truncated, error: None }
+                }
+                QuickOpenSource::Remote(h) => match list_dir_remote(h, &dir, &flag) {
+                    Ok((entries, truncated)) => Listing { dir, entries, truncated, error: None },
+                    Err(e) => Listing {
+                        dir, entries: Vec::new(), truncated: false, error: Some(e),
+                    },
+                },
+            };
             if !flag.load(Ordering::Relaxed) {
-                let _ = tx.send((dir, entries, truncated));
+                let _ = tx.send(listing);
+                // A remote listing can land while nothing else is driving the
+                // UI, and this window only repaints when woken.
+                if source.is_remote() { crate::wake::wake(); }
             }
         });
     }
@@ -132,12 +180,13 @@ impl QuickOpen {
     fn poll(&mut self) {
         let Some(rx) = &self.rx else { return };
         match rx.try_recv() {
-            Ok((dir, entries, truncated)) => {
+            Ok(l) => {
                 self.rx = None;
                 // Guard against a listing that finished after we navigated on.
-                if dir != self.dir { return; }
-                self.entries   = entries;
-                self.truncated = truncated;
+                if l.dir != self.dir { return; }
+                self.entries   = l.entries;
+                self.truncated = l.truncated;
+                self.error     = l.error;
                 self.update_filter();
             }
             Err(mpsc::TryRecvError::Empty)        => {}
@@ -227,25 +276,68 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 /// shows (see `filetree::FileTree::walk`) so the two views agree.
 fn list_dir(dir: &Path, cancel: &AtomicBool) -> (Vec<QuickOpenEntry>, bool) {
     let Ok(iter) = std::fs::read_dir(dir) else { return (Vec::new(), false) };
+    // Lazily, so the cap below actually stops reading rather than filtering a
+    // list already paid for.
+    quick_open_entries(
+        iter.flatten().filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?.to_string();
+            // Resolve through symlinks so a linked directory is still navigable.
+            // Safe to follow here precisely because nothing recurses: a link
+            // cycle costs one extra `read_dir` when the user walks into it, not
+            // an unbounded descent.
+            let path = entry.path();
+            let is_dir = match entry.file_type() {
+                Ok(ft) if ft.is_symlink() => path.is_dir(),
+                Ok(ft)                    => ft.is_dir(),
+                Err(_)                    => return None,
+            };
+            Some((name, path, is_dir))
+        }),
+        cancel,
+    )
+}
+
+/// One remote directory, over the connection instead of this machine's disk.
+///
+/// Same shape as the local listing and the same rules applied to the result, so
+/// `Ctrl+P` behaves identically whichever end the workspace is on. Its own
+/// request, not the explorer's, so opening Quick Open does not move the tree.
+fn list_dir_remote(
+    handles: &crate::ssh::FsHandles,
+    dir:     &Path,
+    cancel:  &AtomicBool,
+) -> Result<(Vec<QuickOpenEntry>, bool), String> {
+    let entries = crate::ssh::fs_list_with(
+        handles,
+        &dir.to_string_lossy(),
+        std::time::Duration::from_secs(20),
+    )?;
+    Ok(quick_open_entries(
+        entries.into_iter().map(|e| (e.name, PathBuf::from(e.path), e.is_dir)),
+        cancel,
+    ))
+}
+
+/// Filter, label and order one directory's worth of entries.
+///
+/// Shared by both listings on purpose: which entries are shown, how a directory
+/// is marked, what order rows come in and where the cap falls are properties of
+/// Quick Open, not of the machine being listed. Two copies would eventually
+/// disagree, and a remote workspace would quietly behave unlike a local one.
+fn quick_open_entries(
+    raw:    impl Iterator<Item = (String, PathBuf, bool)>,
+    cancel: &AtomicBool,
+) -> (Vec<QuickOpenEntry>, bool) {
     let mut out = Vec::new();
     let mut truncated = false;
-    for entry in iter.flatten() {
+    for (name, path, is_dir) in raw {
         if cancel.load(Ordering::Relaxed) { return (out, truncated); }
         if out.len() >= QUICK_OPEN_MAX_ENTRIES { truncated = true; break; }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+        // Hidden entries and `node_modules` are skipped, matching what the file
+        // tree shows (see `filetree::FileTree::walk`) so the two views agree.
         if name.starts_with('.') || name == "node_modules" { continue; }
-        // Resolve through symlinks so a linked directory is still navigable.
-        // Safe to follow here precisely because nothing recurses: a link cycle
-        // costs one extra `read_dir` when the user walks into it, not an
-        // unbounded descent.
-        let path = entry.path();
-        let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => path.is_dir(),
-            Ok(ft)                    => ft.is_dir(),
-            Err(_)                    => continue,
-        };
-        let display = if is_dir { format!("{name}/") } else { name.to_string() };
+        let display = if is_dir { format!("{name}/") } else { name };
         out.push(QuickOpenEntry {
             path,
             name_lower: display.to_lowercase(),
@@ -258,6 +350,33 @@ fn list_dir(dir: &Path, cancel: &AtomicBool) -> (Vec<QuickOpenEntry>, bool) {
         b.is_dir.cmp(&a.is_dir).then_with(|| a.name_lower.cmp(&b.name_lower))
     });
     (out, truncated)
+}
+
+// ── Remote paths ──────────────────────────────────────────────────────────────
+
+/// A remote workspace path, absolute.
+///
+/// `~` is expanded against the home directory learned at connect rather than
+/// sent as-is, because `fs/list` answers with entries and no path: anything that
+/// has to show where it is, or walk up from there, only knows the path it asked
+/// with.
+fn resolve_remote_dir(configured: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let home = if home.is_empty() { "/" } else { home };
+    match configured {
+        "" | "~" => home.to_string(),
+        p if p.starts_with("~/") => format!("{}/{}", home.trim_end_matches('/'), &p[2..]),
+        p => p.to_string(),
+    }
+}
+
+/// One level up a remote path, stopping at the root rather than going above it
+/// or returning the empty string, which would list nothing.
+fn remote_parent(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some(("", _)) | None => "/".to_string(),
+        Some((head, _))      => head.to_string(),
+    }
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -5045,12 +5164,10 @@ impl IdeApp {
         if !terminal_focused {
         if ctrl && !shift && ctx.input(|i| i.key_pressed(egui::Key::P)) {
             self.cmd_palette = None;
-            if !self.has_folder {
-                self.status = "Open a folder first".into();
-            } else if self.quick_open.is_none() {
-                self.quick_open = Some(QuickOpen::new(&self.cwd));
-            } else {
+            if self.quick_open.is_some() {
                 self.quick_open = None;
+            } else {
+                self.open_quick_open();
             }
         }
         if ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::P)) {
@@ -9666,6 +9783,11 @@ impl IdeApp {
 
         // Take ownership so we can also borrow the rest of self freely
         let mut qo = self.quick_open.take().unwrap();
+        let host = if qo.source.is_remote() {
+            self.ssh.as_ref().map(|s| s.host.host.clone())
+        } else {
+            None
+        };
         qo.poll();
         // The listing arrives on a background thread, so keep repainting until
         // it lands — otherwise rows only appear on the next input event.
@@ -9702,10 +9824,15 @@ impl IdeApp {
                         ui.set_width(w);
 
                         // Where we are, so navigating several levels deep stays
-                        // legible when the query box only shows a filter.
+                        // legible when the query box only shows a filter. On a
+                        // remote workspace the host is named too: the whole bug
+                        // this fixes was not being able to tell which machine
+                        // you were looking at.
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new(qo.breadcrumb())
-                            .size(11.0).color(egui::Color32::from_gray(140)));
+                        ui.label(egui::RichText::new(match &host {
+                            Some(h) => format!("{h}:{}", qo.breadcrumb()),
+                            None    => qo.breadcrumb(),
+                        }).size(11.0).color(egui::Color32::from_gray(140)));
 
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut qo.query)
@@ -9742,6 +9869,16 @@ impl IdeApp {
                             ui.add_space(6.0);
                         }
 
+                        // A remote listing can be refused or time out. Saying
+                        // "Empty folder" for that would send the user looking
+                        // for a file they would never find.
+                        if let Some(err) = &qo.error {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(err).size(12.0)
+                                .color(egui::Color32::from_rgb(230, 130, 130)));
+                            ui.add_space(4.0);
+                        }
+
                         egui::ScrollArea::vertical().max_height(h - 80.0).show(ui, |ui| {
                             ui.style_mut().spacing.item_spacing.y = 0.0;
 
@@ -9772,7 +9909,7 @@ impl IdeApp {
                                 if sel { r.scroll_to_me(None); }
             }
 
-                            if !qo.listing() && qo.filtered.is_empty() {
+                            if !qo.listing() && qo.filtered.is_empty() && qo.error.is_none() {
                                 ui.add_space(4.0);
                                 ui.label(egui::RichText::new(
                                     if qo.entries.is_empty() { "Empty folder" }
@@ -9793,8 +9930,14 @@ impl IdeApp {
         if let Some(dir) = descend { qo.enter(dir); }
         else if ascend          { qo.go_up(); }
 
+        let remote = qo.source.is_remote();
         if !dismissed { self.quick_open = Some(qo); }
-        if let Some(path) = open_path { self.open_file(path); }
+        if let Some(path) = open_path {
+            // A remote pick is read over the connection, not off this disk —
+            // where that path names either nothing or, worse, a different file.
+            if remote { self.ssh_open_file(path.to_string_lossy().into_owned()); }
+            else      { self.open_file(path); }
+        }
     }
 
     fn draw_cmd_palette(&mut self, ctx: &egui::Context) {
@@ -9881,11 +10024,7 @@ impl IdeApp {
             Cmd::NewWindow     => { self.pending_new_window = Some(NewWindowSpec::default()); }
             Cmd::ToggleTerminal  => self.show_term  = !self.show_term,
             Cmd::ToggleFileTree  => self.show_tree  = !self.show_tree,
-            Cmd::QuickOpen       => if self.has_folder {
-                self.quick_open = Some(QuickOpen::new(&self.cwd));
-            } else {
-                self.status = "Open a folder first".into();
-            },
+            Cmd::QuickOpen       => self.open_quick_open(),
             Cmd::Plugin(i)       => {
                 if let Some(cmd) = self.plugins.commands.get(i) {
                     if let Some(buf) = self.buffers.get_mut(self.active) {
@@ -9903,32 +10042,44 @@ impl IdeApp {
         }
     }
 
+    /// The remote workspace root as an absolute path, or `None` when this window
+    /// is local.
+    ///
+    /// Resolved here rather than sent as `~`, because `fs/list` answers with
+    /// entries and no path: anything that needs to display where it is, or walk
+    /// up from there, has to know the path it asked with. The home directory is
+    /// already known from connect, so this costs nothing.
+    fn remote_root(&self) -> Option<String> {
+        let ssh = self.ssh.as_ref()?;
+        Some(resolve_remote_dir(&ssh.host.remote_dir, &ssh.remote_home))
+    }
+
+    /// Go to File, on whichever filesystem the workspace is actually on.
+    ///
+    /// The same reason the folder chooser branches: on a remote session the
+    /// local `read_dir` is listing the wrong machine, and it would offer files
+    /// the agent and the editor there cannot see.
+    fn open_quick_open(&mut self) {
+        if let Some((handles, root)) =
+            self.ssh.as_ref().map(|s| s.fs_handles()).zip(self.remote_root())
+        {
+            self.quick_open =
+                Some(QuickOpen::new(Path::new(&root), QuickOpenSource::Remote(handles)));
+            return;
+        }
+        if !self.has_folder {
+            self.status = "Open a folder first".into();
+            return;
+        }
+        let root = self.cwd.clone();
+        self.quick_open = Some(QuickOpen::new(&root, QuickOpenSource::Local));
+    }
+
     fn open_folder_dialog(&mut self) {
         // The native dialog browses *this* machine. On a remote workspace that
         // is the wrong filesystem — it opened a Mac folder while the user was
         // working on a Linux host — so the remote gets its own chooser.
-        if self.ssh.is_some() {
-            // Resolved here, not sent as `~`: fs/list answers with entries and
-            // no path, so the dialog would have nothing to show above the list
-            // and no parent to compute. The home directory is already known
-            // from connect.
-            let home = self
-                .ssh
-                .as_ref()
-                .map(|s| s.remote_home.clone())
-                .unwrap_or_else(|| "/".to_string());
-            let configured = self
-                .ssh
-                .as_ref()
-                .map(|s| s.host.remote_dir.clone())
-                .unwrap_or_default();
-            let start = match configured.as_str() {
-                "" | "~" => home.clone(),
-                p if p.starts_with("~/") => {
-                    format!("{}/{}", home.trim_end_matches('/'), &p[2..])
-                }
-                p => p.to_string(),
-            };
+        if let Some(start) = self.remote_root() {
             self.remote_picker = Some(RemotePicker {
                 path: start.clone(),
                 entries: Vec::new(),
@@ -9998,13 +10149,7 @@ impl IdeApp {
                         // Up first, and absent at the root, where there is
                         // nowhere above to go.
                         if path != "/" {
-                            if ui.button("↑  ..").clicked() {
-                                let parent = match path.trim_end_matches('/').rsplit_once('/') {
-                                    Some(("", _)) | None => "/".to_string(),
-                                    Some((head, _)) => head.to_string(),
-                                };
-                                go = Some(parent);
-                            }
+                            if ui.button("↑  ..").clicked() { go = Some(remote_parent(&path)); }
                         }
                         if loading {
                             ui.label(egui::RichText::new("Listing…").size(11.0)
@@ -10081,52 +10226,13 @@ impl IdeApp {
     /// Its own request rather than `ssh_navigate`'s, so opening the dialog does
     /// not move the explorer's position underneath the user.
     fn picker_list(&mut self, path: String) {
-        let (Some(stdin), Some(pending), Some(next_id)) = (
-            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.stdin)),
-            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.pending)),
-            self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.next_id)),
-        ) else {
-            return;
-        };
+        let Some(handles) = self.ssh.as_ref().map(|s| s.fs_handles()) else { return };
         let (tx, rx) = mpsc::channel();
         self.picker_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = (|| {
-                let id = { let mut n = next_id.lock().unwrap(); let i = *n; *n += 1; i };
-                let msg = forge_proto::Rpc::request(
-                    id,
-                    "fs/list",
-                    serde_json::json!({ "path": path }),
-                );
-                let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-                pending.lock().unwrap().insert(id, resp_tx);
-                if let Ok(mut w) = stdin.lock() {
-                    forge_proto::write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
-                }
-                let value = resp_rx
-                    .recv_timeout(std::time::Duration::from_secs(20))
-                    .map_err(|_| "listing timed out".to_string())??;
-                // fs/list answers with entries only, so the path shown is the
-                // one asked for — which is why the caller resolves `~` before
-                // asking rather than after.
-                let resolved = path;
-                let entries: Vec<forge_proto::FsEntry> = serde_json::from_value(
-                    value.get("entries").cloned().unwrap_or_default(),
-                )
-                .map_err(|e| e.to_string())?;
-                Ok((
-                    resolved,
-                    entries
-                        .into_iter()
-                        .map(|e| crate::ssh::RemoteEntry {
-                            name: e.name,
-                            path: e.path,
-                            is_dir: e.is_dir,
-                            size: e.size,
-                        })
-                        .collect::<Vec<_>>(),
-                ))
-            })();
+            let result = crate::ssh::fs_list_with(
+                &handles, &path, std::time::Duration::from_secs(20),
+            ).map(|entries| (path, entries));
             let _ = tx.send(result);
             crate::wake::wake();
         });
@@ -10173,11 +10279,7 @@ impl IdeApp {
                 });
                 ui.menu_button("Go", |ui| {
                     if ui.button("Go to File…         Ctrl+P").clicked() {
-                        if self.has_folder {
-                            self.quick_open = Some(QuickOpen::new(&self.cwd));
-                        } else {
-                            self.status = "Open a folder first".into();
-                        }
+                        self.open_quick_open();
                         ui.close_menu();
     }
                     if ui.button("Command Palette… Ctrl+Shift+P").clicked() {
@@ -12435,41 +12537,18 @@ impl IdeApp {
     }
 
     /// Navigate to a remote directory — non-blocking; result arrives via ssh_nav_rx.
+    ///
+    /// Off the render thread because it is a round trip: the connection cannot
+    /// cross into a thread, so the listing goes through the shared handles.
     fn ssh_navigate(&mut self, path: String) {
-        if self.ssh.is_none() || self.ssh_nav_rx.is_some() { return; }
-        // Clone the internals needed for the background thread.
-        // SshConnection::fs_list only needs the Arc fields so we can pass a
-        // snapshot of the stdin/pending/next_id via a clone of the connection
-        // — but SshConnection isn't Clone.  Simplest workaround: capture the
-        // Arc fields directly.
-        let stdin   = self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.stdin));
-        let pending = self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.pending));
-        let next_id = self.ssh.as_ref().map(|s| std::sync::Arc::clone(&s.next_id));
-        let (Some(stdin), Some(pending), Some(next_id)) = (stdin, pending, next_id)
-            else { return };
+        if self.ssh_nav_rx.is_some() { return; }
+        let Some(handles) = self.ssh.as_ref().map(|s| s.fs_handles()) else { return };
         let (tx, rx) = mpsc::channel();
         self.ssh_nav_rx = Some(rx);
         std::thread::spawn(move || {
-            // Build a minimal call helper inline (mirrors SshConnection::call)
-            let result = (|| {
-                let id = { let mut n = next_id.lock().unwrap(); let i = *n; *n += 1; i };
-                let msg = forge_proto::Rpc::request(id, "fs/list",
-                    serde_json::json!({ "path": path }));
-                let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-                pending.lock().unwrap().insert(id, resp_tx);
-                if let Ok(mut w) = stdin.lock() {
-                    forge_proto::write_rpc(&mut *w, &msg)
-                        .map_err(|e| e.to_string())?;
-}
-                let r = resp_rx.recv_timeout(std::time::Duration::from_secs(15))
-                    .map_err(|_| "fs/list timeout".to_string())??;
-                let entries: Vec<forge_proto::FsEntry> =
-                    serde_json::from_value(r.get("entries").cloned()
-                        .unwrap_or_default()).map_err(|e| e.to_string())?;
-                Ok::<_, String>((path, entries.into_iter().map(|e| crate::ssh::RemoteEntry {
-                    name: e.name, path: e.path, is_dir: e.is_dir, size: e.size
-                }).collect()))
-            })();
+            let result = crate::ssh::fs_list_with(
+                &handles, &path, std::time::Duration::from_secs(15),
+            ).map(|entries| (path, entries));
             let _ = tx.send(result);
         });
     }
@@ -12954,7 +13033,8 @@ fn setup_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod quick_open_tests {
-    use super::{QuickOpen, QuickOpenEntry, list_dir, fuzzy_match, QUICK_OPEN_MAX_ENTRIES};
+    use super::{QuickOpen, QuickOpenEntry, QuickOpenSource, list_dir, fuzzy_match,
+                QUICK_OPEN_MAX_ENTRIES};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
@@ -13069,7 +13149,7 @@ mod quick_open_tests {
         let root = scratch("bounds");
         std::fs::create_dir(root.join("sub")).unwrap();
 
-        let mut qo = QuickOpen::new(&root);
+        let mut qo = QuickOpen::new(&root, QuickOpenSource::Local);
         assert!(qo.at_root());
         qo.go_up();
         assert_eq!(qo.dir, root, "must not escape above the project root");
@@ -13091,7 +13171,7 @@ mod quick_open_tests {
         let root = scratch("reset");
         std::fs::create_dir(root.join("sub")).unwrap();
 
-        let mut qo = QuickOpen::new(&root);
+        let mut qo = QuickOpen::new(&root, QuickOpenSource::Local);
         qo.query = "zzz".into();
         qo.cursor = 7;
         qo.enter(root.join("sub"));
@@ -13110,7 +13190,7 @@ mod quick_open_tests {
         std::fs::create_dir(root.join("empty")).unwrap();
 
         // At the root there is no `../` row, so slot 0 is the first entry.
-        let mut qo = QuickOpen::new(&root);
+        let mut qo = QuickOpen::new(&root, QuickOpenSource::Local);
         qo.entries = list(&root);
         qo.update_filter();
         assert_eq!(qo.cursor, 0);
@@ -13140,7 +13220,7 @@ mod quick_open_tests {
         std::fs::write(root.join("root-file.rs"), "").unwrap();
         std::fs::write(root.join("sub/sub-file.rs"), "").unwrap();
 
-        let mut qo = QuickOpen::new(&root);
+        let mut qo = QuickOpen::new(&root, QuickOpenSource::Local);
         // Navigate before polling, so the root listing is now stale.
         qo.enter(root.join("sub"));
         for _ in 0..200 {
@@ -13707,47 +13787,151 @@ mod glyph_coverage {
 }
 
 #[cfg(test)]
-mod remote_picker_tests {
-    /// Walking up from a remote path. The picker computes this itself, since
-    /// `fs/list` answers with entries and no path of its own.
-    fn parent_of(path: &str) -> String {
-        match path.trim_end_matches('/').rsplit_once('/') {
-            Some(("", _)) | None => "/".to_string(),
-            Some((head, _)) => head.to_string(),
-        }
-    }
+mod remote_path_tests {
+    use super::{remote_parent, resolve_remote_dir};
 
+    /// Walking up from a remote path. Computed here, not read back from the
+    /// server: `fs/list` answers with entries and no path of its own.
     #[test]
     fn walking_up_stops_at_the_root() {
-        // Not above it, and not into an empty string that would list nothing.
-        assert_eq!(parent_of("/home/sysadmin/code"), "/home/sysadmin");
-        assert_eq!(parent_of("/home/sysadmin"), "/home");
-        assert_eq!(parent_of("/home"), "/");
-        assert_eq!(parent_of("/"), "/");
+        // Not above it, and never the empty string, which would list nothing.
+        assert_eq!(remote_parent("/home/sysadmin/code"), "/home/sysadmin");
+        assert_eq!(remote_parent("/home/sysadmin"), "/home");
+        assert_eq!(remote_parent("/home"), "/");
+        assert_eq!(remote_parent("/"), "/");
     }
 
     #[test]
     fn a_trailing_slash_does_not_cost_a_level() {
-        assert_eq!(parent_of("/home/sysadmin/"), "/home");
-    }
-
-    /// `~` is expanded before asking, using the home directory learned at
-    /// connect — the server would list it correctly but answer with no path,
-    /// leaving the dialog unable to show where it is or compute a parent.
-    fn resolve(configured: &str, home: &str) -> String {
-        match configured {
-            "" | "~" => home.to_string(),
-            p if p.starts_with("~/") => format!("{}/{}", home.trim_end_matches('/'), &p[2..]),
-            p => p.to_string(),
-        }
+        assert_eq!(remote_parent("/home/sysadmin/"), "/home");
     }
 
     #[test]
     fn home_is_resolved_before_the_listing_is_asked_for() {
-        assert_eq!(resolve("~", "/home/sysadmin"), "/home/sysadmin");
-        assert_eq!(resolve("", "/home/sysadmin"), "/home/sysadmin");
-        assert_eq!(resolve("~/code", "/home/sysadmin"), "/home/sysadmin/code");
-        assert_eq!(resolve("~/code", "/home/sysadmin/"), "/home/sysadmin/code");
-        assert_eq!(resolve("/opt/thing", "/home/sysadmin"), "/opt/thing");
+        assert_eq!(resolve_remote_dir("~", "/home/sysadmin"), "/home/sysadmin");
+        assert_eq!(resolve_remote_dir("", "/home/sysadmin"), "/home/sysadmin");
+        assert_eq!(resolve_remote_dir("~/code", "/home/sysadmin"), "/home/sysadmin/code");
+        assert_eq!(resolve_remote_dir("~/code", "/home/sysadmin/"), "/home/sysadmin/code");
+        assert_eq!(resolve_remote_dir("/opt/thing", "/home/sysadmin"), "/opt/thing");
+    }
+
+    /// A root account's home is `/`, and joining onto it naively gives `//code`.
+    #[test]
+    fn a_root_home_does_not_double_its_slash() {
+        assert_eq!(resolve_remote_dir("~", "/"), "/");
+        assert_eq!(resolve_remote_dir("~/code", "/"), "/code");
+    }
+}
+
+#[cfg(test)]
+mod remote_quick_open_tests {
+    use super::{list_dir_remote, quick_open_entries, QUICK_OPEN_MAX_ENTRIES};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn reply(entries: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "entries": entries })
+    }
+
+    fn entry(name: &str, dir: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "path": format!("/home/sysadmin/code/{name}"),
+            "is_dir": dir, "size": 0,
+        })
+    }
+
+    fn names(entries: &[super::QuickOpenEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// The bug this exists for: on a remote workspace the listing must come off
+    /// the remote. Asserted by what goes on the wire — a local `read_dir` of
+    /// this path would send nothing at all.
+    #[test]
+    fn the_remote_is_the_one_asked() {
+        let fake = crate::ssh::fake_fs(Ok(reply(serde_json::json!([]))), true);
+        let dir = PathBuf::from("/home/sysadmin/code");
+        list_dir_remote(&fake.handles, &dir, &AtomicBool::new(false)).unwrap();
+
+        let reqs = fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "one listing per directory, not per row");
+        assert_eq!(reqs[0]["method"], "fs/list");
+        assert_eq!(reqs[0]["params"]["path"], "/home/sysadmin/code");
+    }
+
+    /// Directories are marked and ordered the same way the local listing marks
+    /// and orders them, and hidden entries are skipped by both.
+    #[test]
+    fn a_remote_listing_obeys_the_same_rules_as_a_local_one() {
+        let fake = crate::ssh::fake_fs(
+            Ok(reply(serde_json::json!([
+                entry("zeta.rs", false),
+                entry(".git", true),
+                entry("Cargo.toml", false),
+                entry("src", true),
+                entry("node_modules", true),
+                entry("assets", true),
+            ]))),
+            true,
+        );
+        let (entries, truncated) = list_dir_remote(
+            &fake.handles, &PathBuf::from("/home/sysadmin/code"), &AtomicBool::new(false),
+        ).unwrap();
+
+        assert!(!truncated);
+        // Directories first with a trailing slash, then files, each group
+        // case-insensitively by name. `.git` and `node_modules` are not shown.
+        assert_eq!(names(&entries), ["assets/", "src/", "Cargo.toml", "zeta.rs"]);
+    }
+
+    /// Paths come from the server rather than being rebuilt by joining, so the
+    /// path opened is the path the remote named.
+    #[test]
+    fn the_path_opened_is_the_one_the_remote_gave() {
+        let fake = crate::ssh::fake_fs(
+            Ok(reply(serde_json::json!([
+                { "name": "main.rs", "path": "/srv/elsewhere/main.rs", "is_dir": false, "size": 1 }
+            ]))),
+            true,
+        );
+        let (entries, _) = list_dir_remote(
+            &fake.handles, &PathBuf::from("/home/sysadmin/code"), &AtomicBool::new(false),
+        ).unwrap();
+        assert_eq!(entries[0].path, PathBuf::from("/srv/elsewhere/main.rs"));
+    }
+
+    /// A refused or unreachable listing is an error, not an empty folder. The
+    /// dialog says so instead of sending the user looking for a file that is
+    /// there.
+    #[test]
+    fn a_failed_listing_is_not_an_empty_folder() {
+        let fake = crate::ssh::fake_fs(Err("permission denied".into()), true);
+        let err = match list_dir_remote(
+            &fake.handles, &PathBuf::from("/root"), &AtomicBool::new(false),
+        ) {
+            Err(e) => e,
+            Ok((entries, _)) => panic!("a refusal came back as {} entries", entries.len()),
+        };
+        assert!(err.contains("permission denied"), "got {err:?}");
+    }
+
+    #[test]
+    fn a_listing_that_is_never_answered_gives_up() {
+        let fake = crate::ssh::fake_fs(Ok(reply(serde_json::json!([]))), false);
+        let err = crate::ssh::fs_list_with(
+            &fake.handles, "/home/sysadmin", std::time::Duration::from_millis(50),
+        ).unwrap_err();
+        assert!(err.contains("timed out"), "got {err:?}");
+    }
+
+    /// The cap is Quick Open's, not the local filesystem's, so a remote
+    /// directory of a million entries cannot build a million rows either.
+    #[test]
+    fn the_entry_cap_applies_to_remote_listings_too() {
+        let raw = (0..QUICK_OPEN_MAX_ENTRIES + 50)
+            .map(|i| (format!("f{i:07}.rs"), PathBuf::from(format!("/d/f{i:07}.rs")), false));
+        let (entries, truncated) = quick_open_entries(raw, &AtomicBool::new(false));
+        assert_eq!(entries.len(), QUICK_OPEN_MAX_ENTRIES);
+        assert!(truncated, "the dialog must be able to say it is showing a prefix");
     }
 }

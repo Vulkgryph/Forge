@@ -4,6 +4,13 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed (two dialogs browsed the Mac while the workspace was on a remote host)
+
+- **"Open Folder" and "Go to File…" both listed the local filesystem regardless of where the workspace was.** On a remote session that is the wrong machine: the folder dialog offered Mac folders, and `Ctrl+P` offered Mac files — which, if one happened to be there under the same path, opens a *different file* than the one intended. Both now branch on whether the session is remote, and the local behaviour is unchanged. Quick Open names the host in its header, since the whole failure was not being able to tell which machine you were looking at, and a listing that is refused or times out says so rather than reporting an empty folder.
+- **The remote workspace root was fixed at connect time** by the connection form's "Remote dir" field — the explorer could drill into a directory but the workspace never moved, so the agent kept its original root. Choosing a folder now moves it, restarting the agent there because its project root is fixed at spawn (it is `cd`-ed into the workspace when the process starts). The transcript carries across, as it does for a permission-mode change.
+
+Which entries are shown, how directories are marked, what order rows come in and where the entry cap falls are now one implementation shared by both listings, so a remote workspace cannot quietly behave unlike a local one. The `fs/list` request itself is likewise one implementation, where the explorer, the folder chooser and Quick Open previously each hand-rolled it.
+
 ## [0.3.0] — 2026-08-19
 
 ### Added (native "Set Up AI Provider" wizard — no command line needed)

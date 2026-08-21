@@ -417,6 +417,61 @@ fn conversations_dir() -> std::path::PathBuf {
         .join("conversations")
 }
 
+/// What the agent is doing right now, in words.
+///
+/// "Running shell_exec…" says a tool is running and not much else. The name of
+/// the file being written, or the command being run, is the part that tells you
+/// whether a pause is expected — and it is already in the arguments.
+///
+/// Present tense throughout, unlike `describe_tool_call`, which labels calls that
+/// have already happened.
+pub fn activity_phrase(name: &str, args: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // Long arguments are cut here rather than by the label: this line sits above
+    // the input box, where a wrapped command would push the box down the screen.
+    let clip = |t: String| -> String {
+        let one: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.chars().count() > 48 {
+            format!("{}…", one.chars().take(48).collect::<String>())
+        } else {
+            one
+        }
+    };
+    let path = |k: &str| {
+        let p = s(k);
+        p.rsplit('/').next().unwrap_or(&p).to_string()
+    };
+
+    match name {
+        "read_file"      => format!("Reading {}…", path("path")),
+        "list_directory" => {
+            let p = s("path");
+            if p.is_empty() || p == "." { "Listing the project root…".into() }
+            else { format!("Listing {}…", clip(p)) }
+        }
+        "search_code"    => format!("Searching for {}…", clip(s("query"))),
+        "glob_files"     => format!("Looking for files matching {}…", clip(s("pattern"))),
+        "todo_write"     => "Updating the task list…".into(),
+        "web_search"     => format!("Searching the web for {}…", clip(s("query"))),
+        "web_fetch"      => format!("Fetching {}…", clip(s("url"))),
+        "write_file"     => format!("Writing {}…", path("path")),
+        "edit_file"      => format!("Editing {}…", path("path")),
+        "apply_patch"    => "Applying a patch…".into(),
+        "shell_exec"     => {
+            let cmd = clip(s("command"));
+            if cmd.is_empty() { "Running a command…".into() } else { format!("Running {cmd}") }
+        }
+        "delegate_task"  => {
+            let who = s("agent_type");
+            if who.is_empty() { "Delegating a task…".into() } else { format!("Waiting on the {who} subagent…") }
+        }
+        "enter_plan_mode" => "Entering plan mode…".into(),
+        "ask_question"    => "Asking a question…".into(),
+        other => format!("Running {}…", other.replace('_', " ")),
+    }
+}
+
 pub fn save_conversation(session: &AgentSession, id: &str, cwd: &std::path::Path) {
     let dir = conversations_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -554,6 +609,10 @@ pub struct AgentSession {
     /// updated incrementally as events arrive. Only meaningful while
     /// `turn_active`; drives the live activity strip above the input box.
     pub activity:    String,
+    /// When `activity` last changed, so the panel can say how long this step has
+    /// been going. A model call and a five-minute `sleep` look identical without
+    /// it — both are "working", and neither says whether to keep waiting.
+    activity_since: Option<std::time::Instant>,
     /// Approximate token count streamed so far this turn — counted one per
     /// `AssistantToken`/`ReasoningToken` chunk (not exact tokenizer
     /// accounting, but real and live), reset at the start of each turn.
@@ -651,6 +710,19 @@ impl AgentSession {
     /// True while this session is mid-turn (a request is in flight).
     pub fn is_active(&self) -> bool { self.turn_active }
 
+    /// Set what the agent is doing, and start the clock on it.
+    fn set_activity(&mut self, what: String) {
+        if self.activity != what {
+            self.activity_since = Some(std::time::Instant::now());
+        }
+        self.activity = what;
+    }
+
+    /// How long the current step has been going.
+    pub fn activity_elapsed(&self) -> Option<std::time::Duration> {
+        self.activity_since.map(|t| t.elapsed())
+    }
+
     /// Takes and resets the tool-call pulse count accumulated since the last call.
     pub fn drain_tool_pulses(&mut self) -> u32 { std::mem::take(&mut self.tool_pulses) }
 
@@ -703,6 +775,7 @@ impl AgentSession {
                 pending: None,
                 exited:   false,
                 activity:    String::new(),
+                activity_since: None,
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
@@ -751,6 +824,7 @@ impl AgentSession {
                 pending: None,
                 exited:   false,
                 activity:    String::new(),
+                activity_since: None,
                 turn_tokens: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -846,6 +920,7 @@ impl AgentSession {
                 pending: None,
                 exited:   false,
                 activity:    String::new(),
+                activity_since: None,
                 turn_tokens: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -873,6 +948,7 @@ impl AgentSession {
                 pending: None,
                 exited:   false,
                 activity:    String::new(),
+                activity_since: None,
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
@@ -937,11 +1013,11 @@ impl AgentSession {
             }
             AgentMsg::Thinking | AgentMsg::Reasoning => {
                 self.thinking = true;
-                self.activity = "Thinking…".into();
+                self.set_activity("Thinking…".into());
             }
             AgentMsg::ReasoningToken { content } => {
                 self.thinking = false;
-                self.activity = "Thinking…".into();
+                self.set_activity("Thinking…".into());
                 self.turn_tokens += 1;
                 if let Some(ChatItem::Reasoning { text, done }) = self.items.last_mut() {
                     if !*done { text.push_str(&content); return; }
@@ -950,7 +1026,7 @@ impl AgentSession {
             }
             AgentMsg::AssistantToken { content } => {
                 self.thinking = false;
-                self.activity = "Responding…".into();
+                self.set_activity("Responding…".into());
                 self.turn_tokens += 1;
                 if let Some(ChatItem::Reasoning { done, .. }) = self.items.last_mut() {
                     *done = true;
@@ -985,7 +1061,7 @@ impl AgentSession {
             AgentMsg::ToolRequest { tool_name, tool_args, tool_id, kind, subagent_id, needs_approval } => {
                 self.tool_pulses += 1;
                 if subagent_id.is_none() {
-                    self.activity = format!("Running {tool_name}…");
+                    self.set_activity(activity_phrase(&tool_name, &tool_args));
                 }
                 if WRITE_TOOLS.contains(&tool_name.as_str()) {
                     if let Some(path) = extract_path_arg(&tool_args) {
@@ -1031,7 +1107,7 @@ impl AgentSession {
                 };
                 match subagent_id.and_then(|sid| self.subagent_items_mut(&sid)) {
                     Some(items) => items.push(item),
-                    None => { self.activity = "Thinking…".into(); self.items.push(item); }
+                    None => { self.set_activity("Thinking…".into()); self.items.push(item); }
                 }
             }
             AgentMsg::ToolOutput { tool_name, content } => {
@@ -1069,7 +1145,7 @@ impl AgentSession {
                 }
             }
             AgentMsg::ApiRetry { attempt, max_attempts, error } => {
-                self.activity = format!("Retrying request ({attempt}/{max_attempts})…");
+                self.set_activity(format!("Retrying request ({attempt}/{max_attempts})…"));
                 self.items.push(ChatItem::Status(format!(
                     "Retrying… (attempt {attempt}/{max_attempts}): {error}")));
             }
@@ -1254,7 +1330,7 @@ impl AgentSession {
             return;
         }
         self.turn_active = true;
-        self.activity = "Sending…".into();
+        self.set_activity("Sending…".into());
         self.turn_tokens = 0;
         self.items.push(ChatItem::User(trimmed.clone()));
         let _ = self.write(&OutgoingMsg::SendMessage { content: trimmed });

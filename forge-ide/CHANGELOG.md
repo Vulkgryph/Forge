@@ -4,6 +4,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed (you can see what the agent is doing, and for how long)
+
+- **A running tool call was a static dot.** Colour alone carried "running" versus "finished", so a call thirty seconds in looked exactly like a stale icon and there was no way to tell a working agent from a stuck one. The dot on a running call now breathes, with a halo that grows and fades with it so it reads as motion at a glance rather than only as a colour change. It is on the card that is executing — where the eye already is — not only on the status line above the input box. No extra wakeups: the panel already repaints on a 50ms cadence while a turn is live and not at all when it is not, and the animation asks for exactly that cadence rather than the next frame the loop will give it.
+- **The status line said "Running shell_exec…"**, which says a tool is running and nothing about which one or why it might be slow. It now says what is being done to what — "Running cargo build --release", "Editing cascor.rs…", "Waiting on the explore subagent…" — from arguments it already had. Long commands are cut to one line here rather than wrapped, since this row sits directly above the input box and a wrapped command would push the box down the screen.
+- **And it shows how long the current step has been going**, after two seconds, so the ones that finish quickly stay quiet. A model call and a five-minute `sleep` were previously indistinguishable — both were "working", and neither told you whether to keep waiting.
+
 ### Added (a reloaded remote window reconnects itself)
 
 - **"Reload Window" on a remote workspace now makes the connection again, and the agent tabs carry on where they were** — resuming the session on that machine, which is still there, so the conversation genuinely continues rather than starting over next to a transcript of the old one. Key-based hosts reconnect without asking. A host that wants a password cannot be reconnected silently, since the password is never stored, and falls back to local with the transcript marked.

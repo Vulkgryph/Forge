@@ -1662,6 +1662,53 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 3.0, color);
 }
 
+/// A dot that breathes — a call that is *running*, as opposed to one that has
+/// finished.
+///
+/// The distinction was carried by colour alone, so a call that had been running
+/// for five minutes looked exactly like a stale icon, and there was no way to
+/// tell a working agent from a stuck one. Movement is the only thing that
+/// answers that, and it has to be where the eye already is: on the card that is
+/// executing, not only on the status line above the input box.
+///
+/// The ring around it grows with the dot, so this reads as motion even at a
+/// glance and even for a viewer who cannot see the colour change. Costs nothing
+/// when nothing is running: the panel already repaints on a 50ms cadence while a
+/// turn is live and not at all when it is not, so this adds no wakeups.
+/// Seconds a step must run before its elapsed time is shown.
+///
+/// Most calls finish faster than this, and a number that appears and vanishes on
+/// every one of them is noise — the point is the ones that do not finish.
+const ELAPSED_SHOWN_AFTER: u64 = 2;
+
+/// A duration as a person would say it.
+fn human_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+fn paint_running_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let t = ui.input(|i| i.time);
+    // ~1.6s per breath: slow enough to read as deliberate, fast enough that a
+    // glance catches it.
+    let phase = ((t * 4.0).sin() * 0.5 + 0.5) as f32;
+    let radius = 2.4 + 1.4 * phase;
+    ui.painter().circle_filled(rect.center(), radius, color);
+    let halo = egui::Color32::from_rgba_unmultiplied(
+        color.r(), color.g(), color.b(), (70.0 * (1.0 - phase)) as u8,
+    );
+    ui.painter().circle_stroke(rect.center(), radius + 2.0, egui::Stroke::new(1.0_f32, halo));
+    // Matched to the cadence the panel already keeps while a turn is live, not a
+    // bare `request_repaint()`: that asks for the next frame as fast as the loop
+    // will give it, which is how an animation quietly becomes a busy loop.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+}
+
 /// Unfilled ring — "awaiting approval" (distinguishes from the filled
 /// `paint_dot` "running" state at a glance without relying on color alone).
 fn paint_ring(ui: &mut egui::Ui, color: egui::Color32) {
@@ -2385,7 +2432,7 @@ fn draw_write_card(
                             match (approval, result.is_some(), success) {
                                 (ApprovalState::Denied, ..)  => paint_cross(ui, rail),
                                 (ApprovalState::Pending, ..) => paint_ring(ui, rail),
-                                (_, false, _)                => paint_dot(ui, rail),
+                                (_, false, _)                => paint_running_dot(ui, rail),
                                 (_, true, false)              => paint_cross(ui, rail),
                                 (_, true, true)                => paint_checkmark(ui, rail),
                             }
@@ -2535,7 +2582,7 @@ fn draw_terminal_card(
                         match (approval, result.is_some(), success) {
                             (ApprovalState::Denied, ..)  => paint_cross(ui, status_color),
                             (ApprovalState::Pending, ..) => paint_ring(ui, status_color),
-                            (_, false, _)                => paint_dot(ui, status_color),
+                            (_, false, _)                => paint_running_dot(ui, status_color),
                             (_, true, false)              => paint_cross(ui, status_color),
                             (_, true, true)                => paint_checkmark(ui, status_color),
                         }
@@ -7744,6 +7791,16 @@ impl IdeApp {
                         ui.painter().circle_filled(rect.center(), 3.5, dot);
                         let label = if tab.session.activity.is_empty() { "Working…".to_string() } else { tab.session.activity.clone() };
                         ui.label(egui::RichText::new(label).size(10.5).color(egui::Color32::from_gray(190)));
+                        // How long this step has been going. The difference
+                        // between a model that is thinking and one that has hung
+                        // is entirely in this number, and a five-minute `sleep`
+                        // is only obviously fine once you can see it counting.
+                        if let Some(since) = tab.session.activity_elapsed()
+                            .filter(|d| d.as_secs() >= ELAPSED_SHOWN_AFTER)
+                        {
+                            ui.label(egui::RichText::new(format!("· {}", human_elapsed(since)))
+                                .size(10.5).color(egui::Color32::from_gray(150)));
+                        }
                         if tab.session.turn_tokens > 0 {
                             ui.label(egui::RichText::new(format!("· {} tokens", tab.session.turn_tokens)).size(10.5)
                                 .color(egui::Color32::from_gray(130)));
@@ -15077,4 +15134,112 @@ mod mode_switch_tests {
         assert!(matches!(&items[1], ChatItem::Question { answered: false, .. }));
         assert!(matches!(&items[2], ChatItem::InputNeeded { resolved: false, .. }));
     }
+}
+
+#[cfg(test)]
+mod activity_visibility_tests {
+    use super::human_elapsed;
+    use crate::agent_panel::activity_phrase;
+    use std::time::Duration;
+
+    /// Said the way a person would say it, because it is read at a glance while
+    /// waiting — "154s" makes you do arithmetic to find out if you should worry.
+    #[test]
+    fn elapsed_reads_as_time() {
+        assert_eq!(human_elapsed(Duration::from_secs(3)), "3s");
+        assert_eq!(human_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(human_elapsed(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(human_elapsed(Duration::from_secs(154)), "2m 34s");
+        assert_eq!(human_elapsed(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(human_elapsed(Duration::from_secs(3600)), "1h 00m");
+        assert_eq!(human_elapsed(Duration::from_secs(7860)), "2h 11m");
+    }
+
+    /// The line used to read "Running shell_exec…", which says a tool is running
+    /// and nothing about which one or why it might be slow. What it is doing to
+    /// what is already in the arguments.
+    #[test]
+    fn the_line_says_what_is_being_done_to_what() {
+        assert_eq!(
+            activity_phrase("shell_exec", r#"{"command":"cargo build --release"}"#),
+            "Running cargo build --release",
+        );
+        assert_eq!(
+            activity_phrase("edit_file", r#"{"path":"/a/b/src/cascor.rs"}"#),
+            "Editing cascor.rs…",
+        );
+        assert_eq!(
+            activity_phrase("read_file", r#"{"path":"src/lib.rs"}"#),
+            "Reading lib.rs…",
+        );
+        assert_eq!(
+            activity_phrase("search_code", r#"{"query":"TODO"}"#),
+            "Searching for TODO…",
+        );
+        assert_eq!(
+            activity_phrase("delegate_task", r#"{"agent_type":"explore"}"#),
+            "Waiting on the explore subagent…",
+        );
+    }
+
+    /// A long command must not push the input box down the screen, so it is cut
+    /// here rather than wrapped by the label.
+    #[test]
+    fn a_long_command_is_cut_to_one_line() {
+        let long = "sleep 300\nps -p 72164 -o etime=,pcpu= 2>/dev/null || echo process_gone\ngrep -E 'seed=|====' /tmp/n4_rethinks_v2.log | tail -40";
+        let args = serde_json::json!({ "command": long }).to_string();
+        let phrase = activity_phrase("shell_exec", &args);
+        assert!(phrase.chars().count() <= 58, "too long to sit on one line: {phrase:?}");
+        assert!(!phrase.contains('\n'), "a newline would grow the row: {phrase:?}");
+        // And it still says what it is, not just that something is running.
+        assert!(phrase.starts_with("Running sleep 300"), "{phrase:?}");
+    }
+
+    /// Nothing recognisable still beats a bare tool name.
+    #[test]
+    fn an_unknown_tool_still_reads_as_english() {
+        assert_eq!(activity_phrase("some_new_tool", "{}"), "Running some new tool…");
+        assert_eq!(activity_phrase("shell_exec", "not json at all"), "Running a command…");
+    }
+}
+
+#[cfg(test)]
+mod running_dot_tests {
+    /// The dot has to actually move. A static icon is exactly what it replaces,
+    /// and "it looks animated in the code" is not the property — so this draws
+    /// it at two points in its cycle and insists the geometry differs.
+    #[test]
+    fn the_running_dot_moves() {
+        let ctx = egui::Context::default();
+        let radius_at = |t: f64| -> f32 {
+            let input = egui::RawInput {
+                time: Some(t),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::paint_running_dot(ui, egui::Color32::from_rgb(110, 150, 220));
+                });
+            });
+            out.shapes.iter().find_map(|cs| match &cs.shape {
+                egui::Shape::Circle(c) if c.fill.a() > 0 => Some(c.radius),
+                _ => None,
+            }).expect("no dot was painted")
+        };
+
+        // A quarter of the way through the cycle: the widest separation there is.
+        let small = radius_at(0.0);
+        let large = radius_at(std::f64::consts::FRAC_PI_2 / 4.0);
+        assert!((large - small).abs() > 0.5, "the dot did not move: {small} vs {large}");
+    }
+
+    // Not asserted here: that this asks for frames no faster than the panel's
+    // own 50ms cadence. egui's own animation scheduling already floors a frame
+    // in this harness at 33ms, so the measurement cannot see this function's
+    // request at all — the test passed with a bare `request_repaint()`, which is
+    // exactly the mistake it was meant to catch. The cadence is set at the call
+    // site instead; see `paint_running_dot`.
 }

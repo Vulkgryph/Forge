@@ -543,6 +543,11 @@ pub struct AgentSession {
     pub thinking: bool,
     pub input:    String,
     pub spawn_err: Option<String>,
+    /// Set when there is deliberately no process yet, with what is being waited
+    /// for. Distinct from `spawn_err`: nothing has gone wrong, so it must not be
+    /// reported as a failure — a window reconnecting to its remote host is the
+    /// case this exists for.
+    pub pending: Option<String>,
     pub exited:   bool,
     /// Short, human-readable description of what the agent is doing right
     /// now — "Sending…", "Thinking…", "Responding…", "Running shell_exec…" —
@@ -672,6 +677,22 @@ impl AgentSession {
     /// would be worse than failing: the agent would run on the wrong machine
     /// and edit files that merely happen to share a path, which is exactly the
     /// confusion this feature exists to end.
+    /// A session waiting on something before it can start, carrying what.
+    ///
+    /// A window reloading a remote workspace has a transcript to show and a
+    /// connection still being made. Spawning a local agent in the meantime would
+    /// be wrong twice over — it would run on the wrong machine, and it would try
+    /// to resume a session that lives on the other one — so the tab holds its
+    /// transcript and no process until the connection resolves, then gets a real
+    /// session either way.
+    pub fn pending(note: String, resume: Option<&str>) -> Self {
+        let mut s = Self::failed(String::new());
+        s.spawn_err = None;
+        s.pending = Some(note);
+        s.forge_session_id = resume.unwrap_or_default().to_string();
+        s
+    }
+
     pub fn failed(reason: String) -> Self {
         let (_tx, rx) = mpsc::channel::<SessionEvent>();
         Self {
@@ -679,6 +700,7 @@ impl AgentSession {
                 items: Vec::new(), model: String::new(),
                 thinking: false, input: String::new(),
                 spawn_err: Some(reason),
+                pending: None,
                 exited:   false,
                 activity:    String::new(),
                 turn_tokens: 0,
@@ -726,6 +748,7 @@ impl AgentSession {
                 thinking: false,
                 input:    String::new(),
                 spawn_err: None,
+                pending: None,
                 exited:   false,
                 activity:    String::new(),
                 turn_tokens: 0,
@@ -820,6 +843,7 @@ impl AgentSession {
                 thinking: false,
                 input:    String::new(),
                 spawn_err: None,
+                pending: None,
                 exited:   false,
                 activity:    String::new(),
                 turn_tokens: 0,
@@ -846,6 +870,7 @@ impl AgentSession {
                 items: Vec::new(), model: String::new(),
                 thinking: false, input: String::new(),
                 spawn_err: Some(e),
+                pending: None,
                 exited:   false,
                 activity:    String::new(),
                 turn_tokens: 0,
@@ -1217,6 +1242,13 @@ impl AgentSession {
     pub fn send_user(&mut self, content: String) {
         let trimmed = content.trim().to_string();
         if trimmed.is_empty() { return; }
+        // No process yet, on purpose — a window reconnecting to its host. Held,
+        // not sent: writing into a session with no agent behind it loses the
+        // message and leaves the tab looking like it is thinking about it.
+        if self.pending.is_some() {
+            self.queued.push(trimmed);
+            return;
+        }
         if self.turn_active {
             self.queued.push(trimmed);
             return;
@@ -1228,7 +1260,7 @@ impl AgentSession {
         let _ = self.write(&OutgoingMsg::SendMessage { content: trimmed });
     }
 
-    fn dispatch_next_queued(&mut self) {
+    pub(crate) fn dispatch_next_queued(&mut self) {
         if !self.queued.is_empty() {
             let next = self.queued.remove(0);
             self.send_user(next);

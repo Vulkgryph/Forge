@@ -4,6 +4,13 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added (a reloaded remote window reconnects itself)
+
+- **"Reload Window" on a remote workspace now makes the connection again, and the agent tabs carry on where they were** — resuming the session on that machine, which is still there, so the conversation genuinely continues rather than starting over next to a transcript of the old one. Key-based hosts reconnect without asking. A host that wants a password cannot be reconnected silently, since the password is never stored, and falls back to local with the transcript marked.
+- While the connection is being made, a tab holds its transcript and starts **no process at all**. A local agent started in that gap would be on the wrong machine and would try to resume a session that is on the other one. Anything typed in the meantime is held — in the box or already sent — and goes out once there is something to send it to, rather than being written into a session with no agent behind it and leaving the tab looking like it is thinking about it.
+- The window also restores its own state while reconnecting, which it previously refused to do while connecting anywhere. That refusal is right for a window *opening* a remote workspace — it should not adopt another window's local files and terminals — and wrong for one reloading its own, whose terminals are the local pty daemon's and would otherwise be left running with nothing pointing at them. That was the reason this was not done sooner.
+- **File → Restart Forge still comes back local**, because the new process is told which folders to open and nothing else.
+
 ### Fixed (a reloaded remote window came back local with the remote's transcript and no sign of it)
 
 - **Neither reload can keep an SSH session** — the connection belongs to the app being dropped — so the window comes back local while the transcript comes back whole. Keeping it is right; you can still read what happened. But with no boundary in it, it read as one continuous conversation with the machine you are on, and it was not: the agent that produced it was on the remote, and its session log stayed there. The reload now writes the break into the transcript where it happened, naming the host, saying the session stayed with it, and saying that continuing below continues a different conversation. Written by the code that drops the connection, so it cannot land in the wrong place, and it does not stack if you reload twice.

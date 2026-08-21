@@ -366,6 +366,18 @@ fn should_restore_session(setting: bool, is_reload: bool) -> bool {
     setting || is_reload
 }
 
+/// Whether a window opening should reopen what it had, given that it may also be
+/// connecting to a remote host as it opens.
+///
+/// A window *opening* a remote workspace does not want some other window's local
+/// files and terminals — that is what the connecting check was for. A window
+/// *reloading* one is the same window, and wants exactly its own back: in
+/// particular its terminals, which are the local pty daemon's and, left
+/// unrestored, keep running with nothing pointing at them.
+fn should_restore_on_open(setting: bool, is_reload: bool, connecting: bool) -> bool {
+    should_restore_session(setting, is_reload) && (is_reload || !connecting)
+}
+
 // ── Remote paths ──────────────────────────────────────────────────────────────
 
 /// A remote workspace path, absolute.
@@ -4012,10 +4024,14 @@ impl IdeApp {
             app.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker);
         }
 
-        // Skip it if we're opening a remote (SSH) workspace instead.
-        if should_restore_session(app.settings.restore_session, is_reload)
-            && app.pending_ssh_connect.is_none()
-        {
+        // A window *opening* a remote workspace does not want some other
+        // window's local files and terminals; a window *reloading* one is the
+        // same window and wants exactly its own back — including its terminals,
+        // which are the local pty daemon's and would otherwise be left running
+        // with nothing pointing at them.
+        if should_restore_on_open(
+            app.settings.restore_session, is_reload, app.pending_ssh_connect.is_some(),
+        ) {
             let root = app.workspace_root();
             if let Some(state) = crate::session::load_for_window(app.window_id, root.as_deref()) {
                 let restored: Vec<Buffer> = state.open_files.iter()
@@ -4059,12 +4075,21 @@ impl IdeApp {
                     app.agent_tabs = state.agent_tabs.iter()
                         .filter_map(|id| saved.iter().find(|c| &c.id == id))
                         .map(|conv| {
-                            // Restoring at startup, before any SSH connection
-                            // exists, so these are necessarily local.
                             let mode = app.settings.default_agent_permission_mode;
                             let resume = (!conv.forge_session_id.is_empty())
                                 .then_some(conv.forge_session_id.as_str());
-                            let session = app.start_agent_session(mode, resume);
+                            // With a reconnect in flight, no process yet: a
+                            // local agent started here would be on the wrong
+                            // machine, and would try to resume a session that
+                            // is on the other one. `finish_pending_agents`
+                            // gives these real sessions once the connection
+                            // resolves, either way it resolves.
+                            let session = match &app.pending_ssh_connect {
+                                Some(host) => crate::agent_panel::AgentSession::pending(
+                                    format!("Reconnecting to {}…", host.host), resume,
+                                ),
+                                None => app.start_agent_session(mode, resume),
+                            };
                             AgentTab::reopen(session, mode, conv)
                         })
                         .collect();
@@ -4185,9 +4210,66 @@ impl IdeApp {
     /// newly built `forge-ide` binary, and keep an SSH session — the connection
     /// belongs to the app being dropped, so a remote window comes back local.
     pub fn reload_window(&mut self) {
-        self.note_remote_session_end();
+        // No boundary written here, unlike the process restart: this window
+        // reconnects, and if that works the conversation carries on where it
+        // was. `finish_pending_agents` marks it only if the reconnect fails.
         self.save_session_for_reload();
         self.pending_window_reload = true;
+    }
+
+    /// Give every tab still waiting on a connection a real session.
+    ///
+    /// Called from both ends of the reconnect: with `ssh` set the tab continues
+    /// on the remote, resuming the session that is still sitting on that machine
+    /// — the conversation genuinely carries on, which is the whole point of
+    /// reconnecting rather than starting over. Without it, the tab continues
+    /// locally, and *that* is the case that gets the boundary written into its
+    /// transcript, because it is the case where the conversation really did
+    /// change machines.
+    fn finish_pending_agents(&mut self) {
+        let waiting: Vec<usize> = self.agent_tabs.iter().enumerate()
+            .filter(|(_, t)| t.session.pending.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if waiting.is_empty() { return; }
+
+        let connected = self.ssh.is_some();
+        let host = self.ssh.as_ref().map(|s| s.host.host.clone())
+            .or_else(|| Some(self.ssh_form.host.clone()))
+            .unwrap_or_default();
+
+        for i in waiting {
+            let mode   = self.agent_tabs[i].permission_mode;
+            let resume = self.agent_tabs[i].session.forge_session_id.clone();
+            let items  = std::mem::take(&mut self.agent_tabs[i].session.items);
+            // Anything typed while it was waiting is still wanted — whether it
+            // is sitting in the box or was already sent and held.
+            let typed  = std::mem::take(&mut self.agent_tabs[i].session.input);
+            let held   = std::mem::take(&mut self.agent_tabs[i].session.queued);
+
+            let resume_arg = (connected && !resume.is_empty()).then_some(resume.as_str());
+            let mut session = self.start_agent_session(mode, resume_arg);
+            session.items = items;
+            session.input = typed;
+            if !connected {
+                leave_remote(&mut session.items, &mut session.forge_session_id, &host);
+            }
+            session.queued = held;
+            // Sent now that there is something to send it to. The boundary note
+            // above it, when there is one, is what says which machine answered.
+            session.dispatch_next_queued();
+            self.agent_tabs[i].session = session;
+        }
+
+        if connected {
+            self.output_log(format!("Reconnected to {host}; agent tabs resumed there"),
+                            OutputLevel::Success);
+        } else {
+            self.output_log(
+                format!("Could not reconnect to {host} — agent tabs continue on this machine"),
+                OutputLevel::Warn,
+            );
+        }
     }
 
     /// Mark, in the transcript itself, that everything above it happened
@@ -4222,7 +4304,12 @@ impl IdeApp {
             cwd:       self.workspace_root(),
             window_id: self.window_id,
             is_reload: true,
-            ssh_host:  None,
+            // A remote window comes back remote: the connection cannot survive
+            // the rebuild, so it is made again. Key-based hosts reconnect
+            // without asking; one that wants a password cannot be reconnected
+            // silently — the password was never stored — and falls back to
+            // local with the transcript marked.
+            ssh_host:  self.ssh.as_ref().map(|s| s.host.clone()),
             frame:     None,
             maximized: false,
         }
@@ -5138,6 +5225,10 @@ impl IdeApp {
                     self.ssh_term_focused = false;
                     self.bottom_tab = BottomTab::Terminal; // switch to terminal tab
                     self.ssh = Some(ready.conn);
+                    // Any tab that was holding its transcript waiting for this
+                    // gets a real session now — on the remote, resuming the
+                    // session it had there, which is still on that machine.
+                    self.finish_pending_agents();
                     ctx.request_repaint();
 }
                 Ok(Err(e)) => {
@@ -5161,6 +5252,11 @@ impl IdeApp {
                         self.status    = format!("SSH error: {e}");
                         self.ssh_error = Some(e);
                     }
+                    // Whatever the reason, tabs cannot wait on a connection
+                    // that is not coming. They continue locally, with the break
+                    // written into the transcript so the part that ran on the
+                    // other machine is not mistaken for this one.
+                    self.finish_pending_agents();
                     ctx.request_repaint();
 }
                 Err(mpsc::TryRecvError::Empty)        => {}
@@ -6779,6 +6875,17 @@ impl IdeApp {
             tab.session.cancel_run();
         }
 
+        // Waiting on something, deliberately — not a failure, so it does not
+        // get the red text or the "check your PATH" advice below.
+        if let Some(note) = &tab.session.pending.clone() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(format!("  {note}"))
+                    .size(11.5).color(egui::Color32::from_gray(150)));
+            });
+            ui.add_space(4.0);
+        }
         if let Some(err) = &tab.session.spawn_err.clone() {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -14553,5 +14660,131 @@ mod remote_boundary_tests {
         let mut items = Vec::new();
         assert!(!note_remote_boundary(&mut items, "admin-1"));
         assert!(items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::{IdeApp, NewWindowSpec, should_restore_on_open};
+    use crate::agent_panel::{AgentSession, ChatItem};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-reconnect-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A reloading remote window must restore its own state, connection or no
+    /// connection. Its terminals are the local pty daemon's: not restoring them
+    /// leaves shells running with nothing pointing at them, which is why
+    /// carrying the host across was not done until now.
+    #[test]
+    fn a_reloading_window_restores_even_while_reconnecting() {
+        assert!(should_restore_on_open(false, true, true), "a reload must restore");
+        assert!(should_restore_on_open(true, true, true));
+        // A window merely *opening* a remote workspace is not that window, and
+        // must not adopt whatever local state was last saved.
+        assert!(!should_restore_on_open(true, false, true));
+        // And with nothing remote in play, the setting decides as before.
+        assert!(should_restore_on_open(true, false, false));
+        assert!(!should_restore_on_open(false, false, false));
+    }
+
+    /// A local window has no host to carry, so nothing about reconnecting
+    /// applies to it.
+    #[test]
+    fn a_local_reload_carries_no_host() {
+        let app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("local")), ..Default::default()
+        });
+        assert!(app.reload_spec().ssh_host.is_none());
+    }
+
+    /// The failing half of the reconnect, which is the half that can be driven
+    /// without a remote machine: a tab that was waiting continues locally, keeps
+    /// its transcript and anything typed while it waited, gets the boundary
+    /// written in, and gives up the remote's session id.
+    #[test]
+    fn a_reconnect_that_fails_continues_locally_and_says_so() {
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("failed")), ..Default::default()
+        });
+        app.ssh_form.host = "admin-1".into();
+
+        let mut session = AgentSession::pending(
+            "Reconnecting to admin-1…".into(), Some("20260821_020146_7f9"),
+        );
+        session.items = vec![ChatItem::User("built it on the remote".into())];
+        session.input = "half-typed reply".into();
+        let mode = app.settings.default_agent_permission_mode;
+        app.agent_tabs.push(crate::app::AgentTab::new(session, mode));
+
+        app.finish_pending_agents();
+
+        let tab = &app.agent_tabs[0];
+        assert!(tab.session.pending.is_none(), "still waiting on a connection");
+        assert!(tab.session.forge_session_id.is_empty(),
+                "kept a session id belonging to the remote");
+        assert_eq!(tab.session.input, "half-typed reply", "lost what was typed");
+        assert!(matches!(tab.session.items.first(), Some(ChatItem::User(_))),
+                "lost the transcript");
+        let last = tab.session.items.last().unwrap();
+        match last {
+            ChatItem::Status(note) => {
+                assert!(note.contains("admin-1"), "{note}");
+                assert!(note.contains("local now"), "{note}");
+            }
+            _ => panic!("the last item is not the boundary"),
+        }
+    }
+
+    /// A message sent while the tab was waiting is held, not lost, and goes out
+    /// once there is something to send it to. Writing into a session with no
+    /// agent behind it drops the message and leaves the tab looking like it is
+    /// thinking about it.
+    #[test]
+    fn a_message_sent_while_reconnecting_is_delivered_afterwards() {
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("held")), ..Default::default()
+        });
+        app.ssh_form.host = "admin-1".into();
+
+        let mut session = AgentSession::pending("Reconnecting to admin-1…".into(), None);
+        session.send_user("what did the build say?".into());
+        assert!(session.items.is_empty(), "sent into a session with no agent");
+        assert_eq!(session.queued.len(), 1, "the message was not held");
+
+        let mode = app.settings.default_agent_permission_mode;
+        app.agent_tabs.push(crate::app::AgentTab::new(session, mode));
+        app.finish_pending_agents();
+
+        let tab = &app.agent_tabs[0];
+        assert!(tab.session.queued.is_empty(), "still holding it");
+        assert!(
+            tab.session.items.iter().any(|i| matches!(i, ChatItem::User(t) if t.contains("build"))),
+            "the held message never went out",
+        );
+    }
+
+    /// Tabs that already have a process are left alone — this runs on every
+    /// connect result, including ones that have nothing to do with a reload.
+    #[test]
+    fn a_tab_that_is_not_waiting_is_untouched() {
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("untouched")), ..Default::default()
+        });
+        let mut session = AgentSession::failed("no agent binary".into());
+        session.items = vec![ChatItem::User("hello".into())];
+        let mode = app.settings.default_agent_permission_mode;
+        app.agent_tabs.push(crate::app::AgentTab::new(session, mode));
+
+        app.finish_pending_agents();
+
+        let tab = &app.agent_tabs[0];
+        assert_eq!(tab.session.spawn_err.as_deref(), Some("no agent binary"));
+        assert_eq!(tab.session.items.len(), 1, "a boundary was written where none belonged");
     }
 }

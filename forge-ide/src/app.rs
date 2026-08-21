@@ -3258,6 +3258,183 @@ fn draw_subagent_strip_entry(
     ui.add_space(4.0);
 }
 
+/// Whether this subagent has an approval waiting on it.
+///
+/// The one reason left for the docked strip to exist. A subagent's activity is
+/// in the transcript now, but an approval three screens up in the scroll is an
+/// approval nobody answers — and the turn stays blocked until someone does. So
+/// the strip appears for exactly this, and is otherwise absent rather than
+/// being a second copy of the block.
+fn subagent_awaiting_approval(item: &ChatItem) -> bool {
+    let ChatItem::Subagent { finished: false, items, .. } = item else { return false };
+    items.iter().any(|c| match c {
+        ChatItem::ToolRequest { approval: ApprovalState::Pending, .. } => true,
+        // A nested subagent's approval blocks this one just as surely.
+        nested => subagent_awaiting_approval(nested),
+    })
+}
+
+/// The subagent's own region of the transcript.
+///
+/// A delegated task used to be a one-line marker saying "running — see below",
+/// with the work itself in the docked strip. Reading the transcript, there was
+/// no telling which lines were the main agent's and which belonged to a
+/// subagent — the complaint this exists to answer.
+///
+/// So the subagent gets a *container*: a teal rule down the left edge, its name
+/// at the top, and everything it did inside. Anything inside the rule is the
+/// subagent's; anything outside it is the agent you are talking to. Collapsible,
+/// because a finished subagent's tool calls are exactly the sort of thing you
+/// want folded away once you have its answer.
+///
+/// `path` is this subagent's address in the item tree (`[7]` at the top level,
+/// `[7, 2]` for one it delegated to in turn), so an approval clicked inside a
+/// nested block still lands on the right tool call.
+#[allow(clippy::too_many_arguments)]
+fn draw_subagent_block(
+    ui:           &mut egui::Ui,
+    path:         &[usize],
+    agent_type:   &str,
+    prompt:       &str,
+    current_tool: &str,
+    detail:       &str,
+    finished:     bool,
+    summary:      &str,
+    expanded:     bool,
+    items:        &[ChatItem],
+    pad_l:        f32,
+    pad_r:        f32,
+    pending_action: &mut Option<(Vec<usize>, bool)>,
+    toggle_expand:  &mut Option<Vec<usize>>,
+) {
+    const RULE: egui::Color32 = egui::Color32::from_rgb(72, 132, 142);
+    const NAME: egui::Color32 = egui::Color32::from_rgb(150, 205, 210);
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(pad_l);
+        let block = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(26, 30, 32))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(48, 72, 78)))
+            .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 6.0, bottom: 6.0 })
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width() - pad_r);
+                ui.vertical(|ui| {
+                    let header = ui.horizontal(|ui| {
+                        paint_disclosure_triangle(ui, expanded, egui::Color32::from_gray(150));
+                        if finished { paint_checkmark(ui, NAME); } else { paint_dot(ui, NAME); }
+                        ui.label(egui::RichText::new("subagent").size(11.0)
+                            .color(egui::Color32::from_gray(140)));
+                        ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
+                            .color(NAME));
+                        // What it is doing *now*, in the transcript, rather than
+                        // a pointer to somewhere else. `detail` is the argument
+                        // the tool was called with, which is the part that says
+                        // which file or which command.
+                        //
+                        // Sized to what is left and truncated, never laid out at
+                        // its natural width: a label that big sets a minimum
+                        // width for the row, which sets one for the block, which
+                        // makes the whole transcript wider than the panel it is
+                        // in — and then every line in it is clipped at the right
+                        // edge. `add_sized` cannot push the row wider.
+                        if !finished && !current_tool.is_empty() {
+                            let live = if detail.is_empty() {
+                                current_tool.to_string()
+                            } else {
+                                format!("{current_tool} · {detail}")
+                            };
+                            let font = egui::FontId::monospace(10.0);
+                            let room = ui.available_width();
+                            if room > 24.0 {
+                                let text = elide_path_head(ui, &live, &font, room);
+                                ui.add_sized(
+                                    egui::vec2(room, 14.0),
+                                    egui::Label::new(
+                                        egui::RichText::new(text).monospace().size(10.0)
+                                            .color(egui::Color32::from_gray(140)),
+                                    ).truncate(),
+                                );
+                            }
+                        }
+                    });
+                    if header.response.interact(egui::Sense::click()).clicked() {
+                        *toggle_expand = Some(path.to_vec());
+                    }
+
+                    // The task it was given, always — it is the one line that
+                    // says why this block exists.
+                    let ask: String = prompt.trim().chars().take(120).collect();
+                    if !ask.is_empty() {
+                        ui.label(egui::RichText::new(soft_wrap(&ask, wrap_run(ui, 10.5, false)))
+                            .size(10.5).color(egui::Color32::from_gray(150)));
+                    }
+
+                    if expanded {
+                        let inner = ui.min_rect();
+                        let mut i = 0;
+                        while i < items.len() {
+                            match &items[i] {
+                                ChatItem::ToolRequest { .. } => {
+                                    let mut local_pending: Option<(usize, bool)> = None;
+                                    let mut local_toggle:  Option<usize> = None;
+                                    i = draw_tool_run(ui, items, i, 0.0, 0.0,
+                                                      &mut local_pending, &mut local_toggle);
+                                    if let Some((li, approve)) = local_pending {
+                                        let mut p = path.to_vec();
+                                        p.push(li);
+                                        *pending_action = Some((p, approve));
+                                    }
+                                }
+                                // A subagent that delegated in turn. Nested
+                                // inside its parent's rule, because that is
+                                // where it belongs: the parent is blocked
+                                // waiting on it, not doing something else.
+                                ChatItem::Subagent {
+                                    agent_type: cat, prompt: cprompt, current_tool: ctool,
+                                    detail: cdetail, finished: cfin, summary: csum,
+                                    expanded: cexp, items: nested, ..
+                                } => {
+                                    let mut child = path.to_vec();
+                                    child.push(i);
+                                    draw_subagent_block(
+                                        ui, &child, cat, cprompt, ctool, cdetail, *cfin, csum,
+                                        *cexp, nested, 0.0, 0.0, pending_action, toggle_expand,
+                                    );
+                                    i += 1;
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        if items.is_empty() {
+                            ui.label(egui::RichText::new("no tool calls").italics().size(10.0)
+                                .color(egui::Color32::from_gray(110)));
+                        }
+                        let _ = inner;
+                    }
+
+                    // Its answer, which is the part worth reading once it is
+                    // done — shown whether or not the work above is folded away.
+                    if finished && !summary.trim().is_empty() {
+                        ui.add_space(3.0);
+                        let s: String = summary.trim().chars().take(300).collect();
+                        ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, 10.5, false)))
+                            .size(10.5).color(egui::Color32::from_gray(185)));
+                    }
+                });
+            });
+        // The rule itself, painted down the finished block so it spans
+        // everything inside — including nested blocks, which get their own.
+        let r = block.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 2.0, r.bottom())),
+            0.0,
+            RULE,
+        );
+    });
+}
+
 // ── Find bar ──────────────────────────────────────────────────────────────────
 
 struct FindBar {
@@ -7340,24 +7517,23 @@ impl IdeApp {
         }
 
         // ── Docked subagent strip ───────────────────────────────────────────
-        // Lives between the chat and the input box — a subagent keeps running
-        // "on the side" here (with its own tool-call activity and approvals)
-        // regardless of what the main conversation above is doing, instead of
-        // blocking it or getting buried in the scroll. Only *active*
-        // subagents get a slot — once one finishes, its summary already
-        // surfaced in the main chat (see the `ChatItem::Subagent` arm above),
-        // so it drops out of the strip immediately instead of leaving a
-        // permanent "completed" entry sitting above the input box forever.
+        // A subagent's activity now lives in the transcript, inside its own
+        // block (see `draw_subagent_block`), which is where you can tell whose
+        // work you are reading. The strip is no longer a second copy of that —
+        // it appears only for a subagent with an approval waiting, which is the
+        // one thing the transcript cannot do on its own: an approval buried
+        // three screens up in the scroll is an approval you never answer, and
+        // the turn sits there blocked.
         let tab = &self.agent_tabs[self.agent_active];
-        let is_active_subagent = |i: &ChatItem| matches!(i, ChatItem::Subagent { finished: false, .. });
-        let subagent_count = tab.session.items.iter().filter(|i| is_active_subagent(i)).count();
+        let subagent_count = tab.session.items.iter().filter(|i| subagent_awaiting_approval(i)).count();
         // Paths (not flat indices) since a subagent can nest another one —
         // `[2, 1]` means "items[2] (a Subagent), then its own items[1]".
         let mut subagent_pending_action: Option<(Vec<usize>, bool)> = None;
         let mut subagent_toggle_expand: Option<Vec<usize>> = None;
         if subagent_count > 0 {
             let expanded_count = tab.session.items.iter()
-                .filter(|i| is_active_subagent(i) && matches!(i, ChatItem::Subagent { expanded: true, .. }))
+                .filter(|i| subagent_awaiting_approval(i)
+                            && matches!(i, ChatItem::Subagent { expanded: true, .. }))
                 .count();
             let strip_h = (subagent_count as f32 * 26.0 + expanded_count as f32 * 150.0)
                 .clamp(26.0, 320.0) + 10.0;
@@ -7369,7 +7545,8 @@ impl IdeApp {
                     egui::ScrollArea::vertical().id_salt("subagent_strip_scroll").auto_shrink([false, false])
                         .show(ui, |ui| {
                             for (idx, item) in tab.session.items.iter().enumerate() {
-                                let ChatItem::Subagent { id: _, agent_type, prompt, finished: false, expanded, items, .. } = item
+                                if !subagent_awaiting_approval(item) { continue; }
+                                let ChatItem::Subagent { agent_type, prompt, expanded, items, .. } = item
                                     else { continue };
                                 draw_subagent_strip_entry(
                                     ui, &[idx], agent_type, prompt, *expanded, items,
@@ -7378,28 +7555,6 @@ impl IdeApp {
                             }
                         });
                 });
-        }
-        if let Some(path) = subagent_toggle_expand {
-            let tab = &mut self.agent_tabs[self.agent_active];
-            if let Some(ChatItem::Subagent { expanded, .. }) = subagent_at_path_mut(&mut tab.session.items, &path) {
-                *expanded = !*expanded;
-            }
-        }
-        if let Some((path, approve)) = subagent_pending_action {
-            let tab = &mut self.agent_tabs[self.agent_active];
-            let mut tool_id: Option<String> = None;
-            if let Some((container, &last)) = path.split_last().map(|(l, rest)| (rest, l)) {
-                if let Some(items) = subagent_container_items_mut(&mut tab.session.items, container) {
-                    if let Some(ChatItem::ToolRequest { id, approval, .. }) = items.get_mut(last) {
-                        *approval = if approve { ApprovalState::Approved } else { ApprovalState::Denied };
-                        tool_id = Some(id.clone());
-                    }
-                }
-            }
-            if let Some(tool_id) = tool_id {
-                if approve { tab.session.approve(tool_id); }
-                else { tab.session.deny(tool_id, "User denied in Forge IDE".into()); }
-            }
         }
 
         // Chat scroll area
@@ -7588,61 +7743,19 @@ impl IdeApp {
                                     });
                             });
                         }
-                        ChatItem::Subagent { agent_type, prompt, finished, summary, .. } => {
-                            // While running, this is a minimal marker — the
-                            // docked subagent strip (below the chat) is where
-                            // its live activity and any approvals actually
-                            // live. Once finished, the summary surfaces right
-                            // here instead, same as before: you shouldn't
-                            // have to go hunting in the strip for a result
-                            // that's already done.
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(pad_l);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(28,26,40))
-                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(56, 90, 98)))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                                    .rounding(4.0)
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(ui.available_width() - pad_r);
-                                        let narrow_row = ui.available_width() < 300.0;
-                                        ui.vertical(|ui| {
-                                        ui.horizontal(|ui| {
-                                            if *finished {
-                                                paint_checkmark(ui, egui::Color32::from_rgb(150,170,255));
-                                            } else {
-                                                paint_dot(ui, egui::Color32::from_rgb(150,170,255));
-                                            }
-                                            ui.label(egui::RichText::new("subagent").size(11.5).color(egui::Color32::from_rgb(120, 180, 190)));
-                                            ui.label(egui::RichText::new(agent_type.as_str()).monospace().size(11.5).strong().color(egui::Color32::from_rgb(150, 205, 210)));
-                                            // See the checkpoint row: pinned to
-                                            // the right of a row this narrow it
-                                            // simply landed on top of the name
-                                            // beside it, so below a threshold it
-                                            // goes on its own line instead.
-                                            if !*finished && !narrow_row {
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(egui::RichText::new("running — see below").size(10.0).italics()
-                                                        .color(egui::Color32::from_gray(130)));
-                                                });
-                                            }
-                                        });
-                                        if !*finished && narrow_row {
-                                            ui.label(egui::RichText::new("running — see below").size(10.0).italics()
-                                                .color(egui::Color32::from_gray(130)));
-                                        }
-                                        if *finished {
-                                            let prompt_preview: String = prompt.chars().take(90).collect();
-                                            ui.label(egui::RichText::new(soft_wrap(&prompt_preview, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(160)));
-                                            if !summary.trim().is_empty() {
-                                                let s: String = summary.trim().chars().take(300).collect();
-                                                ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(180)));
-                                            }
-                                        }
-                                        });
-                                    });
-                            });
+                        ChatItem::Subagent {
+                            agent_type, prompt, current_tool, detail,
+                            finished, summary, expanded, items: sub_items, ..
+                        } => {
+                            // The subagent's own region, rule and all. Its work
+                            // used to live in the docked strip, leaving no way
+                            // to tell in the transcript which lines were the
+                            // main agent's and which were a subagent's.
+                            draw_subagent_block(
+                                ui, &[item_idx], agent_type, prompt, current_tool, detail,
+                                *finished, summary, *expanded, sub_items, pad_l, pad_r,
+                                &mut subagent_pending_action, &mut subagent_toggle_expand,
+                            );
                         }
                         ChatItem::Question { tool_id: _, question, items: qitems, selected, other_text, free_text, answered } => {
                             draw_question_card(
@@ -7710,6 +7823,33 @@ impl IdeApp {
                 // view scrolls to and not a permanent band of empty panel.
                 ui.add_space(10.0);
             });
+
+        // Applied here, after the chat area, because both the transcript's
+        // subagent blocks and the docked strip write into these — and a path
+        // recorded during rendering cannot be acted on while the items it
+        // addresses are still borrowed for drawing.
+        if let Some(path) = subagent_toggle_expand {
+            let tab = &mut self.agent_tabs[self.agent_active];
+            if let Some(ChatItem::Subagent { expanded, .. }) = subagent_at_path_mut(&mut tab.session.items, &path) {
+                *expanded = !*expanded;
+            }
+        }
+        if let Some((path, approve)) = subagent_pending_action {
+            let tab = &mut self.agent_tabs[self.agent_active];
+            let mut tool_id: Option<String> = None;
+            if let Some((container, &last)) = path.split_last().map(|(l, rest)| (rest, l)) {
+                if let Some(items) = subagent_container_items_mut(&mut tab.session.items, container) {
+                    if let Some(ChatItem::ToolRequest { id, approval, .. }) = items.get_mut(last) {
+                        *approval = if approve { ApprovalState::Approved } else { ApprovalState::Denied };
+                        tool_id = Some(id.clone());
+                    }
+                }
+            }
+            if let Some(tool_id) = tool_id {
+                if approve { tab.session.approve(tool_id); }
+                else { tab.session.deny(tool_id, "User denied in Forge IDE".into()); }
+            }
+        }
 
         if let Some((idx, approve)) = pending_action {
             let tab = &mut self.agent_tabs[self.agent_active];
@@ -14102,5 +14242,194 @@ mod window_reload_tests {
         // And the setting still decides for a window that was merely opened.
         assert!(should_restore_session(true, false));
         assert!(!should_restore_session(false, false));
+    }
+}
+
+#[cfg(test)]
+mod subagent_block_tests {
+    use super::*;
+    use crate::agent_panel::{ApprovalState, ChatItem};
+
+    fn tool(name: &str, approval: ApprovalState) -> ChatItem {
+        ChatItem::ToolRequest {
+            name: name.into(), args: "{\"path\":\".\"}".into(), id: format!("call-{name}"),
+            kind: "read".into(), approval, expanded: false,
+        }
+    }
+
+    fn sub(id: &str, finished: bool, items: Vec<ChatItem>) -> ChatItem {
+        ChatItem::Subagent {
+            id: id.into(), agent_type: "explore".into(),
+            prompt: "Explore the codebase".into(),
+            current_tool: "read_file".into(), detail: "src/cascor.rs".into(),
+            finished, summary: "the answer".into(), items, expanded: true,
+        }
+    }
+
+    /// A rendering harness: lay the block out at a given width and hand back
+    /// every rectangle and text run it produced, so what it drew can be
+    /// asserted rather than eyeballed in a screenshot.
+    fn render(item: &ChatItem, width: f32) -> (Vec<egui::Rect>, Vec<String>) {
+        let ctx = egui::Context::default();
+        setup_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0), egui::vec2(width, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut pending = None;
+        let mut toggle = None;
+        let draw = |ctx: &egui::Context, pending: &mut _, toggle: &mut _| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let ChatItem::Subagent {
+                    agent_type, prompt, current_tool, detail, finished, summary, expanded, items, ..
+                } = item else { panic!("not a subagent") };
+                draw_subagent_block(
+                    ui, &[0], agent_type, prompt, current_tool, detail, *finished, summary,
+                    *expanded, items, 10.0, 10.0, pending, toggle,
+                );
+            });
+        };
+        // Two passes: egui sizes some things from the previous frame.
+        let _ = ctx.run(input.clone(), |ctx| draw(ctx, &mut pending, &mut toggle));
+        let out = ctx.run(input, |ctx| draw(ctx, &mut pending, &mut toggle));
+
+        let mut rects = Vec::new();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::Shape::Text(t) => {
+                    texts.push(t.galley.text().to_string());
+                    rects.push(t.visual_bounding_rect());
+                }
+                egui::Shape::Rect(r) => rects.push(r.rect),
+                _ => {}
+            }
+        }
+        (rects, texts)
+    }
+
+    /// The point of the whole change: what the subagent did is inside the
+    /// transcript, under the subagent's own name — not in a strip somewhere
+    /// else with a "see below" pointing at it.
+    #[test]
+    fn a_running_subagents_work_is_shown_in_place() {
+        let item = sub("sub_0", false, vec![
+            // An execute call, which is shown by name — consecutive *read*
+            // calls fold into a summarised checklist, so a lone read would be
+            // testing the grouping rather than what is inside the block.
+            ChatItem::ToolRequest {
+                name: "shell_exec".into(), args: "{\"command\":\"cargo build\"}".into(),
+                id: "call-1".into(), kind: "execute".into(),
+                approval: ApprovalState::Approved, expanded: false,
+            },
+        ]);
+        let (_, texts) = render(&item, 420.0);
+        let all = texts.join(" | ");
+        assert!(all.contains("explore"), "the subagent is not named: {all}");
+        // Rendered the way the transcript renders any shell call — "shell"
+        // and the command — so this asserts the work is *there*, not that it
+        // is labelled with the raw tool name.
+        assert!(all.contains("cargo build"), "its tool calls are missing: {all}");
+        assert!(!all.contains("see below"), "still pointing somewhere else: {all}");
+        // And what it is doing right now, which the card never used to show.
+        assert!(all.contains("read_file"), "no live activity: {all}");
+    }
+
+    /// The rule down the left edge is what separates the subagent's lines from
+    /// the main agent's. Without it the block is just another card.
+    #[test]
+    fn the_block_is_ruled_down_its_left_edge() {
+        let item = sub("sub_0", false, vec![tool("list_directory", ApprovalState::Approved)]);
+        let (rects, _) = render(&item, 420.0);
+        let rule = rects.iter().find(|r| r.width() <= 2.5 && r.height() > 30.0);
+        let rule = rule.unwrap_or_else(|| panic!("no left rule was painted; got {} rects", rects.len()));
+        // Tall and thin, at the block's left edge — the whole block's height, so
+        // everything inside falls under it.
+        assert!(rule.height() > 30.0, "the rule does not span the block: {rule:?}");
+    }
+
+    /// A finished subagent keeps its answer visible, since that is the part
+    /// worth reading once the work is folded away.
+    #[test]
+    fn a_finished_subagent_still_shows_its_answer() {
+        let item = sub("sub_0", true, Vec::new());
+        let (_, texts) = render(&item, 420.0);
+        assert!(texts.join(" | ").contains("the answer"), "{texts:?}");
+    }
+
+    /// Nothing overruns the panel — including at the narrow width the panel can
+    /// actually be dragged to.
+    #[test]
+    fn the_block_stays_inside_a_narrow_panel() {
+        for width in [220.0_f32, 260.0, 300.0, 380.0, 700.0] {
+            let item = sub("sub_0", false, vec![
+                tool("list_directory", ApprovalState::Approved),
+                sub("sub_0:call-1", false, vec![tool("read_file", ApprovalState::Pending)]),
+            ]);
+            let (rects, _) = render(&item, width);
+            let mut over: Vec<&egui::Rect> = rects.iter().filter(|r| r.right() > width).collect();
+            over.sort_by(|a, b| b.right().total_cmp(&a.right()));
+            if !over.is_empty() {
+                for r in over.iter().take(5) {
+                    eprintln!("  at {width}pt: right {:.1} left {:.1} w {:.1} h {:.1}",
+                              r.right(), r.left(), r.width(), r.height());
+                }
+                panic!("at {width}pt, {} shapes overran", over.len());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod subagent_strip_tests {
+    use super::subagent_awaiting_approval;
+    use crate::agent_panel::{ApprovalState, ChatItem};
+
+    fn req(approval: ApprovalState) -> ChatItem {
+        ChatItem::ToolRequest {
+            name: "shell_exec".into(), args: "{}".into(), id: "c1".into(),
+            kind: "execute".into(), approval, expanded: false,
+        }
+    }
+
+    fn sub(finished: bool, items: Vec<ChatItem>) -> ChatItem {
+        ChatItem::Subagent {
+            id: "sub_0".into(), agent_type: "explore".into(), prompt: String::new(),
+            current_tool: String::new(), detail: String::new(),
+            finished, summary: String::new(), items, expanded: true,
+        }
+    }
+
+    /// A running subagent with nothing to answer no longer gets a strip slot —
+    /// that was the duplication: the same subagent in the transcript and again
+    /// above the input box.
+    #[test]
+    fn merely_running_does_not_earn_a_strip_slot() {
+        assert!(!subagent_awaiting_approval(&sub(false, vec![req(ApprovalState::Approved)])));
+        assert!(!subagent_awaiting_approval(&sub(false, Vec::new())));
+    }
+
+    /// An approval does, because it is the one thing that cannot wait for the
+    /// user to scroll to it.
+    #[test]
+    fn a_pending_approval_earns_one() {
+        assert!(subagent_awaiting_approval(&sub(false, vec![req(ApprovalState::Pending)])));
+    }
+
+    /// Including one belonging to a subagent this subagent delegated to — the
+    /// whole chain is blocked on it.
+    #[test]
+    fn a_nested_approval_earns_one_too() {
+        let inner = sub(false, vec![req(ApprovalState::Pending)]);
+        assert!(subagent_awaiting_approval(&sub(false, vec![inner])));
+    }
+
+    /// And a finished subagent never does, whatever it is holding.
+    #[test]
+    fn a_finished_subagent_never_does() {
+        assert!(!subagent_awaiting_approval(&sub(true, vec![req(ApprovalState::Pending)])));
     }
 }

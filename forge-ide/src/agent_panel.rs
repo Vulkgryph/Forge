@@ -473,17 +473,51 @@ fn extract_path_arg(args_json: &str) -> Option<String> {
 /// Finds the `ChatItem::Subagent` with this id anywhere in the tree —
 /// searching each level's own nested `items` too, since a subagent can
 /// itself nest another (`delegate_task` called from inside a subagent).
+///
+/// Searched newest-first, because ids are not unique across the life of a
+/// transcript. The agent numbers subagents `sub_0`, `sub_1`, … from a counter
+/// that starts again at zero in a new process — and a transcript outlives the
+/// process: a resumed session, or a tab whose agent was respawned for a
+/// permission-mode change or a window reload, keeps its items and gets a second
+/// `sub_0`. Oldest-first found the *previous* `sub_0`, already finished, and
+/// marked it finished again — so the live subagent never finished, its card
+/// said "running" for good, and the docked strip kept it forever, which is
+/// exactly what this looked like from the outside.
 fn find_subagent_mut<'a>(items: &'a mut [ChatItem], id: &str) -> Option<&'a mut ChatItem> {
-    for item in items {
-        let is_match = matches!(item, ChatItem::Subagent { id: sid, .. } if sid == id);
-        if is_match { return Some(item); }
+    for item in items.iter_mut().rev() {
+        // Nested first: a match deeper in this item is newer than the item
+        // itself, which was started before the subagent it delegated to.
         if let ChatItem::Subagent { items: nested, .. } = item {
-            if let Some(found) = find_subagent_mut(nested, id) {
-                return Some(found);
+            let deeper = find_subagent_mut(nested, id).is_some();
+            if deeper {
+                // Re-borrow: the recursive borrow above cannot be returned
+                // through the `if let` while `item` is still live.
+                let ChatItem::Subagent { items: nested, .. } = item else { unreachable!() };
+                return find_subagent_mut(nested, id);
             }
+        }
+        if matches!(item, ChatItem::Subagent { id: sid, .. } if sid == id) {
+            return Some(item);
         }
     }
     None
+}
+
+/// Close out any subagent still shown as running.
+///
+/// The parent turn cannot end while a subagent is live — `delegate_task` blocks
+/// it until every subagent it started has returned — so a card still marked
+/// running once the turn is over is stale by definition. Without this there was
+/// no mechanism at all for clearing one: a finish that went missing (a crashed
+/// agent, a dropped event, the id collision above) left a card running and a
+/// docked strip entry that would not go away for the rest of the session.
+fn finish_stale_subagents(items: &mut [ChatItem]) {
+    for item in items {
+        if let ChatItem::Subagent { finished, items: nested, .. } = item {
+            finish_stale_subagents(nested);
+            *finished = true;
+        }
+    }
 }
 
 /// Same search, returning the matching subagent's own nested `items` list —
@@ -851,6 +885,8 @@ impl AgentSession {
                     if !self.exited {
                         self.thinking = false;
                         self.exited = true;
+                        // Nothing it delegated survived the process.
+                        finish_stale_subagents(&mut self.items);
                         self.items.push(ChatItem::Error(
                             "Agent process exited. Start a new conversation to continue.".into()));
                     }
@@ -1015,6 +1051,8 @@ impl AgentSession {
             AgentMsg::Done => {
                 self.thinking = false;
                 self.turn_active = false;
+                // The turn is over, so nothing it delegated is still running.
+                finish_stale_subagents(&mut self.items);
                 self.dispatch_next_queued();
                 // Only if that didn't immediately kick off another queued
                 // turn — genuinely idle now, so hand focus back to the
@@ -1028,6 +1066,9 @@ impl AgentSession {
             AgentMsg::Cancelled => {
                 self.thinking = false;
                 self.turn_active = false;
+                // Cancelling aborts the subagents too; their cards should not
+                // sit there claiming otherwise.
+                finish_stale_subagents(&mut self.items);
                 self.items.push(ChatItem::Status("Cancelled".into()));
                 self.dispatch_next_queued();
                 if !self.turn_active { self.request_input_focus = true; }
@@ -1504,5 +1545,124 @@ mod tests {
         append_tool_output(&mut items, "shell_exec".into(), "after".into());
         assert_eq!(items.len(), 2);
         assert_eq!(card(&items), ("shell_exec", "after"));
+    }
+}
+
+#[cfg(test)]
+mod subagent_wire_tests {
+    use super::*;
+
+    /// The exact line forge-agent writes when a delegated task ends. Parsed
+    /// here rather than trusted, because `pump` drops a line it cannot
+    /// deserialize without a word — so a shape mismatch looks like a subagent
+    /// that never finished, which is exactly what it looked like.
+    #[test]
+    fn a_finish_line_parses() {
+        let line = r#"{"type":"subagent_finished","id":"sub-1","agent_type":"explore","summary":"a report"}"#;
+        match serde_json::from_str::<AgentMsg>(line) {
+            Ok(AgentMsg::SubagentFinished { id, summary }) => {
+                assert_eq!(id, "sub-1");
+                assert_eq!(summary, "a report");
+            }
+            other => panic!("did not parse as a finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_start_line_parses() {
+        let line = r#"{"type":"subagent_started","id":"sub-1","agent_type":"explore","prompt":"Explore"}"#;
+        match serde_json::from_str::<AgentMsg>(line) {
+            Ok(AgentMsg::SubagentStarted { id, agent_type, prompt, parent_id }) => {
+                assert_eq!((id.as_str(), agent_type.as_str(), prompt.as_str()), ("sub-1", "explore", "Explore"));
+                assert!(parent_id.is_none());
+            }
+            other => panic!("did not parse as a start: {other:?}"),
+        }
+    }
+
+    fn running(id: &str) -> ChatItem {
+        ChatItem::Subagent {
+            id: id.into(), agent_type: "explore".into(), prompt: String::new(),
+            current_tool: String::new(), detail: String::new(),
+            finished: false, summary: String::new(), items: Vec::new(), expanded: true,
+        }
+    }
+
+    fn finished_state(item: &ChatItem) -> bool {
+        match item { ChatItem::Subagent { finished, .. } => *finished, _ => panic!("not a subagent") }
+    }
+
+    /// Ids repeat. The agent counts `sub_0`, `sub_1`, … from a counter that
+    /// restarts at zero in a new process, and a transcript outlives the process
+    /// — a resumed session, or a tab whose agent was respawned for a
+    /// permission-mode change or a window reload, keeps its items and gets a
+    /// second `sub_0`. The finish belongs to the newer one.
+    #[test]
+    fn a_finish_lands_on_the_live_card_not_an_older_one_with_the_same_id() {
+        let mut items = vec![
+            ChatItem::Subagent {
+                id: "sub_0".into(), agent_type: "explore".into(), prompt: String::new(),
+                current_tool: String::new(), detail: String::new(),
+                finished: true, summary: "the first answer".into(),
+                items: Vec::new(), expanded: false,
+            },
+            ChatItem::Status("… a resume, or a respawned agent …".into()),
+            running("sub_0"),
+        ];
+
+        let found = find_subagent_mut(&mut items, "sub_0").expect("no card found");
+        if let ChatItem::Subagent { finished, summary, .. } = found {
+            *finished = true;
+            *summary = "the second answer".into();
+        }
+
+        assert!(finished_state(&items[2]), "the live subagent is still running");
+        // And the older one keeps the answer it actually returned.
+        let ChatItem::Subagent { summary, .. } = &items[0] else { panic!() };
+        assert_eq!(summary, "the first answer");
+    }
+
+    /// A turn cannot end with a subagent still running — `delegate_task` blocks
+    /// the parent until they return. So anything still marked running once the
+    /// turn is over is stale, and there was previously no way for it to clear:
+    /// the card stayed, and so did the docked strip entry.
+    #[test]
+    fn the_turn_ending_clears_a_card_left_running() {
+        let mut items = vec![running("sub_0"), running("sub_1")];
+        if let ChatItem::Subagent { items: nested, .. } = &mut items[1] {
+            nested.push(running("sub_1:call-9"));
+        }
+
+        finish_stale_subagents(&mut items);
+
+        assert!(finished_state(&items[0]));
+        assert!(finished_state(&items[1]));
+        let ChatItem::Subagent { items: nested, .. } = &items[1] else { panic!() };
+        assert!(finished_state(&nested[0]), "a nested subagent pins the strip too");
+    }
+
+    /// The card is found and flipped wherever it sits — including nested, where
+    /// a subagent delegated to another.
+    #[test]
+    fn finishing_reaches_a_nested_card() {
+        fn card(id: &str) -> ChatItem {
+            ChatItem::Subagent {
+                id: id.into(), agent_type: "explore".into(), prompt: String::new(),
+                current_tool: String::new(), detail: String::new(),
+                finished: false, summary: String::new(), items: Vec::new(), expanded: true,
+            }
+        }
+        let mut items = vec![card("outer")];
+        if let ChatItem::Subagent { items: nested, .. } = &mut items[0] {
+            nested.push(card("inner"));
+        }
+        for id in ["outer", "inner"] {
+            let found = find_subagent_mut(&mut items, id).expect("card not found");
+            if let ChatItem::Subagent { finished, .. } = found { *finished = true; }
+        }
+        let ChatItem::Subagent { finished, items: nested, .. } = &items[0] else { panic!() };
+        assert!(*finished);
+        let ChatItem::Subagent { finished: inner, .. } = &nested[0] else { panic!() };
+        assert!(*inner, "a nested subagent must be reachable too");
     }
 }

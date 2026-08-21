@@ -4,6 +4,17 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed (a subagent's work is now visibly a subagent's)
+
+- **There was no way to tell, reading the transcript, which lines were the main agent's and which belonged to a subagent.** A delegated task rendered as a one-line marker saying "running — see below", with the actual work in a docked strip above the input box — the same subagent in two places, and its tool calls nowhere near the conversation they belonged to. A subagent now gets its own block in the transcript: a rule down the left edge, its name and live activity at the top, its tool calls inside, its answer at the bottom, collapsible. Inside the rule is the subagent's; outside it is the agent you are talking to. Nested subagents nest inside their parent's rule.
+- **The docked strip now appears only for a subagent with an approval waiting.** That is the one thing the transcript cannot do on its own — an approval three screens up in the scroll is one nobody answers, and the turn stays blocked until they do. Otherwise it is absent rather than a second copy of the block.
+
+### Fixed (a finished subagent could keep saying "running" for the rest of the session)
+
+- **The card and its strip entry never cleared, because the finish landed on the wrong card.** Subagent ids are `sub_0`, `sub_1`, … from a counter that restarts at zero in a new process — and a transcript outlives the process: a resumed session, or a tab whose agent was respawned for a permission-mode change or a window reload, keeps its items and gets a second `sub_0`. The lookup searched oldest-first, found the *previous* `sub_0`, and marked it finished again; the live one never finished. It now searches newest-first, which is the only order a finish can mean.
+- **And there was no mechanism to clear a card whose finish went missing at all** — a crashed agent or a dropped event pinned it forever. A parent turn cannot end while a subagent is live, since `delegate_task` blocks it, so anything still marked running when the turn ends, is cancelled, or loses its process is now closed out.
+- **The block could not shrink below ~370pt**, which is how text ends up clipped at the panel's right edge: the live-activity label was laid out at its natural width, setting a minimum width for the row, then the block, then the whole transcript. It is now sized to the space left and truncated, and the block fits down to 220pt.
+
 ### Changed ("Reload Window" reloads a window, not the whole process)
 
 - **`Ctrl+Shift+R` used to replace the entire process**, taking every other window's conversations, language servers and SSH connections down with it — for a reason that was almost always local to one window. It now rebuilds that window's app in place, keeping the OS window, the swapchain and the egui context. Teardown is by drop (the agent child and language servers are killed by their own `Drop`), and shells are untouched: they live in the pty daemon, so the rebuilt window reattaches to the same running ones by id. The window keeps its position and its files, and every other window keeps working.

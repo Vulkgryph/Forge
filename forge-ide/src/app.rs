@@ -1681,6 +1681,35 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
 /// every one of them is noise — the point is the ones that do not finish.
 const ELAPSED_SHOWN_AFTER: u64 = 2;
 
+/// The countdown to show beside the elapsed time, if one is still honest.
+///
+/// Two ways an estimate goes wrong, and both have to fail quietly.
+///
+/// It can be *too long*: the command finishes early. Nothing here can see that,
+/// but nothing needs to — the expectation belongs to the step, and the step ends
+/// when the result arrives, taking its countdown with it. There is no timer left
+/// running against a command that is already done.
+///
+/// And it can be *too short*: the command outlives its own estimate. From that
+/// moment the estimate predicts nothing, so it stops being shown rather than
+/// sitting at "0s left" or counting into the negative. The elapsed time carries
+/// on, which is the honest thing left to say.
+fn countdown_label(
+    expect:  Option<crate::agent_panel::Expectation>,
+    elapsed: std::time::Duration,
+) -> Option<String> {
+    use crate::agent_panel::Expectation;
+    let expect = expect?;
+    let remaining = expect.duration().checked_sub(elapsed)?;
+    if remaining.as_secs() == 0 { return None; }
+    Some(match expect {
+        // "about" for a sleep, which is waiting on the clock and will take that
+        // long; "up to" for a timeout, which is a ceiling it may come in under.
+        Expectation::About(_)  => format!("~{} left", human_elapsed(remaining)),
+        Expectation::AtMost(_) => format!("up to {} left", human_elapsed(remaining)),
+    })
+}
+
 /// A duration as a person would say it.
 fn human_elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs();
@@ -7800,6 +7829,12 @@ impl IdeApp {
                         {
                             ui.label(egui::RichText::new(format!("· {}", human_elapsed(since)))
                                 .size(10.5).color(egui::Color32::from_gray(150)));
+                            // And what the command itself said about how long it
+                            // would be, while that is still true.
+                            if let Some(left) = countdown_label(tab.session.activity_expect(), since) {
+                                ui.label(egui::RichText::new(format!("· {left}"))
+                                    .size(10.5).color(egui::Color32::from_gray(130)));
+                            }
                         }
                         if tab.session.turn_tokens > 0 {
                             ui.label(egui::RichText::new(format!("· {} tokens", tab.session.turn_tokens)).size(10.5)
@@ -15242,4 +15277,109 @@ mod running_dot_tests {
     // request at all — the test passed with a bare `request_repaint()`, which is
     // exactly the mistake it was meant to catch. The cadence is set at the call
     // site instead; see `paint_running_dot`.
+}
+
+#[cfg(test)]
+mod countdown_tests {
+    use super::{countdown_label, human_elapsed};
+    use crate::agent_panel::{Expectation, expected_runtime};
+    use std::time::Duration;
+
+    fn secs(n: u64) -> Duration { Duration::from_secs(n) }
+
+    /// A sleep is a promise, so the countdown says "about".
+    #[test]
+    fn a_sleep_counts_down() {
+        let e = expected_runtime("sleep 300").unwrap();
+        assert_eq!(e, Expectation::About(secs(300)));
+        assert_eq!(countdown_label(Some(e), secs(41)).as_deref(), Some("~4m 19s left"));
+    }
+
+    /// A timeout is a ceiling, and says so — "~5m left" for `timeout 300 cargo
+    /// test` would be wrong every time the tests pass in twenty seconds.
+    #[test]
+    fn a_timeout_is_a_ceiling_not_a_promise() {
+        let e = expected_runtime("timeout 300 cargo test").unwrap();
+        assert_eq!(e, Expectation::AtMost(secs(300)));
+        assert_eq!(countdown_label(Some(e), secs(60)).as_deref(), Some("up to 4m 00s left"));
+    }
+
+    /// Outliving the estimate: the estimate predicts nothing from then on, so it
+    /// stops being shown rather than sitting at zero or going negative. The
+    /// elapsed time carries on beside it, which is the honest part.
+    #[test]
+    fn an_estimate_that_runs_out_stops_claiming_anything() {
+        let e = Expectation::About(secs(30));
+        assert!(countdown_label(Some(e), secs(29)).is_some());
+        assert_eq!(countdown_label(Some(e), secs(30)), None, "sat at zero");
+        assert_eq!(countdown_label(Some(e), secs(31)), None, "counted past the end");
+        assert_eq!(countdown_label(Some(e), secs(9_999)), None, "still claiming a finish");
+    }
+
+    /// And with nothing claimed, nothing is shown — most commands say nothing
+    /// about their own length.
+    #[test]
+    fn no_claim_no_countdown() {
+        assert_eq!(countdown_label(None, secs(5)), None);
+        assert!(expected_runtime("cargo build --release").is_none());
+        assert!(expected_runtime("ps -p 72164 -o etime=").is_none());
+    }
+
+    /// The forms an agent actually writes, on the three platforms.
+    #[test]
+    fn the_platforms_agree() {
+        assert_eq!(expected_runtime("sleep 5m"), Some(Expectation::About(secs(300))));
+        assert_eq!(expected_runtime("sleep 1.5"), Some(Expectation::About(Duration::from_millis(1500))));
+        assert_eq!(expected_runtime("sleep 2h"), Some(Expectation::About(secs(7200))));
+        // GNU sleep sums its arguments.
+        assert_eq!(expected_runtime("sleep 1m 30s"), Some(Expectation::About(secs(90))));
+        // Windows.
+        assert_eq!(expected_runtime("timeout /t 30 /nobreak"), Some(Expectation::AtMost(secs(30))));
+        // PowerShell.
+        assert_eq!(expected_runtime("Start-Sleep -Seconds 45"), Some(Expectation::About(secs(45))));
+        assert_eq!(expected_runtime("Start-Sleep -Milliseconds 500"),
+                   Some(Expectation::About(Duration::from_millis(500))));
+        assert_eq!(expected_runtime("Start-Sleep 12"), Some(Expectation::About(secs(12))));
+        // GNU timeout's own flags are not the duration.
+        assert_eq!(expected_runtime("timeout -k 5 30 ./run.sh"), Some(Expectation::AtMost(secs(30))));
+        assert_eq!(expected_runtime("timeout --signal=KILL 45 ./run.sh"),
+                   Some(Expectation::AtMost(secs(45))));
+    }
+
+    /// A wrapped sleep cannot outlast the limit wrapped around it: `timeout 60
+    /// sleep 300` is a minute, not six.
+    #[test]
+    fn a_limit_beats_the_sleep_it_wraps() {
+        assert_eq!(expected_runtime("timeout 60 sleep 300"), Some(Expectation::AtMost(secs(60))));
+        // And the other way round, the sleep is what happens.
+        assert_eq!(expected_runtime("timeout 600 sleep 30"), Some(Expectation::AtMost(secs(30))));
+    }
+
+    /// Sequential parts add up, and a ceiling anywhere makes the total a ceiling
+    /// — the command line from the screenshot that started this is one of these.
+    #[test]
+    fn parts_of_a_command_line_add_up() {
+        assert_eq!(expected_runtime("sleep 30; sleep 15"), Some(Expectation::About(secs(45))));
+        assert_eq!(expected_runtime("sleep 30 && timeout 10 ./x"), Some(Expectation::AtMost(secs(40))));
+        let real = "sleep 300\nps -p 72164 -o etime=,pcpu= 2>/dev/null || echo process_gone\ngrep -E 'seed=|====' /tmp/n4.log | tail -40";
+        assert_eq!(expected_runtime(real), Some(Expectation::About(secs(300))));
+    }
+
+    /// A command that only *mentions* a sleep does not sleep. The pattern in the
+    /// screenshot's own `grep` is exactly this, and a naive scan reports five
+    /// minutes for a command that returns instantly.
+    #[test]
+    fn a_quoted_sleep_is_not_a_sleep() {
+        assert!(expected_runtime("grep -E 'sleep 300' /tmp/log").is_none());
+        assert!(expected_runtime("echo \"sleep 300\"").is_none());
+        assert!(expected_runtime("grep -E 'seed=|sleep 60|STOP' log | tail -40").is_none());
+        // But a real one after a mention of one still counts.
+        assert_eq!(expected_runtime("echo 'sleep 300'; sleep 5"),
+                   Some(Expectation::About(secs(5))));
+    }
+
+    #[test]
+    fn a_countdown_reads_as_time() {
+        assert_eq!(human_elapsed(secs(259)), "4m 19s");
+    }
 }

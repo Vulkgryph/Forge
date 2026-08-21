@@ -417,6 +417,191 @@ fn conversations_dir() -> std::path::PathBuf {
         .join("conversations")
 }
 
+/// The command out of a `shell_exec` call's arguments.
+fn shell_command_of(args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    v.get("command")?.as_str().map(str::to_string)
+}
+
+/// How long a command says it will take.
+///
+/// A `sleep` is a promise; a `timeout` is a ceiling. Worth keeping apart: showing
+/// "~5m left" for `timeout 300 cargo test` would be wrong every time the tests
+/// pass in twenty seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expectation {
+    /// About this long — the command is waiting on the clock.
+    About(std::time::Duration),
+    /// This long at most — the command is bounded, and may well finish sooner.
+    AtMost(std::time::Duration),
+}
+
+impl Expectation {
+    pub fn duration(self) -> std::time::Duration {
+        match self { Self::About(d) | Self::AtMost(d) => d }
+    }
+    /// Two parts of one command line, one after the other. A ceiling anywhere
+    /// makes the whole thing a ceiling: the total can come in under it.
+    fn then(self, other: Self) -> Self {
+        let total = self.duration() + other.duration();
+        match (self, other) {
+            (Self::About(_), Self::About(_)) => Self::About(total),
+            _ => Self::AtMost(total),
+        }
+    }
+}
+
+/// What a command line says about how long it will take, if it says anything.
+///
+/// Only ever a rough figure, and deliberately so — the point is the difference
+/// between "this will sit here for five minutes" and "this has hung", which does
+/// not need precision. `sleep 300` in a five-command pipeline is still five
+/// minutes of waiting, and knowing that is the whole value.
+///
+/// Reads the forms an agent actually writes, across the three platforms: POSIX
+/// `sleep` with GNU's `s`/`m`/`h`/`d` suffixes, GNU `timeout` (whose flags are
+/// skipped and whose wrapped command is read in turn, so `timeout 60 sleep 300`
+/// is a minute and not six), Windows `timeout /t 30`, and PowerShell
+/// `Start-Sleep -Seconds 30`.
+pub fn expected_runtime(command: &str) -> Option<Expectation> {
+    let mut total: Option<Expectation> = None;
+    for simple in split_commands(command) {
+        if let Some(e) = estimate_simple(&simple) {
+            total = Some(match total { Some(t) => t.then(e), None => e });
+        }
+    }
+    total.filter(|e| !e.duration().is_zero())
+}
+
+/// Split a command line into simple commands, respecting quotes.
+///
+/// Quote-aware because the alternative reads its own examples: `grep -E
+/// 'seed=|sleep 300' log` names a sleep it does not run, and a command is only a
+/// command in command position. Anything inside quotes is one token and never
+/// starts a command.
+fn split_commands(line: &str) -> Vec<Vec<String>> {
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut tok = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+
+    let push_tok = |tok: &mut String, cur: &mut Vec<String>| {
+        if !tok.is_empty() { cur.push(std::mem::take(tok)); }
+    };
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => { chars.next(); }
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            c if quote == Some(c) => {
+                quote = None;
+                // A quoted run is a token even when empty, so it cannot merge
+                // with what follows and be mistaken for a command name.
+                if tok.is_empty() { tok.push('\0'); }
+            }
+            _ if quote.is_some() => tok.push(c),
+            ';' | '\n' | '&' | '|' => {
+                push_tok(&mut tok, &mut cur);
+                if !cur.is_empty() { cmds.push(std::mem::take(&mut cur)); }
+                // `&&`/`||` are one separator, not two.
+                if chars.peek() == Some(&c) { chars.next(); }
+            }
+            c if c.is_whitespace() => push_tok(&mut tok, &mut cur),
+            '(' | ')' => push_tok(&mut tok, &mut cur),
+            _ => tok.push(c),
+        }
+    }
+    push_tok(&mut tok, &mut cur);
+    if !cur.is_empty() { cmds.push(cur); }
+    cmds
+}
+
+/// One simple command's own claim about its runtime.
+fn estimate_simple(tokens: &[String]) -> Option<Expectation> {
+    let name = tokens.first()?.rsplit('/').next()?.to_ascii_lowercase();
+    match name.as_str() {
+        // `sleep 1m 30s` is a real thing: GNU sleep sums its arguments.
+        "sleep" => {
+            let total: f64 = tokens[1..].iter().filter_map(|a| parse_duration(a)).sum();
+            (total > 0.0).then(|| Expectation::About(secs(total)))
+        }
+        "start-sleep" => parse_start_sleep(&tokens[1..]).map(|d| Expectation::About(d)),
+        "timeout" | "gtimeout" => {
+            let (limit, rest) = parse_timeout(&tokens[1..])?;
+            // What it wraps may finish first, or may be a sleep longer than the
+            // limit — in which case the limit is the answer.
+            let inner = estimate_simple(rest).map(|e| e.duration());
+            let effective = inner.map_or(limit, |i| i.min(limit));
+            Some(Expectation::AtMost(effective))
+        }
+        _ => None,
+    }
+}
+
+fn secs(v: f64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(v.max(0.0))
+}
+
+/// A duration argument: bare seconds, or GNU's `s`/`m`/`h`/`d` suffixes.
+fn parse_duration(arg: &str) -> Option<f64> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.starts_with('-') { return None; }
+    let (num, mult) = match arg.chars().last()? {
+        's' => (&arg[..arg.len() - 1], 1.0),
+        'm' => (&arg[..arg.len() - 1], 60.0),
+        'h' => (&arg[..arg.len() - 1], 3600.0),
+        'd' => (&arg[..arg.len() - 1], 86_400.0),
+        _   => (arg, 1.0),
+    };
+    num.parse::<f64>().ok().filter(|v| *v >= 0.0).map(|v| v * mult)
+}
+
+/// `timeout`'s limit and the command it wraps.
+///
+/// Handles both the GNU form (flags, then a duration, then the command) and the
+/// Windows one (`/t 30`, in any order among its own switches).
+fn parse_timeout(args: &[String]) -> Option<(std::time::Duration, &[String])> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // Windows: the limit is the value after `/t`.
+        if a.eq_ignore_ascii_case("/t") {
+            let v = args.get(i + 1).and_then(|v| parse_duration(v))?;
+            return Some((secs(v), &[]));
+        }
+        if a.starts_with('/') { i += 1; continue; }
+        // GNU: `-k 5`, `--kill-after=5`, `-s KILL`, `--signal=KILL`, `--foreground`.
+        if a == "-k" || a == "-s" || a == "--kill-after" || a == "--signal" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') { i += 1; continue; }
+        let v = parse_duration(a)?;
+        return Some((secs(v), &args[i + 1..]));
+    }
+    None
+}
+
+/// PowerShell: `Start-Sleep -Seconds 30`, `-s 30`, `-Milliseconds 500`, or a
+/// bare number, which it also accepts.
+fn parse_start_sleep(args: &[String]) -> Option<std::time::Duration> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].to_ascii_lowercase();
+        let value = || args.get(i + 1).and_then(|v| v.parse::<f64>().ok());
+        match a.as_str() {
+            "-seconds" | "-s" => return value().map(secs),
+            "-milliseconds" | "-ms" => return value().map(|v| secs(v / 1000.0)),
+            _ => {
+                if let Some(v) = parse_duration(&a) { return Some(secs(v)); }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// What the agent is doing right now, in words.
 ///
 /// "Running shell_exec…" says a tool is running and not much else. The name of
@@ -613,6 +798,10 @@ pub struct AgentSession {
     /// been going. A model call and a five-minute `sleep` look identical without
     /// it — both are "working", and neither says whether to keep waiting.
     activity_since: Option<std::time::Instant>,
+    /// What the running step said about its own length, if anything. Cleared
+    /// with the step, so a command that finishes early takes its countdown with
+    /// it rather than leaving one running against nothing.
+    activity_expect: Option<Expectation>,
     /// Approximate token count streamed so far this turn — counted one per
     /// `AssistantToken`/`ReasoningToken` chunk (not exact tokenizer
     /// accounting, but real and live), reset at the start of each turn.
@@ -711,17 +900,23 @@ impl AgentSession {
     pub fn is_active(&self) -> bool { self.turn_active }
 
     /// Set what the agent is doing, and start the clock on it.
-    fn set_activity(&mut self, what: String) {
+    fn set_activity(&mut self, what: String, expect: Option<Expectation>) {
         if self.activity != what {
             self.activity_since = Some(std::time::Instant::now());
         }
         self.activity = what;
+        // Always overwritten, never merged: every step gets its own claim, and a
+        // step that makes none must not inherit the last one's.
+        self.activity_expect = expect;
     }
 
     /// How long the current step has been going.
     pub fn activity_elapsed(&self) -> Option<std::time::Duration> {
         self.activity_since.map(|t| t.elapsed())
     }
+
+    /// What the current step claimed about its own length.
+    pub fn activity_expect(&self) -> Option<Expectation> { self.activity_expect }
 
     /// Takes and resets the tool-call pulse count accumulated since the last call.
     pub fn drain_tool_pulses(&mut self) -> u32 { std::mem::take(&mut self.tool_pulses) }
@@ -776,6 +971,7 @@ impl AgentSession {
                 exited:   false,
                 activity:    String::new(),
                 activity_since: None,
+                activity_expect: None,
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
@@ -825,6 +1021,7 @@ impl AgentSession {
                 exited:   false,
                 activity:    String::new(),
                 activity_since: None,
+                activity_expect: None,
                 turn_tokens: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -921,6 +1118,7 @@ impl AgentSession {
                 exited:   false,
                 activity:    String::new(),
                 activity_since: None,
+                activity_expect: None,
                 turn_tokens: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -949,6 +1147,7 @@ impl AgentSession {
                 exited:   false,
                 activity:    String::new(),
                 activity_since: None,
+                activity_expect: None,
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
@@ -1013,11 +1212,11 @@ impl AgentSession {
             }
             AgentMsg::Thinking | AgentMsg::Reasoning => {
                 self.thinking = true;
-                self.set_activity("Thinking…".into());
+                self.set_activity("Thinking…".into(), None);
             }
             AgentMsg::ReasoningToken { content } => {
                 self.thinking = false;
-                self.set_activity("Thinking…".into());
+                self.set_activity("Thinking…".into(), None);
                 self.turn_tokens += 1;
                 if let Some(ChatItem::Reasoning { text, done }) = self.items.last_mut() {
                     if !*done { text.push_str(&content); return; }
@@ -1026,7 +1225,7 @@ impl AgentSession {
             }
             AgentMsg::AssistantToken { content } => {
                 self.thinking = false;
-                self.set_activity("Responding…".into());
+                self.set_activity("Responding…".into(), None);
                 self.turn_tokens += 1;
                 if let Some(ChatItem::Reasoning { done, .. }) = self.items.last_mut() {
                     *done = true;
@@ -1061,7 +1260,12 @@ impl AgentSession {
             AgentMsg::ToolRequest { tool_name, tool_args, tool_id, kind, subagent_id, needs_approval } => {
                 self.tool_pulses += 1;
                 if subagent_id.is_none() {
-                    self.set_activity(activity_phrase(&tool_name, &tool_args));
+                    self.set_activity(
+                        activity_phrase(&tool_name, &tool_args),
+                        (tool_name == "shell_exec")
+                            .then(|| shell_command_of(&tool_args).and_then(|c| expected_runtime(&c)))
+                            .flatten(),
+                    );
                 }
                 if WRITE_TOOLS.contains(&tool_name.as_str()) {
                     if let Some(path) = extract_path_arg(&tool_args) {
@@ -1107,7 +1311,7 @@ impl AgentSession {
                 };
                 match subagent_id.and_then(|sid| self.subagent_items_mut(&sid)) {
                     Some(items) => items.push(item),
-                    None => { self.set_activity("Thinking…".into()); self.items.push(item); }
+                    None => { self.set_activity("Thinking…".into(), None); self.items.push(item); }
                 }
             }
             AgentMsg::ToolOutput { tool_name, content } => {
@@ -1145,7 +1349,7 @@ impl AgentSession {
                 }
             }
             AgentMsg::ApiRetry { attempt, max_attempts, error } => {
-                self.set_activity(format!("Retrying request ({attempt}/{max_attempts})…"));
+                self.set_activity(format!("Retrying request ({attempt}/{max_attempts})…"), None);
                 self.items.push(ChatItem::Status(format!(
                     "Retrying… (attempt {attempt}/{max_attempts}): {error}")));
             }
@@ -1330,7 +1534,7 @@ impl AgentSession {
             return;
         }
         self.turn_active = true;
-        self.set_activity("Sending…".into());
+        self.set_activity("Sending…".into(), None);
         self.turn_tokens = 0;
         self.items.push(ChatItem::User(trimmed.clone()));
         let _ = self.write(&OutgoingMsg::SendMessage { content: trimmed });
@@ -1772,5 +1976,74 @@ mod subagent_wire_tests {
         assert!(*finished);
         let ChatItem::Subagent { finished: inner, .. } = &nested[0] else { panic!() };
         assert!(*inner, "a nested subagent must be reachable too");
+    }
+}
+
+#[cfg(test)]
+mod countdown_lifetime_tests {
+    use super::*;
+
+    fn policy() -> SessionPolicy<'static> {
+        SessionPolicy { password_auto_inject: false, session_password: None }
+    }
+
+    fn shell_request(command: &str) -> AgentMsg {
+        AgentMsg::ToolRequest {
+            tool_name: "shell_exec".into(),
+            tool_args: serde_json::json!({ "command": command }).to_string(),
+            tool_id: "call-1".into(),
+            kind: "execute".into(),
+            subagent_id: None,
+            needs_approval: false,
+        }
+    }
+
+    /// A command that finishes early must take its countdown with it. The
+    /// expectation belongs to the step, and the result ends the step — so there
+    /// is no timer left running against a command that is already done, which is
+    /// the failure mode a countdown invites.
+    #[test]
+    fn a_command_that_finishes_early_takes_its_countdown_with_it() {
+        let mut s = AgentSession::pending("test".into(), None);
+        s.handle(shell_request("sleep 300"), policy());
+        assert_eq!(
+            s.activity_expect(),
+            Some(Expectation::About(std::time::Duration::from_secs(300))),
+            "the sleep was not picked up at all",
+        );
+
+        // Back after two seconds, not five minutes.
+        s.handle(
+            AgentMsg::ToolResult {
+                tool_name: "shell_exec".into(), result: "done".into(),
+                success: true, subagent_id: None,
+            },
+            policy(),
+        );
+        assert_eq!(s.activity_expect(), None, "the countdown outlived the command");
+    }
+
+    /// And the next step does not inherit the last one's claim — every step
+    /// speaks for itself or says nothing.
+    #[test]
+    fn the_next_step_does_not_inherit_a_countdown() {
+        let mut s = AgentSession::pending("test".into(), None);
+        s.handle(shell_request("sleep 300"), policy());
+        assert!(s.activity_expect().is_some());
+        s.handle(shell_request("cargo build"), policy());
+        assert_eq!(s.activity_expect(), None, "a build inherited a sleep's countdown");
+    }
+
+    /// The clock restarts with the step, so a long turn's second command does not
+    /// begin already counted against the first.
+    #[test]
+    fn the_clock_restarts_with_each_step() {
+        let mut s = AgentSession::pending("test".into(), None);
+        s.handle(shell_request("sleep 300"), policy());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let first = s.activity_elapsed().unwrap();
+        s.handle(shell_request("sleep 60"), policy());
+        let second = s.activity_elapsed().unwrap();
+        assert!(second < first, "the clock carried over: {second:?} vs {first:?}");
     }
 }

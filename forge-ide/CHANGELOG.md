@@ -4,6 +4,11 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed (a reloaded remote window came back local with the remote's transcript and no sign of it)
+
+- **Neither reload can keep an SSH session** — the connection belongs to the app being dropped — so the window comes back local while the transcript comes back whole. Keeping it is right; you can still read what happened. But with no boundary in it, it read as one continuous conversation with the machine you are on, and it was not: the agent that produced it was on the remote, and its session log stayed there. The reload now writes the break into the transcript where it happened, naming the host, saying the session stayed with it, and saying that continuing below continues a different conversation. Written by the code that drops the connection, so it cannot land in the wrong place, and it does not stack if you reload twice.
+- **It also stops trying to resume the remote's session.** That recovered — forge-agent reports the session as missing and the tab falls back to a fresh one — but it recovered from a spawn that could never have worked, and reported it as an error the reader then has to interpret. An id naming a log on a host we are no longer connected to is not a resumable session, so it is given up at the same moment the connection is.
+
 ### Changed (a subagent's work is now visibly a subagent's)
 
 - **There was no way to tell, reading the transcript, which lines were the main agent's and which belonged to a subagent.** A delegated task rendered as a one-line marker saying "running — see below", with the actual work in a docked strip above the input box — the same subagent in two places, and its tool calls nowhere near the conversation they belonged to. A subagent now gets its own block in the transcript: a rule down the left edge, its name and live activity at the top, its tool calls inside, its answer at the bottom, collapsible. Inside the rule is the subagent's; outside it is the agent you are talking to. Nested subagents nest inside their parent's rule.

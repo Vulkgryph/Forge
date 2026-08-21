@@ -3258,6 +3258,35 @@ fn draw_subagent_strip_entry(
     ui.add_space(4.0);
 }
 
+/// Append the "this ran elsewhere" divider, once.
+///
+/// Idempotent: reloading twice in a row must not stack two of them, and a window
+/// that never reconnected has nothing new to mark.
+/// Part company with a remote host: mark the transcript, and give up the session
+/// id that belonged to it.
+///
+/// The id names a log on a machine we are no longer connected to, so resuming it
+/// cannot work. It did *recover* — forge-agent reports the session as missing and
+/// the tab falls back to a fresh one — but it recovered from a spawn that never
+/// could have worked, and reported it as an error the reader then has to
+/// interpret. Better not to ask.
+fn leave_remote(items: &mut Vec<ChatItem>, session_id: &mut String, host: &str) {
+    note_remote_boundary(items, host);
+    session_id.clear();
+}
+
+fn note_remote_boundary(items: &mut Vec<ChatItem>, host: &str) -> bool {
+    if items.is_empty() { return false; }
+    let note = format!(
+        "Connection to {host} ended here. Everything above ran on {host} — \
+         including its session, which stays there. This window is local now, so \
+         continuing below continues a different conversation."
+    );
+    if matches!(items.last(), Some(ChatItem::Status(s)) if *s == note) { return false; }
+    items.push(ChatItem::Status(note));
+    true
+}
+
 /// Whether this subagent has an approval waiting on it.
 ///
 /// The one reason left for the docked strip to exist. A subagent's activity is
@@ -4129,6 +4158,7 @@ impl IdeApp {
     /// state still very much alive further up the call stack) would leave
     /// all of it orphaned instead of cleanly torn down.
     pub fn restart_process(&mut self) {
+        self.note_remote_session_end();
         self.save_session_for_reload();
         self.pending_reload = true;
     }
@@ -4155,8 +4185,28 @@ impl IdeApp {
     /// newly built `forge-ide` binary, and keep an SSH session — the connection
     /// belongs to the app being dropped, so a remote window comes back local.
     pub fn reload_window(&mut self) {
+        self.note_remote_session_end();
         self.save_session_for_reload();
         self.pending_window_reload = true;
+    }
+
+    /// Mark, in the transcript itself, that everything above it happened
+    /// somewhere else.
+    ///
+    /// Neither reload can keep an SSH session — the connection belongs to the
+    /// app being dropped — so the window comes back local while the transcript
+    /// comes back whole. Keeping it is right; you can still read what happened.
+    /// But without a boundary in it, it reads as one continuous conversation
+    /// with the machine you are on, and it is not: the agent that produced it
+    /// was on the remote, its session log is on the remote, and continuing here
+    /// continues something else. Written here, by the code that drops the
+    /// connection, so the mark lands exactly where the break is — and it is part
+    /// of the transcript that gets saved a moment later, so it survives.
+    fn note_remote_session_end(&mut self) {
+        let Some(host) = self.ssh.as_ref().map(|s| s.host.host.clone()) else { return };
+        for tab in &mut self.agent_tabs {
+            leave_remote(&mut tab.session.items, &mut tab.session.forge_session_id, &host);
+        }
     }
 
     /// How the window comes back: same workspace, same session identity,
@@ -14431,5 +14481,77 @@ mod subagent_strip_tests {
     #[test]
     fn a_finished_subagent_never_does() {
         assert!(!subagent_awaiting_approval(&sub(true, vec![req(ApprovalState::Pending)])));
+    }
+}
+
+#[cfg(test)]
+mod remote_boundary_tests {
+    use super::note_remote_boundary;
+    use crate::agent_panel::ChatItem;
+
+    fn transcript() -> Vec<ChatItem> {
+        vec![
+            ChatItem::User("build the kernel".into()),
+            ChatItem::Assistant { text: "done".into(), done: true },
+        ]
+    }
+
+    /// The mark says where it happened, that the session stayed there, and that
+    /// carrying on here is not carrying on the same conversation — the three
+    /// things a reader needs to not be misled by a transcript that survived a
+    /// reload the connection did not.
+    #[test]
+    fn the_mark_says_what_happened_and_where() {
+        let mut items = transcript();
+        assert!(note_remote_boundary(&mut items, "admin-1"));
+        let ChatItem::Status(note) = items.last().unwrap() else { panic!("not a status line") };
+        assert!(note.contains("admin-1"), "{note}");
+        assert!(note.contains("local now"), "{note}");
+        assert!(note.contains("different conversation"), "{note}");
+    }
+
+    /// Reloading twice must not stack two of them.
+    #[test]
+    fn marking_twice_marks_once() {
+        let mut items = transcript();
+        assert!(note_remote_boundary(&mut items, "admin-1"));
+        let after_first = items.len();
+        assert!(!note_remote_boundary(&mut items, "admin-1"), "marked again");
+        assert_eq!(items.len(), after_first);
+    }
+
+    /// A later remote session that ends the same way gets its own mark, since
+    /// there is real conversation between the two boundaries.
+    #[test]
+    fn a_second_session_gets_its_own_mark() {
+        let mut items = transcript();
+        note_remote_boundary(&mut items, "admin-1");
+        items.push(ChatItem::User("now on the mac".into()));
+        assert!(note_remote_boundary(&mut items, "admin-2"));
+        assert_eq!(
+            items.iter().filter(|i| matches!(i, ChatItem::Status(s) if s.contains("ended here"))).count(),
+            2,
+        );
+    }
+
+    /// Leaving also gives up the remote's session id: resuming a log that lives
+    /// on a machine we are no longer connected to cannot work, and asking
+    /// produces an error the reader has to interpret.
+    #[test]
+    fn leaving_gives_up_the_remote_session_id() {
+        use super::leave_remote;
+        let mut items = transcript();
+        let mut id = "20260821_020146_7f9".to_string();
+        leave_remote(&mut items, &mut id, "admin-1");
+        assert!(id.is_empty(), "still holding a session id from the remote: {id}");
+        assert!(matches!(items.last(), Some(ChatItem::Status(_))), "no boundary was marked");
+    }
+
+    /// An empty transcript has nothing to mark the end of.
+    #[test]
+    fn an_empty_transcript_is_left_alone() {
+        let mut items = Vec::new();
+        assert!(!note_remote_boundary(&mut items, "admin-1"));
+        assert!(items.is_empty());
     }
 }

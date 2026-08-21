@@ -1113,6 +1113,10 @@ struct AgentTab {
     /// clone+JSON-serialize+disk-write of the whole conversation on every
     /// single frame when nothing's actually changed since the last one).
     last_saved_item_count: usize,
+    /// A mode that has been chosen but needs a new agent process to fully take
+    /// effect, waiting for the turn to end so it does not take the turn with it.
+    /// See `mode_switch_plan`.
+    pending_mode_respawn: Option<crate::settings::AgentPermissionMode>,
 }
 
 impl Drop for AgentTab {
@@ -1174,6 +1178,82 @@ fn mode_change_needs_respawn(
     from != to && (from == Mode::DangerouslySkipAll || to == Mode::DangerouslySkipAll)
 }
 
+/// How to apply a permission-mode change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeSwitch {
+    /// Take effect now, on the running agent. No process is replaced.
+    Live,
+    /// Take effect now as far as it can, and replace the agent once the turn is
+    /// over. `Skip All Permissions` is a spawn-time flag — forge-agent has no
+    /// runtime toggle for it — so the part that needs a new process waits, and
+    /// the part that unblocks the user does not.
+    LiveThenRespawnAfterTurn,
+    /// Replace the agent now, ending the turn with it.
+    RespawnNow,
+}
+
+/// Deciding how to apply a mode change, including mid-turn.
+///
+/// Changing modes used to mean the same thing whatever was happening: if the
+/// change touched `Skip All Permissions` the agent was replaced, and if a turn
+/// was running it died with it. So the way to approve a call you were being
+/// asked about was to stop the turn, change the mode, and ask again.
+///
+/// Loosening can be applied live, and mid-turn that is the whole point: the call
+/// the agent is blocked on gets approved and it carries on.
+///
+/// Tightening *out of* `Skip All Permissions` cannot wait, and is the one case
+/// worth interrupting a turn for — the mode exists to skip confirmation on
+/// anything at all, including tools nothing recognises, and "it will stop doing
+/// that when it finishes" is not a safety property. Restarting is abrupt; an
+/// agent that keeps skipping everything after being told to stop is worse.
+fn mode_switch_plan(
+    from: crate::settings::AgentPermissionMode,
+    to:   crate::settings::AgentPermissionMode,
+    turn_active: bool,
+) -> ModeSwitch {
+    use crate::settings::AgentPermissionMode as Mode;
+    if !mode_change_needs_respawn(from, to) {
+        return ModeSwitch::Live;
+    }
+    if turn_active && to == Mode::DangerouslySkipAll {
+        return ModeSwitch::LiveThenRespawnAfterTurn;
+    }
+    ModeSwitch::RespawnNow
+}
+
+/// Whether this mode answers approval requests by itself.
+fn mode_auto_approves(mode: crate::settings::AgentPermissionMode) -> bool {
+    use crate::settings::AgentPermissionMode as Mode;
+    !matches!(mode, Mode::AlwaysAsk)
+}
+
+/// Approve every tool call currently waiting on an answer, returning their ids.
+///
+/// Only `ToolRequest` cards, which is the point rather than an oversight: a plan
+/// waiting for approval, a question the agent asked, and a password prompt are
+/// each a decision only the user can make, and none of them is what a permission
+/// mode is about. Nested subagent requests are included — one of those blocks its
+/// subagent, which blocks the turn just as surely.
+fn release_pending_approvals(items: &mut [ChatItem]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for item in items {
+        match item {
+            ChatItem::ToolRequest { id, approval, .. }
+                if matches!(approval, ApprovalState::Pending) =>
+            {
+                *approval = ApprovalState::Approved;
+                ids.push(id.clone());
+            }
+            ChatItem::Subagent { items: nested, .. } => {
+                ids.extend(release_pending_approvals(nested));
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
 impl AgentTab {
     /// `session` is supplied rather than started here: whether the agent runs
     /// locally or on the machine being worked on is the app's decision, and it
@@ -1190,6 +1270,7 @@ impl AgentTab {
             password_tmp_path: None,
             show_full_history: false,
             last_saved_item_count: 0,
+            pending_mode_respawn: None,
         }
     }
 
@@ -1214,6 +1295,7 @@ impl AgentTab {
             password_tmp_path: None,
             show_full_history: false,
             last_saved_item_count: 0,
+            pending_mode_respawn: None,
         };
         tab.session.items = conv.items.clone();
         tab.session.model = conv.model.clone();
@@ -1261,14 +1343,28 @@ impl AgentTab {
     ///
     /// `--dangerously-allow-all` is only settable as a flag at spawn time, so
     /// crossing into or out of it cannot be done live.
-    fn mode_change_needs_respawn(&self, mode: crate::settings::AgentPermissionMode) -> bool {
-        mode_change_needs_respawn(self.permission_mode, mode)
-    }
-
     /// `replacement` is supplied by the caller when `mode_change_needs_respawn`
     /// said one was needed. Spawning it here would always produce a *local*
     /// agent, which on a remote workspace would quietly move the agent back
     /// onto this machine the first time the permission mode changed.
+    /// Swap in a replacement agent for a mode this tab is already in — the
+    /// deferred half of `ModeSwitch::LiveThenRespawnAfterTurn`, where the mode
+    /// was set when the user chose it and only the process is catching up.
+    fn set_permission_mode_forced(
+        &mut self,
+        mode: crate::settings::AgentPermissionMode,
+        replacement: Option<crate::agent_panel::AgentSession>,
+    ) {
+        if let Some(replacement) = replacement {
+            let items = std::mem::take(&mut self.session.items);
+            let model = self.session.model.clone();
+            self.session = replacement;
+            self.session.items = items;
+            self.session.model = model;
+        }
+        self.permission_mode = mode;
+    }
+
     fn set_permission_mode(
         &mut self,
         mode: crate::settings::AgentPermissionMode,
@@ -4215,6 +4311,78 @@ impl IdeApp {
         // was. `finish_pending_agents` marks it only if the reconnect fails.
         self.save_session_for_reload();
         self.pending_window_reload = true;
+    }
+
+    /// Apply a permission-mode change to the active tab, mid-turn included.
+    ///
+    /// Mid-turn, a loosening change now does what the user meant by making it:
+    /// the call the agent is blocked on is approved and the turn carries on. The
+    /// alternative was interrupting the turn, changing the mode, and asking
+    /// again — three steps to say "yes, go ahead".
+    fn change_permission_mode(&mut self, mode: crate::settings::AgentPermissionMode) {
+        let idx = self.agent_active;
+        let Some(tab) = self.agent_tabs.get(idx) else { return };
+        if tab.permission_mode == mode { return; }
+
+        let turn_active = tab.session.is_active();
+        let plan = mode_switch_plan(tab.permission_mode, mode, turn_active);
+        let resume_id = tab.session.forge_session_id.clone();
+
+        let replacement = matches!(plan, ModeSwitch::RespawnNow).then(|| {
+            let resume = (!resume_id.is_empty()).then_some(resume_id.as_str());
+            self.start_agent_session(mode, resume)
+        });
+
+        match plan {
+            ModeSwitch::RespawnNow => {
+                self.agent_tabs[idx].set_permission_mode(mode, replacement);
+                if turn_active {
+                    // Worth saying: the turn stopping is a consequence of the
+                    // mode, not something that went wrong.
+                    self.output_log(
+                        format!("{} needs a new agent, so this turn ended with the old one",
+                                mode.label()),
+                        OutputLevel::Warn,
+                    );
+                }
+            }
+            ModeSwitch::Live | ModeSwitch::LiveThenRespawnAfterTurn => {
+                // The live part: forge-agent's auto mode, which it can be told
+                // to change while running.
+                let tab = &mut self.agent_tabs[idx];
+                let want_auto = mode_auto_approves(mode);
+                if tab.session.auto_mode != want_auto {
+                    tab.session.toggle_auto_mode();
+                }
+                tab.permission_mode = mode;
+                if plan == ModeSwitch::LiveThenRespawnAfterTurn {
+                    tab.pending_mode_respawn = Some(mode);
+                }
+
+                // And the reason for doing this mid-turn at all.
+                if want_auto {
+                    let ids = release_pending_approvals(&mut tab.session.items);
+                    let n = ids.len();
+                    for id in ids {
+                        tab.session.approve(id);
+                    }
+                    if n > 0 {
+                        self.output_log(
+                            format!("{}: approved {n} call{} the agent was waiting on",
+                                    mode.label(), if n == 1 { "" } else { "s" }),
+                            OutputLevel::Info,
+                        );
+                    }
+                }
+                if plan == ModeSwitch::LiveThenRespawnAfterTurn {
+                    self.output_log(
+                        format!("{} applies to the rest of this turn; the agent restarts \
+                                 after it to skip unrecognised tools too", mode.label()),
+                        OutputLevel::Info,
+                    );
+                }
+            }
+        }
     }
 
     /// Give every tab still waiting on a connection a real session.
@@ -8035,14 +8203,22 @@ impl IdeApp {
         // reading a `perm_change` nothing had set yet, so it was always None and
         // no permission change ever took effect at all.
         if let Some(mode) = perm_change {
-            let tab = &self.agent_tabs[self.agent_active];
-            let needs_respawn = tab.mode_change_needs_respawn(mode);
-            let resume_id = tab.session.forge_session_id.clone();
-            let replacement = needs_respawn.then(|| {
-                let resume = (!resume_id.is_empty()).then_some(resume_id.as_str());
-                self.start_agent_session(mode, resume)
-            });
-            self.agent_tabs[self.agent_active].set_permission_mode(mode, replacement);
+            self.change_permission_mode(mode);
+        }
+
+        // A mode that was waiting on the turn to finish taking effect.
+        let idx = self.agent_active;
+        if let Some(mode) = self.agent_tabs.get(idx).and_then(|t| {
+            (!t.session.is_active()).then_some(t.pending_mode_respawn).flatten()
+        }) {
+            self.agent_tabs[idx].pending_mode_respawn = None;
+            let resume_id = self.agent_tabs[idx].session.forge_session_id.clone();
+            let resume = (!resume_id.is_empty()).then_some(resume_id.as_str());
+            let replacement = self.start_agent_session(mode, resume);
+            // Already the tab's mode — this is the process catching up with it.
+            self.agent_tabs[idx].permission_mode = mode;
+            self.agent_tabs[idx].set_permission_mode_forced(mode, Some(replacement));
+            self.output_log(format!("{} is now fully in effect", mode.label()), OutputLevel::Info);
         }
 
         if let Some(idx) = toggle_expand {
@@ -14786,5 +14962,119 @@ mod reconnect_tests {
         let tab = &app.agent_tabs[0];
         assert_eq!(tab.session.spawn_err.as_deref(), Some("no agent binary"));
         assert_eq!(tab.session.items.len(), 1, "a boundary was written where none belonged");
+    }
+}
+
+#[cfg(test)]
+mod mode_switch_tests {
+    use super::{ModeSwitch, mode_auto_approves, mode_switch_plan, release_pending_approvals};
+    use crate::agent_panel::{ApprovalState, ChatItem};
+    use crate::settings::AgentPermissionMode as Mode;
+
+    /// Loosening mid-turn is applied to the running agent. The whole point: the
+    /// call it is blocked on gets approved and it carries on, instead of the
+    /// user interrupting the turn, changing the mode and asking again.
+    #[test]
+    fn loosening_mid_turn_is_applied_live() {
+        assert_eq!(mode_switch_plan(Mode::AlwaysAsk, Mode::AutoApprove, true), ModeSwitch::Live);
+        assert_eq!(mode_switch_plan(Mode::AlwaysAsk, Mode::AutoApprove, false), ModeSwitch::Live);
+    }
+
+    /// Skip All is a spawn-time flag, so the process has to be replaced — but
+    /// mid-turn the part that unblocks the user happens now and the process
+    /// waits, rather than the turn dying for a flag it did not need yet.
+    #[test]
+    fn skip_all_mid_turn_waits_for_the_turn_to_replace_the_agent() {
+        assert_eq!(
+            mode_switch_plan(Mode::AlwaysAsk, Mode::DangerouslySkipAll, true),
+            ModeSwitch::LiveThenRespawnAfterTurn,
+        );
+        // Idle, there is no turn to protect, so it is done properly at once.
+        assert_eq!(
+            mode_switch_plan(Mode::AlwaysAsk, Mode::DangerouslySkipAll, false),
+            ModeSwitch::RespawnNow,
+        );
+    }
+
+    /// Tightening *out of* Skip All does not wait, even mid-turn. The mode skips
+    /// confirmation on anything at all, including tools nothing recognises, and
+    /// "it will stop when it finishes" is not a safety property.
+    #[test]
+    fn leaving_skip_all_takes_effect_immediately() {
+        for to in [Mode::AlwaysAsk, Mode::AutoApprove] {
+            assert_eq!(
+                mode_switch_plan(Mode::DangerouslySkipAll, to, true),
+                ModeSwitch::RespawnNow,
+                "mid-turn switch to {to:?} was deferred",
+            );
+        }
+    }
+
+    #[test]
+    fn only_always_ask_asks() {
+        assert!(!mode_auto_approves(Mode::AlwaysAsk));
+        assert!(mode_auto_approves(Mode::AutoApprove));
+        assert!(mode_auto_approves(Mode::DangerouslySkipAll));
+    }
+
+    fn req(id: &str, approval: ApprovalState) -> ChatItem {
+        ChatItem::ToolRequest {
+            name: "shell_exec".into(), args: "{}".into(), id: id.into(),
+            kind: "execute".into(), approval, expanded: false,
+        }
+    }
+
+    /// Every call the turn is blocked on, including one inside a subagent —
+    /// which blocks its subagent, which blocks the turn.
+    #[test]
+    fn every_waiting_call_is_released_including_a_subagents() {
+        let mut items = vec![
+            req("done", ApprovalState::Approved),
+            req("waiting", ApprovalState::Pending),
+            ChatItem::Subagent {
+                id: "sub_0".into(), agent_type: "explore".into(), prompt: String::new(),
+                current_tool: String::new(), detail: String::new(),
+                finished: false, summary: String::new(),
+                items: vec![req("nested", ApprovalState::Pending)], expanded: true,
+            },
+        ];
+
+        let ids = release_pending_approvals(&mut items);
+
+        assert_eq!(ids, vec!["waiting".to_string(), "nested".to_string()]);
+        // And the cards say so, rather than still showing a question.
+        assert!(matches!(&items[1], ChatItem::ToolRequest { approval: ApprovalState::Approved, .. }));
+        let ChatItem::Subagent { items: nested, .. } = &items[2] else { panic!() };
+        assert!(matches!(&nested[0], ChatItem::ToolRequest { approval: ApprovalState::Approved, .. }));
+    }
+
+    /// A decision that is not a permission decision is left for the user, which
+    /// is the reason this only looks at tool requests: a plan, a question, and a
+    /// password prompt are each theirs to answer, whatever the mode says.
+    #[test]
+    fn a_plan_a_question_and_a_password_are_not_permissions() {
+        let mut items = vec![
+            ChatItem::Plan {
+                plan_path: "plan.md".into(), content: "do the thing".into(),
+                resolved: false, resolution: String::new(),
+                reject_feedback: String::new(), expanded: true,
+            },
+            ChatItem::Question {
+                tool_id: "q1".into(), question: "which one?".into(), items: Vec::new(),
+                selected: Vec::new(), other_text: Vec::new(),
+                free_text: String::new(), answered: false,
+            },
+            ChatItem::InputNeeded {
+                bg_id: None, command: "sudo make install".into(),
+                prompt: "Password:".into(), is_password: true,
+                resolved: false, resolution: String::new(),
+                text: String::new(), remember_confirm: String::new(),
+            },
+        ];
+
+        assert!(release_pending_approvals(&mut items).is_empty());
+        assert!(matches!(&items[0], ChatItem::Plan { resolved: false, .. }));
+        assert!(matches!(&items[1], ChatItem::Question { answered: false, .. }));
+        assert!(matches!(&items[2], ChatItem::InputNeeded { resolved: false, .. }));
     }
 }

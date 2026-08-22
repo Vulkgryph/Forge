@@ -111,22 +111,50 @@ const NO_FOLDER: &str = "--no-folder";
 /// `remembered` is a closure so tests can supply a set without touching the
 /// user's configuration, and so it is not consulted at all on the paths that must
 /// not be influenced by it.
-fn parse_window_args(args: &[String]) -> (bool, Vec<Option<std::path::PathBuf>>) {
-    let is_reload = args.iter().any(|a| a == "--reload");
-    let cwds = args
-        .iter()
-        .filter(|a| *a != "--reload")
-        .map(|a| (a != NO_FOLDER).then(|| std::path::PathBuf::from(a)))
-        .collect();
-    (is_reload, cwds)
+/// One window, restarted into a process of its own. `--reload-window <id>`.
+///
+/// The soft reload rebuilds a window's state inside the process it is already in,
+/// which is fast and keeps everything, but cannot replace the *process* — so it
+/// cannot pick up a newly built binary, and cannot clear anything the process
+/// itself is holding. This is the other kind: a genuinely new process for that
+/// one window, while every other window carries on in the old one.
+const RELOAD_WINDOW: &str = "--reload-window";
+
+/// What the argument list asks for.
+struct WindowArgs {
+    /// Launched by a reload of some kind, so restore regardless of the setting.
+    is_reload: bool,
+    /// Restart exactly this recorded window and no others.
+    only:      Option<u64>,
+    /// One entry per window; `None` is a window with no folder.
+    cwds:      Vec<Option<std::path::PathBuf>>,
+}
+
+fn parse_window_args(args: &[String]) -> WindowArgs {
+    let mut out = WindowArgs { is_reload: false, only: None, cwds: Vec::new() };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reload" => out.is_reload = true,
+            RELOAD_WINDOW => {
+                // A reload either way — the id just narrows it to one window.
+                out.is_reload = true;
+                out.only = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 1;
+            }
+            a => out.cwds.push((a != NO_FOLDER).then(|| std::path::PathBuf::from(a))),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn plan_initial_windows(
-    cwds:            Vec<Option<std::path::PathBuf>>,
+    args:            WindowArgs,
     remembered:      impl FnOnce() -> Vec<session::WindowRecord>,
     restore_windows: bool,
-    is_reload:       bool,
 ) -> Vec<NewWindowSpec> {
+    let WindowArgs { is_reload, only, cwds } = args;
     // A folder that has since been deleted or moved is dropped rather than
     // opening a window onto a path that is not there.
     fn still_there(r: &session::WindowRecord) -> bool {
@@ -145,6 +173,27 @@ fn plan_initial_windows(
         cwds.into_iter()
             .map(|cwd| NewWindowSpec { cwd, is_reload, ..Default::default() })
             .collect()
+    }
+
+    // Restarting a single window: take that one record and nothing else, so the
+    // other windows are left to the process that still has them. Its geometry
+    // comes from the record, like any reload — argv has nowhere to put a frame.
+    if let Some(id) = only {
+        let mine: Vec<session::WindowRecord> =
+            remembered().into_iter().filter(|r| r.id == id).collect();
+        let specs = if mine.is_empty() {
+            // No record for it (never written, or pruned). The folder was passed
+            // alongside precisely for this, so the window still opens on the
+            // right workspace rather than not at all.
+            from_paths(cwds, true)
+        } else {
+            from_records(mine, true)
+        };
+        return if specs.is_empty() {
+            vec![NewWindowSpec { is_reload: true, ..Default::default() }]
+        } else {
+            specs
+        };
     }
 
     let usable: Vec<NewWindowSpec> = if is_reload {
@@ -660,6 +709,7 @@ impl ApplicationHandler for Ide {
         // Render each window, harvest any new-window/reload requests, and
         // track the earliest repaint any of them asked for.
         let mut new_specs: Vec<NewWindowSpec> = Vec::new();
+        let mut restart_ids: Vec<(WindowId, u64, Option<std::path::PathBuf>)> = Vec::new();
         let mut reload_requested = false;
         let mut earliest: Option<std::time::Instant> = None;
         for win in &mut self.windows {
@@ -684,8 +734,57 @@ impl ApplicationHandler for Ide {
             if std::mem::take(&mut win.app.pending_window_reload) {
                 win.app = IdeApp::new_with_spec(win.app.reload_spec());
             }
+            // The hard one: hand this window to a new process and close it here.
+            // Collected rather than done inline — the window has to be torn down
+            // the same way a user closing it is torn down, which happens below.
+            if std::mem::take(&mut win.app.pending_window_restart) {
+                restart_ids.push((win.id, win.app.window_id, win.app.workspace_root()));
+            }
         }
         self.pending.extend(new_specs);
+
+        // One window into a process of its own. Spawned first, so if that fails
+        // the window is still here rather than closed with nothing to replace it.
+        for (winit_id, window_id, cwd) in restart_ids {
+            let exe = std::env::current_exe().unwrap_or_default();
+            if exe.as_os_str().is_empty() || !exe.exists() {
+                eprintln!("restart_window: couldn't resolve current_exe, staying open");
+                continue;
+            }
+            // The record carries geometry, which argv cannot; the folder is
+            // passed anyway so the window still opens on the right workspace if
+            // no record can be read.
+            let folder = cwd.map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| NO_FOLDER.to_string());
+            // Written while the window is still here to measure, for the same
+            // reason the full restart writes it here.
+            self.write_windows(true);
+            match std::process::Command::new(&exe)
+                .arg(RELOAD_WINDOW)
+                .arg(window_id.to_string())
+                .arg(folder)
+                .spawn()
+            {
+                Ok(_) => {
+                    if let Some(win) = self.find_mut(winit_id) {
+                        // Torn down exactly as a user-closed window is: its GPU
+                        // resources released here, then dropped from the list
+                        // below. Skipping this leaked them for the life of the
+                        // process, since the device stays alive for the others.
+                        #[cfg(feature = "vulkan-renderer")]
+                        win.egui.destroy(win.gfx.device());
+                        win.closing = true;
+                    }
+                }
+                Err(e) => eprintln!("restart_window: could not start a new process: {e}"),
+            }
+        }
+        if self.windows.iter().any(|w| w.closing) {
+            self.windows.retain(|w| !w.closing);
+            // The last window handing itself over means this process is done —
+            // the new one has it now.
+            if self.windows.is_empty() { event_loop.exit(); }
+        }
 
         // "Reload Window" spawns a genuinely new process (new PID) and
         // exits this one — every window's Vulkan/Metal/window-server
@@ -873,7 +972,7 @@ fn main() {
     // restore the session it just saved regardless of the `restore_session`
     // setting.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (is_reload, cwds) = parse_window_args(&args);
+    let window_args = parse_window_args(&args);
     // Session files for windows that are no longer in the record are dead weight.
     // Done here, once, because the recorded set is authoritative only before any
     // window exists — doing it while running would race the windows that have
@@ -886,10 +985,9 @@ fn main() {
     let remembered = session::load_windows();
     session::prune_window_sessions(&remembered);
     let initial_specs = plan_initial_windows(
-        cwds,
+        window_args,
         move || remembered,
         settings::load().restore_windows,
-        is_reload,
     );
 
     let mut builder = EventLoop::builder();
@@ -978,10 +1076,9 @@ mod startup_tests {
     fn a_reload_restores_geometry_from_the_record() {
         let dir = std::env::temp_dir();
         let saved = frame(300, 150, 1000, 700);
-        let (is_reload, cwds) =
-            parse_window_args(&["--reload".to_string(), dir.to_string_lossy().into_owned()]);
+        let args = parse_window_args(&["--reload".to_string(), dir.to_string_lossy().into_owned()]);
         let specs = plan_initial_windows(
-            cwds,
+            args,
             || vec![session::WindowRecord {
                 cwd: Some(dir.clone()), frame: Some(saved), maximized: true,
                 ..Default::default()
@@ -989,7 +1086,6 @@ mod startup_tests {
             // Off on purpose: a reload restores what was open regardless of the
             // setting, which only governs a real quit-and-relaunch.
             false,
-            is_reload,
         );
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].frame, Some(saved), "the frame came back");
@@ -1001,13 +1097,12 @@ mod startup_tests {
     #[test]
     fn a_reload_with_no_arguments_restores_the_record() {
         let dir = std::env::temp_dir();
-        let (is_reload, cwds) = parse_window_args(&["--reload".to_string()]);
-        assert!(is_reload && cwds.is_empty());
+        let args = parse_window_args(&["--reload".to_string()]);
+        assert!(args.is_reload && args.cwds.is_empty());
         let specs = plan_initial_windows(
-            cwds,
+            args,
             || vec![record(dir.to_str()), record(None)],
             false,
-            is_reload,
         );
         assert_eq!(specs.len(), 2, "both windows, not one empty one: {specs:?}");
         assert_eq!(specs[0].cwd, Some(dir));
@@ -1019,16 +1114,14 @@ mod startup_tests {
     #[test]
     fn a_stale_record_does_not_override_the_reload_arguments() {
         let dir = std::env::temp_dir();
-        let (is_reload, cwds) =
-            parse_window_args(&["--reload".to_string(), dir.to_string_lossy().into_owned()]);
+        let args = parse_window_args(&["--reload".to_string(), dir.to_string_lossy().into_owned()]);
         let specs = plan_initial_windows(
-            cwds,
+            args,
             || vec![
                 record(dir.to_str()),
                 record(Some("/some/window/that/was/closed")),
             ],
             false,
-            is_reload,
         );
         assert_eq!(specs.len(), 1, "one window, as the arguments said: {specs:?}");
         assert_eq!(specs[0].cwd, Some(dir));
@@ -1041,12 +1134,11 @@ mod startup_tests {
         let dir = std::env::temp_dir();
         let saved = frame(64, 32, 900, 600);
         let specs = plan_initial_windows(
-            Vec::new(),
+            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
             || vec![session::WindowRecord {
                 cwd: Some(dir), frame: Some(saved), ..Default::default()
             }],
             true,
-            false,
         );
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].frame, Some(saved));
@@ -1060,10 +1152,9 @@ mod startup_tests {
         let a = std::env::temp_dir();
         let b = std::env::temp_dir().join("..");
         let specs = plan_initial_windows(
-            Vec::new(),
+            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
             || vec![record(a.to_str()), record(b.to_str()), record(None)],
             true,
-            false,
         );
         assert_eq!(specs.len(), 3, "all three, not one: {specs:?}");
         assert!(specs.iter().any(|s| s.cwd.is_none()), "including the folderless one");
@@ -1073,9 +1164,8 @@ mod startup_tests {
     #[test]
     fn the_toggle_off_opens_one_empty_window() {
         let specs = plan_initial_windows(
-            Vec::new(),
+            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
             || vec![record(std::env::temp_dir().to_str()), record(None)],
-            false,
             false,
         );
         assert_eq!(specs.len(), 1);
@@ -1087,12 +1177,11 @@ mod startup_tests {
     fn nothing_is_loaded_when_the_toggle_is_off() {
         let mut read = false;
         let _ = plan_initial_windows(
-            Vec::new(),
+            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
             || {
                 read = true;
                 Vec::new()
             },
-            false,
             false,
         );
         assert!(!read, "the window list was read despite the toggle being off");
@@ -1103,10 +1192,12 @@ mod startup_tests {
     #[test]
     fn command_line_paths_take_precedence() {
         let specs = plan_initial_windows(
-            vec![Some(PathBuf::from("/one")), Some(PathBuf::from("/two"))],
+            WindowArgs {
+                is_reload: false, only: None,
+                cwds: vec![Some(PathBuf::from("/one")), Some(PathBuf::from("/two"))],
+            },
             || panic!("the remembered set must not be consulted"),
             true,
-            false,
         );
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].cwd, Some(PathBuf::from("/one")));
@@ -1118,9 +1209,11 @@ mod startup_tests {
     fn the_reload_flag_is_carried() {
         let dir = std::env::temp_dir();
         let specs = plan_initial_windows(
-            vec![Some(dir.clone()), Some(dir)],
+            WindowArgs {
+                is_reload: true, only: None,
+                cwds: vec![Some(dir.clone()), Some(dir)],
+            },
             Vec::new,
-            true,
             true,
         );
         assert_eq!(specs.len(), 2);
@@ -1136,13 +1229,13 @@ mod startup_tests {
         // Exactly what the reload path builds, for a folder window and a
         // folderless one.
         let argv = vec!["--reload".to_string(), "/work".to_string(), NO_FOLDER.to_string()];
-        let (is_reload, cwds) = parse_window_args(&argv);
-        assert!(is_reload);
+        let args = parse_window_args(&argv);
+        assert!(args.is_reload);
 
         // Nothing recorded — the config directory was not writable — so the
         // argument list is all there is, and the marker has to carry the folderless
         // window through it.
-        let specs = plan_initial_windows(cwds, Vec::new, true, is_reload);
+        let specs = plan_initial_windows(args, Vec::new, true);
         assert_eq!(specs.len(), 2, "both windows: {specs:?}");
         assert_eq!(specs[0].cwd, Some(PathBuf::from("/work")), "the real folder is kept");
         assert_eq!(specs[1].cwd, None, "and the folderless one is still folderless");
@@ -1151,8 +1244,8 @@ mod startup_tests {
     /// The marker must never be mistaken for a workspace path.
     #[test]
     fn the_marker_is_not_treated_as_a_path() {
-        let (_, cwds) = parse_window_args(&[NO_FOLDER.to_string()]);
-        let specs = plan_initial_windows(cwds, Vec::new, true, true);
+        let args = parse_window_args(&[NO_FOLDER.to_string()]);
+        let specs = plan_initial_windows(args, Vec::new, true);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].cwd, None, "not a folder named {NO_FOLDER}");
     }
@@ -1163,10 +1256,9 @@ mod startup_tests {
     fn folders_that_no_longer_exist_are_dropped() {
         let real = std::env::temp_dir();
         let specs = plan_initial_windows(
-            Vec::new(),
+            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
             || vec![record(Some("/definitely/not/a/real/path")), record(real.to_str())],
             true,
-            false,
         );
         assert_eq!(specs.len(), 1, "only the one that still exists: {specs:?}");
         assert_eq!(specs[0].cwd, Some(real));
@@ -1180,7 +1272,7 @@ mod startup_tests {
             Vec::new(),
             vec![record(Some("/gone/one")), record(Some("/gone/two"))],
         ] {
-            let specs = plan_initial_windows(Vec::new(), || remembered.clone(), true, false);
+            let specs = plan_initial_windows(WindowArgs { is_reload: false, only: None, cwds: Vec::new() }, || remembered.clone(), true);
             assert_eq!(specs.len(), 1, "never zero windows");
             assert!(specs[0].cwd.is_none());
         }
@@ -1189,7 +1281,7 @@ mod startup_tests {
     /// A folderless window stays folderless rather than inheriting a directory.
     #[test]
     fn a_folderless_record_reopens_without_a_folder() {
-        let specs = plan_initial_windows(Vec::new(), || vec![record(None)], true, false);
+        let specs = plan_initial_windows(WindowArgs { is_reload: false, only: None, cwds: Vec::new() }, || vec![record(None)], true);
         assert_eq!(specs.len(), 1);
         assert!(specs[0].cwd.is_none());
     }

@@ -3988,6 +3988,8 @@ pub struct IdeApp {
     /// Rebuild this one window in place, leaving the process and every other
     /// window alone. See `reload_window`.
     pub pending_window_reload: bool,
+    /// Restart this one window into a process of its own. See `restart_window`.
+    pub pending_window_restart: bool,
     /// Which rebuild of this window this is. See `NewWindowSpec::reload_count`.
     reload_count: u32,
     /// SSH host to connect on the first draw (set by new_with_spec).
@@ -4192,6 +4194,7 @@ impl IdeApp {
             pending_new_window:  None,
             pending_reload:      false,
             pending_window_reload: false,
+            pending_window_restart: false,
             reload_count: spec_reload_count,
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
@@ -4401,6 +4404,28 @@ impl IdeApp {
         self.note_remote_session_end();
         self.save_session_for_reload();
         self.pending_reload = true;
+    }
+
+    /// Restart this one window into a new process, leaving the others in this one.
+    ///
+    /// The hard counterpart to `reload_window`. That one rebuilds the window's
+    /// state inside the process it is already in, which is fast and keeps
+    /// everything — and cannot replace the process, so it cannot pick up a newly
+    /// built binary, cannot clear anything the process itself holds (a leaked
+    /// handle, a wedged language server, the GPU state), and gives a suspicious
+    /// user nothing to see because there is nothing to see.
+    ///
+    /// This is the other kind. The window is handed to a genuinely new process —
+    /// new PID, current binary on disk — and closed here. Every other window
+    /// carries on in this process, untouched, which is the part `Restart Forge`
+    /// cannot offer.
+    ///
+    /// The terminals survive it: they belong to the pty daemon, and the new
+    /// process reattaches by id, the same way it does across a full restart.
+    pub fn restart_window(&mut self) {
+        self.note_remote_session_end();
+        self.save_session_for_reload();
+        self.pending_window_restart = true;
     }
 
     /// Rebuild *this* window and nothing else.
@@ -10938,6 +10963,14 @@ impl IdeApp {
                     ui.separator();
                     if ui.button("Reload Window      Ctrl+Shift+R").clicked() {
                         self.reload_window();
+                        ui.close_menu();
+    }
+                    // Between the two: a new process, but only for this window.
+                    // The soft reload cannot pick up a new binary or clear
+                    // anything the process itself is holding; the full restart
+                    // can, and takes every other window with it.
+                    if ui.button("Restart This Window").clicked() {
+                        self.restart_window();
                         ui.close_menu();
     }
                     // Separate because it is a different blast radius, not a

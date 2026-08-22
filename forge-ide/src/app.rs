@@ -15859,3 +15859,71 @@ mod stale_build_tests {
         assert_eq!(app.build_checked, Some(first), "checked again immediately");
     }
 }
+
+#[cfg(test)]
+mod reload_cost_probe {
+    use super::{IdeApp, NewWindowSpec};
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    /// What a soft reload actually costs, since it is the number the status line
+    /// reports and the reason to prefer it over a restart.
+    ///
+    /// Measured on an M-series Mac, release build, a workspace with six source
+    /// files reopened: 23–27ms per rebuild, 40ms for the first construction in a
+    /// process (which pays for the plugin scan and the git open once).
+    ///
+    /// Run it in release. The same probe in a debug build reports ~465ms, which
+    /// is a fact about `cargo test` and not about the reload — I quoted a figure
+    /// from the wrong profile once and it was ten times out.
+    ///
+    /// Ignored by default: it is a measurement, not a pass/fail, and it touches
+    /// the real pty host to ask which sessions exist — the same read-only call a
+    /// window makes when it opens.
+    ///
+    ///   cargo test -p forge-ide reload_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement"]
+    fn what_a_rebuild_costs() {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A few real files to reopen, of the size a source file actually is.
+        let mut files: Vec<PathBuf> = Vec::new();
+        for i in 0..6 {
+            let p = dir.join(format!("file{i}.rs"));
+            let body = (0..400).map(|n| format!("fn f{n}() {{ let x = {n}; }}\n"))
+                .collect::<String>();
+            std::fs::write(&p, body).unwrap();
+            files.push(p);
+        }
+        crate::session::save(&dir, &crate::session::SessionState {
+            open_files: files.clone(), active_file: 0, ..Default::default()
+        });
+
+        let time = |label: &str, spec: NewWindowSpec| {
+            let t = Instant::now();
+            let app = IdeApp::new_with_spec(spec);
+            let took = t.elapsed();
+            eprintln!("{label:<34} {:>7.1}ms   {} file(s), {} terminal(s)",
+                      took.as_secs_f64() * 1000.0, app.buffers.len(), app.terminal_tabs.len());
+            took
+        };
+
+        // A window with nothing to restore: the floor.
+        time("empty window", NewWindowSpec {
+            cwd: Some(dir.clone()), ..Default::default()
+        });
+        // The rebuild a reload actually performs.
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..5 {
+            let t = time("rebuild, 6 files restored", NewWindowSpec {
+                cwd: Some(dir.clone()), is_reload: true, reload_count: 1, ..Default::default()
+            });
+            worst = worst.max(t);
+        }
+        eprintln!("\nworst of five: {:.1}ms", worst.as_secs_f64() * 1000.0);
+    }
+}

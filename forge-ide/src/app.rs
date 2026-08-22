@@ -502,6 +502,14 @@ pub struct NewWindowSpec {
     /// Window — regardless of the `restore_session` *setting*, which only
     /// governs restoring across a real quit-and-relaunch later.
     pub is_reload: bool,
+    /// How many times *this window* has been rebuilt in place. Carried by
+    /// `reload_spec` so each rebuild can say which one it is — a reload that
+    /// takes 40ms is hard to tell from one that did not happen, and a number
+    /// that goes up settles it.
+    ///
+    /// In-memory only: a process restart cannot carry it through an argument
+    /// list, and starts again from zero, which is honest — that is a new process.
+    pub reload_count: u32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -3980,6 +3988,8 @@ pub struct IdeApp {
     /// Rebuild this one window in place, leaving the process and every other
     /// window alone. See `reload_window`.
     pub pending_window_reload: bool,
+    /// Which rebuild of this window this is. See `NewWindowSpec::reload_count`.
+    reload_count: u32,
     /// SSH host to connect on the first draw (set by new_with_spec).
     pending_ssh_connect: Option<crate::ssh::SshHost>,
 }
@@ -4007,7 +4017,9 @@ impl IdeApp {
     }
 
     pub fn new_with_spec(spec: NewWindowSpec) -> Self {
+        let built_from = std::time::Instant::now();
         let is_reload = spec.is_reload;
+        let spec_reload_count = spec.reload_count;
         // `None` means "no workspace", not "inherit the process working
         // directory". That old behavior meant a window opened from the Dock —
         // where the process cwd is `/` — rendered the entire filesystem as the
@@ -4180,6 +4192,7 @@ impl IdeApp {
             pending_new_window:  None,
             pending_reload:      false,
             pending_window_reload: false,
+            reload_count: spec_reload_count,
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
             update_check_rx: None,
@@ -4270,6 +4283,36 @@ impl IdeApp {
                     }
                 }
             }
+        }
+
+        // A rebuild is fast enough to be hard to believe: the OS window, the
+        // swapchain and the egui context all stay, so nothing flickers and the
+        // whole thing lands inside a frame or two. So it says so — with a count
+        // that goes up, which is the part a suspicious user can actually check,
+        // and what it brought back with it.
+        let took = built_from.elapsed();
+        if spec_reload_count > 0 {
+            let files = app.buffers.len();
+            let terms = app.terminal_tabs.len();
+            let tabs  = app.agent_tabs.len();
+            app.status = format!(
+                "Window reloaded (#{spec_reload_count}) in {}ms", took.as_millis(),
+            );
+            app.output_log(
+                format!(
+                    "Window rebuilt (#{spec_reload_count}) in {}ms —                      {files} file(s), {terms} terminal(s), {tabs} agent tab(s)",
+                    took.as_millis(),
+                ),
+                OutputLevel::Success,
+            );
+        } else if is_reload {
+            // The other kind: a new process, which cannot be handed a count
+            // through its argument list and legitimately starts again at one.
+            app.status = "Forge restarted".into();
+            app.output_log(
+                format!("New process ready in {}ms", took.as_millis()),
+                OutputLevel::Success,
+            );
         }
         app
     }
@@ -4548,6 +4591,7 @@ impl IdeApp {
             cwd:       self.workspace_root(),
             window_id: self.window_id,
             is_reload: true,
+            reload_count: self.reload_count + 1,
             // A remote window comes back remote: the connection cannot survive
             // the rebuild, so it is made again. Key-based hosts reconnect
             // without asking; one that wants a password cannot be reconnected
@@ -14959,6 +15003,43 @@ mod reconnect_tests {
         // And with nothing remote in play, the setting decides as before.
         assert!(should_restore_on_open(true, false, false));
         assert!(!should_restore_on_open(false, false, false));
+    }
+
+    /// The rebuild counts itself, so a reload that takes 40ms can be told apart
+    /// from one that did not happen. Each rebuild is one higher than the last.
+    #[test]
+    fn each_rebuild_counts_itself() {
+        let dir = scratch("counted");
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir.clone()), ..Default::default()
+        });
+
+        // The first rebuild is #1, and the app it produces says so.
+        let spec = app.reload_spec();
+        assert_eq!(spec.reload_count, 1);
+        app = IdeApp::new_with_spec(spec);
+        assert!(
+            app.output_log.iter().any(|(m, _)| m.contains("Window rebuilt (#1)")),
+            "a rebuild left no trace in {} log line(s)", app.output_log.len(),
+        );
+        assert!(app.status.contains("reloaded (#1)"), "{}", app.status);
+
+        // And the next carries on from it rather than starting again.
+        let spec = app.reload_spec();
+        assert_eq!(spec.reload_count, 2);
+        let app = IdeApp::new_with_spec(spec);
+        assert!(app.status.contains("reloaded (#2)"), "{}", app.status);
+    }
+
+    /// A window that was merely opened says nothing — the line is there to prove
+    /// a rebuild, and printing it on a fresh window would prove nothing.
+    #[test]
+    fn a_window_that_was_not_rebuilt_says_nothing_about_rebuilding() {
+        let app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("fresh")), ..Default::default()
+        });
+        assert!(!app.status.contains("reloaded"), "{}", app.status);
+        assert!(!app.output_log.iter().any(|(m, _)| m.contains("rebuilt")));
     }
 
     /// A local window has no host to carry, so nothing about reconnecting

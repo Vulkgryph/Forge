@@ -137,7 +137,7 @@ fn plan_initial_windows(
             .filter(still_there)
             .map(|r| NewWindowSpec {
                 cwd: r.cwd, frame: r.frame, maximized: r.maximized,
-                window_id: r.id, ssh_host: None, is_reload,
+                window_id: r.id, ssh_host: None, is_reload, reload_count: 0,
             })
             .collect()
     }

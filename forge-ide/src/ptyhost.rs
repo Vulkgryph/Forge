@@ -75,6 +75,9 @@ pub struct PtyHostClient {
     /// daemon would otherwise cost `CALL_TIMEOUT` per terminal, per operation,
     /// for the life of the process.
     responsive: Arc<std::sync::atomic::AtomicBool>,
+    /// Broadcasts from other Forge processes, waiting to be read. See
+    /// `take_broadcasts`.
+    heard: Arc<Mutex<Vec<String>>>,
 }
 
 impl PtyHostClient {
@@ -146,8 +149,10 @@ impl PtyHostClient {
         let pending: PendMap = Arc::new(Mutex::new(HashMap::new()));
         let pushes:  PushMap = Arc::new(Mutex::new(HashMap::new()));
 
+        let heard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let pending2 = Arc::clone(&pending);
         let pushes2  = Arc::clone(&pushes);
+        let heard2   = Arc::clone(&heard);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(read_half);
             while let Some(msg) = read_rpc(&mut reader) {
@@ -167,14 +172,44 @@ impl PtyHostClient {
                             crate::wake::wake();
                         }
                     }
+                } else if msg.method.as_deref() == Some("broadcast") {
+                    // Another Forge process asking everyone to do something. The
+                    // flag is read by the app on its next frame, and `wake` is
+                    // what gets it a next frame: an idle window is asleep, and
+                    // this is the only thing that can reach it from outside its
+                    // own process.
+                    let kind = msg.params.unwrap_or_default()
+                        .get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !kind.is_empty() {
+                        heard2.lock().unwrap().push(kind);
+                        crate::wake::wake();
+                    }
                 }
             }
         });
 
         Self {
-            next_id: Arc::new(Mutex::new(1)), pending, writer, pushes,
+            next_id: Arc::new(Mutex::new(1)), pending, writer, pushes, heard,
             responsive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// Ask every other Forge process to do something, and answer how many heard.
+    ///
+    /// The daemon is the only thing every Forge process already talks to, which
+    /// is what makes it the place for this — the alternative is a second channel
+    /// between processes that exists solely to carry one message.
+    ///
+    /// A daemon from an older build does not know the method and says so; the
+    /// caller reports that rather than pretending everyone was told.
+    pub fn broadcast(&self, kind: &str) -> Result<usize, String> {
+        let v = self.call("broadcast", serde_json::json!({ "kind": kind }))?;
+        Ok(v.get("reached").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+    }
+
+    /// Broadcasts heard since this was last called.
+    pub fn take_broadcasts(&self) -> Vec<String> {
+        std::mem::take(&mut *self.heard.lock().unwrap())
     }
 
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -225,6 +260,13 @@ impl PtyHostClient {
     pub fn reattach(&self, id: u32) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::sync_channel(256);
         self.pushes.lock().unwrap().insert(id, tx);
+        // And tell the daemon, which otherwise keeps pushing this session to
+        // whichever client connected most recently. That was invisible while
+        // Forge IDE was one process — there was never another client to push to
+        // by mistake — and is exactly wrong now that a window can restart into a
+        // process of its own. Failure is ignored: an older daemon does not know
+        // the method, and reattaching to it is no worse than it was before.
+        let _ = self.call("pty/subscribe", serde_json::json!({ "id": id }));
         rx
     }
 

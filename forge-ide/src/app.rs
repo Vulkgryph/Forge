@@ -4523,6 +4523,54 @@ impl IdeApp {
         self.restart_process();
     }
 
+    /// Ask every Forge window, in every process, to restart.
+    ///
+    /// One process can only restart its own windows. Once windows have been
+    /// moved out one at a time — which is the whole point of the per-window
+    /// restart — "all of them" spans processes that have no way to talk to each
+    /// other. Except that they do: every one of them is already connected to the
+    /// pty host, so it carries the message. Nothing new to run, and it reaches an
+    /// idle window, which a file on disk would not.
+    ///
+    /// Reports what it reached rather than claiming to have told everyone: an
+    /// older daemon does not know how to pass this on, and a process that has
+    /// never opened a terminal is not connected to hear it.
+    pub fn restart_every_window(&mut self) {
+        let reached = crate::ptyhost::shared()
+            .map(|c| c.broadcast("restart"))
+            .unwrap_or_else(|| Err("no pty host to carry it".into()));
+        match reached {
+            Ok(0) => self.output_log(
+                "No other Forge processes to tell — restarting this one".to_string(),
+                OutputLevel::Info,
+            ),
+            Ok(n) => self.output_log(
+                format!("Asked {n} other Forge process{} to restart", if n == 1 { "" } else { "es" }),
+                OutputLevel::Success,
+            ),
+            Err(e) => self.output_log(
+                format!("Could not reach other Forge processes ({e}); \
+                         restarting this one only — use Restart All Windows in each of the others"),
+                OutputLevel::Warn,
+            ),
+        }
+        self.restart_all_windows();
+    }
+
+    /// Act on anything another process asked for.
+    fn poll_broadcasts(&mut self) {
+        let Some(client) = crate::ptyhost::shared() else { return };
+        for kind in client.take_broadcasts() {
+            if kind == "restart" {
+                self.output_log(
+                    "Another Forge window asked everything to restart".to_string(),
+                    OutputLevel::Info,
+                );
+                self.restart_all_windows();
+            }
+        }
+    }
+
     /// Restart this one window into a new process, leaving the others in this one.
     ///
     /// The hard counterpart to `reload_window`. That one rebuilds the window's
@@ -6417,6 +6465,7 @@ impl IdeApp {
         self.draw_debug_panel(ctx);
         self.draw_update_prompt(ctx);
         self.refresh_build_staleness();
+        self.poll_broadcasts();
         self.draw_update_banner(ctx);
         self.draw_onboarding_wizard(ctx);
     }
@@ -6733,7 +6782,7 @@ impl IdeApp {
                     if ui.button("Restart this window").clicked() {
                         action = Some(BuildUpdateAction::ThisWindow);
                     }
-                    if ui.button("Restart all windows").clicked() {
+                    if ui.button("Restart everything").clicked() {
                         action = Some(BuildUpdateAction::Everything);
                     }
                     // The part worth saying out loud: this is not all-or-nothing.
@@ -6750,7 +6799,7 @@ impl IdeApp {
             });
             match action {
                 Some(BuildUpdateAction::ThisWindow) => self.restart_window(),
-                Some(BuildUpdateAction::Everything) => self.restart_all_windows(),
+                Some(BuildUpdateAction::Everything) => self.restart_every_window(),
                 Some(BuildUpdateAction::Later) => self.update_banner_dismissed = true,
                 None => {}
             }
@@ -11171,6 +11220,12 @@ impl IdeApp {
                     // session that needs re-establishing.
                     if ui.button("Restart All Windows").clicked() {
                         self.restart_all_windows();
+                        ui.close_menu();
+    }
+                    // Across processes, for when windows have been restarted
+                    // individually and now live in several.
+                    if ui.button("Restart Every Window (all processes)").clicked() {
+                        self.restart_every_window();
                         ui.close_menu();
     }
                 });

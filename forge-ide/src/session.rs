@@ -203,6 +203,18 @@ fn write_state(path: &Path, state: &SessionState) {
 mod window_tests {
     use super::*;
 
+    /// A fixed clock, so staleness is something a test states rather than waits
+    /// for, and two pids standing in for two Forge processes.
+    const NOW: u64 = 1_800_000_000;
+    const PROC_A: u32 = 100;
+    const PROC_B: u32 = 200;
+
+    /// The records without their bookkeeping, for comparing against what was
+    /// asked to be written — the pid and the timestamp are stamped on the way in.
+    fn unstamped(rs: Vec<WindowRecord>) -> Vec<WindowRecord> {
+        rs.into_iter().map(|mut r| { r.pid = 0; r.seen = 0; r }).collect()
+    }
+
     /// A distinct path per test. These used to share the one global file, so they
     /// clobbered each other when run in parallel — and worse, wrote to the real
     /// configuration.
@@ -222,10 +234,11 @@ mod window_tests {
             WindowRecord { cwd: Some(PathBuf::from("/one")), ..Default::default() },
             WindowRecord { cwd: Some(PathBuf::from("/two")), ..Default::default() },
         ];
-        save_windows_to(&path, &two);
-        save_windows_to(&path, &[]);
+        // One process, twice: the second write is the last window closing.
+        save_windows_to(&path, &two, PROC_A, NOW);
+        save_windows_to(&path, &[], PROC_A, NOW);
         assert_eq!(
-            load_windows_from(&path), two,
+            unstamped(load_windows_from(&path)), two,
             "quitting must not wipe the set it is meant to restore",
         );
     }
@@ -239,8 +252,8 @@ mod window_tests {
             WindowRecord { cwd: None, ..Default::default() },
             WindowRecord { cwd: Some(PathBuf::from("/project/three")), ..Default::default() },
         ];
-        save_windows_to(&path, &records);
-        assert_eq!(load_windows_from(&path), records);
+        save_windows_to(&path, &records, PROC_A, NOW);
+        assert_eq!(unstamped(load_windows_from(&path)), records);
     }
 
     /// A folderless window records `None`, not the directory its terminal
@@ -249,8 +262,98 @@ mod window_tests {
     #[test]
     fn a_folderless_window_records_no_folder() {
         let path = scratch("folderless");
-        save_windows_to(&path, &[WindowRecord::default()]);
-        assert_eq!(load_windows_from(&path), vec![WindowRecord::default()]);
+        save_windows_to(&path, &[WindowRecord::default()], PROC_A, NOW);
+        assert_eq!(unstamped(load_windows_from(&path)), vec![WindowRecord::default()]);
+    }
+
+    fn win(path: &str, id: u64) -> WindowRecord {
+        WindowRecord { cwd: Some(PathBuf::from(path)), id, ..Default::default() }
+    }
+
+    /// The rollout this exists for. Three projects in three windows; window two
+    /// is restarted onto a new build, so it is now its own process. Both
+    /// processes keep writing the same file, and the file has to end up
+    /// describing all three windows — not whichever process wrote last.
+    #[test]
+    fn one_window_moving_to_a_new_process_keeps_the_others() {
+        let path = scratch("rollout");
+
+        // One process, three windows.
+        save_windows_to(&path, &[win("/p1", 1), win("/p2", 2), win("/p3", 3)], PROC_A, NOW);
+
+        // Window two restarts into its own process, which records itself…
+        save_windows_to(&path, &[win("/p2", 2)], PROC_B, NOW + 1);
+        // …and the old process, now down to two windows, records that.
+        save_windows_to(&path, &[win("/p1", 1), win("/p3", 3)], PROC_A, NOW + 2);
+
+        let mut ids: Vec<u64> = load_windows_from(&path).iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3], "a window was lost to the other process's write");
+
+        // And window two is on record as belonging to the new process, which is
+        // what stops the old one from claiming it back.
+        let two = load_windows_from(&path).into_iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(two.pid, PROC_B);
+    }
+
+    /// Continuing that rollout to the end: each window moves in turn, and at no
+    /// point does the file describe fewer windows than are open.
+    #[test]
+    fn a_gradual_rollout_never_loses_a_window() {
+        let path = scratch("gradual");
+        save_windows_to(&path, &[win("/p1", 1), win("/p2", 2), win("/p3", 3)], PROC_A, NOW);
+
+        let mut old = vec![win("/p1", 1), win("/p2", 2), win("/p3", 3)];
+        for (step, id) in [2u64, 3, 1].into_iter().enumerate() {
+            let t = NOW + step as u64 * 10;
+            // The window arrives in its own process…
+            save_windows_to(&path, &[win("/p", id)], 300 + id as u32, t + 1);
+            // …and leaves the old one.
+            old.retain(|r| r.id != id);
+            save_windows_to(&path, &old, PROC_A, t + 2);
+
+            let mut ids: Vec<u64> = load_windows_from(&path).iter().map(|r| r.id).collect();
+            ids.sort();
+            assert_eq!(ids, vec![1, 2, 3], "after moving window {id}, the set was {ids:?}");
+        }
+        // Every window is now in a process of its own, and the old process holds
+        // none — its empty write deregistered it rather than erasing everyone.
+        let all = load_windows_from(&path);
+        assert!(all.iter().all(|r| r.pid != PROC_A), "the old process still claims a window");
+    }
+
+    /// A process that dies without deregistering leaves its entries behind, and
+    /// they are kept — a crash should not cost you the window. They go once they
+    /// are as old as the sessions they refer to, so a long-dead process does not
+    /// resurrect a window forever.
+    #[test]
+    fn a_dead_process_keeps_its_windows_until_they_go_stale() {
+        let path = scratch("stale");
+        save_windows_to(&path, &[win("/crashed", 9)], PROC_B, NOW);
+
+        // Another process writes the next day: the crashed one's window is still
+        // there to be restored.
+        save_windows_to(&path, &[win("/live", 1)], PROC_A, NOW + 86_400);
+        let ids: Vec<u64> = load_windows_from(&path).iter().map(|r| r.id).collect();
+        assert!(ids.contains(&9), "a crash lost the window it had open");
+
+        // Long enough after, it is gone rather than coming back forever.
+        save_windows_to(&path, &[win("/live", 1)], PROC_A, NOW + SESSION_KEEP.as_secs() + 1);
+        let ids: Vec<u64> = load_windows_from(&path).iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&9), "a window from a week-dead process still came back");
+    }
+
+    /// Records written before any of this had no pid. They are not attributed to
+    /// anyone, so the first process to write replaces them wholesale — which is
+    /// the old behaviour, and correct: there is one process at that point.
+    #[test]
+    fn records_from_before_this_are_replaced_not_kept_forever() {
+        let path = scratch("legacy");
+        // Straight to disk, as an older build would have written it.
+        std::fs::write(&path, serde_json::to_string(&vec![win("/old", 7)]).unwrap()).unwrap();
+        save_windows_to(&path, &[win("/new", 8)], PROC_A, NOW);
+        let ids: Vec<u64> = load_windows_from(&path).iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![8], "an unattributed record outlived the process that wrote it");
     }
 
     /// Nothing saved yet is an empty list, not a panic, so a first run falls back
@@ -390,6 +493,29 @@ pub struct WindowRecord {
     /// back to its workspace's own session file.
     #[serde(default)]
     pub id: u64,
+    /// Which process has this window open.
+    ///
+    /// One Forge can be several processes — a window restarted on its own moves
+    /// into a new one, which is how a new build gets rolled out to one project at
+    /// a time. The record is a single file, so without knowing whose each entry
+    /// is, whichever process wrote last erased the others' windows and the next
+    /// launch came back missing them.
+    #[serde(default)]
+    pub pid: u32,
+    /// When this entry was last written, as seconds since the epoch. A process
+    /// that dies without deregistering leaves its entries behind; they are kept
+    /// for as long as its saved session is (see `SESSION_KEEP`) and then go, so a
+    /// crash does not cost you the window but a long-dead process does not
+    /// resurrect one either.
+    #[serde(default)]
+    pub seen: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // Only the folder is recorded, not a remote connection. `IdeApp` tracks a
@@ -410,9 +536,10 @@ fn windows_path() -> Option<PathBuf> {
 /// to restore — the exact failure this is meant to fix. The last non-empty set
 /// therefore survives a quit, which is also what a user means by "reopen what I
 /// had".
+/// Record the windows *this* process has open, keeping what other processes have.
 pub fn save_windows(records: &[WindowRecord]) {
     if let Some(path) = windows_path() {
-        save_windows_to(&path, records);
+        save_windows_to(&path, records, std::process::id(), now_secs());
     }
 }
 
@@ -423,14 +550,33 @@ pub fn load_windows() -> Vec<WindowRecord> {
 
 /// The path is a parameter so tests can exercise this without writing to the
 /// user's real configuration — which the first version of these tests did.
-fn save_windows_to(path: &Path, records: &[WindowRecord]) {
-    if records.is_empty() {
+/// `pid` and `now` are parameters so a test can play several processes against
+/// one file, which is the only way to exercise what this exists for.
+fn save_windows_to(path: &Path, records: &[WindowRecord], pid: u32, now: u64) {
+    // Everything the file already holds that belongs to somebody else, minus
+    // whatever is too old to still be open. Ours is replaced wholesale: this
+    // process knows exactly which windows it has, including none.
+    let keep_after = now.saturating_sub(SESSION_KEEP.as_secs());
+    let mut merged: Vec<WindowRecord> = load_windows_from(path)
+        .into_iter()
+        .filter(|r| r.pid != pid && r.pid != 0 && r.seen >= keep_after)
+        .collect();
+    merged.extend(records.iter().cloned().map(|mut r| {
+        r.pid = pid;
+        r.seen = now;
+        r
+    }));
+
+    // An empty file is not written, but an empty *set* from this process must
+    // still be recorded when other processes have windows — that is how a
+    // process deregisters as its last window closes.
+    if merged.is_empty() {
         return;
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(json) = serde_json::to_string(records) else { return };
+    let Ok(json) = serde_json::to_string(&merged) else { return };
 
     // Written via a temporary and renamed, so a crash mid-write cannot leave a
     // truncated file that loses every window instead of one.

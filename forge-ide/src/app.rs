@@ -1683,6 +1683,53 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
 /// glance and even for a viewer who cannot see the colour change. Costs nothing
 /// when nothing is running: the panel already repaints on a 50ms cadence while a
 /// turn is live and not at all when it is not, so this adds no wakeups.
+/// Which build this process is running.
+///
+/// The version alone does not distinguish two builds of the same version, which
+/// is exactly the case that matters while rolling a new build out one window at a
+/// time — every window says `0.3.0` and none of them says which `0.3.0`. The
+/// binary's own timestamp does distinguish them, and needs nothing compiled in.
+///
+/// Read once per process: it is the file this process was started from, and
+/// replacing that file on disk does not change what is already running — which is
+/// the whole point of being able to ask.
+fn build_stamp() -> &'static str {
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| {
+        let built = std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .and_then(|m| m.modified())
+            .ok()
+            .map(format_build_time)
+            .unwrap_or_else(|| "unknown build".to_string());
+        format!("{} · {built}", env!("CARGO_PKG_VERSION"))
+    })
+}
+
+/// A build time as `Aug 21 23:16` — local enough to compare against when you
+/// built it, which is all it is for.
+fn format_build_time(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Civil date from a unix timestamp, without reaching for a date library for
+    // one line of output. Days-from-epoch to y/m/d by Howard Hinnant's method.
+    let days = (secs / 86_400) as i64;
+    let rem  = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _year = y + i64::from(m <= 2);
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let name = MONTHS.get((m as usize).saturating_sub(1)).copied().unwrap_or("???");
+    format!("{name} {d} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
 /// Seconds a step must run before its elapsed time is shown.
 ///
 /// Most calls finish faster than this, and a number that appears and vanishes on
@@ -4294,6 +4341,9 @@ impl IdeApp {
         // that goes up, which is the part a suspicious user can actually check,
         // and what it brought back with it.
         let took = built_from.elapsed();
+        // Every window, not just a rebuilt one: with a build rolled out one
+        // window at a time, "which one is this?" is a question about all of them.
+        app.output_log(format!("Forge IDE {}", build_stamp()), OutputLevel::Info);
         if spec_reload_count > 0 {
             let files = app.buffers.len();
             let terms = app.terminal_tabs.len();
@@ -10973,6 +11023,16 @@ impl IdeApp {
                         self.restart_window();
                         ui.close_menu();
     }
+                    ui.separator();
+                    // Which build *this* window is running. With a new build
+                    // rolled out one window at a time, they are not all the same
+                    // and the version number alone cannot tell them apart.
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(
+                            egui::RichText::new(format!("Forge IDE {}", build_stamp())).size(11.0),
+                        ),
+                    );
                     // Separate because it is a different blast radius, not a
                     // stronger version of the same thing: every window's
                     // conversations and language servers go down with it. The
@@ -14137,7 +14197,9 @@ mod output_log_tests {
     fn a_single_huge_line_is_truncated() {
         let mut a = app();
         a.push_output("x".repeat(MAX_OUTPUT_LINE_CHARS * 3), OutputLevel::Warn);
-        let (msg, _) = &a.output_log[0];
+        // The line just pushed, not the first in the log: a window logs which
+        // build it is running as it opens, so index 0 belongs to that.
+        let (msg, _) = a.output_log.last().unwrap();
         assert_eq!(msg.chars().count(), MAX_OUTPUT_LINE_CHARS + 1, "cap + ellipsis");
         assert!(msg.ends_with('…'));
     }
@@ -14146,7 +14208,7 @@ mod output_log_tests {
     fn short_lines_are_untouched() {
         let mut a = app();
         a.push_output("hello".into(), OutputLevel::Info);
-        assert_eq!(a.output_log[0].0, "hello");
+        assert_eq!(a.output_log.last().unwrap().0, "hello");
     }
 }
 
@@ -15495,5 +15557,44 @@ mod countdown_tests {
     #[test]
     fn a_countdown_reads_as_time() {
         assert_eq!(human_elapsed(secs(259)), "4m 19s");
+    }
+}
+
+#[cfg(test)]
+mod build_stamp_tests {
+    use super::{build_stamp, format_build_time};
+
+    /// The version alone cannot tell two builds of the same version apart, which
+    /// is the whole case for having this: rolling one out window by window, every
+    /// window says 0.3.0 and none says *which* 0.3.0.
+    #[test]
+    fn the_stamp_carries_more_than_the_version() {
+        let s = build_stamp();
+        assert!(s.starts_with(env!("CARGO_PKG_VERSION")), "{s}");
+        assert!(s.contains('·'), "no build time in {s:?}");
+        assert!(s.len() > env!("CARGO_PKG_VERSION").len() + 3, "{s}");
+    }
+
+    /// Read from the binary this process started from, so it does not change
+    /// under a running window when the file on disk is replaced.
+    #[test]
+    fn the_stamp_is_stable_within_a_process() {
+        assert_eq!(build_stamp(), build_stamp());
+    }
+
+    #[test]
+    fn a_build_time_reads_as_a_date() {
+        let t = |secs: u64| format_build_time(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+        );
+        // 2026-08-21 23:16:00 UTC — checked against a date library rather than
+        // guessed; my first guess for this constant was five days out, and the
+        // arithmetic was right.
+        assert_eq!(t(1_787_354_160), "Aug 21 23:16");
+        // Epoch itself, and a leap day, since the civil-date arithmetic is hand
+        // rolled rather than borrowed.
+        assert_eq!(t(0), "Jan 1 00:00");
+        assert_eq!(t(1_709_164_800), "Feb 29 00:00");
+        assert_eq!(t(1_735_689_599), "Dec 31 23:59");
     }
 }

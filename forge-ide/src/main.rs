@@ -503,6 +503,10 @@ impl Ide {
                     session::WindowFrame { x: p.x, y: p.y, w: size.width, h: size.height }
                 }),
                 maximized: w.window.is_maximized(),
+                // Stamped by `session::save_windows`, which is what knows the
+                // process it is writing for.
+                pid:  0,
+                seen: 0,
             })
             .collect()
     }

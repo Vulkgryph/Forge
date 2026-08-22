@@ -492,6 +492,51 @@ mod daemon_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The routing fix itself, which is what terminals surviving a restart
+    /// depends on: a session's output goes to the client that has it, and moves
+    /// when another client says it has it now.
+    ///
+    /// Previously every push went to whichever connection was newest, so B
+    /// received A's shell output the moment B connected — without asking, and
+    /// while A was still using it.
+    #[test]
+    fn a_sessions_output_follows_the_client_that_subscribes() {
+        let path = socket_for("routing");
+        daemon(&path);
+        let mut a = Client::connect(&path);
+        let mut b = Client::connect(&path);
+        const ID: u32 = 4242;
+
+        assert!(
+            a.call("pty/open", json!({ "id": ID, "cols": 80, "rows": 24, "cwd": "/tmp" }))
+                .error.is_none(),
+            "could not open a pty",
+        );
+
+        // A owns it: A sees output, B sees none — even though B connected after.
+        let _ = a.drain_notifications(Duration::from_millis(600));
+        assert!(a.call("pty/write", json!({ "id": ID, "data": b"echo one\n" })).error.is_none());
+        let to_a = a.drain_notifications(Duration::from_millis(800));
+        let to_b = b.drain_notifications(Duration::from_millis(200));
+        assert!(to_a.iter().any(|m| m.method.as_deref() == Some("pty/data")),
+                "the client that opened the session got no output");
+        assert!(!to_b.iter().any(|m| m.method.as_deref() == Some("pty/data")),
+                "a client that never asked for this session received its output");
+
+        // B reattaches — a window that restarted into a new process.
+        assert!(b.call("pty/subscribe", json!({ "id": ID })).error.is_none());
+        assert!(b.call("pty/write", json!({ "id": ID, "data": b"echo two\n" })).error.is_none());
+        let to_b = b.drain_notifications(Duration::from_millis(800));
+        let to_a = a.drain_notifications(Duration::from_millis(200));
+        assert!(to_b.iter().any(|m| m.method.as_deref() == Some("pty/data")),
+                "output did not follow the subscribing client");
+        assert!(!to_a.iter().any(|m| m.method.as_deref() == Some("pty/data")),
+                "the old client still receives a session it handed over");
+
+        let _ = b.call("pty/close", json!({ "id": ID }));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Subscribing to a session that is not there is an error rather than a
     /// silent success — a client that believes it is attached to a shell that
     /// does not exist waits forever for output.

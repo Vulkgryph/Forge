@@ -1683,6 +1683,9 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
 /// glance and even for a viewer who cannot see the colour change. Costs nothing
 /// when nothing is running: the panel already repaints on a 50ms cadence while a
 /// turn is live and not at all when it is not, so this adds no wakeups.
+/// What the user chose from the "a newer build is installed" banner.
+enum BuildUpdateAction { ThisWindow, Everything, Later }
+
 /// Which build this process is running.
 ///
 /// The version alone does not distinguish two builds of the same version, which
@@ -1696,14 +1699,54 @@ fn paint_dot(ui: &mut egui::Ui, color: egui::Color32) {
 fn build_stamp() -> &'static str {
     static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     STAMP.get_or_init(|| {
-        let built = std::env::current_exe()
-            .and_then(|p| p.metadata())
-            .and_then(|m| m.modified())
-            .ok()
-            .map(format_build_time)
+        let built = running_build().map(format_build_time)
             .unwrap_or_else(|| "unknown build".to_string());
         format!("{} · {built}", env!("CARGO_PKG_VERSION"))
     })
+}
+
+fn exe_mtime() -> Option<std::time::SystemTime> {
+    std::env::current_exe().and_then(|p| p.metadata()).and_then(|m| m.modified()).ok()
+}
+
+/// The binary this process started from, captured once.
+///
+/// Captured rather than read on demand: installing a new build replaces the file
+/// underneath a running process, and what this process is *running* does not
+/// change when that happens. That difference is the whole signal — see
+/// `newer_build_installed`.
+fn running_build() -> Option<std::time::SystemTime> {
+    static AT_START: std::sync::OnceLock<Option<std::time::SystemTime>> =
+        std::sync::OnceLock::new();
+    *AT_START.get_or_init(exe_mtime)
+}
+
+/// Whether a newer build has been installed since this process started.
+///
+/// Installing an update does not change a running window — it cannot, the
+/// process is already up. Until now nothing said so, which left the state where
+/// a user installs an update, sees no change, and has no way to tell whether it
+/// worked. Comparing what is on disk against what this process started from says
+/// it exactly.
+fn newer_build_installed() -> bool {
+    build_is_newer(running_build(), exe_mtime())
+}
+
+/// The comparison behind `newer_build_installed`, separated so both answers can
+/// be tested — the interesting one being "yes", which a test cannot arrange by
+/// replacing the binary it is running from.
+///
+/// Unknown either way is "not behind": a window that cannot read its own
+/// timestamp should say nothing rather than nag about an update it cannot
+/// confirm.
+fn build_is_newer(
+    started: Option<std::time::SystemTime>,
+    on_disk: Option<std::time::SystemTime>,
+) -> bool {
+    match (started, on_disk) {
+        (Some(started), Some(now)) => now > started,
+        _ => false,
+    }
 }
 
 /// A build time as `Aug 21 23:16` — local enough to compare against when you
@@ -3808,6 +3851,12 @@ pub struct IdeApp {
     show_update_prompt: bool,
     update_check_rx: Option<std::sync::mpsc::Receiver<Option<crate::update_check::UpdateAvailable>>>,
     update_available: Option<crate::update_check::UpdateAvailable>,
+    /// Whether a newer build is sitting on disk than the one this window is
+    /// running, and when that was last checked. Checked on a slow cadence
+    /// because it is a `stat`, and only while the window is drawing anyway — an
+    /// untouched window learning about it a few seconds late costs nothing.
+    build_is_stale: bool,
+    build_checked:  Option<std::time::Instant>,
     update_banner_dismissed: bool,
     /// AI-provider setup wizard — `Some` while open, regardless of which
     /// step it's on. `Some(ProviderPicker)` at startup when forge-agent has
@@ -4247,6 +4296,8 @@ impl IdeApp {
             show_update_prompt: false,
             update_check_rx: None,
             update_available: None,
+            build_is_stale: false,
+            build_checked:  None,
             update_banner_dismissed: false,
             onboarding: None,
         };
@@ -4454,6 +4505,22 @@ impl IdeApp {
         self.note_remote_session_end();
         self.save_session_for_reload();
         self.pending_reload = true;
+    }
+
+    /// Restart every window this process has, together.
+    ///
+    /// The "bring everything up to date" command, for when the piecemeal rollout
+    /// is finished with and the answer is just "all of it". Deliberately not on a
+    /// keyboard chord: it takes down every window at once, which is a thing to
+    /// choose from a menu or approve from the update banner, not to discover by
+    /// mistyping the per-window one.
+    ///
+    /// It covers the windows *in this process*. A window that has already been
+    /// restarted on its own is in a process of its own, and this cannot reach
+    /// there — but that window is then the only one in its process, where the
+    /// same command means the same thing.
+    pub fn restart_all_windows(&mut self) {
+        self.restart_process();
     }
 
     /// Restart this one window into a new process, leaving the others in this one.
@@ -6349,6 +6416,7 @@ impl IdeApp {
         self.draw_task_picker(ctx);
         self.draw_debug_panel(ctx);
         self.draw_update_prompt(ctx);
+        self.refresh_build_staleness();
         self.draw_update_banner(ctx);
         self.draw_onboarding_wizard(ctx);
     }
@@ -6624,9 +6692,70 @@ impl IdeApp {
         }
     }
 
+    /// How often to look for a newly installed build.
+    const BUILD_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+    fn refresh_build_staleness(&mut self) {
+        let due = self.build_checked
+            .is_none_or(|t| t.elapsed() >= Self::BUILD_CHECK_EVERY);
+        if !due { return; }
+        self.build_checked = Some(std::time::Instant::now());
+        let stale = newer_build_installed();
+        if stale && !self.build_is_stale {
+            // Said once, when it becomes true, rather than every check.
+            self.output_log(
+                format!("A newer build is installed. This window is running {} — \
+                         restart it (File → Restart This Window) to use the new one; \
+                         other windows keep running until you restart them too.",
+                        build_stamp()),
+                OutputLevel::Info,
+            );
+        }
+        self.build_is_stale = stale;
+    }
+
     /// Dismissible banner once a newer release is found. Purely informational
     /// — no auto-download, just a link to the release page.
     fn draw_update_banner(&mut self, ctx: &egui::Context) {
+        // A newer build actually *installed* outranks news of a newer release:
+        // one is something to read about, the other is something this window is
+        // not running yet.
+        if self.build_is_stale && !self.update_banner_dismissed {
+            let mut action: Option<BuildUpdateAction> = None;
+            let running = build_stamp().to_string();
+            egui::TopBottomPanel::top("build_stale_banner").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("A newer build is installed.")
+                        .strong().color(egui::Color32::from_rgb(230, 210, 150)));
+                    ui.label(egui::RichText::new(format!("This window is running {running}."))
+                        .color(egui::Color32::from_gray(190)));
+                    if ui.button("Restart this window").clicked() {
+                        action = Some(BuildUpdateAction::ThisWindow);
+                    }
+                    if ui.button("Restart all windows").clicked() {
+                        action = Some(BuildUpdateAction::Everything);
+                    }
+                    // The part worth saying out loud: this is not all-or-nothing.
+                    // One window can move to the new build while the others carry
+                    // on with whatever they are in the middle of.
+                    ui.label(egui::RichText::new(
+                        "— one window at a time is fine; the others keep running.")
+                        .size(11.0).color(egui::Color32::from_gray(140)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        if ui.button("×").clicked() { action = Some(BuildUpdateAction::Later); }
+                    });
+                });
+            });
+            match action {
+                Some(BuildUpdateAction::ThisWindow) => self.restart_window(),
+                Some(BuildUpdateAction::Everything) => self.restart_all_windows(),
+                Some(BuildUpdateAction::Later) => self.update_banner_dismissed = true,
+                None => {}
+            }
+            return;
+        }
         let Some(update) = &self.update_available else { return };
         if self.update_banner_dismissed { return; }
         let (version, url) = (update.latest_version.clone(), update.url.clone());
@@ -11027,19 +11156,21 @@ impl IdeApp {
                     // Which build *this* window is running. With a new build
                     // rolled out one window at a time, they are not all the same
                     // and the version number alone cannot tell them apart.
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(
-                            egui::RichText::new(format!("Forge IDE {}", build_stamp())).size(11.0),
-                        ),
-                    );
+                    let label = if self.build_is_stale {
+                        format!("Forge IDE {} — newer build installed", build_stamp())
+                    } else {
+                        format!("Forge IDE {}", build_stamp())
+                    };
+                    ui.add_enabled(false, egui::Button::new(
+                        egui::RichText::new(label).size(11.0),
+                    ));
                     // Separate because it is a different blast radius, not a
                     // stronger version of the same thing: every window's
                     // conversations and language servers go down with it. The
                     // reasons to want it are a newly built binary and an SSH
                     // session that needs re-establishing.
-                    if ui.button("Restart Forge (All Windows)").clicked() {
-                        self.restart_process();
+                    if ui.button("Restart All Windows").clicked() {
+                        self.restart_all_windows();
                         ui.close_menu();
     }
                 });
@@ -15596,5 +15727,80 @@ mod build_stamp_tests {
         assert_eq!(t(0), "Jan 1 00:00");
         assert_eq!(t(1_709_164_800), "Feb 29 00:00");
         assert_eq!(t(1_735_689_599), "Dec 31 23:59");
+    }
+}
+
+#[cfg(test)]
+mod stale_build_tests {
+    use super::{IdeApp, NewWindowSpec, build_stamp, exe_mtime, newer_build_installed};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-stale-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Installing a build cannot change a running process, so "am I behind?" is a
+    /// question about the file on disk versus the one this process started from.
+    /// Nothing has replaced it during the test, so nothing is stale.
+    #[test]
+    fn a_process_running_its_own_binary_is_not_behind() {
+        assert!(exe_mtime().is_some(), "no binary to compare against");
+        assert!(!newer_build_installed());
+    }
+
+    /// And a window says which build it is on, which is what makes a staggered
+    /// rollout legible: the ones that are behind can be told from the ones that
+    /// are not.
+    #[test]
+    fn a_window_records_the_build_it_opened_with() {
+        let app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("stamp")), ..Default::default()
+        });
+        assert!(
+            app.output_log.iter().any(|(m, _)| m.contains(build_stamp())),
+            "a window opened without saying what it is running",
+        );
+        // Nothing has been installed over it, so no banner and no menu note.
+        assert!(!app.build_is_stale);
+    }
+
+    /// The direction that matters, which cannot be arranged by replacing the
+    /// binary a test is running from: a file on disk newer than the one this
+    /// process started from means this window is behind.
+    #[test]
+    fn a_newer_file_on_disk_means_behind() {
+        use super::build_is_newer;
+        use std::time::{Duration, SystemTime};
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_787_354_160);
+        let later   = started + Duration::from_secs(60);
+
+        assert!(build_is_newer(Some(started), Some(later)), "a new build went unnoticed");
+        assert!(!build_is_newer(Some(started), Some(started)), "same build reported as new");
+        // Rolling *back* to an older build is not "behind" either — it is what is
+        // running, and nagging about it would be wrong.
+        assert!(!build_is_newer(Some(later), Some(started)));
+        // And an unreadable timestamp says nothing rather than nagging about an
+        // update it cannot confirm.
+        assert!(!build_is_newer(None, Some(later)));
+        assert!(!build_is_newer(Some(started), None));
+        assert!(!build_is_newer(None, None));
+    }
+
+    /// The check is throttled: it is a filesystem call, and this runs from the
+    /// draw loop. A stale-build notice arriving a few seconds late costs nothing;
+    /// a `stat` per frame is not free.
+    #[test]
+    fn the_check_does_not_run_every_frame() {
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("throttle")), ..Default::default()
+        });
+        app.refresh_build_staleness();
+        let first = app.build_checked.expect("the first check did not happen");
+        app.refresh_build_staleness();
+        assert_eq!(app.build_checked, Some(first), "checked again immediately");
     }
 }

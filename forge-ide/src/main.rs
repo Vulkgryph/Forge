@@ -149,25 +149,55 @@ fn parse_window_args(args: &[String]) -> WindowArgs {
     out
 }
 
+/// Turn recorded windows into specs, reconnecting the ones that named a host.
+///
+/// `hosts` is passed in rather than read here so this can be exercised without
+/// the machine's own SSH config — and so the config is read once for a whole set
+/// rather than per window.
+fn specs_from_records(
+    rs:        Vec<session::WindowRecord>,
+    is_reload: bool,
+    hosts:     &[ssh::SshHost],
+) -> Vec<NewWindowSpec> {
+    rs.into_iter()
+        // A folder that has since been deleted or moved is dropped rather than
+        // opening a window onto a path that is not there.
+        .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
+        .map(|r| {
+            // A recorded host is reconnected to by name. One that has since been
+            // renamed or removed from the config opens the window locally —
+            // guessing at a connection is worse than not making one.
+            let ssh_host = r.remote_host.as_ref().and_then(|name| {
+                hosts.iter().find(|h| &h.name == name).cloned().map(|mut h| {
+                    // The folder open on the remote is per window, so it comes
+                    // from the record; everything else about the host comes from
+                    // the config, where it is kept once.
+                    if let Some(dir) = r.remote_dir.clone() { h.remote_dir = dir; }
+                    h
+                })
+            });
+            NewWindowSpec {
+                cwd: r.cwd, frame: r.frame, maximized: r.maximized,
+                window_id: r.id, ssh_host, is_reload, reload_count: 0,
+            }
+        })
+        .collect()
+}
+
 fn plan_initial_windows(
     args:            WindowArgs,
     remembered:      impl FnOnce() -> Vec<session::WindowRecord>,
     restore_windows: bool,
 ) -> Vec<NewWindowSpec> {
     let WindowArgs { is_reload, only, cwds } = args;
-    // A folder that has since been deleted or moved is dropped rather than
-    // opening a window onto a path that is not there.
-    fn still_there(r: &session::WindowRecord) -> bool {
-        r.cwd.as_ref().is_none_or(|p| p.is_dir())
-    }
     fn from_records(rs: Vec<session::WindowRecord>, is_reload: bool) -> Vec<NewWindowSpec> {
-        rs.into_iter()
-            .filter(still_there)
-            .map(|r| NewWindowSpec {
-                cwd: r.cwd, frame: r.frame, maximized: r.maximized,
-                window_id: r.id, ssh_host: None, is_reload, reload_count: 0,
-            })
-            .collect()
+        // The config is only read when some window actually names a host.
+        let hosts = if rs.iter().any(|r| r.remote_host.is_some()) {
+            ssh::load_hosts()
+        } else {
+            Vec::new()
+        };
+        specs_from_records(rs, is_reload, &hosts)
     }
     fn from_paths(cwds: Vec<Option<std::path::PathBuf>>, is_reload: bool) -> Vec<NewWindowSpec> {
         cwds.into_iter()
@@ -503,6 +533,10 @@ impl Ide {
                     session::WindowFrame { x: p.x, y: p.y, w: size.width, h: size.height }
                 }),
                 maximized: w.window.is_maximized(),
+                // So a window restarted into a new process connects again
+                // instead of coming back local.
+                remote_host: w.app.remote_identity().map(|(h, _)| h),
+                remote_dir:  w.app.remote_identity().map(|(_, d)| d),
                 // Stamped by `session::save_windows`, which is what knows the
                 // process it is writing for.
                 pid:  0,
@@ -714,6 +748,8 @@ impl ApplicationHandler for Ide {
         // track the earliest repaint any of them asked for.
         let mut new_specs: Vec<NewWindowSpec> = Vec::new();
         let mut restart_ids: Vec<(WindowId, u64, Option<std::path::PathBuf>)> = Vec::new();
+        let mut consolidate: Option<Vec<Option<std::path::PathBuf>>> = None;
+        let mut quit_now = false;
         let mut reload_requested = false;
         let mut earliest: Option<std::time::Instant> = None;
         for win in &mut self.windows {
@@ -744,8 +780,60 @@ impl ApplicationHandler for Ide {
             if std::mem::take(&mut win.app.pending_window_restart) {
                 restart_ids.push((win.id, win.app.window_id, win.app.workspace_root()));
             }
+            if let Some(folders) = win.app.pending_consolidate.take() {
+                consolidate = Some(folders);
+            }
+            // Another process is taking this one's windows: leave, rather than
+            // coming back as a replacement.
+            if std::mem::take(&mut win.app.pending_quit) {
+                quit_now = true;
+            }
         }
         self.pending.extend(new_specs);
+
+        // Somebody else is taking our windows. Their state is already saved and
+        // their entries are still in the record, which is where the process
+        // taking over reads them from — so there is nothing left to do but go.
+        if quit_now {
+            #[cfg(feature = "vulkan-renderer")]
+            for win in &mut self.windows {
+                win.egui.destroy(win.gfx.device());
+            }
+            event_loop.exit();
+            return;
+        }
+
+        // Every window, from every process, into one new process — and this one
+        // ends with them. Spawned with the full folder list rather than letting
+        // the new process read the record, because the processes handing over are
+        // still writing to it as they go.
+        if let Some(folders) = consolidate {
+            let exe = std::env::current_exe().unwrap_or_default();
+            if exe.as_os_str().is_empty() || !exe.exists() {
+                eprintln!("consolidate: couldn't resolve current_exe, staying open");
+            } else {
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg("--reload");
+                for f in &folders {
+                    cmd.arg(match f {
+                        Some(p) => p.to_string_lossy().into_owned(),
+                        None    => NO_FOLDER.to_string(),
+                    });
+                }
+                self.write_windows(true);
+                match cmd.spawn() {
+                    Ok(_) => {
+                        #[cfg(feature = "vulkan-renderer")]
+                        for win in &mut self.windows {
+                            win.egui.destroy(win.gfx.device());
+                        }
+                        event_loop.exit();
+                        return;
+                    }
+                    Err(e) => eprintln!("consolidate: could not start a new process: {e}"),
+                }
+            }
+        }
 
         // One window into a process of its own. Spawned first, so if that fails
         // the window is still here rather than closed with nothing to replace it.
@@ -1072,6 +1160,60 @@ mod startup_tests {
     fn with_no_monitors_reported_the_frame_is_kept() {
         let f = frame(10, 20, 800, 600);
         assert_eq!(onscreen_frame(f, &[]), Some(f));
+    }
+
+    /// A remote window restarted into a new process used to come back local: a
+    /// connection cannot travel through an argument list, and the record did not
+    /// carry one. The host's name does travel, and everything else about it is
+    /// read back from the SSH config.
+    #[test]
+    fn a_recorded_remote_window_reopens_against_its_host() {
+        let dir = std::env::temp_dir();
+        let hosts = vec![ssh::SshHost {
+            name: "admin-1".into(), host: "spark.local".into(), port: 22,
+            user: "sysadmin".into(), key_path: "/keys/id_ed25519".into(),
+            remote_dir: "~".into(),
+        }];
+        let rec = session::WindowRecord {
+            cwd: Some(dir.clone()),
+            remote_host: Some("admin-1".into()),
+            remote_dir: Some("/home/sysadmin/code".into()),
+            ..Default::default()
+        };
+
+        let spec = specs_from_records(vec![rec], true, &hosts).remove(0);
+        let host = spec.ssh_host.expect("the window came back local");
+        assert_eq!(host.name, "admin-1");
+        // The connection's details come from the config, not from the record —
+        // one copy, so they cannot disagree.
+        assert_eq!(host.user, "sysadmin");
+        assert_eq!(host.port, 22);
+        // The folder open *on the remote* does come from the record, since that
+        // is per window rather than per host.
+        assert_eq!(host.remote_dir, "/home/sysadmin/code");
+    }
+
+    /// A host that has since been renamed or removed is not guessed at: the
+    /// window opens locally rather than connecting somewhere unasked.
+    #[test]
+    fn an_unknown_host_reopens_locally() {
+        let rec = session::WindowRecord {
+            cwd: Some(std::env::temp_dir()),
+            remote_host: Some("a-host-that-was-deleted".into()),
+            ..Default::default()
+        };
+        let spec = specs_from_records(vec![rec], true, &[]).remove(0);
+        assert!(spec.ssh_host.is_none(), "connected to a host that is not configured");
+        assert!(spec.cwd.is_some(), "and it still opens its folder");
+    }
+
+    /// A local window records no host and gets none back.
+    #[test]
+    fn a_local_window_stays_local() {
+        let rec = session::WindowRecord {
+            cwd: Some(std::env::temp_dir()), ..Default::default()
+        };
+        assert!(specs_from_records(vec![rec], true, &[]).remove(0).ssh_host.is_none());
     }
 
     /// Geometry cannot travel through the argument list, so a reload has to take

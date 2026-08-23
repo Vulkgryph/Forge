@@ -502,6 +502,17 @@ pub struct WindowRecord {
     /// launch came back missing them.
     #[serde(default)]
     pub pid: u32,
+    /// The remote host this window was connected to, by the name it has in the
+    /// SSH config, and the folder it had open there.
+    ///
+    /// The name rather than the whole connection: the host's user, port and key
+    /// live in the SSH config already, and copying them here would be a second
+    /// copy to go stale. Looked up again on open; a host that has since been
+    /// renamed or removed reopens the window locally rather than guessing.
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_dir:  Option<String>,
     /// When this entry was last written, as seconds since the epoch. A process
     /// that dies without deregistering leaves its entries behind; they are kept
     /// for as long as its saved session is (see `SESSION_KEEP`) and then go, so a
@@ -518,12 +529,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// Only the folder is recorded, not a remote connection. `IdeApp` tracks a
-// *pending* SSH host rather than an established one, so there is no reliable way
-// to ask a connected window which host it is on — and reopening against a guess
-// would connect somewhere the user did not ask for. A remote window therefore
-// reopens as its folder; reconnecting stays manual until the app tracks the live
-// host.
+// The remote connection *is* recorded now, by host name. This used to say it
+// could not be: the app tracked a pending SSH host rather than an established
+// one, so there was no reliable way to ask a connected window where it was. There
+// is now — a live connection carries its own host — and without this a window
+// restarted into a new process came back local, because a connection cannot
+// travel through an argument list. Only the name travels; everything else about
+// the host is read from the SSH config on the way back in.
 
 fn windows_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("forge-ide").join("windows.json"))

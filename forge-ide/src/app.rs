@@ -4089,6 +4089,12 @@ pub struct IdeApp {
     pub pending_window_reload: bool,
     /// Restart this one window into a process of its own. See `restart_window`.
     pub pending_window_restart: bool,
+    /// Reopen *these* folders in one new process and end this one — the window
+    /// list gathered from every Forge process, not just this one's. See
+    /// `consolidate_windows`.
+    pub pending_consolidate: Option<Vec<Option<PathBuf>>>,
+    /// Exit without replacing this process: another one is taking its windows.
+    pub pending_quit: bool,
     /// Which rebuild of this window this is. See `NewWindowSpec::reload_count`.
     reload_count: u32,
     /// SSH host to connect on the first draw (set by new_with_spec).
@@ -4307,6 +4313,8 @@ impl IdeApp {
             pending_reload:      false,
             pending_window_reload: false,
             pending_window_restart: false,
+            pending_consolidate: None,
+            pending_quit: false,
             reload_count: spec_reload_count,
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
@@ -4539,6 +4547,57 @@ impl IdeApp {
         self.restart_process();
     }
 
+    /// Bring every window back into one process.
+    ///
+    /// The rollout leaves a process per window, and macOS gives every instance of
+    /// an app its own Dock tile — so three projects rolled out one at a time is
+    /// three Forge icons, and the pinned one goes dark once the instance it was
+    /// associated with has been replaced. That is the cost of the model, and this
+    /// is the way back from it: when the rollout is done and every window is on
+    /// the new build, collapse them into a single process again.
+    ///
+    /// The window list comes from the record rather than from this process, which
+    /// only knows its own windows. The record knows all of them because each
+    /// process writes its own entries and keeps everyone else's.
+    pub fn consolidate_windows(&mut self) {
+        let mut folders: Vec<Option<PathBuf>> = crate::session::load_windows()
+            .into_iter()
+            .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
+            .map(|r| r.cwd)
+            .collect();
+        // This process's own windows may not be in the record yet — a window
+        // opened seconds ago writes on a settle timer.
+        for w in self.agent_windows_hint() {
+            if !folders.contains(&w) { folders.push(w); }
+        }
+        if folders.is_empty() { folders.push(self.workspace_root()); }
+
+        let reached = crate::ptyhost::shared()
+            .map(|c| c.broadcast("handover"))
+            .unwrap_or_else(|| Err("no pty host to carry it".into()));
+        match reached {
+            Ok(n) => self.output_log(
+                format!("Collecting {} window(s) from {} other process{} into this one",
+                        folders.len(), n, if n == 1 { "" } else { "es" }),
+                OutputLevel::Info,
+            ),
+            Err(e) => self.output_log(
+                format!("Could not reach the other processes ({e}) — they will keep their \
+                         own windows; close them by hand to finish consolidating"),
+                OutputLevel::Warn,
+            ),
+        }
+
+        self.save_session_for_reload();
+        self.pending_consolidate = Some(folders);
+    }
+
+    /// This window's folder, as a one-item list — the record is authoritative for
+    /// everything else, and this is the entry most likely to be missing from it.
+    fn agent_windows_hint(&self) -> Vec<Option<PathBuf>> {
+        vec![self.workspace_root()]
+    }
+
     /// Ask every Forge window, in every process, to restart.
     ///
     /// One process can only restart its own windows. Once windows have been
@@ -4577,12 +4636,28 @@ impl IdeApp {
     fn poll_broadcasts(&mut self) {
         let Some(client) = crate::ptyhost::shared() else { return };
         for kind in client.take_broadcasts() {
-            if kind == "restart" {
-                self.output_log(
-                    "Another Forge window asked everything to restart".to_string(),
-                    OutputLevel::Info,
-                );
-                self.restart_all_windows();
+            match kind.as_str() {
+                "restart" => {
+                    self.output_log(
+                        "Another Forge window asked everything to restart".to_string(),
+                        OutputLevel::Info,
+                    );
+                    self.restart_all_windows();
+                }
+                // Somebody is collecting every window into one process. Save
+                // what this window has and step aside — *without* replacing this
+                // process, which is the difference from a restart, and without
+                // deregistering its windows from the record, which is where the
+                // process taking over reads them from.
+                "handover" => {
+                    self.output_log(
+                        "Handing this window over to another Forge process".to_string(),
+                        OutputLevel::Info,
+                    );
+                    self.save_session_for_reload();
+                    self.pending_quit = true;
+                }
+                _ => {}
             }
         }
     }
@@ -11088,6 +11163,18 @@ impl IdeApp {
         }
     }
 
+    /// The host this window is connected to and the folder it has open there, for
+    /// the record — so a restart into a new process can connect again rather than
+    /// coming back local.
+    pub fn remote_identity(&self) -> Option<(String, String)> {
+        let ssh = self.ssh.as_ref()?;
+        // The name is what the SSH config calls it, which is what can be looked
+        // up again. A host reached by address with no config entry has no name to
+        // record, and is not guessed at on the way back.
+        (!ssh.host.name.is_empty())
+            .then(|| (ssh.host.name.clone(), ssh.host.remote_dir.clone()))
+    }
+
     /// The remote workspace root as an absolute path, or `None` when this window
     /// is local.
     ///
@@ -11465,6 +11552,12 @@ impl IdeApp {
                     // individually and now live in several.
                     if ui.button("Restart Every Window (all processes)").clicked() {
                         self.restart_every_window();
+                        ui.close_menu();
+    }
+                    // The way back to one process, and one Dock icon, after a
+                    // window-by-window rollout has left several.
+                    if ui.button("Collect All Windows Into One Process").clicked() {
+                        self.consolidate_windows();
                         ui.close_menu();
     }
                 });

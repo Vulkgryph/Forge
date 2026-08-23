@@ -4531,19 +4531,14 @@ impl IdeApp {
         self.pending_reload = true;
     }
 
-    /// Restart every window this process has, together.
+    /// Restart the windows *this* process has.
     ///
-    /// The "bring everything up to date" command, for when the piecemeal rollout
-    /// is finished with and the answer is just "all of it". Deliberately not on a
-    /// keyboard chord: it takes down every window at once, which is a thing to
-    /// choose from a menu or approve from the update banner, not to discover by
-    /// mistyping the per-window one.
-    ///
-    /// It covers the windows *in this process*. A window that has already been
-    /// restarted on its own is in a process of its own, and this cannot reach
-    /// there — but that window is then the only one in its process, where the
-    /// same command means the same thing.
-    pub fn restart_all_windows(&mut self) {
+    /// Not offered as a command any more: a menu with both this and the
+    /// cross-process restart on it asked the user to care which process a window
+    /// happens to live in, which is exactly the thing they should not have to
+    /// think about. It stays as the thing a process does when it *receives* the
+    /// broadcast — one process's share of a restart everyone was asked to make.
+    fn restart_all_windows(&mut self) {
         self.restart_process();
     }
 
@@ -6908,7 +6903,7 @@ impl IdeApp {
                     if ui.button("Restart this window").clicked() {
                         action = Some(BuildUpdateAction::ThisWindow);
                     }
-                    if ui.button("Restart everything").clicked() {
+                    if ui.button("Restart all windows").clicked() {
                         action = Some(BuildUpdateAction::Everything);
                     }
                     // The part worth saying out loud: this is not all-or-nothing.
@@ -11544,13 +11539,15 @@ impl IdeApp {
                     // conversations and language servers go down with it. The
                     // reasons to want it are a newly built binary and an SSH
                     // session that needs re-establishing.
+                    // One item, not two. There used to be a process-scoped
+                    // restart beside this one, and the names — "All Windows"
+                    // against "Every Window" — carried none of the difference:
+                    // "all" that quietly meant "some of them" is a trap, and
+                    // nobody wants to restart a subset chosen by which process
+                    // a window happens to live in. This is every window there
+                    // is; when the message cannot reach the other processes it
+                    // says so and does what it can.
                     if ui.button("Restart All Windows").clicked() {
-                        self.restart_all_windows();
-                        ui.close_menu();
-    }
-                    // Across processes, for when windows have been restarted
-                    // individually and now live in several.
-                    if ui.button("Restart Every Window (all processes)").clicked() {
                         self.restart_every_window();
                         ui.close_menu();
     }

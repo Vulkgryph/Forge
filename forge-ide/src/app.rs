@@ -3995,6 +3995,9 @@ pub struct IdeApp {
     /// native dialog on a remote workspace — that browses this machine, which
     /// is the one the user is not working on.
     remote_picker:   Option<RemotePicker>,
+    /// The "New Folder…" prompt, and the result of the last attempt.
+    remote_new_folder: Option<RemoteNewFolder>,
+    mkdir_rx:          Option<mpsc::Receiver<Result<String, String>>>,
     /// Listing in flight for the picker, kept separate from `ssh_nav_rx` so
     /// browsing in the dialog does not disturb the explorer's own position.
     picker_rx:       Option<mpsc::Receiver<Result<(String, Vec<crate::ssh::RemoteEntry>), String>>>,
@@ -4092,6 +4095,14 @@ pub struct IdeApp {
     pending_ssh_connect: Option<crate::ssh::SshHost>,
 }
 
+/// Asking for a folder on the remote, and where.
+struct RemoteNewFolder {
+    parent: String,
+    name:   String,
+    error:  Option<String>,
+    busy:   bool,
+}
+
 /// State of the remote folder chooser.
 struct RemotePicker {
     /// Directory being shown. Absolute on the remote, or `~` before the first
@@ -4102,6 +4113,9 @@ struct RemotePicker {
     /// looking frozen on a slow link.
     loading: bool,
     error:   Option<String>,
+    /// What is in the path box. Kept apart from `path`, which is where the
+    /// listing came from — otherwise every keystroke would look like navigation.
+    typed:   String,
 }
 
 impl IdeApp {
@@ -4250,6 +4264,8 @@ impl IdeApp {
             ssh_log_rx:       None,
             ssh_nav_rx:      None,
             remote_picker:   None,
+            remote_new_folder: None,
+            mkdir_rx:          None,
             picker_rx:       None,
             ssh_open_rx:     None,
             ssh_upload_rx:   None,
@@ -5654,6 +5670,10 @@ impl IdeApp {
             match rx.try_recv() {
                 Ok(Ok((path, entries))) => {
                     if let Some(p) = &mut self.remote_picker {
+                        // The box follows a successful listing, so walking the
+                        // tree keeps it accurate and a typed path that worked is
+                        // left as typed.
+                        p.typed = path.clone();
                         p.path = path;
                         // Directories only: this chooses a workspace, and a
                         // file in the list is something to mis-click.
@@ -5674,6 +5694,36 @@ impl IdeApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => { self.picker_rx = None; }
+            }
+        }
+
+        // Poll a remote mkdir
+        if let Some(rx) = &self.mkdir_rx {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.mkdir_rx = None;
+                    self.remote_new_folder = None;
+                    self.output_log(format!("Created {path}"), OutputLevel::Success);
+                    // Show it: the folder exists but the listing on screen was
+                    // taken before it did.
+                    if let Some((here, _)) = self.ssh_tree.pop() {
+                        self.ssh_navigate(here);
+                    }
+                    // And if the chooser is open, re-list there too.
+                    if let Some(p) = &self.remote_picker {
+                        let at = p.path.clone();
+                        self.picker_list(at);
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.mkdir_rx = None;
+                    if let Some(p) = &mut self.remote_new_folder {
+                        p.busy = false;
+                        p.error = Some(e);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => { self.mkdir_rx = None; }
             }
         }
 
@@ -6360,6 +6410,7 @@ impl IdeApp {
         if self.settings_open { self.draw_settings(ctx); }
         self.draw_host_key_dialogs(ctx);
         self.draw_remote_folder_picker(ctx);
+        self.draw_remote_new_folder(ctx);
 
         // ── SSH quick-pick overlay ────────────────────────────────────────────
         if self.ssh_overlay {
@@ -10118,6 +10169,11 @@ impl IdeApp {
         let mut open_path: Option<String> = None;
         let mut push_dir:  Option<String> = None;
         let mut pop = false;
+        // Chosen from the context menu, acted on after the rows are drawn — the
+        // tree is borrowed for drawing while the menu is open.
+        let mut new_dir_in:    Option<String> = None;
+        let mut open_workspace: Option<String> = None;
+        let mut refresh = false;
         // Remote row geometry, so a dropped file can be attributed to the
         // directory it landed on (see the drop handling after the scroll area).
         let panel_rect = ui.max_rect();
@@ -10193,12 +10249,66 @@ impl IdeApp {
                             if entry.is_dir { push_dir = Some(entry.path.clone()); }
                             else            { open_path = Some(entry.path.clone()); }
         }
+                        // Right-click, which on this tree did nothing at all —
+                        // the local tree has had a menu here since it was
+                        // written, and a remote workspace is where you are least
+                        // able to fall back on Finder.
+                        resp.context_menu(|ui| {
+                            ui.set_min_width(190.0);
+                            // A folder's own contents; a file's containing
+                            // folder, since that is where a sibling would go.
+                            let dir = if entry.is_dir {
+                                entry.path.clone()
+                            } else {
+                                remote_parent(&entry.path)
+                            };
+                            if ui.button("New Folder…").clicked() {
+                                new_dir_in = Some(dir.clone());
+                                ui.close_menu();
+                            }
+                            if entry.is_dir && ui.button("Open This Folder").clicked() {
+                                open_workspace = Some(entry.path.clone());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Copy Path").clicked() {
+                                ui.output_mut(|o| o.copied_text = entry.path.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("Refresh").clicked() {
+                                refresh = true;
+                                ui.close_menu();
+                            }
+                        });
     }
                 } else if self.ssh_nav_rx.is_some() {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| { ui.add_space(8.0); ui.spinner(); });
 }
             });
+
+        // The same menu for the empty space below the rows, which is where you
+        // right-click when what you want is "a new folder *here*" and there is no
+        // row that means here.
+        let here = self.ssh_tree.last().map(|(p, _)| p.clone());
+        if let Some(here) = here {
+            ui.interact(panel_rect, ui.id().with("ssh_tree_bg"), egui::Sense::click())
+                .context_menu(|ui| {
+                    ui.set_min_width(190.0);
+                    if ui.button("New Folder…").clicked() {
+                        new_dir_in = Some(here.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Copy Path").clicked() {
+                        ui.output_mut(|o| o.copied_text = here.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Refresh").clicked() {
+                        refresh = true;
+                        ui.close_menu();
+                    }
+                });
+        }
 
         // ── Dropped files upload to the remote ────────────────────────────
         // Local drops copy into a local folder; on a remote workspace the
@@ -10224,6 +10334,17 @@ impl IdeApp {
         if pop { self.ssh_tree.pop(); }
         if let Some(dir) = push_dir  { self.ssh_navigate(dir); }
         if let Some(path) = open_path { self.ssh_open_file(path); }
+        if let Some(dir) = new_dir_in { self.remote_new_folder = Some(RemoteNewFolder {
+            parent: dir, name: String::new(), error: None, busy: false,
+        }); }
+        if let Some(path) = open_workspace { self.open_remote_workspace(path); }
+        if refresh {
+            // Re-list where we are: the same request the explorer makes when it
+            // navigates, so a folder made outside Forge shows up.
+            if let Some((here, _)) = self.ssh_tree.pop() {
+                self.ssh_navigate(here);
+            }
+        }
     }
 
     /// Send dropped local files to a remote directory, then refresh the view.
@@ -11010,6 +11131,7 @@ impl IdeApp {
                 entries: Vec::new(),
                 loading: true,
                 error: None,
+                typed: start.clone(),
             });
             self.picker_list(start);
             return;
@@ -11020,6 +11142,96 @@ impl IdeApp {
             let result = rfd::FileDialog::new().pick_folder();
             let _ = tx.send(result);
         });
+    }
+
+    /// Ask the remote to make a directory, then show it.
+    fn remote_mkdir(&mut self, path: String) {
+        let Some(handles) = self.ssh.as_ref().map(|s| s.fs_handles()) else { return };
+        let (tx, rx) = mpsc::channel();
+        self.mkdir_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::ssh::fs_mkdir_with(
+                &handles, &path, std::time::Duration::from_secs(15),
+            ).map(|()| path);
+            let _ = tx.send(result);
+            crate::wake::wake();
+        });
+    }
+
+    /// "New Folder…", asked plainly: where it will go, and what to call it.
+    fn draw_remote_new_folder(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &self.remote_new_folder else { return };
+        let (parent, mut name, error, busy) =
+            (prompt.parent.clone(), prompt.name.clone(), prompt.error.clone(), prompt.busy);
+        let mut create = false;
+        let mut cancel = false;
+
+        egui::Window::new("remote_new_folder")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(460.0)
+            .frame(egui::Frame::popup(ctx.style().as_ref())
+                .fill(egui::Color32::from_rgb(37, 37, 38))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
+                .rounding(6.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("New folder").size(14.0).strong()
+                    .color(egui::Color32::from_gray(230)));
+                ui.add_space(2.0);
+                // Where, in full: a name alone does not say which folder it lands
+                // in, and on a remote tree you may be several levels from where
+                // you think you are.
+                ui.label(egui::RichText::new(format!("in {parent}"))
+                    .monospace().size(11.0).color(egui::Color32::from_rgb(150, 205, 210)));
+                ui.add_space(6.0);
+                let resp = ui.add(egui::TextEdit::singleline(&mut name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("name, or a/nested/path"));
+                resp.request_focus();
+                // Enter is the button, since typing a name and reaching for the
+                // mouse is not how anyone makes a folder.
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    create = true;
+                }
+                if let Some(e) = &error {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(e).size(11.0)
+                        .color(egui::Color32::from_rgb(235, 130, 120)));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                    } else {
+                        if ui.add_enabled(!name.trim().is_empty(),
+                                          egui::Button::new("Create")).clicked() {
+                            create = true;
+                        }
+                        if ui.button("Cancel").clicked() { cancel = true; }
+                    }
+                });
+                ui.add_space(4.0);
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { cancel = true; }
+
+        if let Some(p) = &mut self.remote_new_folder { p.name = name.clone(); }
+        if cancel {
+            self.remote_new_folder = None;
+            self.mkdir_rx = None;
+            return;
+        }
+        if create && !name.trim().is_empty() && !busy {
+            let path = format!("{}/{}", parent.trim_end_matches('/'), name.trim().trim_matches('/'));
+            if let Some(p) = &mut self.remote_new_folder {
+                p.busy = true;
+                p.error = None;
+            }
+            self.remote_mkdir(path);
+        }
     }
 
     /// The remote folder chooser.
@@ -11041,6 +11253,10 @@ impl IdeApp {
         let mut go: Option<String> = None;
         let mut choose = false;
         let mut cancel = false;
+        let mut new_folder_here = false;
+        // The box starts as wherever the list is, so typing means editing that
+        // path rather than retyping it from `/`.
+        let mut typed = picker.typed.clone();
 
         egui::Window::new("remote_folder_picker")
             .title_bar(false)
@@ -11058,10 +11274,23 @@ impl IdeApp {
                 ui.label(egui::RichText::new(format!("Open folder on {host}"))
                     .size(14.0).strong().color(egui::Color32::from_gray(230)));
                 ui.add_space(4.0);
-                // The path is the thing being chosen, so it is shown in full
-                // and monospaced rather than abbreviated.
-                ui.label(egui::RichText::new(&path).monospace().size(11.5)
-                    .color(egui::Color32::from_rgb(150, 205, 210)));
+                // The path, editable. Clicking down through a tree is fine when
+                // you are looking for a folder and hopeless when you already
+                // know where it is — and on a remote box the answer is usually
+                // already known, from a terminal in the next panel.
+                ui.horizontal(|ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut typed)
+                        .desired_width(ui.available_width() - 150.0)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("/path/on/the/remote"));
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        // Go there, rather than opening it blind: the listing
+                        // that comes back is the confirmation it exists.
+                        go = Some(typed.trim().to_string());
+                    }
+                    if ui.button("Go").clicked() { go = Some(typed.trim().to_string()); }
+                    if ui.button("New Folder…").clicked() { new_folder_here = true; }
+                });
                 ui.add_space(6.0);
                 ui.separator();
 
@@ -11104,10 +11333,16 @@ impl IdeApp {
                 ui.add_space(6.0);
             });
 
+        if let Some(p) = &mut self.remote_picker { p.typed = typed; }
+        if new_folder_here {
+            self.remote_new_folder = Some(RemoteNewFolder {
+                parent: path.clone(), name: String::new(), error: None, busy: false,
+            });
+        }
         if cancel {
             self.remote_picker = None;
             self.picker_rx = None;
-        } else if let Some(next) = go {
+        } else if let Some(next) = go.filter(|p| !p.is_empty()) {
             if let Some(p) = &mut self.remote_picker {
                 p.loading = true;
             }

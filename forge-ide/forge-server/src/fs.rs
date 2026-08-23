@@ -35,6 +35,23 @@ pub fn write(path: &str, text: &str) -> Result<(), String> {
     fs::write(&expanded, text).map_err(|e| format!("{expanded}: {e}"))
 }
 
+/// Create a directory, and any parent it needs.
+///
+/// `write` already creates the parents of a file, but a folder someone wants to
+/// put files in later has no file to hang off — and asking for one to be made is
+/// the ordinary thing to want from a file tree.
+///
+/// Refuses when something is already there, rather than reporting success for a
+/// directory it did not create. `create_dir_all` is happy to do nothing, which
+/// would make a typo look like it worked.
+pub fn mkdir(path: &str) -> Result<(), String> {
+    let expanded = expand_home(path);
+    if std::path::Path::new(&expanded).exists() {
+        return Err(format!("{expanded}: already exists"));
+    }
+    fs::create_dir_all(&expanded).map_err(|e| format!("{expanded}: {e}"))
+}
+
 fn expand_home(path: &str) -> String {
     if path.starts_with('~') {
         // Try $HOME first, then fall back to /etc/passwd via getpwuid.

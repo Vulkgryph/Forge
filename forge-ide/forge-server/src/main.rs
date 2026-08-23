@@ -223,6 +223,15 @@ fn handle_request(
                 Err(e) => Rpc::err(id, -32000, &e),
             }
         }
+        "fs/mkdir" => {
+            let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
+                return Rpc::err(id, -32602, "bad params");
+            };
+            match fs::mkdir(path) {
+                Ok(())  => Rpc::ok(id, json!({})),
+                Err(e)  => Rpc::err(id, -32000, &e),
+            }
+        }
         "fs/write" => {
             let Ok(p) = serde_json::from_value::<FsWriteParams>(params)
                 else { return Rpc::err(id, -32602, "bad params") };
@@ -353,7 +362,6 @@ fn handle_request(
 #[cfg(all(test, unix))]
 mod daemon_tests {
     use super::*;
-    use std::io::BufRead;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
@@ -548,5 +556,54 @@ mod daemon_tests {
         let reply = a.call("pty/subscribe", json!({ "id": 999_999 }));
         assert!(reply.error.is_some(), "claimed a subscription to a session that does not exist");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mkdir_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> String {
+        let p = format!("/tmp/fs-mkdir-{}-{tag}", std::process::id());
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// A folder someone asked for, including the parents it needs — "a/b/c" typed
+    /// into the box is one request, not three.
+    #[test]
+    fn a_nested_folder_is_made_in_one_go() {
+        let base = scratch("nested");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = format!("{base}/one/two/three");
+        assert!(fs::mkdir(&target).is_ok());
+        assert!(std::path::Path::new(&target).is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Refused when something is already there, rather than reporting success
+    /// for a folder it did not create: `create_dir_all` is happy to do nothing,
+    /// which would make a typo — or overwriting someone's work — look like it
+    /// worked.
+    #[test]
+    fn making_one_that_exists_is_an_error() {
+        let base = scratch("exists");
+        std::fs::create_dir_all(&base).unwrap();
+        let err = fs::mkdir(&base).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+
+        // And the same for a *file* in the way, which is the case that would
+        // otherwise fail obscurely later.
+        let file = format!("{base}/taken");
+        std::fs::write(&file, "").unwrap();
+        assert!(fs::mkdir(&file).unwrap_err().contains("already exists"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Somewhere unwritable is an error the dialog can show, not a panic.
+    #[test]
+    fn an_unwritable_place_is_reported() {
+        let err = fs::mkdir("/this-should-not-be-writable-forge-test").unwrap_err();
+        assert!(!err.is_empty());
     }
 }

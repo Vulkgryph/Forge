@@ -167,31 +167,49 @@ pub fn fake_fs(reply: Result<serde_json::Value, String>, answer: bool) -> FakeFs
     }
 }
 
+/// `fs/mkdir` over the same shared handles as `fs_list_with`.
+pub fn fs_mkdir_with(
+    handles: &FsHandles,
+    path:    &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    call_with(handles, "fs/mkdir", serde_json::json!({ "path": path }), timeout).map(|_| ())
+}
+
 /// `fs/list` over shared handles rather than `&SshConnection`.
 ///
 /// One implementation, because the explorer, the folder chooser and Quick Open
 /// all list remote directories, and three hand-rolled copies of this request
 /// would be three chances to disagree about what a listing means.
-pub fn fs_list_with(
+/// One request over shared handles, and its reply.
+fn call_with(
     handles: &FsHandles,
-    path:    &str,
+    method:  &str,
+    params:  serde_json::Value,
     timeout: std::time::Duration,
-) -> Result<Vec<RemoteEntry>, String> {
+) -> Result<serde_json::Value, String> {
     let id = {
         let mut n = handles.next_id.lock().unwrap();
         let i = *n;
         *n += 1;
         i
     };
-    let msg = Rpc::request(id, "fs/list", serde_json::json!({ "path": path }));
+    let msg = Rpc::request(id, method, params);
     let (tx, rx) = mpsc::sync_channel(1);
     handles.pending.lock().unwrap().insert(id, tx);
     if let Ok(mut w) = handles.stdin.lock() {
         write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
     }
-    let value = rx
-        .recv_timeout(timeout)
-        .map_err(|_| "listing timed out".to_string())??;
+    rx.recv_timeout(timeout)
+        .map_err(|_| format!("{method} timed out"))?
+}
+
+pub fn fs_list_with(
+    handles: &FsHandles,
+    path:    &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<RemoteEntry>, String> {
+    let value = call_with(handles, "fs/list", serde_json::json!({ "path": path }), timeout)?;
     // The reply carries entries and no path of its own, so a caller that needs
     // to display where it is, or to walk up from it, must resolve the path it
     // asked with — it will not be told it back.

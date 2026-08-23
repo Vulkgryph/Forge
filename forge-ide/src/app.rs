@@ -9970,7 +9970,11 @@ impl IdeApp {
             // them is a round trip each.
             const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
             let candidate = (visible_rows, visible_cols);
-            let settled = match self.ssh_term_pending_size {
+            // The *first* fit is not a drag and has nothing to debounce: the
+            // grid opened at a guess, and waiting 400ms to correct it is 400ms
+            // of showing the wrong thing. Only later changes wait to settle.
+            let first_fit = self.ssh_term_size == (0, 0);
+            let settled = first_fit || match self.ssh_term_pending_size {
                 Some((c, since)) if c == candidate => since.elapsed() >= RESIZE_SETTLE,
                 _ => {
                     self.ssh_term_pending_size = Some((candidate, std::time::Instant::now()));

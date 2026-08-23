@@ -61,6 +61,12 @@ impl Cell {
     fn blank() -> Self { Self { ch: ' ', fg: default_fg(), bg: None } }
 }
 
+/// Nothing printed on this row. A background colour counts as something: a shell
+/// that paints an empty highlighted band has drawn it deliberately.
+fn row_is_blank(row: &[Cell]) -> bool {
+    row.iter().all(|c| c.ch == ' ' && c.bg.is_none())
+}
+
 /// Serializable form of a `Cell` — `egui::Color32` itself isn't `Serialize`
 /// without enabling egui's own "serde" feature, so this stores plain
 /// `[u8; 4]` RGBA arrays instead of pulling that in for one small struct.
@@ -380,7 +386,28 @@ impl Grid {
                 self.wrapped.push(false);
             }
         } else if new_rows < self.rows {
-            let shrink = self.rows - new_rows;
+            let mut shrink = self.rows - new_rows;
+
+            // Give up the empty space below the cursor first. A terminal made
+            // shorter loses the blank rows under the prompt, not the prompt —
+            // and this used to scroll the top away unconditionally, which threw
+            // whatever had been printed into scrollback and left a viewport of
+            // nothing. Most visible on a freshly opened remote terminal: its
+            // grid starts taller than the panel, the shell prints its prompt at
+            // the top, then the fit-to-panel resize pushed that prompt out of
+            // sight and the terminal opened apparently blank, scrolled to the
+            // bottom of its own empty space.
+            while shrink > 0 && self.viewport.len() > self.cur_row + 1 {
+                let last = self.viewport.len() - 1;
+                if !row_is_blank(&self.viewport[last]) { break; }
+                self.viewport.pop();
+                self.wrapped.pop();
+                shrink -= 1;
+            }
+
+            // Only then take from the top, which is what keeps the cursor in
+            // view when there is real content in the way.
+            let scrolled = shrink;
             for _ in 0..shrink {
                 if self.viewport.is_empty() { break; }
                 let row = self.viewport.remove(0);
@@ -388,7 +415,7 @@ impl Grid {
                 self.scrollback.push_back(row);
                 self.sb_wrapped.push_back(flag);
             }
-            self.cur_row = self.cur_row.saturating_sub(shrink);
+            self.cur_row = self.cur_row.saturating_sub(scrolled);
         }
         self.rows = new_rows;
         self.cur_row = self.cur_row.min(self.rows - 1);
@@ -2374,5 +2401,98 @@ mod private_mode_tests {
         assert_eq!(g.version(), before, "still nothing");
         g.process("second half\x1b[?2026l");
         assert_eq!(g.version(), before + 1, "one frame once complete");
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::Grid;
+
+    /// What the viewport says, top to bottom, trailing blanks trimmed.
+    fn viewport(g: &Grid) -> Vec<String> {
+        g.viewport.iter()
+            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    fn scrollback(g: &Grid) -> Vec<String> {
+        g.scrollback.iter()
+            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    /// The reported bug. A remote terminal's grid opens taller than the panel it
+    /// is drawn in, the shell prints its prompt at the top, and then the grid is
+    /// fitted to the panel. Shrinking used to scroll the top away regardless, so
+    /// the prompt went into scrollback and the terminal opened showing nothing
+    /// at all — you had to scroll up to find your own shell.
+    #[test]
+    fn fitting_a_tall_grid_to_a_short_panel_keeps_what_was_printed() {
+        let mut g = Grid::with_size(50, 80);
+        g.process("sysadmin@spark:~$ ");
+
+        g.resize(20, 80);
+
+        assert!(viewport(&g).iter().any(|l| l.contains("sysadmin@spark")),
+                "the prompt left the viewport: {:?}", viewport(&g));
+        assert!(scrollback(&g).is_empty(),
+                "blank space was filed as history: {:?}", scrollback(&g));
+        // And the cursor is still on the prompt's line, so what is typed next
+        // appears where the prompt is.
+        assert_eq!(g.cursor().0, 0);
+    }
+
+    /// Content that genuinely does not fit still scrolls off the top, which is
+    /// what keeps the cursor in view — the old behaviour, for the case it was
+    /// right for.
+    #[test]
+    fn content_taller_than_the_new_size_still_scrolls_off() {
+        let mut g = Grid::with_size(10, 40);
+        for i in 0..10 { g.process(&format!("line {i}\r\n")); }
+        // Ten lines printed into ten rows: the grid has already scrolled once,
+        // so the cursor sits on the last row with content above it.
+        let before = g.scrollback.len();
+
+        g.resize(4, 40);
+
+        assert!(g.scrollback.len() > before, "nothing scrolled off a grid that had to shrink");
+        let view = viewport(&g);
+        assert_eq!(view.len(), 4);
+        assert!(view.iter().any(|l| l.contains("line 9")),
+                "the newest line is not visible: {view:?}");
+    }
+
+    /// Shrinking to fit, then growing back, restores what was hidden rather than
+    /// leaving a gap — the two halves have to agree about where rows go.
+    #[test]
+    fn shrinking_then_growing_is_not_lossy() {
+        let mut g = Grid::with_size(30, 40);
+        for i in 0..8 { g.process(&format!("out {i}\r\n")); }
+        let before = viewport(&g).into_iter().filter(|l| !l.is_empty()).collect::<Vec<_>>();
+
+        g.resize(6, 40);
+        g.resize(30, 40);
+
+        let after = viewport(&g).into_iter().filter(|l| !l.is_empty()).collect::<Vec<_>>();
+        assert_eq!(after, before, "a round trip through a smaller size lost lines");
+    }
+
+    /// A blank row a program painted a background onto is not empty space — a
+    /// highlighted band with no text in it was drawn on purpose.
+    #[test]
+    fn a_coloured_blank_row_is_not_free_space() {
+        let mut g = Grid::with_size(6, 20);
+        // Green background, one blank line, back to normal.
+        g.process("first\r\n\x1b[42m     \x1b[0m\r\n");
+        let filled_rows = g.viewport.iter()
+            .filter(|r| r.iter().any(|c| c.bg.is_some())).count();
+        assert_eq!(filled_rows, 1, "precondition: one row carries a background");
+
+        g.resize(3, 20);
+
+        assert!(
+            g.viewport.iter().any(|r| r.iter().any(|c| c.bg.is_some())),
+            "a deliberately painted row was discarded as blank",
+        );
     }
 }

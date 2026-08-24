@@ -412,6 +412,7 @@ enum Cmd {
     NewFile, SaveFile, OpenFolder, NewWindow,
     ToggleTerminal, ToggleFileTree,
     QuickOpen,
+    ReloadWindow, RestartWindow, RestartAll, Consolidate,
     /// Index into PluginHost::commands.
     Plugin(usize),
 }
@@ -424,6 +425,13 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Toggle Terminal",   "",             Cmd::ToggleTerminal),
     ("Toggle File Tree",  "",             Cmd::ToggleFileTree),
     ("Go to File…",       "Ctrl+P",       Cmd::QuickOpen),
+    // Also in the Window menu. Here as well because typing the name is how
+    // anyone who knows what they want reaches a command — it is how VS Code
+    // offers its reload, and the only place it offers it.
+    ("Reload Window",     "Ctrl+Shift+R", Cmd::ReloadWindow),
+    ("Restart This Window", "",           Cmd::RestartWindow),
+    ("Restart All Windows", "",           Cmd::RestartAll),
+    ("Collect All Windows Into One Process", "", Cmd::Consolidate),
 ];
 
 struct CmdPalette {
@@ -11141,6 +11149,10 @@ impl IdeApp {
             Cmd::ToggleTerminal  => self.show_term  = !self.show_term,
             Cmd::ToggleFileTree  => self.show_tree  = !self.show_tree,
             Cmd::QuickOpen       => self.open_quick_open(),
+            Cmd::ReloadWindow    => self.reload_window(),
+            Cmd::RestartWindow   => self.restart_window(),
+            Cmd::RestartAll      => self.restart_every_window(),
+            Cmd::Consolidate     => self.consolidate_windows(),
             Cmd::Plugin(i)       => {
                 if let Some(cmd) = self.plugins.commands.get(i) {
                     if let Some(buf) = self.buffers.get_mut(self.active) {
@@ -11495,10 +11507,6 @@ impl IdeApp {
                         self.open_folder_dialog();
                         ui.close_menu();
     }
-                    if ui.button("New Window").clicked() {
-                        self.pending_new_window = Some(NewWindowSpec::default());
-                        ui.close_menu();
-    }
                     ui.separator();
                     if ui.button("Save               Ctrl+S").clicked() {
                         self.save_active();
@@ -11509,44 +11517,44 @@ impl IdeApp {
                         self.settings_open = true;
                         ui.close_menu();
     }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.show_tree, "File Tree");
+                    ui.checkbox(&mut self.show_term, "Terminal");
+                });
+                // Window, rather than more of File.
+                //
+                // File is for documents; every one of these acts on a window or
+                // on the process behind it, which is what a Window menu is for —
+                // and it is where a macOS user looks for New Window anyway. They
+                // had accumulated at the bottom of File because that is where the
+                // first one went.
+                //
+                // Not hidden behind a "Developer" submenu, which is where VS Code
+                // keeps its reload: with a build rolled out one window at a time,
+                // these are the ordinary controls of a normal day's work, not
+                // diagnostics.
+                ui.menu_button("Window", |ui| {
+                    if ui.button("New Window").clicked() {
+                        self.pending_new_window = Some(NewWindowSpec::default());
+                        ui.close_menu();
+    }
                     ui.separator();
                     if ui.button("Reload Window      Ctrl+Shift+R").clicked() {
                         self.reload_window();
                         ui.close_menu();
     }
-                    // Between the two: a new process, but only for this window.
-                    // The soft reload cannot pick up a new binary or clear
-                    // anything the process itself is holding; the full restart
-                    // can, and takes every other window with it.
+                    // A new process, but only for this window. The soft reload
+                    // cannot pick up a new binary or clear anything the process
+                    // itself is holding; this can, without touching the others.
                     if ui.button("Restart This Window").clicked() {
                         self.restart_window();
                         ui.close_menu();
     }
                     ui.separator();
-                    // Which build *this* window is running. With a new build
-                    // rolled out one window at a time, they are not all the same
-                    // and the version number alone cannot tell them apart.
-                    let label = if self.build_is_stale {
-                        format!("Forge IDE {} — newer build installed", build_stamp())
-                    } else {
-                        format!("Forge IDE {}", build_stamp())
-                    };
-                    ui.add_enabled(false, egui::Button::new(
-                        egui::RichText::new(label).size(11.0),
-                    ));
-                    // Separate because it is a different blast radius, not a
-                    // stronger version of the same thing: every window's
-                    // conversations and language servers go down with it. The
-                    // reasons to want it are a newly built binary and an SSH
-                    // session that needs re-establishing.
-                    // One item, not two. There used to be a process-scoped
-                    // restart beside this one, and the names — "All Windows"
-                    // against "Every Window" — carried none of the difference:
-                    // "all" that quietly meant "some of them" is a trap, and
-                    // nobody wants to restart a subset chosen by which process
-                    // a window happens to live in. This is every window there
-                    // is; when the message cannot reach the other processes it
-                    // says so and does what it can.
+                    // Every window there is, across every Forge process. When the
+                    // message cannot reach the others it says so and does what it
+                    // can.
                     if ui.button("Restart All Windows").clicked() {
                         self.restart_every_window();
                         ui.close_menu();
@@ -11557,10 +11565,19 @@ impl IdeApp {
                         self.consolidate_windows();
                         ui.close_menu();
     }
-                });
-                ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_tree, "File Tree");
-                    ui.checkbox(&mut self.show_term, "Terminal");
+                    ui.separator();
+                    // Which build *this* window is running, at the bottom where a
+                    // footer belongs rather than in the middle of the actions. The
+                    // version number alone cannot tell two builds of one version
+                    // apart, which is the whole case for showing it.
+                    let label = if self.build_is_stale {
+                        format!("Forge IDE {} — newer build installed", build_stamp())
+                    } else {
+                        format!("Forge IDE {}", build_stamp())
+                    };
+                    ui.add_enabled(false, egui::Button::new(
+                        egui::RichText::new(label).size(11.0),
+                    ));
                 });
                 ui.menu_button("Go", |ui| {
                     if ui.button("Go to File…         Ctrl+P").clicked() {
@@ -16254,5 +16271,52 @@ mod reload_cost_probe {
             worst = worst.max(t);
         }
         eprintln!("\nworst of five: {:.1}ms", worst.as_secs_f64() * 1000.0);
+    }
+}
+
+#[cfg(test)]
+mod command_palette_tests {
+    use super::{COMMANDS, Cmd};
+
+    /// Everything on the Window menu is typeable too. A command reachable only by
+    /// hunting through menus is one that has to be remembered by position.
+    #[test]
+    fn the_window_commands_are_in_the_palette() {
+        let named = |name: &str| COMMANDS.iter().any(|(t, _, _)| *t == name);
+        for name in [
+            "New Window",
+            "Reload Window",
+            "Restart This Window",
+            "Restart All Windows",
+            "Collect All Windows Into One Process",
+        ] {
+            assert!(named(name), "{name:?} cannot be reached by typing it");
+        }
+    }
+
+    /// Each entry does something distinct — the restarts differ only by scope,
+    /// which is exactly the kind of thing that gets miswired by copy-paste.
+    #[test]
+    fn the_restarts_are_wired_to_different_things() {
+        let of = |name: &str| COMMANDS.iter()
+            .find(|(t, _, _)| *t == name)
+            .map(|(_, _, c)| std::mem::discriminant(c))
+            .unwrap();
+        assert_ne!(of("Reload Window"), of("Restart This Window"));
+        assert_ne!(of("Restart This Window"), of("Restart All Windows"));
+        assert_ne!(of("Restart All Windows"), of("Collect All Windows Into One Process"));
+    }
+
+    /// A shortcut listed in the palette has to be the one that actually works;
+    /// the only one here is the reload's.
+    #[test]
+    fn the_listed_shortcut_matches_the_binding() {
+        let (_, keys, _) = COMMANDS.iter().find(|(t, _, _)| *t == "Reload Window").unwrap();
+        assert_eq!(*keys, "Ctrl+Shift+R");
+        // And the ones with no chord say nothing rather than inventing one.
+        for name in ["Restart This Window", "Restart All Windows"] {
+            let (_, keys, _) = COMMANDS.iter().find(|(t, _, _)| *t == name).unwrap();
+            assert!(keys.is_empty(), "{name} claims a shortcut it does not have: {keys}");
+        }
     }
 }

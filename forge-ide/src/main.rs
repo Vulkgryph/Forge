@@ -124,22 +124,32 @@ const RELOAD_WINDOW: &str = "--reload-window";
 struct WindowArgs {
     /// Launched by a reload of some kind, so restore regardless of the setting.
     is_reload: bool,
-    /// Restart exactly this recorded window and no others.
-    only:      Option<u64>,
+    /// Restart exactly these recorded windows and no others.
+    ///
+    /// Ids rather than folders, because a record holds everything a window needs
+    /// to come back as itself — its geometry, and the remote host it was
+    /// connected to — and neither of those can travel through an argument list.
+    /// Naming windows by id also stops the restart depending on the record
+    /// *agreeing* with the folder list, which it cannot be relied on to do: the
+    /// record is shared with every other Forge process, so it holds windows this
+    /// process has never had.
+    only:      Vec<u64>,
     /// One entry per window; `None` is a window with no folder.
     cwds:      Vec<Option<std::path::PathBuf>>,
 }
 
 fn parse_window_args(args: &[String]) -> WindowArgs {
-    let mut out = WindowArgs { is_reload: false, only: None, cwds: Vec::new() };
+    let mut out = WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--reload" => out.is_reload = true,
             RELOAD_WINDOW => {
-                // A reload either way — the id just narrows it to one window.
+                // A reload either way — the ids just narrow it to those windows.
                 out.is_reload = true;
-                out.only = args.get(i + 1).and_then(|v| v.parse().ok());
+                if let Some(id) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    out.only.push(id);
+                }
                 i += 1;
             }
             a => out.cwds.push((a != NO_FOLDER).then(|| std::path::PathBuf::from(a))),
@@ -205,12 +215,13 @@ fn plan_initial_windows(
             .collect()
     }
 
-    // Restarting a single window: take that one record and nothing else, so the
-    // other windows are left to the process that still has them. Its geometry
-    // comes from the record, like any reload — argv has nowhere to put a frame.
-    if let Some(id) = only {
+    // Restarting named windows: take those records and nothing else, so any
+    // window belonging to another process is left to it. Their geometry and their
+    // remote host come from the record, like any reload — argv has nowhere to put
+    // a frame, and nowhere to put a connection.
+    if !only.is_empty() {
         let mine: Vec<session::WindowRecord> =
-            remembered().into_iter().filter(|r| r.id == id).collect();
+            remembered().into_iter().filter(|r| only.contains(&r.id)).collect();
         let specs = if mine.is_empty() {
             // No record for it (never written, or pruned). The folder was passed
             // alongside precisely for this, so the window still opens on the
@@ -748,7 +759,7 @@ impl ApplicationHandler for Ide {
         // track the earliest repaint any of them asked for.
         let mut new_specs: Vec<NewWindowSpec> = Vec::new();
         let mut restart_ids: Vec<(WindowId, u64, Option<std::path::PathBuf>)> = Vec::new();
-        let mut consolidate: Option<Vec<Option<std::path::PathBuf>>> = None;
+        let mut consolidate: Option<Vec<(u64, Option<std::path::PathBuf>)>> = None;
         let mut quit_now = false;
         let mut reload_requested = false;
         let mut earliest: Option<std::time::Instant> = None;
@@ -814,7 +825,13 @@ impl ApplicationHandler for Ide {
             } else {
                 let mut cmd = std::process::Command::new(&exe);
                 cmd.arg("--reload");
-                for f in &folders {
+                // Named by id, so each window comes back with its geometry and,
+                // if it had one, its remote connection.
+                for (id, _) in &folders {
+                    cmd.arg(RELOAD_WINDOW).arg(id.to_string());
+                }
+                // Folders as the fallback, for a record that cannot be read.
+                for (_, f) in &folders {
                     cmd.arg(match f {
                         Some(p) => p.to_string_lossy().into_owned(),
                         None    => NO_FOLDER.to_string(),
@@ -919,6 +936,17 @@ impl ApplicationHandler for Ide {
                         None => NO_FOLDER.to_string(),
                     })
                     .collect();
+                // The windows by id, so the new process takes their records
+                // rather than trying to match the folder list against them. It
+                // could not: the record is shared with every other Forge
+                // process, so it holds windows this one never had, the sets
+                // differed, the folder list won — and a remote window came back
+                // local, because a folder is all a folder can say.
+                let ids: Vec<String> = self
+                    .windows
+                    .iter()
+                    .map(|w| w.app.window_id.to_string())
+                    .collect();
                 // `reload_window()` already unconditionally saved *its own*
                 // window's session — but a reload tears down every open
                 // window, not just the one that triggered it, so every
@@ -933,7 +961,16 @@ impl ApplicationHandler for Ide {
                 self.remember_windows_now();
                 self.windows.clear();
                 self.shared = None;
-                if std::process::Command::new(&exe).arg("--reload").args(&cwds).spawn().is_ok() {
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg("--reload");
+                for id in &ids {
+                    cmd.arg(RELOAD_WINDOW).arg(id);
+                }
+                // The folders stay as the fallback for a record that cannot be
+                // read at all — no writable config directory — where a window
+                // opening on the right workspace beats not opening.
+                cmd.args(&cwds);
+                if cmd.spawn().is_ok() {
                     // Leave through winit rather than AppKit's `terminate:`.
                     //
                     // `terminate:` looked right — it runs the documented
@@ -1280,7 +1317,7 @@ mod startup_tests {
         let dir = std::env::temp_dir();
         let saved = frame(64, 32, 900, 600);
         let specs = plan_initial_windows(
-            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
+            WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() },
             || vec![session::WindowRecord {
                 cwd: Some(dir), frame: Some(saved), ..Default::default()
             }],
@@ -1298,7 +1335,7 @@ mod startup_tests {
         let a = std::env::temp_dir();
         let b = std::env::temp_dir().join("..");
         let specs = plan_initial_windows(
-            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
+            WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() },
             || vec![record(a.to_str()), record(b.to_str()), record(None)],
             true,
         );
@@ -1310,7 +1347,7 @@ mod startup_tests {
     #[test]
     fn the_toggle_off_opens_one_empty_window() {
         let specs = plan_initial_windows(
-            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
+            WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() },
             || vec![record(std::env::temp_dir().to_str()), record(None)],
             false,
         );
@@ -1323,7 +1360,7 @@ mod startup_tests {
     fn nothing_is_loaded_when_the_toggle_is_off() {
         let mut read = false;
         let _ = plan_initial_windows(
-            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
+            WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() },
             || {
                 read = true;
                 Vec::new()
@@ -1339,7 +1376,7 @@ mod startup_tests {
     fn command_line_paths_take_precedence() {
         let specs = plan_initial_windows(
             WindowArgs {
-                is_reload: false, only: None,
+                is_reload: false, only: Vec::new(),
                 cwds: vec![Some(PathBuf::from("/one")), Some(PathBuf::from("/two"))],
             },
             || panic!("the remembered set must not be consulted"),
@@ -1356,7 +1393,7 @@ mod startup_tests {
         let dir = std::env::temp_dir();
         let specs = plan_initial_windows(
             WindowArgs {
-                is_reload: true, only: None,
+                is_reload: true, only: Vec::new(),
                 cwds: vec![Some(dir.clone()), Some(dir)],
             },
             Vec::new,
@@ -1402,7 +1439,7 @@ mod startup_tests {
     fn folders_that_no_longer_exist_are_dropped() {
         let real = std::env::temp_dir();
         let specs = plan_initial_windows(
-            WindowArgs { is_reload: false, only: None, cwds: Vec::new() },
+            WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() },
             || vec![record(Some("/definitely/not/a/real/path")), record(real.to_str())],
             true,
         );
@@ -1418,7 +1455,7 @@ mod startup_tests {
             Vec::new(),
             vec![record(Some("/gone/one")), record(Some("/gone/two"))],
         ] {
-            let specs = plan_initial_windows(WindowArgs { is_reload: false, only: None, cwds: Vec::new() }, || remembered.clone(), true);
+            let specs = plan_initial_windows(WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() }, || remembered.clone(), true);
             assert_eq!(specs.len(), 1, "never zero windows");
             assert!(specs[0].cwd.is_none());
         }
@@ -1427,8 +1464,123 @@ mod startup_tests {
     /// A folderless window stays folderless rather than inheriting a directory.
     #[test]
     fn a_folderless_record_reopens_without_a_folder() {
-        let specs = plan_initial_windows(WindowArgs { is_reload: false, only: None, cwds: Vec::new() }, || vec![record(None)], true);
+        let specs = plan_initial_windows(WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() }, || vec![record(None)], true);
         assert_eq!(specs.len(), 1);
         assert!(specs[0].cwd.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reconnect_paths_tests {
+    use super::*;
+
+    fn host() -> ssh::SshHost {
+        ssh::SshHost {
+            name: "admin-1".into(), host: "spark.local".into(), port: 22,
+            user: "sysadmin".into(), key_path: "/k".into(), remote_dir: "~".into(),
+        }
+    }
+
+    fn remote_record(id: u64, dir: &std::path::Path) -> session::WindowRecord {
+        session::WindowRecord {
+            cwd: Some(dir.to_path_buf()), id,
+            remote_host: Some("admin-1".into()),
+            remote_dir: Some("/home/sysadmin/code".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A restart names its windows by id, so a remote one comes back connected
+    /// even though the record also holds windows belonging to other Forge
+    /// processes.
+    ///
+    /// This is what the folder list could not do. The record is shared, so with
+    /// more than one process — now the normal case — the recorded set and the
+    /// folder list differ, the folder list won, and a folder is all a folder can
+    /// say: the window came back local. Which was the reported bug, still there
+    /// after the record learned to carry a host.
+    #[test]
+    fn a_restart_reconnects_even_with_other_processes_windows_recorded() {
+        let dir = std::env::temp_dir();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "1".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        let specs = plan_initial_windows(
+            parse_window_args(&argv),
+            // Window 2 belongs to another process and must be left alone.
+            || vec![remote_record(1, &dir), remote_record(2, &dir)],
+            false,
+        );
+        // The selection is what naming windows by id fixed. Whether the host
+        // then resolves is `specs_from_records`' job, asserted below against an
+        // explicit host list — this path reads the machine's own SSH config, and
+        // another test in this binary moves `HOME`, so asserting on a real
+        // lookup here passes or fails depending on what else is running.
+        assert_eq!(specs.len(), 1, "took another process's window too");
+        assert_eq!(specs[0].window_id, 1);
+    }
+
+    /// Several windows at once — a full restart of one process's set — each
+    /// coming back as itself.
+    #[test]
+    fn a_full_restart_takes_exactly_the_windows_it_names() {
+        let dir = std::env::temp_dir();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "1".to_string(),
+            RELOAD_WINDOW.to_string(), "3".to_string(),
+        ];
+        let specs = plan_initial_windows(
+            parse_window_args(&argv),
+            || vec![
+                remote_record(1, &dir),
+                remote_record(2, &dir),
+                remote_record(3, &dir),
+            ],
+            false,
+        );
+        let mut ids: Vec<u64> = specs.iter().map(|s| s.window_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3], "window 2 belongs to another process");
+    }
+
+    /// With no record to read — no writable config directory — the folder list is
+    /// still honoured, so the windows open on the right workspaces. Local, since
+    /// a folder cannot carry a connection, which is the whole reason the ids are
+    /// passed as well.
+    #[test]
+    fn without_a_record_the_folders_still_open() {
+        let dir = std::env::temp_dir();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "1".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        let specs = plan_initial_windows(parse_window_args(&argv), Vec::new, false);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].cwd, Some(dir));
+        assert!(specs[0].ssh_host.is_none());
+    }
+
+    /// The lookup all of that feeds into, against a host list this test owns —
+    /// the real config belongs to the machine, and another test in this binary
+    /// moves `HOME` out from under it.
+    #[test]
+    fn a_recorded_window_comes_back_connected_when_its_host_is_configured() {
+        let dir = std::env::temp_dir();
+
+        let specs = specs_from_records(vec![remote_record(1, &dir)], true, &[host()]);
+        let got = specs[0].ssh_host.as_ref().expect("came back local");
+        assert_eq!(got.name, "admin-1");
+        assert_eq!(got.user, "sysadmin");
+        // The folder open on the remote is per window, so it comes from the
+        // record rather than the host entry's own default.
+        assert_eq!(got.remote_dir, "/home/sysadmin/code");
+
+        // And a host that has since been renamed or removed is not guessed at.
+        let specs = specs_from_records(vec![remote_record(1, &dir)], true, &[]);
+        assert!(specs[0].ssh_host.is_none());
     }
 }

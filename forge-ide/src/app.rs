@@ -4100,7 +4100,7 @@ pub struct IdeApp {
     /// Reopen *these* folders in one new process and end this one — the window
     /// list gathered from every Forge process, not just this one's. See
     /// `consolidate_windows`.
-    pub pending_consolidate: Option<Vec<Option<PathBuf>>>,
+    pub pending_consolidate: Option<Vec<(u64, Option<PathBuf>)>>,
     /// Exit without replacing this process: another one is taking its windows.
     pub pending_quit: bool,
     /// Which rebuild of this window this is. See `NewWindowSpec::reload_count`.
@@ -4563,17 +4563,19 @@ impl IdeApp {
     /// only knows its own windows. The record knows all of them because each
     /// process writes its own entries and keeps everyone else's.
     pub fn consolidate_windows(&mut self) {
-        let mut folders: Vec<Option<PathBuf>> = crate::session::load_windows()
+        // By id as well as folder: the id is what carries a window's geometry and
+        // its remote host through the record, neither of which fits in an
+        // argument list.
+        let mut folders: Vec<(u64, Option<PathBuf>)> = crate::session::load_windows()
             .into_iter()
             .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
-            .map(|r| r.cwd)
+            .map(|r| (r.id, r.cwd))
             .collect();
-        // This process's own windows may not be in the record yet — a window
+        // This process's own window may not be in the record yet — a window
         // opened seconds ago writes on a settle timer.
-        for w in self.agent_windows_hint() {
-            if !folders.contains(&w) { folders.push(w); }
+        if !folders.iter().any(|(id, _)| *id == self.window_id) {
+            folders.push((self.window_id, self.workspace_root()));
         }
-        if folders.is_empty() { folders.push(self.workspace_root()); }
 
         let reached = crate::ptyhost::shared()
             .map(|c| c.broadcast("handover"))
@@ -4593,12 +4595,6 @@ impl IdeApp {
 
         self.save_session_for_reload();
         self.pending_consolidate = Some(folders);
-    }
-
-    /// This window's folder, as a one-item list — the record is authoritative for
-    /// everything else, and this is the entry most likely to be missing from it.
-    fn agent_windows_hint(&self) -> Vec<Option<PathBuf>> {
-        vec![self.workspace_root()]
     }
 
     /// Ask every Forge window, in every process, to restart.

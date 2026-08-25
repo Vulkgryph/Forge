@@ -14,6 +14,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed (a remote window restarted into a new process came back local)
 
+- **A restart now names its windows by id**, so each comes back from its own record — with its geometry and, if it had one, its remote connection. Passing folders could not do that: the record is shared with every Forge process, so with more than one — now the normal case — the recorded set and the folder list differ, the folder list wins, and a folder is all a folder can say. That is why a remote window still came back local *after* the record learned to carry a host. Folders are still passed as the fallback for a record that cannot be read at all, where opening on the right workspace beats not opening.
+
 - **The soft reload reconnects; a process restart could not**, because a connection cannot travel through an argument list and the window record did not carry one. The record now keeps the host's *name* and the folder that was open on it. Everything else about the host — user, port, key — is read back from the SSH config, where it is already kept once, so there is no second copy to go stale. A host that has since been renamed or removed opens the window locally instead: guessing at a connection is worse than not making one.
 - The record's comment said this could not be done, because the app tracked a *pending* SSH host rather than an established one and could not be asked where a window was. That stopped being true when the connection started carrying its own host.
 

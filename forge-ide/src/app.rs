@@ -1765,10 +1765,58 @@ fn build_is_newer(
     }
 }
 
-/// A build time as `Aug 21 23:16` — local enough to compare against when you
-/// built it, which is all it is for.
+/// This machine's offset from UTC, in seconds, read once.
+///
+/// Asked of `date`, which knows about the zone and about daylight saving, rather
+/// than reimplemented or pulled in as a dependency. Once per process, so the cost
+/// is one subprocess at the first mention of a build time.
+fn utc_offset_secs() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        // `+%z` is `-0400`, `+0530`, and so on.
+        let out = std::process::Command::new("date").arg("+%z").output().ok();
+        let text = out
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        parse_utc_offset(text.trim())
+    })
+}
+
+/// `-0400` as seconds. Unparseable is zero, which shows UTC rather than a wrong
+/// local time — a build time nobody can compare against is better than one that
+/// looks comparable and is four hours out.
+fn parse_utc_offset(text: &str) -> i64 {
+    let sign = match text.as_bytes().first() {
+        Some(b'-') => -1,
+        Some(b'+') => 1,
+        _ => return 0,
+    };
+    let digits = &text[1..];
+    if digits.len() < 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let hours: i64 = digits[..2].parse().unwrap_or(0);
+    let mins:  i64 = digits[2..4].parse().unwrap_or(0);
+    sign * (hours * 3600 + mins * 60)
+}
+
+/// A build time as `Aug 21 23:16`, in *this machine's* time.
+///
+/// It was rendered in UTC, which for the one thing it is for — telling whether a
+/// window is running the build you just made — is worse than useless: it looked
+/// like a local time and was four hours out, so a window on an old build could
+/// read as newer than the one on disk.
 fn format_build_time(t: std::time::SystemTime) -> String {
     let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format_civil((secs as i64 + utc_offset_secs()).max(0) as u64)
+}
+
+/// Seconds since the epoch as `Aug 21 23:16`, with no notion of a timezone —
+/// whatever it is handed is what it renders. Kept apart from the shift above so
+/// the calendar arithmetic can be tested against known instants without the test
+/// depending on where the machine is.
+fn format_civil(secs: u64) -> String {
     // Civil date from a unix timestamp, without reaching for a date library for
     // one line of output. Days-from-epoch to y/m/d by Howard Hinnant's method.
     let days = (secs / 86_400) as i64;
@@ -16248,7 +16296,7 @@ mod countdown_tests {
 
 #[cfg(test)]
 mod build_stamp_tests {
-    use super::{build_stamp, format_build_time};
+    use super::{build_stamp, format_civil};
 
     /// The version alone cannot tell two builds of the same version apart, which
     /// is the whole case for having this: rolling one out window by window, every
@@ -16270,9 +16318,9 @@ mod build_stamp_tests {
 
     #[test]
     fn a_build_time_reads_as_a_date() {
-        let t = |secs: u64| format_build_time(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
-        );
+        // The calendar arithmetic, with no timezone in the way: what it is
+        // handed is what it renders.
+        let t = format_civil;
         // 2026-08-21 23:16:00 UTC — checked against a date library rather than
         // guessed; my first guess for this constant was five days out, and the
         // arithmetic was right.
@@ -16654,4 +16702,49 @@ pub(crate) fn simulate_restart(
     );
     assert_eq!(pending.host, host.host);
     eprintln!("chain ok: record -> argv -> spec -> window pending connect to {}", pending.host);
+}
+
+#[cfg(test)]
+mod build_time_tests {
+    use super::{format_build_time, parse_utc_offset, utc_offset_secs};
+
+    /// The offset `date +%z` prints, in the forms it prints it in.
+    #[test]
+    fn an_offset_parses() {
+        assert_eq!(parse_utc_offset("-0400"), -4 * 3600);
+        assert_eq!(parse_utc_offset("+0000"), 0);
+        assert_eq!(parse_utc_offset("+0530"), 5 * 3600 + 30 * 60);
+        assert_eq!(parse_utc_offset("-0930"), -(9 * 3600 + 30 * 60));
+    }
+
+    /// Anything unexpected reads as UTC rather than as a wrong local time: a
+    /// build time nobody can compare against beats one that looks comparable and
+    /// is hours out, which is what this whole fix is about.
+    #[test]
+    fn nonsense_reads_as_utc() {
+        for bad in ["", "0400", "-04", "-04xx", "z", "--0400"] {
+            assert_eq!(parse_utc_offset(bad), 0, "{bad:?} was not treated as UTC");
+        }
+    }
+
+    /// The offset is actually applied. Rendering a known instant in UTC gave
+    /// 17:13 for a binary built at 13:13 in New York — it looked like a local
+    /// time and was four hours ahead, so a window on an old build could read as
+    /// newer than the one on disk.
+    #[test]
+    fn the_rendered_time_follows_this_machines_clock() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_787_354_160);
+        let rendered = format_build_time(t);
+
+        // Whatever this machine's zone is, the rendering has to match it — worked
+        // out here the same way, from the same offset, rather than hard-coding a
+        // timezone the test machine may not be in.
+        let shifted = 1_787_354_160_i64 + utc_offset_secs();
+        let hh = (shifted % 86_400) / 3600;
+        let mm = (shifted % 3600) / 60;
+        assert!(
+            rendered.ends_with(&format!("{hh:02}:{mm:02}")),
+            "{rendered} does not end in this machine's local time {hh:02}:{mm:02}",
+        );
+    }
 }

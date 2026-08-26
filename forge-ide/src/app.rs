@@ -2358,6 +2358,37 @@ fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
 ///
 /// Returns the text unchanged when it already fits, or when there is no path in
 /// it to shorten — the caller's `truncate()` is the backstop for that case.
+/// How many characters of a host name the status badge shows.
+///
+/// Long enough for the names people actually use, short enough that the badge
+/// stays a badge. `Admin-1-Tailscale` is 17.
+const HOST_BADGE_CHARS: usize = 14;
+
+/// The connected badge's text: a power symbol and the host, cut to a length the
+/// badge can hold.
+///
+/// The badge used to be a fixed 36pt slot with this painted centred inside it, so
+/// a name of any real length spilled out of both sides — clipped at the window
+/// edge on the left and drawn over the next thing along on the right. Two fixes,
+/// and this is the one that bounds it: past a limit the name ends in an ellipsis
+/// rather than growing without end. The badge sizes itself to whatever this
+/// returns.
+fn ssh_badge_label(name: &str) -> String {
+    format!("⏻ {}", elide_chars(name, HOST_BADGE_CHARS))
+}
+
+/// `text`, or its first `max` characters and an ellipsis.
+///
+/// Counts characters, not bytes: cutting a name mid-character is a panic, and a
+/// remote host can be called anything.
+fn elide_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
+}
+
 fn elide_path_head(ui: &egui::Ui, text: &str, font: &egui::FontId, avail: f32) -> String {
     elide_path_head_by(text, avail, |s| {
         ui.fonts(|f| {
@@ -6395,9 +6426,23 @@ impl IdeApp {
 
                 ui.horizontal(|ui| {
                     // ── >< SSH Remote button (far left, VSCode-style) ──────────
-                    let (ssh_rect, ssh_resp) = ui.allocate_exact_size(
-                        egui::vec2(36.0, 22.0), egui::Sense::click());
                     let connected = self.ssh.is_some();
+                    // Sized to its text rather than a fixed 36pt. Centring a name
+                    // inside a slot too small for it put half of it outside the
+                    // badge: off the left edge of the window, and on top of the
+                    // label to its right.
+                    let badge_font = egui::FontId::proportional(10.5);
+                    let badge_text = connected.then(|| {
+                        let name = self.ssh.as_ref().map(|s| s.host.name.clone())
+                            .unwrap_or_default();
+                        ssh_badge_label(&name)
+                    });
+                    let badge_w = match &badge_text {
+                        Some(t) => text_width(ui, t, badge_font.size, false) + 14.0,
+                        None    => 36.0,
+                    }.max(36.0);
+                    let (ssh_rect, ssh_resp) = ui.allocate_exact_size(
+                        egui::vec2(badge_w, 22.0), egui::Sense::click());
                     let ssh_bg = if connected {
                         egui::Color32::from_rgb(14, 99, 156)
                     } else {
@@ -6408,11 +6453,11 @@ impl IdeApp {
                     let cy = ssh_rect.center().y;
                     let cx = ssh_rect.center().x;
                     let fg = egui::Color32::from_gray(210);
-                    if connected {
-                        let name = self.ssh.as_ref().map(|s| s.host.name.clone())
-                            .unwrap_or_default();
-                        p.text(egui::pos2(cx, cy), egui::Align2::CENTER_CENTER,
-                            format!("⏻ {name}"), egui::FontId::proportional(10.5), fg);
+                    if let Some(text) = &badge_text {
+                        // Left-aligned inside its own box, so it cannot grow
+                        // leftwards past the edge of the window.
+                        p.text(egui::pos2(ssh_rect.left() + 7.0, cy),
+                            egui::Align2::LEFT_CENTER, text, badge_font.clone(), fg);
                     } else {
                         // ><  rendered as text — simple, readable, matches VSCode's icon
                         p.text(egui::pos2(cx, cy), egui::Align2::CENTER_CENTER,
@@ -16491,5 +16536,53 @@ mod live_remote_record_tests {
         // recording the connection rather than a name to look up.
         assert!(!recorded.host.is_empty());
         assert!(!dir_on_remote.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_badge_tests {
+    use super::{HOST_BADGE_CHARS, elide_chars, ssh_badge_label};
+
+    /// The reported symptom: `Admin-1-Tailscale` in a badge that could not hold
+    /// it, spilling off the left edge of the window and over the label to its
+    /// right. The badge sizes itself now, and the name is bounded so "sizes
+    /// itself" cannot mean "grows without end".
+    #[test]
+    fn a_long_host_name_is_cut_with_an_ellipsis() {
+        let label = ssh_badge_label("Admin-1-Tailscale");
+        assert!(label.ends_with('…'), "not cut: {label:?}");
+        // The power symbol, a space, the cap, and the ellipsis.
+        assert_eq!(label.chars().count(), HOST_BADGE_CHARS + 3);
+        assert!(label.starts_with("⏻ Admin-1-Tail"), "{label:?}");
+    }
+
+    /// A name that fits is left exactly as it is — no ellipsis on names that
+    /// never needed one.
+    #[test]
+    fn a_short_host_name_is_untouched() {
+        assert_eq!(ssh_badge_label("admin-1"), "⏻ admin-1");
+        assert_eq!(ssh_badge_label(""), "⏻ ");
+    }
+
+    /// Exactly at the limit is not "over" it.
+    #[test]
+    fn the_limit_is_inclusive() {
+        let exact: String = "a".repeat(HOST_BADGE_CHARS);
+        assert_eq!(elide_chars(&exact, HOST_BADGE_CHARS), exact);
+        let one_more: String = "a".repeat(HOST_BADGE_CHARS + 1);
+        assert!(elide_chars(&one_more, HOST_BADGE_CHARS).ends_with('…'));
+    }
+
+    /// Counted in characters, not bytes. A host can be called anything, and
+    /// slicing a name mid-character is a panic rather than a cosmetic bug.
+    #[test]
+    fn a_multibyte_name_is_not_sliced_apart() {
+        let name = "日本語のホスト名です-とても長い";
+        let out = elide_chars(name, 5);
+        assert_eq!(out.chars().count(), 6, "{out:?}");
+        assert!(out.starts_with("日本語のホ"), "{out:?}");
+        // And an emoji, which is more than one byte and more than one scalar in
+        // some fonts but exactly one `char` here.
+        assert_eq!(elide_chars("🦀🦀🦀", 2).chars().count(), 3);
     }
 }

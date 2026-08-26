@@ -11206,13 +11206,13 @@ impl IdeApp {
     /// The host this window is connected to and the folder it has open there, for
     /// the record — so a restart into a new process can connect again rather than
     /// coming back local.
-    pub fn remote_identity(&self) -> Option<(String, String)> {
+    pub fn remote_identity(&self) -> Option<(crate::ssh::SshHost, String)> {
         let ssh = self.ssh.as_ref()?;
-        // The name is what the SSH config calls it, which is what can be looked
-        // up again. A host reached by address with no config entry has no name to
-        // record, and is not guessed at on the way back.
-        (!ssh.host.name.is_empty())
-            .then(|| (ssh.host.name.clone(), ssh.host.remote_dir.clone()))
+        // Anything with somewhere to connect to. This used to require a *name*,
+        // which a connection typed in by hand does not have — so those recorded
+        // nothing and came back local with no way for the user to see why.
+        (!ssh.host.host.is_empty())
+            .then(|| (ssh.host.clone(), ssh.host.remote_dir.clone()))
     }
 
     /// The remote workspace root as an absolute path, or `None` when this window

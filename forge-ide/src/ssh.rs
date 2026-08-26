@@ -36,7 +36,10 @@ use forge_proto::*;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+// `PartialEq`/`Eq` so a window record holding one can be compared against the
+// last one written — that comparison is what decides whether connecting is worth
+// writing to disk.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SshHost {
     pub name:       String,
     pub host:       String,

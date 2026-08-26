@@ -159,6 +159,29 @@ fn parse_window_args(args: &[String]) -> WindowArgs {
     out
 }
 
+/// Whether this change to the window set has to reach disk now, rather than
+/// waiting for the geometry settle timer.
+///
+/// Opening a folder, opening or closing a window, and *connecting to a remote*
+/// are deliberate acts, and each could be the last thing that happens before the
+/// process goes away. Geometry alone waits, because it changes continuously while
+/// a window is dragged.
+///
+/// Connecting was missing from that list, and it was the whole bug behind a
+/// remote window not reconnecting: a connection changed only `remote_host`, which
+/// read as geometry, so the write waited for a timer — and the timer is only
+/// looked at again when a *window* event arrives, which connecting is not. The
+/// connection was never recorded, so a restart had nothing to reconnect to.
+fn worth_writing_now(
+    now:   &[session::WindowRecord],
+    saved: &[session::WindowRecord],
+) -> bool {
+    now.len() != saved.len()
+        || now.iter().zip(saved).any(|(a, b)| {
+            a.cwd != b.cwd || a.remote_host != b.remote_host || a.remote_dir != b.remote_dir
+        })
+}
+
 /// Turn recorded windows into specs, reconnecting the ones that named a host.
 ///
 /// `hosts` is passed in rather than read here so this can be exercised without
@@ -169,7 +192,28 @@ fn specs_from_records(
     is_reload: bool,
     hosts:     &[ssh::SshHost],
 ) -> Vec<NewWindowSpec> {
-    rs.into_iter()
+    // One entry per window. An id can name two records: a window restarted into a
+    // new process keeps its id, and the process it came from may have died
+    // without deregistering, so its entry lingers — deliberately, so a crash does
+    // not lose the window. Reopening both would open the same window twice, and
+    // the older of the two carries older geometry, which is how a restart came
+    // back at the wrong size.
+    let mut newest: Vec<session::WindowRecord> = Vec::new();
+    for r in rs {
+        // `0` is not an id, it is a record written before windows had them — so
+        // every such record is a *different* window and none of them can be
+        // deduplicated against another. Treating them as one identity collapsed
+        // three remembered windows into one, which the tests said immediately.
+        let same = (r.id != 0)
+            .then(|| newest.iter().position(|k| k.id == r.id))
+            .flatten();
+        match same {
+            Some(i) if newest[i].seen < r.seen => newest[i] = r,
+            Some(_) => {}
+            None => newest.push(r),
+        }
+    }
+    newest.into_iter()
         // A folder that has since been deleted or moved is dropped rather than
         // opening a window onto a path that is not there.
         .filter(|r| r.cwd.as_ref().is_none_or(|p| p.is_dir()))
@@ -177,14 +221,19 @@ fn specs_from_records(
             // A recorded host is reconnected to by name. One that has since been
             // renamed or removed from the config opens the window locally —
             // guessing at a connection is worse than not making one.
-            let ssh_host = r.remote_host.as_ref().and_then(|name| {
-                hosts.iter().find(|h| &h.name == name).cloned().map(|mut h| {
-                    // The folder open on the remote is per window, so it comes
-                    // from the record; everything else about the host comes from
-                    // the config, where it is kept once.
-                    if let Some(dir) = r.remote_dir.clone() { h.remote_dir = dir; }
-                    h
-                })
+            let ssh_host = r.remote_host.clone().map(|recorded| {
+                // The config wins where it still names this host, so a changed
+                // key path or port is picked up rather than pinned to whatever
+                // was recorded. Otherwise the recorded connection is used as it
+                // stands — including for a host that was never in the config,
+                // which is the case that recording only a name could not serve.
+                let mut h = hosts.iter()
+                    .find(|h| !recorded.name.is_empty() && h.name == recorded.name)
+                    .cloned()
+                    .unwrap_or(recorded);
+                // The folder open on the remote is per window.
+                if let Some(dir) = r.remote_dir.clone() { h.remote_dir = dir; }
+                h
             });
             NewWindowSpec {
                 cwd: r.cwd, frame: r.frame, maximized: r.maximized,
@@ -548,6 +597,8 @@ impl Ide {
                 // instead of coming back local.
                 remote_host: w.app.remote_identity().map(|(h, _)| h),
                 remote_dir:  w.app.remote_identity().map(|(_, d)| d),
+                // (Both from the same call; kept as two fields because the folder
+                // on the remote is per window and the host is not.)
                 // Stamped by `session::save_windows`, which is what knows the
                 // process it is writing for.
                 pid:  0,
@@ -567,8 +618,7 @@ impl Ide {
         // it changes: those are deliberate acts, and each one could be the last
         // thing that happens before the process goes away. Geometry alone waits,
         // because it changes continuously while a window is dragged.
-        let set_changed = records.len() != self.saved_windows.len()
-            || records.iter().zip(&self.saved_windows).any(|(a, b)| a.cwd != b.cwd);
+        let set_changed = worth_writing_now(&records, &self.saved_windows);
         if !force && !set_changed {
             let since = *self.geometry_dirty_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed() < GEOMETRY_SETTLE {
@@ -1213,7 +1263,7 @@ mod startup_tests {
         }];
         let rec = session::WindowRecord {
             cwd: Some(dir.clone()),
-            remote_host: Some("admin-1".into()),
+            remote_host: Some(hosts[0].clone()),
             remote_dir: Some("/home/sysadmin/code".into()),
             ..Default::default()
         };
@@ -1232,15 +1282,30 @@ mod startup_tests {
 
     /// A host that has since been renamed or removed is not guessed at: the
     /// window opens locally rather than connecting somewhere unasked.
+    /// A connection the config no longer names still comes back, because the
+    /// record holds the connection itself. Recording only a name meant a host
+    /// typed in by hand — which has no name — reconnected to nothing, silently,
+    /// in precisely the case the user cannot fix by editing a config file.
     #[test]
-    fn an_unknown_host_reopens_locally() {
+    fn a_host_the_config_forgot_still_reconnects() {
         let rec = session::WindowRecord {
             cwd: Some(std::env::temp_dir()),
-            remote_host: Some("a-host-that-was-deleted".into()),
+            // Recorded whole, so it reconnects on what it recorded even though
+            // nothing in the config names it any more. That is the point of
+            // recording the connection rather than a name: a host the user typed
+            // in by hand has no name to look up, and used to reconnect to
+            // nothing at all.
+            remote_host: Some(ssh::SshHost {
+                name: "a-host-that-was-deleted".into(),
+                host: "10.0.0.9".into(), port: 22, user: "me".into(),
+                key_path: "/keys/id".into(), remote_dir: "~".into(),
+            }),
             ..Default::default()
         };
         let spec = specs_from_records(vec![rec], true, &[]).remove(0);
-        assert!(spec.ssh_host.is_none(), "connected to a host that is not configured");
+        let host = spec.ssh_host.as_ref().expect("the recorded connection was dropped");
+        assert_eq!(host.host, "10.0.0.9");
+        assert_eq!(host.user, "me");
         assert!(spec.cwd.is_some(), "and it still opens its folder");
     }
 
@@ -1484,7 +1549,7 @@ mod reconnect_paths_tests {
     fn remote_record(id: u64, dir: &std::path::Path) -> session::WindowRecord {
         session::WindowRecord {
             cwd: Some(dir.to_path_buf()), id,
-            remote_host: Some("admin-1".into()),
+            remote_host: Some(host()),
             remote_dir: Some("/home/sysadmin/code".into()),
             ..Default::default()
         }
@@ -1579,8 +1644,86 @@ mod reconnect_paths_tests {
         // record rather than the host entry's own default.
         assert_eq!(got.remote_dir, "/home/sysadmin/code");
 
-        // And a host that has since been renamed or removed is not guessed at.
+        // With nothing in the config naming it, the recorded connection is used
+        // as it stands — which is the point of recording the connection rather
+        // than a name to look up. A window with no recorded host is the case that
+        // stays local.
         let specs = specs_from_records(vec![remote_record(1, &dir)], true, &[]);
-        assert!(specs[0].ssh_host.is_none());
+        let got = specs[0].ssh_host.as_ref().expect("a recorded connection was dropped");
+        assert_eq!(got.host, "spark.local");
+    }
+}
+
+#[cfg(test)]
+mod record_write_tests {
+    use super::*;
+
+    fn win(cwd: &str) -> session::WindowRecord {
+        session::WindowRecord {
+            cwd: Some(std::path::PathBuf::from(cwd)), id: 1, ..Default::default()
+        }
+    }
+
+    fn host() -> ssh::SshHost {
+        ssh::SshHost {
+            name: "admin-1".into(), host: "spark.local".into(), port: 22,
+            user: "sysadmin".into(), key_path: "/k".into(), remote_dir: "~".into(),
+        }
+    }
+
+    /// The bug behind a remote window not reconnecting. Connecting changes only
+    /// the host, which used to read as a geometry-ish change and wait for a
+    /// settle timer — and that timer is only looked at again when a window event
+    /// arrives, which connecting is not. So it was never written, and a restart
+    /// had nothing to reconnect to.
+    #[test]
+    fn connecting_is_written_immediately() {
+        let before = vec![win("/p")];
+        let mut after = before.clone();
+        after[0].remote_host = Some(host());
+        assert!(worth_writing_now(&after, &before), "a connection waited on a timer");
+    }
+
+    /// And so is moving to a different folder on the remote, which is the same
+    /// kind of deliberate act.
+    #[test]
+    fn changing_the_remote_folder_is_written_immediately() {
+        let mut before = vec![win("/p")];
+        before[0].remote_host = Some(host());
+        let mut after = before.clone();
+        after[0].remote_dir = Some("/home/sysadmin/other".into());
+        assert!(worth_writing_now(&after, &before));
+    }
+
+    /// Disconnecting too — a window that came back local must not be recorded as
+    /// still being on a host.
+    #[test]
+    fn disconnecting_is_written_immediately() {
+        let mut before = vec![win("/p")];
+        before[0].remote_host = Some(host());
+        let after = vec![win("/p")];
+        assert!(worth_writing_now(&after, &before));
+    }
+
+    /// Opening and closing windows, and opening a folder, as before.
+    #[test]
+    fn the_window_set_changing_is_still_written_immediately() {
+        assert!(worth_writing_now(&[win("/a"), win("/b")], &[win("/a")]));
+        assert!(worth_writing_now(&[win("/a")], &[win("/b")]));
+        assert!(worth_writing_now(&[], &[win("/a")]));
+    }
+
+    /// Geometry alone still waits: it changes continuously while a window is
+    /// dragged, and writing every frame of that is an fsync per mouse-move.
+    #[test]
+    fn geometry_alone_still_waits() {
+        let before = vec![win("/p")];
+        let mut after = before.clone();
+        after[0].frame = Some(session::WindowFrame { x: 10, y: 20, w: 800, h: 600 });
+        assert!(!worth_writing_now(&after, &before), "a drag now writes per frame");
+
+        let mut zoomed = before.clone();
+        zoomed[0].maximized = true;
+        assert!(!worth_writing_now(&zoomed, &before));
     }
 }

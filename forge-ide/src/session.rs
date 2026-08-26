@@ -502,15 +502,23 @@ pub struct WindowRecord {
     /// launch came back missing them.
     #[serde(default)]
     pub pid: u32,
-    /// The remote host this window was connected to, by the name it has in the
-    /// SSH config, and the folder it had open there.
+    /// The remote host this window was connected to, and the folder it had open
+    /// there.
     ///
-    /// The name rather than the whole connection: the host's user, port and key
-    /// live in the SSH config already, and copying them here would be a second
-    /// copy to go stale. Looked up again on open; a host that has since been
-    /// renamed or removed reopens the window locally rather than guessing.
+    /// The whole connection, not just its name. Recording only the name was the
+    /// tidier idea — the host's user, port and key live in the SSH config, so a
+    /// copy here is a copy to go stale — but it only works for a window connected
+    /// to a *named* host, and a connection typed in by hand has no name to record.
+    /// Which meant no reconnect, silently, for exactly the case where the user
+    /// cannot fix it by editing a config file. Nothing secret is involved: this is
+    /// the path to a key, not a key, and it is the same information the SSH config
+    /// holds in plain text.
+    ///
+    /// Still refreshed from the config on the way back in when the name matches
+    /// something there, so a changed key path or port is picked up rather than
+    /// being pinned by whatever was recorded.
     #[serde(default)]
-    pub remote_host: Option<String>,
+    pub remote_host: Option<crate::ssh::SshHost>,
     #[serde(default)]
     pub remote_dir:  Option<String>,
     /// When this entry was last written, as seconds since the epoch. A process

@@ -1009,7 +1009,7 @@ fn shell_quote(s: &str) -> String {
 ///
 /// The tilde is left outside the quotes so the shell expands it; everything
 /// after it is quoted as usual, so a path with spaces still survives.
-fn shell_quote_path(s: &str) -> String {
+pub fn shell_quote_path(s: &str) -> String {
     if s == "~" {
         return "~".to_string();
     }
@@ -1682,5 +1682,52 @@ mod path_quoting_tests {
         // The tilde exception must not open a hole in the quoting.
         let out = shell_quote_path("~/it's; rm -rf /");
         assert_eq!(out, r#"~/'it'\''s; rm -rf /'"#);
+    }
+}
+
+#[cfg(test)]
+mod cd_quoting_tests {
+    use super::shell_quote_path;
+
+    /// The line sent to the remote shell to follow a folder change. A remote path
+    /// is not a promise about spaces, and this is being typed into a shell.
+    fn cd_line(dir: &str) -> String {
+        format!("cd {}\n", shell_quote_path(dir))
+    }
+
+    /// Quoted whether or not it needs to be. Deciding per path is a rule with
+    /// exceptions to get wrong; always quoting has none.
+    #[test]
+    fn an_ordinary_path_is_quoted_anyway() {
+        assert_eq!(cd_line("/home/sysadmin/code"), "cd '/home/sysadmin/code'\n");
+    }
+
+    /// A space would otherwise make `cd` see two arguments and land nowhere.
+    #[test]
+    fn a_path_with_a_space_survives() {
+        let line = cd_line("/home/sysadmin/my code");
+        assert!(line.contains("'/home/sysadmin/my code'"), "{line}");
+    }
+
+    /// The tilde has to stay outside the quotes or the shell will not expand it —
+    /// the bug that made `cd '~'` fail when the remote dir was left at its
+    /// default.
+    #[test]
+    fn the_tilde_stays_expandable() {
+        assert_eq!(cd_line("~"), "cd ~\n");
+        let line = cd_line("~/my code");
+        assert!(line.starts_with("cd ~/"), "the tilde was quoted away: {line}");
+        assert!(line.contains("'my code'"), "{line}");
+    }
+
+    /// A name with a quote in it cannot be allowed to end the quoting and run as
+    /// a command — this is a shell, and the name came off a remote filesystem.
+    #[test]
+    fn a_quote_in_a_name_cannot_escape() {
+        let line = cd_line("/tmp/it's a folder; rm -rf x");
+        // Whatever the quoting scheme, the dangerous characters must not be
+        // sitting outside quotes where the shell would act on them.
+        assert!(!line.contains("; rm -rf x\n"), "a command escaped the quoting: {line}");
+        assert!(line.ends_with('\n'));
     }
 }

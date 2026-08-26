@@ -10247,6 +10247,7 @@ impl IdeApp {
         // tree is borrowed for drawing while the menu is open.
         let mut new_dir_in:    Option<String> = None;
         let mut open_workspace: Option<String> = None;
+        let mut cd_to:          Option<String> = None;
         let mut refresh = false;
         // Remote row geometry, so a dropped file can be attributed to the
         // directory it landed on (see the drop handling after the scroll area).
@@ -10340,6 +10341,14 @@ impl IdeApp {
                                 new_dir_in = Some(dir.clone());
                                 ui.close_menu();
                             }
+                            // The local menu has had this since it was written.
+                            // Separate from opening the folder as the workspace:
+                            // sometimes you want the shell somewhere without
+                            // moving everything else there.
+                            if ui.button("Open in Terminal").clicked() {
+                                cd_to = Some(dir.clone());
+                                ui.close_menu();
+                            }
                             if entry.is_dir && ui.button("Open This Folder").clicked() {
                                 open_workspace = Some(entry.path.clone());
                                 ui.close_menu();
@@ -10371,6 +10380,10 @@ impl IdeApp {
                     ui.set_min_width(190.0);
                     if ui.button("New Folder…").clicked() {
                         new_dir_in = Some(here.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Open in Terminal").clicked() {
+                        cd_to = Some(here.clone());
                         ui.close_menu();
                     }
                     if ui.button("Copy Path").clicked() {
@@ -10412,6 +10425,14 @@ impl IdeApp {
             parent: dir, name: String::new(), error: None, busy: false,
         }); }
         if let Some(path) = open_workspace { self.open_remote_workspace(path); }
+        if let Some(dir) = cd_to {
+            self.ssh_cd(&dir);
+            // Shown, since the shell may be busy and the cd will not appear at a
+            // prompt until whatever is running there finishes.
+            self.output_log(format!("Terminal → {dir}"), OutputLevel::Info);
+            self.bottom_tab = BottomTab::Terminal;
+            self.show_term = true;
+        }
         if refresh {
             // Re-list where we are: the same request the explorer makes when it
             // navigates, so a folder made outside Forge shows up.
@@ -10419,6 +10440,22 @@ impl IdeApp {
                 self.ssh_navigate(here);
             }
         }
+    }
+
+    /// Send the remote shell to a directory.
+    ///
+    /// Typed into the shell rather than reopening it. The local terminal restarts
+    /// when the workspace moves, which is fine for a shell that starts in a
+    /// fraction of a second — but a remote shell may have a build running in it,
+    /// and its scrollback is the record of a session that took a round trip per
+    /// keystroke to produce. `cd` keeps both. If the shell is busy the line waits
+    /// in the pty and runs when the prompt comes back, which is exactly what
+    /// typing it would have done.
+    fn ssh_cd(&mut self, dir: &str) {
+        let Some(shell) = &self.ssh_shell else { return };
+        // Quoted, because a remote path is not a promise about spaces.
+        let line = format!("cd {}\n", crate::ssh::shell_quote_path(dir));
+        let _ = shell.tx.try_send(line.into_bytes());
     }
 
     /// Send dropped local files to a remote directory, then refresh the view.
@@ -11459,6 +11496,11 @@ impl IdeApp {
         // that leads somewhere else.
         self.ssh_tree.clear();
         self.ssh_navigate(path.clone());
+        // And the terminal goes there too. Opening a folder locally restarts
+        // every local shell in it; the remote shell was left wherever it was, so
+        // the workspace and the prompt disagreed and the first thing you had to
+        // do in a new folder was cd into it by hand.
+        self.ssh_cd(&path);
         self.output_log(format!("Remote workspace is now {path}"), OutputLevel::Info);
 
         let idx = self.agent_active;

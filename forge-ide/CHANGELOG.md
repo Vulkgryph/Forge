@@ -29,6 +29,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 - **Rolling a build out window by window leaves a process per window, and macOS gives every instance of an app its own Dock tile** — so three projects rolled out one at a time is three Forge icons, and the pinned one goes dark once the instance it was associated with has been replaced. That is inherent to running several processes, not a bug to fix, but there was no way back from it. This is the way back: when the rollout is done, every window is collected into a single process again, and the Dock returns to one icon. The window list comes from the record, which knows every process's windows, rather than from the process running the command, which only knows its own.
 
+### Fixed (the remote terminal stayed put when the workspace moved)
+
+- **Opening a folder on the remote left the shell wherever it was**, so the workspace and the prompt disagreed and the first thing you did in a new folder was `cd` into it by hand. Opening a folder locally has always restarted every local shell in it; the remote shell was simply never told. It now follows.
+- Sent as a `cd` rather than by reopening the shell. A local shell starts in a fraction of a second, so restarting it costs nothing; a remote one may have a build running in it, and its scrollback is a session that took a round trip per keystroke to produce. `cd` keeps both, and if the shell is busy the line waits in the pty and runs when the prompt returns — exactly what typing it would have done. The path is quoted whether it needs it or not, with the tilde left outside the quotes so the shell still expands it.
+- **Open in Terminal** is on the remote context menu too, for sending the shell somewhere without moving the workspace there — another thing the local tree has always had.
+
 ### Added (the remote explorer answers a right-click, and can make a folder)
 
 - **Right-clicking a remote file or folder did nothing.** The local tree has had a context menu since it was written; the remote one never got one, which is backwards — a remote workspace is where you are least able to fall back on Finder. Rows now offer New Folder…, Copy Path, Refresh, and Open This Folder on a directory. The empty space below the rows has the same menu, since "a new folder *here*" is a thing to ask when no row means here.

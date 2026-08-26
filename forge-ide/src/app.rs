@@ -518,6 +518,14 @@ pub struct NewWindowSpec {
     /// In-memory only: a process restart cannot carry it through an argument
     /// list, and starts again from zero, which is honest — that is a new process.
     pub reload_count: u32,
+    /// What was decided about this window before it existed, for its OUTPUT
+    /// panel.
+    ///
+    /// Whether a restarted window found its record, and whether that record had a
+    /// connection to remake, is exactly what nobody could see while a remote
+    /// window kept coming back local — every explanation for it was invisible
+    /// from inside the window it happened to. It is written down now.
+    pub notes: Vec<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -4142,10 +4150,11 @@ impl IdeApp {
         self.has_folder.then(|| self.cwd.clone())
     }
 
-    pub fn new_with_spec(spec: NewWindowSpec) -> Self {
+    pub fn new_with_spec(mut spec: NewWindowSpec) -> Self {
         let built_from = std::time::Instant::now();
         let is_reload = spec.is_reload;
         let spec_reload_count = spec.reload_count;
+        let notes = std::mem::take(&mut spec.notes);
         // `None` means "no workspace", not "inherit the process working
         // directory". That old behavior meant a window opened from the Dock —
         // where the process cwd is `/` — rendered the entire filesystem as the
@@ -4427,6 +4436,9 @@ impl IdeApp {
         // Every window, not just a rebuilt one: with a build rolled out one
         // window at a time, "which one is this?" is a question about all of them.
         app.output_log(format!("Forge IDE {}", build_stamp()), OutputLevel::Info);
+        for note in notes {
+            app.output_log(note, OutputLevel::Info);
+        }
         if spec_reload_count > 0 {
             let files = app.buffers.len();
             let terms = app.terminal_tabs.len();
@@ -4880,6 +4892,7 @@ impl IdeApp {
             ssh_host:  self.ssh.as_ref().map(|s| s.host.clone()),
             frame:     None,
             maximized: false,
+            notes:     Vec::new(),
         }
     }
 
@@ -16360,5 +16373,80 @@ mod command_palette_tests {
             let (_, keys, _) = COMMANDS.iter().find(|(t, _, _)| *t == name).unwrap();
             assert!(keys.is_empty(), "{name} claims a shortcut it does not have: {keys}");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_remote_record_tests {
+    use super::{IdeApp, NewWindowSpec};
+
+    /// The recording path, against a real connection.
+    ///
+    /// Twice now I have said a restart "should" reconnect and been wrong, both
+    /// times because something upstream never wrote the connection down. This
+    /// asserts the write actually happens, end to end, rather than reasoning
+    /// about it: connect to a host from the SSH config, then ask the window what
+    /// it would record.
+    ///
+    /// Ignored by default — it needs the network and that host:
+    ///   cargo test -p forge-ide live_remote_record -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a reachable host from ~/.ssh/config"]
+    fn a_connected_window_records_its_connection() {
+        // Only the hosts this is meant for. Connecting is not a read-only act —
+        // it uploads `forge-server` when the remote's copy is out of date — so a
+        // test must not go wandering through whatever is in the SSH config
+        // looking for something that answers.
+        let hosts = crate::ssh::load_hosts();
+        let answers = |h: &crate::ssh::SshHost| {
+            std::net::ToSocketAddrs::to_socket_addrs(&(h.host.as_str(), h.port))
+                .ok()
+                .and_then(|mut a| a.next())
+                .map(|addr| {
+                    std::net::TcpStream::connect_timeout(
+                        &addr, std::time::Duration::from_millis(1500),
+                    ).is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let Some(host) = hosts.iter()
+            .filter(|h| h.name.starts_with("admin-1"))
+            .find(|h| answers(h))
+            .cloned()
+        else {
+            eprintln!("admin-1 is not answering on 22; nothing to test against");
+            return;
+        };
+        eprintln!("testing against {} ({})", host.name, host.host);
+
+        let dir = std::env::temp_dir().join(format!("forge-live-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir), ..Default::default()
+        });
+
+        // Nothing to record before connecting, which is the control.
+        assert!(app.remote_identity().is_none());
+
+        app.ssh_form = host.clone();
+        app.ssh_connect();
+        let rx = app.ssh_connect_rx.take().expect("no connect in flight");
+        let ready = match rx.recv_timeout(std::time::Duration::from_secs(45)) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(e)) => panic!("could not connect to {}: {e}", host.host),
+            Err(_) => panic!("connecting to {} timed out", host.host),
+        };
+        app.ssh = Some(ready.conn);
+
+        let (recorded, dir_on_remote) =
+            app.remote_identity().expect("a connected window recorded nothing");
+        eprintln!("recorded: name={:?} host={:?} user={:?} dir={dir_on_remote:?}",
+                  recorded.name, recorded.host, recorded.user);
+        assert_eq!(recorded.host, host.host);
+        assert_eq!(recorded.user, host.user);
+        // And enough to connect again without the config, which is the point of
+        // recording the connection rather than a name to look up.
+        assert!(!recorded.host.is_empty());
+        assert!(!dir_on_remote.is_empty());
     }
 }

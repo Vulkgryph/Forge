@@ -235,9 +235,20 @@ fn specs_from_records(
                 if let Some(dir) = r.remote_dir.clone() { h.remote_dir = dir; }
                 h
             });
+            let notes = match (&ssh_host, r.remote_host.is_some()) {
+                (Some(h), _) => vec![format!("Reconnecting to {} ({})", h.name, h.host)],
+                // Recorded as remote and coming back local: the only way now is a
+                // record written by a build that did not keep the connection, and
+                // saying so beats the window looking inexplicably local.
+                (None, true) => vec![
+                    "This window was on a remote host, but its record has no \
+                     connection to remake — reconnect from the sidebar".to_string(),
+                ],
+                (None, false) => Vec::new(),
+            };
             NewWindowSpec {
                 cwd: r.cwd, frame: r.frame, maximized: r.maximized,
-                window_id: r.id, ssh_host, is_reload, reload_count: 0,
+                window_id: r.id, ssh_host, is_reload, reload_count: 0, notes,
             }
         })
         .collect()
@@ -274,8 +285,18 @@ fn plan_initial_windows(
         let specs = if mine.is_empty() {
             // No record for it (never written, or pruned). The folder was passed
             // alongside precisely for this, so the window still opens on the
-            // right workspace rather than not at all.
-            from_paths(cwds, true)
+            // right workspace rather than not at all — but it comes back without
+            // its geometry or its connection, and looking like a brand new window
+            // is exactly what that felt like from the outside.
+            let mut specs = from_paths(cwds, true);
+            if let Some(first) = specs.first_mut() {
+                first.notes.push(format!(
+                    "No saved record for window {} — reopened from its folder only, \
+                     without its size or any remote connection",
+                    only.first().copied().unwrap_or(0),
+                ));
+            }
+            specs
         } else {
             from_records(mine, true)
         };
@@ -1725,5 +1746,69 @@ mod record_write_tests {
         let mut zoomed = before.clone();
         zoomed[0].maximized = true;
         assert!(!worth_writing_now(&zoomed, &before));
+    }
+}
+
+#[cfg(test)]
+mod restore_notes_tests {
+    use super::*;
+
+    fn host() -> ssh::SshHost {
+        ssh::SshHost {
+            name: "admin-1".into(), host: "spark.local".into(), port: 22,
+            user: "sysadmin".into(), key_path: "/k".into(), remote_dir: "~".into(),
+        }
+    }
+
+    /// A window that comes back local when it was remote has to say why. Every
+    /// explanation for that was invisible from inside the window it happened to,
+    /// which is how the same report came back three times.
+    #[test]
+    fn a_record_with_no_connection_says_so() {
+        let dir = std::env::temp_dir();
+        let rec = session::WindowRecord {
+            cwd: Some(dir), id: 7,
+            // Written by a build that recorded the host as a name it could no
+            // longer resolve to a connection.
+            remote_host: None,
+            remote_dir: Some("/home/sysadmin/code".into()),
+            ..Default::default()
+        };
+        // `remote_dir` alone is not a connection, so this window is local — and
+        // must not be silent about it.
+        let mut rec_with_marker = rec.clone();
+        rec_with_marker.remote_host = Some(host());
+        let reconnecting = specs_from_records(vec![rec_with_marker], true, &[host()]);
+        assert!(
+            reconnecting[0].notes.iter().any(|n| n.contains("Reconnecting to admin-1")),
+            "a reconnect said nothing: {:?}", reconnecting[0].notes,
+        );
+
+        let local = specs_from_records(vec![rec], true, &[]);
+        assert!(local[0].notes.is_empty(), "a plain local window narrated itself");
+    }
+
+    /// The "fresh window" case: a restart named a window the record does not have,
+    /// so it comes back with its folder and nothing else. That looked exactly like
+    /// a brand new window, with no way to tell which of several causes it was.
+    #[test]
+    fn a_window_with_no_record_says_it_lost_its_state() {
+        let dir = std::env::temp_dir();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "42".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        // The record holds a different window entirely.
+        let specs = plan_initial_windows(
+            parse_window_args(&argv),
+            || vec![session::WindowRecord { cwd: Some(dir), id: 9, ..Default::default() }],
+            false,
+        );
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].notes.iter().any(|n| n.contains("No saved record for window 42")),
+            "came back stateless without saying so: {:?}", specs[0].notes,
+        );
     }
 }

@@ -10074,7 +10074,11 @@ impl IdeApp {
 
         let font_id  = egui::FontId::monospace(self.settings.font_size);
         let row_h    = ui.fonts(|f| f.row_height(&font_id));
-        let char_w   = ui.fonts(|f| f.glyph_width(&font_id, ' '));
+        // The same measurement the local terminal uses, and for the reason given
+        // where it lives: a column is not the font's advance for a space, and the
+        // difference is a fraction of a pixel per character that shows up as a
+        // gap between the end of the prompt and the cursor.
+        let char_w   = crate::terminal::mono_advance(ui, &font_id);
         let focus_id = ui.id().with("ssh_term_focus");
 
         // Fit the grid to the panel, as the local terminal does.

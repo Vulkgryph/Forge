@@ -1084,6 +1084,27 @@ pub struct Terminal {
     cached_scrollback_galley: Option<(u64, egui::FontId, std::sync::Arc<egui::Galley>)>,
 }
 
+/// The width of one column, measured the way the text is actually laid out.
+///
+/// Not `glyph_width(' ')`. That is the font's own advance for a space, and egui
+/// snaps a glyph's advance when it lays a line out — so the two disagree by a
+/// fraction of a pixel per character, which is invisible at one character and
+/// three quarters of a character wide by the end of a shell prompt. The remote
+/// terminal put its cursor at `column × glyph_width`, and the gap between the
+/// end of the prompt and the cursor was that error, accumulated. At a different
+/// font size the same error runs the other way and the cursor sits inside the
+/// text.
+///
+/// Measured over a run so the division averages out the rounding of any single
+/// advance, and in one place so the cursor, the column count and the text cannot
+/// hold different opinions about where column *n* is.
+pub fn mono_advance(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap("a".repeat(40), font.clone(), egui::Color32::WHITE)
+            .rect.width() / 40.0
+    }).max(1.0)
+}
+
 impl Terminal {
     /// True while this terminal has keyboard focus (clicked into). Used by
     /// the app to suppress global keyboard shortcuts so typing shell
@@ -1340,10 +1361,7 @@ impl Terminal {
     pub fn draw_sized(&mut self, ui: &mut egui::Ui, font_size: f32) {
         let font_id = egui::FontId::monospace(font_size);
         let row_h   = ui.fonts(|f| f.row_height(&font_id));
-        let char_w  = ui.fonts(|f| {
-            f.layout_no_wrap("a".repeat(40), font_id.clone(), egui::Color32::WHITE)
-                .rect.width() / 40.0
-        });
+        let char_w  = mono_advance(ui, &font_id);
 
         let visible_rows = (ui.available_height() / row_h).floor().max(1.0) as u16;
         let visible_cols = (ui.available_width()  / char_w).floor().max(1.0) as u16;
@@ -2493,6 +2511,77 @@ mod shrink_tests {
         assert!(
             g.viewport.iter().any(|r| r.iter().any(|c| c.bg.is_some())),
             "a deliberately painted row was discarded as blank",
+        );
+    }
+}
+
+#[cfg(test)]
+mod column_width_tests {
+    use super::mono_advance;
+
+    /// A shell prompt's worth of text has to end where the cursor is drawn.
+    ///
+    /// The reported symptom was a gap between the end of a remote prompt and the
+    /// block cursor. It was the terminal placing the cursor at `column ×
+    /// glyph_width(' ')` while the text beside it was placed by the galley: at
+    /// 13pt those differ by about a quarter of a pixel per character, which is
+    /// nine pixels — three quarters of a character — by the end of
+    /// `sysadmin@spark-9f0d:~/Biophysical_NN$ `. At 14pt the error runs the other
+    /// way and the cursor sits inside the text instead.
+    #[test]
+    fn a_column_is_the_width_the_text_is_actually_drawn_at() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+
+        for size in [11.0_f32, 12.0, 13.0, 14.0, 16.0] {
+            let font = egui::FontId::monospace(size);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0), egui::vec2(900.0, 300.0),
+                )),
+                ..Default::default()
+            };
+            let mut advance = 0.0_f32;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    advance = mono_advance(ui, &font);
+                });
+            });
+
+            let text = "sysadmin@spark-9f0d:~/Biophysical_NN$ ";
+            let drawn = ctx.fonts(|f| {
+                f.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE)
+            }).size().x;
+            let by_column = text.chars().count() as f32 * advance;
+
+            // Within a pixel over a whole prompt: the cursor lands where the text
+            // ends, which is all this has to be.
+            assert!(
+                (drawn - by_column).abs() < 1.0,
+                "at {size}pt a {}-character prompt drifts {:.2}px \
+                 (text ends at {drawn:.2}, column maths says {by_column:.2})",
+                text.chars().count(), drawn - by_column,
+            );
+        }
+    }
+
+    /// And the naive measurement really is wrong, so this is testing something.
+    #[test]
+    fn the_glyph_advance_alone_would_drift() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let font = egui::FontId::monospace(13.0);
+        let text = "sysadmin@spark-9f0d:~/Biophysical_NN$ ";
+
+        let space = ctx.fonts(|f| f.glyph_width(&font, ' '));
+        let drawn = ctx.fonts(|f| {
+            f.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE)
+        }).size().x;
+        let drift = drawn - text.chars().count() as f32 * space;
+        assert!(
+            drift.abs() > 2.0,
+            "the space advance no longer drifts ({drift:.2}px) — if egui stopped \
+             snapping advances, this test has nothing left to say",
         );
     }
 }

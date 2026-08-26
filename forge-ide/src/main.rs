@@ -159,6 +159,56 @@ fn parse_window_args(args: &[String]) -> WindowArgs {
     out
 }
 
+/// What one window puts in the record.
+///
+/// Separated from the windows themselves so it can be tested: the geometry needs
+/// a real OS window, and everything that matters for coming back — the folder and
+/// the connection — does not. This is the link that kept quietly failing, and it
+/// was the one part of the chain no test could reach.
+fn record_for(
+    app:       &IdeApp,
+    frame:     Option<session::WindowFrame>,
+    maximized: bool,
+) -> session::WindowRecord {
+    let remote = app.remote_identity();
+    session::WindowRecord {
+        id:  app.window_id,
+        cwd: app.workspace_root(),
+        frame,
+        maximized,
+        // So a window restarted into a new process connects again instead of
+        // coming back local. Both from one call: the host is the host, and the
+        // folder on the remote is per window.
+        remote_host: remote.as_ref().map(|(h, _)| h.clone()),
+        remote_dir:  remote.map(|(_, d)| d),
+        // Stamped by `session::save_windows`, which knows the process it writes
+        // for.
+        pid:  0,
+        seen: 0,
+    }
+}
+
+/// The child's view of a single-window restart: the argument list a restart
+/// spawns, planned against a set of records.
+///
+/// Exists so the whole chain can be walked in a test without a real
+/// configuration directory to write into.
+#[cfg(test)]
+pub(crate) fn plan_one_restarted_window(
+    window_id: u64,
+    records:   Vec<session::WindowRecord>,
+) -> app::NewWindowSpec {
+    let argv = vec![
+        "--reload".to_string(),
+        RELOAD_WINDOW.to_string(),
+        window_id.to_string(),
+        NO_FOLDER.to_string(),
+    ];
+    let mut specs = plan_initial_windows(parse_window_args(&argv), move || records, false);
+    assert_eq!(specs.len(), 1, "a single-window restart planned {} windows", specs.len());
+    specs.remove(0)
+}
+
 /// Whether this change to the window set has to reach disk now, rather than
 /// waiting for the geometry settle timer.
 ///
@@ -603,27 +653,15 @@ impl Ide {
     fn window_records(&self) -> Vec<session::WindowRecord> {
         self.windows
             .iter()
-            .map(|w| session::WindowRecord {
-                id:        w.app.window_id,
-                cwd:       w.app.workspace_root(),
+            .map(|w| {
                 // `outer_position` is unsupported on some platforms and fails
                 // while a window is being created; no frame simply means the
                 // platform picks one.
-                frame:     w.window.outer_position().ok().map(|p| {
+                let frame = w.window.outer_position().ok().map(|p| {
                     let size = w.window.inner_size();
                     session::WindowFrame { x: p.x, y: p.y, w: size.width, h: size.height }
-                }),
-                maximized: w.window.is_maximized(),
-                // So a window restarted into a new process connects again
-                // instead of coming back local.
-                remote_host: w.app.remote_identity().map(|(h, _)| h),
-                remote_dir:  w.app.remote_identity().map(|(_, d)| d),
-                // (Both from the same call; kept as two fields because the folder
-                // on the remote is per window and the host is not.)
-                // Stamped by `session::save_windows`, which is what knows the
-                // process it is writing for.
-                pid:  0,
-                seen: 0,
+                });
+                record_for(&w.app, frame, w.window.is_maximized())
             })
             .collect()
     }
@@ -939,6 +977,18 @@ impl ApplicationHandler for Ide {
             // Written while the window is still here to measure, for the same
             // reason the full restart writes it here.
             self.write_windows(true);
+            // And say what reached the record, since that is what the new window
+            // will come back from. The other side of the `restart_window` log:
+            // between them they say whether the connection made it to disk, which
+            // is the step that kept failing invisibly.
+            let recorded = session::load_windows().into_iter()
+                .filter(|r| r.id == window_id)
+                .filter_map(|r| r.remote_host.map(|h| h.host))
+                .next();
+            match &recorded {
+                Some(h) => eprintln!("restart_window: record for {window_id} carries {h}"),
+                None => eprintln!("restart_window: record for {window_id} carries no connection"),
+            }
             match std::process::Command::new(&exe)
                 .arg(RELOAD_WINDOW)
                 .arg(window_id.to_string())

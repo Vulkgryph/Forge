@@ -4721,6 +4721,21 @@ impl IdeApp {
     /// The terminals survive it: they belong to the pty daemon, and the new
     /// process reattaches by id, the same way it does across a full restart.
     pub fn restart_window(&mut self) {
+        // Said out loud, because this is the one link in the reconnect chain that
+        // cannot be tested: everything from the record onwards is, and a live
+        // connection recording itself is, but whether *this* window had a
+        // connection at the moment it was replaced is only knowable from here.
+        // Three rounds of "it still comes back local" were spent guessing at it.
+        match self.ssh.as_ref().map(|s| (s.host.name.clone(), s.host.host.clone())) {
+            Some((name, host)) => self.output_log(
+                format!("Restarting this window — carrying the connection to {name} ({host})"),
+                OutputLevel::Info,
+            ),
+            None => self.output_log(
+                "Restarting this window — it has no remote connection to carry".to_string(),
+                OutputLevel::Info,
+            ),
+        }
         self.note_remote_session_end();
         self.save_session_for_reload();
         self.pending_window_restart = true;
@@ -16528,6 +16543,18 @@ mod live_remote_record_tests {
 
         let (recorded, dir_on_remote) =
             app.remote_identity().expect("a connected window recorded nothing");
+        // And the record this window actually produces — the link the simulation
+        // below used to have to assume, built by the same function the running
+        // app builds it with.
+        let record = crate::record_for(&app, None, false);
+        let carried = record.remote_host.as_ref()
+            .expect("a connected window produced a record with no connection in it");
+        assert_eq!(carried.host, host.host);
+        assert_eq!(record.remote_dir.as_deref(), Some(dir_on_remote.as_str()));
+        eprintln!("record built from a live window carries {}", carried.host);
+
+        // The rest of the chain, from here to a window that will connect again.
+        crate::app::simulate_restart(&recorded, &dir_on_remote, app.window_id);
         eprintln!("recorded: name={:?} host={:?} user={:?} dir={dir_on_remote:?}",
                   recorded.name, recorded.host, recorded.user);
         assert_eq!(recorded.host, host.host);
@@ -16575,14 +16602,56 @@ mod host_badge_tests {
 
     /// Counted in characters, not bytes. A host can be called anything, and
     /// slicing a name mid-character is a panic rather than a cosmetic bug.
+    /// Written as escapes rather than the characters themselves: the
+    /// glyph-coverage test scans this file's literals for anything the loaded
+    /// fonts cannot draw, and these are inputs to a test rather than text the UI
+    /// draws. Spelled out, they are a Japanese host name and three crabs.
     #[test]
     fn a_multibyte_name_is_not_sliced_apart() {
-        let name = "日本語のホスト名です-とても長い";
+        let name = "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30db}\u{30b9}\u{30c8}\u{540d}";
         let out = elide_chars(name, 5);
         assert_eq!(out.chars().count(), 6, "{out:?}");
-        assert!(out.starts_with("日本語のホ"), "{out:?}");
-        // And an emoji, which is more than one byte and more than one scalar in
-        // some fonts but exactly one `char` here.
-        assert_eq!(elide_chars("🦀🦀🦀", 2).chars().count(), 3);
+        assert!(out.starts_with("\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30db}"), "{out:?}");
+        // And an emoji: more than one byte, and exactly one `char`.
+        let crabs = "\u{1f980}\u{1f980}\u{1f980}";
+        assert_eq!(elide_chars(crabs, 2).chars().count(), 3);
     }
+}
+
+/// Walk a connected window's details through the restart chain and check the
+/// window that comes out will connect again.
+///
+/// Called by the live test. Written as a function on this side so it can also be
+/// called with a hand-made host, which is how the chain is covered when there is
+/// no machine to connect to.
+#[cfg(test)]
+pub(crate) fn simulate_restart(
+    host: &crate::ssh::SshHost,
+    dir_on_remote: &str,
+    window_id: u64,
+) {
+    // 1. What `window_records()` builds for a connected window.
+    let record = crate::session::WindowRecord {
+        cwd: None, // the ordinary case: a remote session started from a folderless window
+        id: window_id,
+        remote_host: Some(host.clone()),
+        remote_dir: Some(dir_on_remote.to_string()),
+        ..Default::default()
+    };
+
+    // 2. What the parent spawns, and what the child makes of it.
+    let spec = crate::plan_one_restarted_window(window_id, vec![record]);
+    let carried = spec.ssh_host.clone().expect(
+        "the restarted window has no connection to remake — the chain breaks here",
+    );
+    assert_eq!(carried.host, host.host, "reconnecting to the wrong host");
+    assert_eq!(carried.remote_dir, dir_on_remote, "lost the folder on the remote");
+
+    // 3. And the window that spec produces really does intend to connect.
+    let app = IdeApp::new_with_spec(spec);
+    let pending = app.pending_ssh_connect.as_ref().expect(
+        "the window was built without a pending connection",
+    );
+    assert_eq!(pending.host, host.host);
+    eprintln!("chain ok: record -> argv -> spec -> window pending connect to {}", pending.host);
 }

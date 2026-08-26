@@ -4,7 +4,7 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
-## [0.3.0] — 2026-08-19
+## [0.3.0] — 2026-08-26
 
 First release of the Rust terminal client. It replaces `forge-tui`, the earlier TypeScript one, which is retired and removed from the repository — see the [README](README.md) for why it was rewritten rather than repaired.
 

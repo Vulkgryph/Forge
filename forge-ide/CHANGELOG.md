@@ -4,6 +4,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-26
+
+First public release. Everything below shipped in it; the version was written up
+before it was tagged, and a further week of work landed on top of it, so the two
+are one entry rather than a release nobody could install and a sequel to it.
+
 ### Changed (you can see what the agent is doing, and for how long)
 
 - **A running tool call was a static dot.** Colour alone carried "running" versus "finished", so a call thirty seconds in looked exactly like a stale icon and there was no way to tell a working agent from a stuck one. The dot on a running call now breathes, with a halo that grows and fades with it so it reads as motion at a glance rather than only as a colour change. It is on the card that is executing — where the eye already is — not only on the status line above the input box. No extra wakeups: the panel already repaints on a 50ms cadence while a turn is live and not at all when it is not, and the animation asks for exactly that cadence rather than the next frame the loop will give it.
@@ -136,7 +142,6 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 Which entries are shown, how directories are marked, what order rows come in and where the entry cap falls are now one implementation shared by both listings, so a remote workspace cannot quietly behave unlike a local one. The `fs/list` request itself is likewise one implementation, where the explorer, the folder chooser and Quick Open previously each hand-rolled it.
 
-## [0.3.0] — 2026-08-19
 
 ### Added (native "Set Up AI Provider" wizard — no command line needed)
 

@@ -5367,6 +5367,25 @@ impl IdeApp {
                             if self.ssh.is_some() {
                                 // Remote workspace: show the SSH file tree in Explorer
                                 self.draw_remote_explorer(ui);
+                            } else if self.ssh_connecting || self.pending_ssh_connect.is_some() {
+                                // Coming back to a remote host. Starting a remote
+                                // session from a window with no local folder is
+                                // the ordinary way in — you open the IDE and
+                                // connect from what is already there — so a
+                                // restarted remote window has no folder to show
+                                // and used to read as a brand new window for the
+                                // second or two the connection takes, and for good
+                                // if it failed. It says what it is doing instead.
+                                let host = self.pending_ssh_connect.as_ref()
+                                    .map(|h| h.host.clone())
+                                    .unwrap_or_else(|| self.ssh_form.host.clone());
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new(format!("Reconnecting to {host}…"))
+                                        .size(12.0).color(egui::Color32::from_gray(190)));
+                                });
                             } else if !self.has_folder {
                                 // No workspace open. Don't render `cwd` as if it
                                 // were one — offer to pick a folder instead.
@@ -5383,6 +5402,26 @@ impl IdeApp {
                                         self.open_folder_dialog();
                                     }
                                 });
+                                // And if it *was* on a host and could not get back,
+                                // the window says so where the folder would be
+                                // rather than only in the OUTPUT panel — this is
+                                // the state that looked like a fresh window.
+                                if let Some(err) = &self.ssh_error.clone() {
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new(format!(
+                                            "Could not reconnect: {err}"))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(235, 130, 120)));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(10.0);
+                                        if ui.button("Try again").clicked() {
+                                            self.ssh_connect();
+                                        }
+                                    });
+                                }
                             } else {
                                 match self.file_tree.draw(ui, self.git.as_ref()) {
                                     Some(TreeAction::Open(path))          => self.open_file(path),
@@ -16409,8 +16448,12 @@ mod live_remote_record_tests {
                 })
                 .unwrap_or(false)
         };
+        // Case-insensitively, and matching anywhere in the name: the entry that
+        // actually answers is `Admin-1-Tailscale`, and a case-sensitive
+        // `starts_with` skipped it — so this reported "not answering" about a
+        // host that was up the whole time.
         let Some(host) = hosts.iter()
-            .filter(|h| h.name.starts_with("admin-1"))
+            .filter(|h| h.name.to_ascii_lowercase().contains("admin-1"))
             .find(|h| answers(h))
             .cloned()
         else {

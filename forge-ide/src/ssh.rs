@@ -745,14 +745,23 @@ impl client::Handler for ClientHandler {
         _connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let routes = self.upstream.lock().unwrap().clone();
         async move {
             let Some(routes) = routes else {
-                // Nothing is proxying, so this port is not ours to answer.
+                // Nothing is proxying, so this port is not ours to answer, and
+                // saying so is now possible: `reply` is russh 0.62's fix for
+                // channel callbacks being reachable before anyone agreed to the
+                // channel (CVE-2026-68930). Refusing is the honest answer, and
+                // the remote learns immediately rather than waiting on a channel
+                // that will never be served.
+                reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
                 return Ok(());
             };
+            // Ours to serve, so the channel is agreed to before it is used.
+            reply.accept().await;
             let (reader, writer) = bridge_channel(channel);
             std::thread::spawn(move || {
                 let mut stream = BridgedStream { reader, writer };

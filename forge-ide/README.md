@@ -21,7 +21,7 @@ Forge IDE is built for engineers who want to see and understand the tool they us
 - **Editor** — multi-tab, syntax highlighting, line numbers, undo, find/replace, multi-file search, split editors, multi-cursor editing, bracket matching + pair colorization, minimap, indent guides, auto-close brackets, word wrap, go-to-line
 - **LSP** — full language server support (diagnostics, completions, hover, go-to-definition, find references, rename, code actions, signature help, formatting, symbol outline). Ships wired up for `rust-analyzer`; any LSP-compliant server works.
 - **Git** — status-colored file tree, staged/unstaged source control panel, inline diff gutter, unified diff view, commit/push/pull/fetch, inline blame, `gh`-backed "Publish to GitHub," and a `~/.ssh/config`-integrated remote picker
-- **SSH Remote** — a small Rust daemon (`forge-server`) auto-uploads itself to the remote machine over SFTP and speaks JSON-RPC back over the SSH channel. Remote file tree, remote terminal, and remote file editing all route through it — no VS Code Server–style background install step, and it works fully offline on the remote end (nothing is downloaded there).
+- **SSH Remote** — a small Rust daemon (`forge-server`) uploads itself to the remote machine over SFTP, runs there, and speaks JSON-RPC back over the SSH channel. Remote file tree, remote terminal, and remote file editing all route through it — no VS Code Server–style background install step, and it works fully offline on the remote end (nothing is downloaded there).
 - **Debugging** — DAP client (breakpoints, step over/in/out, call stack, variables) against `lldb-dap`, `debugpy`, or any DAP-compliant adapter
 - **Terminal** — a real PTY with VT100/ANSI support, plus an Output panel for build/task/connection logs
 - **Task runner** — named tasks in `.forge/tasks.toml`, run from a picker, output streamed live
@@ -58,6 +58,17 @@ Forge IDE is a Cargo workspace with three crates:
 cargo build -p forge-ide --release
 cargo run -p forge-ide --release
 ```
+
+### The app bundle is not notarized
+
+`scripts/package_macos.sh` signs the bundle with a Developer ID if one is in
+your keychain and ad-hoc signs it otherwise. Neither is notarized by Apple.
+
+A bundle you did not build yourself will therefore be refused on first open —
+*"cannot be opened because the developer cannot be verified"*. Right-click →
+**Open**, or **System Settings → Privacy & Security → Open Anyway**, allows it.
+If that is not a trade you want to make, build from source: it is the two
+`cargo build` commands above.
 
 ### Build the remote server (optional — only needed for SSH Remote)
 

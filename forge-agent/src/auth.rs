@@ -288,9 +288,28 @@ async fn fetch_latest_github_release(repo: &str) -> Option<String> {
 /// API call entirely. Cached values are still used; the fallback applies if
 /// the cache is empty. Useful for airgapped environments or anyone auditing
 /// outgoing network traffic.
+/// Whether the weekly GitHub poll is allowed to happen.
+///
+/// `offline_mode` lives in `AppConfig`, which this module cannot see — so it is
+/// mirrored here at startup. Without that, a user who ticked offline mode on a
+/// ChatGPT Codex endpoint still reached api.github.com, which is precisely what
+/// they asked not to happen, and the config field's own documentation said it
+/// would not.
+static OFFLINE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called at startup, and again when the setting is toggled mid-session.
+pub fn set_offline_mode(on: bool) {
+    OFFLINE_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn version_self_check_disabled() -> bool {
+    std::env::var("FORGE_NO_AUTO_VERSION_CHECK").is_ok()
+        || OFFLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn resolve_client_version(repo: &str, cache_file: &str, fallback: &str) -> String {
     const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-    let auto_check_disabled = std::env::var("FORGE_NO_AUTO_VERSION_CHECK").is_ok();
+    let auto_check_disabled = version_self_check_disabled();
 
     if let Some(cached) = read_version_cache(cache_file) {
         // When auto-check is disabled, accept the cache regardless of age.
@@ -1344,5 +1363,31 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "Model B");
         assert_eq!(models[0].context_window, 1900);
+    }
+}
+
+#[cfg(test)]
+mod offline_self_check_tests {
+    use super::{set_offline_mode, version_self_check_disabled};
+
+    /// The weekly GitHub poll keeps the Codex client version current. It is not
+    /// part of making a model call, so `offline_mode` has to reach it — and it
+    /// could not, because `offline_mode` lives in a config this module cannot
+    /// see. A user who ticked the box on a Codex endpoint still reached
+    /// api.github.com, while the field's own documentation said they would not.
+    ///
+    /// Serialised into one test because the flag is process-global: two tests
+    /// setting it would race under the default threaded runner.
+    #[test]
+    fn offline_mode_stops_the_version_self_check() {
+        set_offline_mode(false);
+        let baseline = version_self_check_disabled();
+
+        set_offline_mode(true);
+        assert!(version_self_check_disabled(), "offline mode does not reach the poll");
+
+        set_offline_mode(false);
+        assert_eq!(version_self_check_disabled(), baseline,
+            "turning it back off did not restore the previous state");
     }
 }

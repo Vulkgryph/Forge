@@ -245,9 +245,17 @@ pub struct AgentConfig {
     /// (not recommended — a stuck wait=true shell can hold the turn again).
     #[serde(default = "default_forced_shell_background_secs")]
     pub forced_shell_background_secs: u64,
-    /// When true, forces off every network touchpoint that isn't the model
-    /// API call itself: `web_search`/`web_fetch` tools, ChatGPT Codex's
-    /// periodic OAuth token refresh, and its weekly version self-check.
+    /// When true, forces off the network touchpoints that are not part of
+    /// making a model call: the `web_search`/`web_fetch` tools, the weekly
+    /// GitHub version self-check, and the ChatGPT Codex model-catalog fetch
+    /// unless Codex is the endpoint actually in use.
+    ///
+    /// What it does not turn off, because a model call cannot happen without
+    /// it: refreshing the ChatGPT Codex OAuth token when Codex is the active
+    /// endpoint. That reaches the provider, the same as the request it
+    /// authenticates. Anything else — a local endpoint, an API key — makes no
+    /// such call.
+    ///
     /// Off by default — nothing changes unless a user opts in.
     #[serde(default)]
     pub offline_mode: bool,

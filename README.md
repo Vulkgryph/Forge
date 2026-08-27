@@ -77,7 +77,12 @@ this is actually used against is ARM64.
 | `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested | untested |
 | `forge-ide` | supported | untested | untested | untested |
 
-**supported** — used daily, and built and tested in CI on every push.
+**supported** — used daily and interactively on this platform by the person who
+writes it, which is the evidence behind the word. CI coverage is not what it
+rests on and differs by component: `forge-ide` is built and its tests run on a
+macOS runner on every push; `forge-agent` is built on macOS by the packaging job
+but its test suite runs on Linux; `forge-tui-rs` is built and tested on Linux
+only.
 
 **compiles and passes tests** — CI builds it on x86-64 Linux and the test suite
 passes there on every push. Nobody has sat in front of it on a Linux desktop. A
@@ -123,6 +128,11 @@ rely on it:
   own tools. It works today. It is not a sanctioned integration, and it could
   stop working, or be objected to, at any point — in which case this project
   will comply and remove it.
+- The risk of an objection lands on your OpenAI account rather than on this
+  project: a consumer subscription driven through an unsanctioned client can be
+  flagged or suspended without notice. That is exactly why Anthropic
+  subscription login was removed outright rather than kept — see
+  [forge-agent's CHANGELOG](forge-agent/CHANGELOG.md).
 - If that matters to you, use an API key. Every other provider path is a
   documented, sanctioned one.
 
@@ -157,6 +167,21 @@ nothing of the sort is in the tree today, and this README makes no claim about
 when or whether it will be.
 
 `web_fetch` is unaffected: give it a URL and it fetches that page.
+
+## Using this safely
+
+Forge is a sharp tool. It reads, writes, and executes code on your machine with
+your user account's permissions. There is no sandbox — approval prompts are the
+barrier, and auto-approval modes remove them on purpose. `forge-ide` also
+uploads a helper binary to any SSH host you connect to and runs it there.
+
+Read the [Safety Model](forge-agent/README.md#safety-model) before turning on
+anything that skips approval, and the per-component disclaimers in
+[forge-agent](forge-agent/README.md) and [forge-ide](forge-ide/README.md).
+
+Forge is provided **"AS IS"**, without warranty of any kind, and you are
+responsible for what you approve it to do. [LICENSE](LICENSE) is the binding
+document; [SECURITY.md](SECURITY.md) is how to report a vulnerability.
 
 ## License
 

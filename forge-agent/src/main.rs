@@ -173,6 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut all_endpoints = app_config.models.endpoints.clone();
 
+    // Mirrored into auth before anything there can reach the network: the
+    // version self-check is not part of a model call and has no business
+    // running when the user asked for no incidental traffic.
+    auth::set_offline_mode(app_config.agent.offline_mode);
+
     // In offline mode, this whole block only runs if the active endpoint is
     // itself ChatGPT Codex — otherwise it's pure incidental network traffic
     // for a catalog of models this session isn't even using.

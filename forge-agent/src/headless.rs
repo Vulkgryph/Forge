@@ -813,6 +813,10 @@ fn json_to_user_action(
         }
         IncomingMessage::UpdateOfflineMode { enabled } => {
             app_config.agent.offline_mode = enabled;
+            // The setting is togglable mid-session, so the mirror in `auth`
+            // has to move with it — otherwise turning it on only takes effect
+            // at the next start, which is not what a toggle means.
+            crate::auth::set_offline_mode(enabled);
             let _ = app_config.save();
             let _ = action_tx.send(UserAction::UpdateConfig(app_config.clone()));
             None

@@ -14,7 +14,7 @@ This policy covers everything in this monorepo:
 It does **not** cover:
 
 - Third-party LLM endpoints, models, or providers used through Forge
-- Misuse of Forge by an authenticated user against their own machine (see the Safety Model section in the README — Forge is a sharp tool by design)
+- Misuse of Forge by an authenticated user against their own machine (see [Safety Model](forge-agent/README.md#safety-model) and [Using this safely](README.md#using-this-safely) — Forge is a sharp tool by design)
 - Vulnerabilities in dependencies, unless Forge's use of the dependency creates a new attack surface
 
 ## Reporting a vulnerability
@@ -52,7 +52,7 @@ If your report leads to a fix, you will be credited in the release notes and the
 
 The following are explicitly **not** considered vulnerabilities:
 
-- Forge running shell commands or modifying files that the operating system permits the launching user to access. This is the intended behavior and is documented in the README's Safety Model section.
+- Forge running shell commands or modifying files that the operating system permits the launching user to access. This is the intended behavior and is documented in [Safety Model](forge-agent/README.md#safety-model).
 - Auto-approval modes (`--dangerously-allow-all`, the auto-accept and approve-everything permission modes) doing exactly what they advertise.
 - Prompt-injection results that depend on the user pasting untrusted content into the LLM context. We are interested in **novel injection paths** (e.g. tool output that escalates beyond the approval boundary), not generic prompt injection.
 - Resource exhaustion caused by user-approved commands or unbounded model output.

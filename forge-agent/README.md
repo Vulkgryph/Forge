@@ -29,7 +29,7 @@ Forge is intentionally not chasing the newest agent architecture every month. If
 ## Features
 
 - **Fully offline-capable** — runs with no internet when paired with a local LLM (LM Studio, Ollama, llama.cpp, vLLM, etc.). See [Offline use](#offline-use) below.
-- **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, web search/fetch
+- **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, fetch a URL (`web_fetch`). `web_search` ships disabled and does not work in practice — see [Web search does not really work](../README.md#web-search-does-not-really-work)
 - **Parallel subagents** — delegate subtasks to specialized agents running concurrently
 - **Planning mode** — agent drafts a plan for your approval before making changes
 - **Session persistence** — resume prior sessions with full context
@@ -76,7 +76,18 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
    export FORGE_NO_AUTO_VERSION_CHECK=1
    ```
 
+Simplest route, instead of the four steps above: set `offline_mode = true` under
+`[agent]`, or toggle it from the tools menu. It forces off the web tools, the
+weekly version self-check, and the Codex model-catalog fetch in one move.
+
 After that, Forge has zero outgoing network traffic outside your local LLM.
+
+One detail about the requests Forge does make: they carry an `x-forge-session`
+header, so a provider's logs can group one conversation's requests together
+(subagents get the same id with a suffix). It is the local session id —
+`YYYYMMDD_HHMMSS_` plus three hex characters, a timestamp rather than anything
+about you — it goes only to the endpoint you configured, and it reports nothing
+back here. Forge collects no telemetry of any kind.
 
 ### Environment variables
 
@@ -88,7 +99,7 @@ Forge respects a small set of environment variables for users who want to overri
 | `FORGE_SHOW_INTERNAL_MODELS=1` | Show ChatGPT Codex models marked as internal (e.g. `codex-auto-review`). These aren't general chat targets — selecting one will likely fail at the API. Hidden by default. |
 | `FORGE_SKIP_DANGEROUS_CONFIRM=1` | Skip the confirmation prompt that fires when launching with `--dangerously-allow-all`. Intended for scripted / CI usage; never set in interactive shells. |
 | `FORGE_AGENT_PATH` | Override the path the wrapper uses to find `forge-agent`. Useful for testing local builds. |
-| `FORGE_RUSTUP_SHA256` / `FORGE_BUN_SHA256` | Pin the expected SHA-256 of the rustup / bun installers when `install.sh` fetches them. If unset, the script prints the hash so you can pin it on a future run. |
+| `FORGE_RUSTUP_SHA256` | Pin the expected SHA-256 of the rustup installer when `install.sh` fetches it. If unset, the script prints the hash so you can pin it on a future run. |
 | `FORGE_REPO` / `FORGE_DEST` / `FORGE_BRANCH` | Override defaults in `bootstrap.sh` / `bootstrap.ps1`. |
 
 ## Platforms
@@ -109,7 +120,6 @@ Windows and Intel Macs are untested. See the
 
 - **macOS, Linux, or Windows**
 - **Rust** (installed automatically by the installer if missing)
-- **Bun** (installed automatically by the installer if missing)
 - **An LLM endpoint** — OpenAI-compatible, Anthropic, or ChatGPT Codex
 
 **Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `install.sh`:
@@ -120,7 +130,7 @@ sudo apt-get update && sudo apt-get install -y git build-essential unzip
 
 `install.sh` will detect these and tell you exactly what to install if any are missing.
 
-**Windows preflight** — `install.ps1` uses `winget` to install missing prerequisites (Git, Rust via rustup, Bun). It assumes Visual Studio Build Tools 2022 (or higher) is already installed for the MSVC linker — install from [aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the "Desktop development with C++" workload if missing.
+**Windows preflight** — `install.ps1` uses `winget` to install missing prerequisites (Git, and Rust via rustup). It assumes Visual Studio Build Tools 2022 (or higher) is already installed for the MSVC linker — install from [aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the "Desktop development with C++" workload if missing.
 
 ## Installation
 

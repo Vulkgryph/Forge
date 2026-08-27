@@ -46,4 +46,8 @@ Security issues do **not** go in the issue tracker — see [SECURITY.md](SECURIT
 
 ## Licence
 
-By contributing you agree that your contributions are licensed under the [Apache License 2.0](LICENSE), the same as the rest of the project.
+Pull requests are closed for now — see [Contributing](README.md#contributing) for
+why, and open an issue instead. This section is here for when they open, and for
+anything contributed by another route: by contributing you agree that your
+contributions are licensed under the [Apache License 2.0](LICENSE), the same as
+the rest of the project.

@@ -86,6 +86,23 @@ Click the `><` indicator in the bottom-left of the status bar (or a saved host f
 
 Everything — the remote file tree, remote file open/save, and the remote terminal — goes through that one channel. Nothing else touches the remote machine's network.
 
+### What lands on the remote
+
+Two static binaries and a version marker beside each, under `~/.forge/`:
+
+| Path | What | Size |
+|---|---|---|
+| `~/.forge/forge-server` | the file/pty/LSP server this editor talks to | ~1.2 MB |
+| `~/.forge/forge-agent` | the agent, so its tool calls are local to the machine you are working on rather than a round trip back | ~6 MB |
+
+Uploaded on demand, not at connect: a session that never opens the agent panel never pays for the agent. Each is replaced when this client's version moves on, which the marker beside it is for. Removing the directory is safe and costs one re-upload.
+
+Two names, one directory, worth knowing about: a *workspace*'s own `.forge/` holds that project's session logs, so if you open a remote home directory as a workspace, both live in `~/.forge/` — the binaries alongside a `sessions/` folder. Nothing collides, but clearing session history there triggers a re-upload.
+
+Where VS Code would use `~/.forge-server/`, this uses `~/.forge/`. Deliberate: renaming it now would re-upload on every remote's first connect and leave the old directory behind, for no behaviour anyone would notice.
+
+No `sudo`, no package manager, no compiler, and nothing written outside `~/.forge/` except a workspace's own `.forge/` when the agent runs there.
+
 ## Status
 
 Forge IDE is pre-1.0 and under active development. Expect breaking changes to settings file formats and keybindings while things stabilize.

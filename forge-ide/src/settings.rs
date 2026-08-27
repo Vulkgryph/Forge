@@ -29,6 +29,19 @@ impl AgentPermissionMode {
         }
     }
 
+    /// The same thing in as few characters as still say it, for the agent
+    /// panel's status strip at a width where the full labels do not fit.
+    ///
+    /// `Skip All` keeps the word "Skip", which is the part that should worry
+    /// somebody who did not mean to be in that mode.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::AlwaysAsk          => "Ask",
+            Self::AutoApprove        => "Auto",
+            Self::DangerouslySkipAll => "Skip All",
+        }
+    }
+
     /// Short line explaining the tradeoff, shown under each option in the picker.
     pub fn description(&self) -> &'static str {
         match self {

@@ -1657,6 +1657,17 @@ fn reasoning_badge_label(ep: &serde_json::Value) -> String {
     format!("Reasoning: {label}")
 }
 
+/// The reasoning badge without the word "Reasoning", for a narrow strip.
+///
+/// The value is the part that changes and the part worth reading; the noun is
+/// nearly half the width and says the same thing every time.
+fn reasoning_badge_label_short(ep: &serde_json::Value) -> String {
+    reasoning_badge_label(ep)
+        .strip_prefix("Reasoning: ")
+        .unwrap_or("Default")
+        .to_string()
+}
+
 /// Draw one row of the model picker — a hand-drawn hover-highlighted row (same
 /// convention as the conversation-history list above), rather than a default
 /// `ui.button()`, to match the rest of this panel's look. The current model
@@ -1972,6 +1983,13 @@ fn draw_model_row(ui: &mut egui::Ui, name: &str, ctx_tokens: u64, is_current: bo
 /// on the text. This gives each one its own padded, full-bar-height hit
 /// area with a hover highlight, so the clickable region is obvious and
 /// comfortably larger than the label itself.
+/// What a status badge costs beyond its text: the padding either side, the gap
+/// before the disclosure triangle, and the triangle itself. Named so the width
+/// test measures the same chrome the badge actually draws.
+fn status_badge_chrome(triangle: bool) -> f32 {
+    if triangle { 6.0 + 2.0 + 10.0 + 6.0 } else { 6.0 + 6.0 }
+}
+
 fn draw_status_badge(
     ui: &mut egui::Ui,
     salt: &str,
@@ -1979,6 +1997,7 @@ fn draw_status_badge(
     color: egui::Color32,
     expanded: bool,
     height: f32,
+    triangle: bool,
 ) -> egui::Response {
     let bg = ui.painter().add(egui::Shape::Noop);
     let inner = ui.allocate_ui(egui::vec2(0.0, height), |ui| {
@@ -1986,8 +2005,10 @@ fn draw_status_badge(
             ui.set_height(height);
             ui.add_space(6.0);
             ui.label(egui::RichText::new(text).size(10.5).color(color));
-            ui.add_space(2.0);
-            paint_disclosure_triangle(ui, expanded, color);
+            if triangle {
+                ui.add_space(2.0);
+                paint_disclosure_triangle(ui, expanded, color);
+            }
             ui.add_space(6.0);
         });
     });
@@ -2406,35 +2427,70 @@ fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
 ///
 /// Returns the text unchanged when it already fits, or when there is no path in
 /// it to shorten — the caller's `truncate()` is the backstop for that case.
-/// How much of the agent's status strip to show at a given width.
+/// How the agent's status strip is drawn at a given width.
 ///
-/// The strip carries four things you click — the model, the permission mode, the
-/// reasoning effort, the context strategy — and three you only read: whether it
-/// is thinking, how full the context is, and whether it is online. Plus `·`
-/// separators, which are decoration.
+/// Four things earn a place in the strip, because they are what you need while
+/// working: which model, what it is allowed to do without asking, how hard it is
+/// thinking when that applies, and how full the context is. Everything else —
+/// the context strategy, whether the session is online — is a setting you touch
+/// occasionally, and lives behind the overflow rather than competing for the row.
 ///
-/// Narrow, it used to wrap raggedly: the separators are their own widgets, so a
-/// wrap could put one at the *start* of a row, and an item could be split from
-/// the separator that introduced it. Now it gives up the decoration first, then
-/// the things you only read, and keeps what you click for last — the panel gets
-/// narrower in a way somebody chose rather than however the wrap happened to
-/// fall.
+/// Below that, the labels shorten before anything is dropped: `Always Ask`
+/// becomes `Ask`, `Reasoning: Default` becomes `Default`, `0% ctx` becomes `0%`.
+/// The value is the part that changes; the noun is nearly half the width and
+/// reads the same every time.
+///
+/// The narrow case used to wrap raggedly instead. The `·` separators are their
+/// own widgets, so a wrap could leave one at the *start* of a row, or split an
+/// item from the separator that introduced it — which is why a narrow panel
+/// looked broken rather than merely full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StripDetail {
-    /// The `·` between items.
+    /// The `·` between items. Decoration, and the first thing to go.
     separators: bool,
-    /// The read-only extras: thinking, context percentage, online/offline.
-    extras: bool,
+    /// Short labels rather than full ones.
+    compact: bool,
+    /// How much model name there is room for. Names run long — dated Anthropic
+    /// ids, local `qwen3-coder-30b-a3b`-style tags — and one of those was
+    /// enough to wrap the row by itself, so it gets an explicit budget rather
+    /// than whatever is left.
+    model_chars: usize,
+    /// The little disclosure triangles. A badge still highlights on hover and
+    /// still opens its menu without one, so at the narrowest the panel goes
+    /// they are 40pt of chrome bought back across the four badges.
+    triangles: bool,
 }
 
-/// Widths measured from the real strip: below ~430pt the seven items plus
-/// separators no longer sit on one row, and below ~310pt the four badges alone
-/// need it.
+/// What to give up first as the panel narrows. Decoration goes before words,
+/// words shorten before anything is dropped, and nothing is dropped at all —
+/// model, permissions, reasoning and context usage survive to 240pt, which is
+/// as narrow as the splitter goes. The thresholds are measured against real
+/// font layout in `strip_width_tests`, not estimated.
 fn strip_detail(avail: f32) -> StripDetail {
     StripDetail {
-        separators: avail >= 430.0,
-        extras: avail >= 310.0,
+        separators: avail >= 620.0,
+        compact:    avail < 520.0,
+        triangles:  avail >= 310.0,
+        model_chars: if avail < 310.0 { 7 }
+                     else if avail < 520.0 { 14 }
+                     else if avail < 620.0 { 20 }
+                     else { 34 },
     }
+}
+
+/// The model, for a strip too narrow to spell it out. The vendor is the least
+/// useful part of the name when there is one badge showing it, so it goes
+/// first, and what is left is cut to fit.
+fn model_badge_label_short(label: &str, max: usize) -> String {
+    let trimmed = ["claude-", "gpt-", "grok-", "gemini-", "llama-", "qwen-", "deepseek-"]
+        .iter()
+        .find_map(|p| label.strip_prefix(*p))
+        .unwrap_or(label);
+    elide_chars(trimmed, max)
+}
+
+fn model_badge_label(label: &str, detail: StripDetail) -> String {
+    model_badge_label_short(label, detail.model_chars)
 }
 
 /// How many characters of a host name the status badge shows.
@@ -4047,6 +4103,9 @@ pub struct IdeApp {
     agent_thinking_picker_open:  bool,
     agent_thinking_picker_frame: u8,
     agent_context_picker_open:  bool,
+    /// The `⋯` menu at the end of the agent's status strip: the settings you
+    /// touch occasionally, kept out of the row that has to fit while working.
+    agent_overflow_open:        bool,
     agent_context_picker_frame: u8,
     forge_icon:      Option<egui::TextureHandle>,
     /// 0.0 (cold) to 1.0 (white-hot) — climbs while any Forge Agent tab has a
@@ -4355,6 +4414,7 @@ impl IdeApp {
             agent_thinking_picker_open:  false,
             agent_thinking_picker_frame: 0,
             agent_context_picker_open:  false,
+            agent_overflow_open:        false,
             agent_context_picker_frame: 0,
             forge_icon:      None,
             anvil_heat:      0.0,
@@ -7773,7 +7833,6 @@ impl IdeApp {
         let mut perm_badge_rect      = egui::Rect::NOTHING;
         let mut reasoning_badge_rect = egui::Rect::NOTHING;
         let mut context_badge_rect   = egui::Rect::NOTHING;
-        let mut toggle_offline_mode  = false;
         // Applied after the panel is drawn: a respawn needs the app (for the
         // SSH connection, so a remote workspace gets a remote agent), and the
         // tab is borrowed mutably throughout the drawing below.
@@ -7794,10 +7853,12 @@ impl IdeApp {
             };
             let model = if tab.session.model.is_empty() { "starting…".to_string() }
                         else { display_model_label(&tab.session.model, &tab.session.endpoints) };
+            let model = model_badge_label(&model, detail);
             let has_choices = !tab.session.endpoints.is_empty();
             if has_choices {
                 let badge = draw_status_badge(ui, "model_badge", &model,
-                    egui::Color32::from_gray(140), self.agent_model_picker_open, status_bar_h);
+                    egui::Color32::from_gray(140), self.agent_model_picker_open, status_bar_h,
+                    detail.triangles);
                 model_badge_rect = badge.rect;
                 if badge.clicked() {
                     self.agent_model_picker_open = !self.agent_model_picker_open;
@@ -7814,8 +7875,10 @@ impl IdeApp {
                 crate::settings::AgentPermissionMode::AutoApprove        => egui::Color32::from_rgb(220, 190, 120),
                 crate::settings::AgentPermissionMode::DangerouslySkipAll => egui::Color32::from_rgb(230, 110, 100),
             };
-            let perm_badge = draw_status_badge(ui, "perm_badge", tab.permission_mode.label(),
-                perm_color, self.agent_perm_picker_open, status_bar_h);
+            let perm_label = if detail.compact { tab.permission_mode.short_label() }
+                             else               { tab.permission_mode.label() };
+            let perm_badge = draw_status_badge(ui, "perm_badge", perm_label,
+                perm_color, self.agent_perm_picker_open, status_bar_h, detail.triangles);
             perm_badge_rect = perm_badge.rect;
             if perm_badge.clicked() {
                 self.agent_perm_picker_open = !self.agent_perm_picker_open;
@@ -7828,55 +7891,55 @@ impl IdeApp {
                 .cloned();
             if let Some(ep) = &current_ep {
                 sep(ui);
-                let reasoning_badge = draw_status_badge(ui, "reasoning_badge", &reasoning_badge_label(ep),
-                    egui::Color32::from_gray(140), self.agent_thinking_picker_open, status_bar_h);
+                let reasoning_label = if detail.compact { reasoning_badge_label_short(ep) }
+                                      else               { reasoning_badge_label(ep) };
+                let reasoning_badge = draw_status_badge(ui, "reasoning_badge", &reasoning_label,
+                    egui::Color32::from_gray(140), self.agent_thinking_picker_open, status_bar_h,
+                    detail.triangles);
                 reasoning_badge_rect = reasoning_badge.rect;
                 if reasoning_badge.clicked() {
                     self.agent_thinking_picker_open = !self.agent_thinking_picker_open;
                     self.agent_thinking_picker_frame = 0;
                 }
             }
-            if tab.session.thinking && detail.extras {
+            if tab.session.thinking && !detail.compact {
                 let text = if detail.separators { "· thinking" } else { "thinking" };
                 ui.label(egui::RichText::new(text).size(10.5)
                     .color(egui::Color32::from_rgb(180, 200, 120)));
             }
             let usage = &tab.session.usage;
-            if usage.max_context_tokens > 0 && detail.extras {
+            if usage.max_context_tokens > 0 {
                 let pct = (usage.last_prompt_tokens as f64 / usage.max_context_tokens as f64 * 100.0)
                     .round() as i64;
                 let dot = if detail.separators { "· " } else { "" };
-                ui.label(egui::RichText::new(format!("{dot}{pct}% ctx")).size(10.5)
+                let unit = if detail.compact { "" } else { " ctx" };
+                ui.label(egui::RichText::new(format!("{dot}{pct}%{unit}")).size(10.5)
                     .color(egui::Color32::from_gray(120)))
                     .on_hover_text(format!("{} / {} tokens (last request)",
                         usage.last_prompt_tokens, usage.max_context_tokens));
             }
-            if !tab.session.context_strategy.is_empty() {
-                sep(ui);
-                let label = context_strategy_label(&tab.session.context_strategy);
-                let context_badge = draw_status_badge(ui, "context_strategy_badge", label,
-                    egui::Color32::from_gray(140), self.agent_context_picker_open, status_bar_h);
-                context_badge_rect = context_badge.rect;
-                if context_badge.clicked() {
-                    self.agent_context_picker_open = !self.agent_context_picker_open;
-                    self.agent_context_picker_frame = 0;
-                }
+            // Offline is not a setting you glance at, it is a state that changes
+            // what the agent can do — so it stays in the row, while its normal
+            // counterpart (online) says nothing and lives in the menu.
+            if tab.session.offline_mode {
+                let dot = if detail.separators { "· " } else { " " };
+                ui.label(egui::RichText::new(format!("{dot}offline")).size(10.5)
+                    .color(egui::Color32::from_rgb(200, 150, 90)))
+                    .on_hover_text("The agent will not reach the network. Change it under ⋯.");
             }
-            if detail.extras {
-                sep(ui);
-                let (label, color, hover) = if tab.session.offline_mode {
-                    ("Offline", egui::Color32::from_rgb(140, 180, 140),
-                     "No network calls except this session's own model API — click to disable")
-                } else {
-                    ("Online", egui::Color32::from_gray(110),
-                     "web_search/web_fetch and Codex background checks run normally — click to go offline")
-                };
-                let badge = ui.label(egui::RichText::new(label).size(10.5).color(color))
-                    .on_hover_text(hover)
-                    .interact(egui::Sense::click());
-                if badge.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
-                if badge.clicked() { toggle_offline_mode = true; }
+            // Everything you touch occasionally rather than while working. It
+            // was in the row, and between them the context strategy and the
+            // network state are the two widest items — which is why the strip
+            // wrapped at the width the panel actually opens at.
+            sep(ui);
+            let overflow = draw_status_badge(ui, "agent_overflow", "⋯",
+                egui::Color32::from_gray(140), self.agent_overflow_open, status_bar_h,
+                detail.triangles);
+            context_badge_rect = overflow.rect;
+            if overflow.clicked() {
+                self.agent_overflow_open = !self.agent_overflow_open;
             }
+            let _ = overflow.on_hover_text("Context strategy, network");
         }).response.rect;
         ui.painter().set(
             status_bar_bg,
@@ -7889,10 +7952,6 @@ impl IdeApp {
                 egui::Color32::from_rgb(30, 30, 30),
             ),
         );
-        if toggle_offline_mode {
-            let next = !tab.session.offline_mode;
-            tab.session.update_offline_mode(next);
-        }
         ui.separator();
         ui.add_space(2.0);
 
@@ -8189,6 +8248,94 @@ impl IdeApp {
                 if dismissed { self.agent_thinking_picker_open = false; }
             } else {
                 self.agent_thinking_picker_open = false;
+            }
+        }
+
+        // The `⋯` menu: the settings that used to sit in the strip and made it
+        // wrap at the width the panel actually opens at. Two entries, each
+        // opening or toggling exactly what the badge beside it used to.
+        if self.agent_overflow_open {
+            let strategy_label = context_strategy_label(&tab.session.context_strategy);
+            let offline = tab.session.offline_mode;
+            let mut open_strategy = false;
+            let mut toggle_network = false;
+            let mut dismissed = false;
+            let response = egui::Area::new(egui::Id::new("agent_overflow_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(context_badge_rect.left() - 150.0,
+                                      context_badge_rect.bottom() + 2.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(37, 37, 38))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(65)))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+                        .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0,
+                            spread: 0.0, color: egui::Color32::from_black_alpha(90) })
+                        .show(ui, |ui| {
+                            ui.set_width(210.0);
+                            // Each row says what it is and what it currently is,
+                            // since neither is on screen any more.
+                            let row = |ui: &mut egui::Ui, name: &str, value: &str| {
+                                let r = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 22.0),
+                                    egui::Sense::click(),
+                                );
+                                if r.1.hovered() {
+                                    ui.painter().rect_filled(r.0, 3.0,
+                                        egui::Color32::from_gray(55));
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                ui.painter().text(
+                                    r.0.left_center() + egui::vec2(6.0, 0.0),
+                                    egui::Align2::LEFT_CENTER, name,
+                                    egui::FontId::proportional(11.5),
+                                    egui::Color32::from_gray(210));
+                                ui.painter().text(
+                                    r.0.right_center() - egui::vec2(6.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER, value,
+                                    egui::FontId::proportional(11.0),
+                                    egui::Color32::from_gray(140));
+                                r.1
+                            };
+                            if row(ui, "Context strategy", strategy_label).clicked() {
+                                open_strategy = true;
+                            }
+                            if row(ui, "Network", if offline { "Offline" } else { "Online" })
+                                .on_hover_text(if offline {
+                                    "No network calls except this session's own model API"
+                                } else {
+                                    "web_fetch and Codex background checks run normally"
+                                })
+                                .clicked()
+                            {
+                                toggle_network = true;
+                            }
+                        });
+                })
+                .response;
+            // Click anywhere else closes it, as the other pickers do.
+            if ui.ctx().input(|i| i.pointer.any_click())
+                && !response.rect.contains(
+                    ui.ctx().input(|i| i.pointer.interact_pos().unwrap_or_default()))
+                && !context_badge_rect.contains(
+                    ui.ctx().input(|i| i.pointer.interact_pos().unwrap_or_default()))
+            {
+                dismissed = true;
+            }
+            if open_strategy {
+                self.agent_overflow_open = false;
+                self.agent_context_picker_open = true;
+                self.agent_context_picker_frame = 0;
+            } else if toggle_network {
+                self.agent_overflow_open = false;
+                // Applied here rather than through the strip's own flag: that one
+                // is read further up, before this menu is drawn, so setting it
+                // would do nothing — which the compiler said plainly.
+                let next = !tab.session.offline_mode;
+                tab.session.update_offline_mode(next);
+            } else if dismissed {
+                self.agent_overflow_open = false;
             }
         }
 
@@ -16791,47 +16938,148 @@ mod build_time_tests {
 }
 
 #[cfg(test)]
+mod strip_width_tests {
+    /// The thresholds in `strip_detail` were eyeballed once and the row still
+    /// wrapped at the width the panel actually opens at, so they are measured
+    /// here against real font layout rather than trusted.
+    ///
+    /// Returns the width the four items worth having while working occupy at a
+    /// given detail level: model, permissions, reasoning, context usage — plus
+    /// the `⋯` that holds the rest.
+    fn row_width(ctx: &egui::Context, detail: super::StripDetail, model: &str) -> f32 {
+        let text_w = |s: &str| {
+            ctx.fonts(|f| f.layout_no_wrap(
+                s.to_string(), egui::FontId::proportional(10.5), egui::Color32::WHITE).size().x)
+        };
+        // A badge, plus the 4pt egui puts between two items in a row.
+        let badge = |s: &str| text_w(s) + super::status_badge_chrome(detail.triangles) + 4.0;
+        let perm = if detail.compact { "Skip All" } else { "Dangerously skip all" };
+        let reasoning = if detail.compact { "high" } else { "Reasoning: high" };
+        let ctx_pct = if detail.compact { "· 100%" } else { "· 100% ctx" };
+        let model = super::model_badge_label(model, detail);
+        let mut w = 4.0                       // the leading add_space
+            + badge(&model) + badge(perm) + badge(reasoning)
+            + text_w(ctx_pct) + 4.0
+            + badge("\u{22ef}");
+        if detail.separators { w += 3.0 * (text_w("\u{b7}") + 4.0); }
+        w
+    }
+
+    /// The panel opens at 360pt and its frame takes some of that. The row has
+    /// to fit in what is left, at the detail level `strip_detail` picks for it —
+    /// this is exactly the case the user saw wrap.
+    #[test]
+    fn the_row_fits_the_width_the_panel_opens_at() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let avail = 360.0 - 16.0;
+        let w = row_width(&ctx, super::strip_detail(avail), "claude-opus-4-6");
+        assert!(w <= avail, "{w:.0}pt of badges in {avail:.0}pt of panel — it wraps");
+    }
+
+    /// And at the narrowest the splitter allows, which is the real floor.
+    #[test]
+    fn the_row_fits_the_narrowest_panel_allowed() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let avail = 240.0 - 16.0;
+        let w = row_width(&ctx, super::strip_detail(avail), "claude-opus-4-6");
+        assert!(w <= avail, "{w:.0}pt of badges in {avail:.0}pt of panel — it wraps");
+    }
+
+    /// Every width the splitter allows, not just the interesting ones: a
+    /// threshold set a few points off leaves a band that still wraps, and a
+    /// band is exactly what the eye finds and a spot-check misses.
+    #[test]
+    fn no_width_the_splitter_allows_wraps_the_row() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        for model in ["claude-opus-4-6", "claude-opus-4-6-20260501", "qwen3-coder-30b-a3b"] {
+            let mut panel = 240.0_f32;
+            while panel <= 800.0 {
+                let avail = panel - 16.0;
+                let d = super::strip_detail(avail);
+                let w = row_width(&ctx, d, model);
+                assert!(w <= avail,
+                    "{model} at {panel:.0}pt: {w:.0}pt of badges in {avail:.0}pt ({d:?})");
+                panel += 2.0;
+            }
+        }
+    }
+
+    /// Full labels are only claimed to fit where `strip_detail` still asks for
+    /// them; if that boundary is wrong, the wide case wraps instead.
+    #[test]
+    fn full_labels_fit_where_they_are_still_asked_for() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        for avail in [430.0_f32, 470.0, 520.0, 700.0] {
+            let d = super::strip_detail(avail);
+            let w = row_width(&ctx, d, "claude-opus-4-6");
+            assert!(w <= avail, "{w:.0}pt at {avail:.0}pt ({d:?}) — it wraps");
+        }
+    }
+}
+
+#[cfg(test)]
 mod strip_detail_tests {
     use super::strip_detail;
 
-    /// Wide, everything shows.
+    /// Wide, the labels are the full ones and the separators are drawn.
     #[test]
-    fn a_wide_panel_shows_all_of_it() {
+    fn a_wide_panel_shows_everything_in_full() {
         let d = strip_detail(700.0);
-        assert!(d.separators && d.extras);
+        assert!(d.separators && !d.compact && d.triangles);
     }
 
     /// The first thing given up is decoration. The `·` separators are their own
     /// widgets, so a wrap could leave one at the start of a row — which is what
     /// made a narrow panel look broken rather than merely full.
     #[test]
-    fn decoration_goes_before_content() {
-        let d = strip_detail(360.0);
+    fn decoration_goes_before_words() {
+        let d = strip_detail(560.0);
         assert!(!d.separators, "kept the separators past the point they fit");
-        assert!(d.extras, "gave up content while decoration was still worth losing");
+        assert!(!d.compact, "shortened the labels while decoration was still there to lose");
     }
 
-    /// Narrower still, what remains is what you click: the model, the permission
-    /// mode, the reasoning effort and the context strategy. The three read-only
-    /// items go, because a status you cannot act on is the cheapest thing to lose.
+    /// Then the labels shorten. Nothing is dropped: the four things worth having
+    /// while working — model, permissions, reasoning, context usage — all stay,
+    /// which is the point of the `⋯` menu taking the rest.
     #[test]
-    fn what_you_click_is_kept_for_last() {
-        let d = strip_detail(280.0);
-        assert!(!d.separators && !d.extras);
+    fn the_labels_shorten_rather_than_the_row_losing_items() {
+        assert!(strip_detail(500.0).compact);
+        assert!(strip_detail(380.0).compact);
+        assert!(strip_detail(300.0).compact);
     }
 
-    /// Monotonic: getting wider never takes something away. A threshold written
-    /// the wrong way round would flicker items in and out as the splitter moves.
+    /// Monotonic: getting wider never takes something away, and never lengthens
+    /// a label that had already shortened. A threshold written the wrong way
+    /// round would flicker while the splitter moves.
     #[test]
-    fn widening_never_removes_anything() {
+    fn widening_never_takes_anything_back() {
         let mut w = 100.0_f32;
         let mut prev = strip_detail(w);
         while w < 900.0 {
             w += 5.0;
             let now = strip_detail(w);
             assert!(!(prev.separators && !now.separators), "separators vanished at {w}pt");
-            assert!(!(prev.extras && !now.extras), "extras vanished at {w}pt");
+            assert!(!(!prev.compact && now.compact), "labels re-shortened at {w}pt");
+            assert!(!(prev.triangles && !now.triangles), "triangles vanished at {w}pt");
+            assert!(now.model_chars >= prev.model_chars, "model name shrank at {w}pt");
             prev = now;
+        }
+    }
+
+    /// The two states do not contradict: separators are decoration around full
+    /// labels, so a strip should never be drawing them while also cutting words
+    /// to fit.
+    #[test]
+    fn separators_and_short_labels_never_happen_together() {
+        let mut w = 100.0_f32;
+        while w < 900.0 {
+            let d = strip_detail(w);
+            assert!(!(d.separators && d.compact), "at {w}pt: decoration beside cut labels");
+            w += 5.0;
         }
     }
 }

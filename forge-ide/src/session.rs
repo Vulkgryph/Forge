@@ -517,7 +517,7 @@ pub struct WindowRecord {
     /// Still refreshed from the config on the way back in when the name matches
     /// something there, so a changed key path or port is picked up rather than
     /// being pinned by whatever was recorded.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "recorded_host")]
     pub remote_host: Option<crate::ssh::SshHost>,
     #[serde(default)]
     pub remote_dir:  Option<String>,
@@ -606,9 +606,92 @@ fn save_windows_to(path: &Path, records: &[WindowRecord], pid: u32, now: u64) {
     }
 }
 
+/// `remote_host`, in either shape any build has written it.
+///
+/// It was the host's *name* for a few builds and is the whole connection now.
+/// Read strictly, a file from the other side of that change fails to parse — and
+/// because the failure took the whole record with it, a window restarted onto a
+/// different build came back with no connection, no geometry and no identity.
+/// That is the difference the user saw between restarting onto the same build,
+/// which reconnected, and onto a new one, which did not.
+///
+/// A bare name becomes a host with only its name set, which is enough: the
+/// lookup on the way in matches by name against the SSH config, which is exactly
+/// what the build that wrote it intended.
+fn recorded_host<'de, D>(de: D) -> Result<Option<crate::ssh::SshHost>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Whole(crate::ssh::SshHost),
+        Name(String),
+        Nothing,
+    }
+    use serde::Deserialize as _;
+    Ok(match Option::<Either>::deserialize(de)? {
+        Some(Either::Whole(h)) => Some(h),
+        Some(Either::Name(name)) if !name.is_empty() => Some(crate::ssh::SshHost {
+            name,
+            ..Default::default()
+        }),
+        _ => None,
+    })
+}
+
+/// Read the record, keeping every entry that can be read.
+///
+/// One entry at a time, because `serde_json::from_str::<Vec<_>>` gives up on the
+/// whole file at the first entry it dislikes — one record written by a build with
+/// a different shape discarded every other window's geometry and connection along
+/// with it. Silently: the error was thrown away by `unwrap_or_default`.
+///
+/// An entry that still will not parse strictly is read field by field, so a shape
+/// change in one field costs that field rather than the window.
 fn load_windows_from(path: &Path) -> Vec<WindowRecord> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    serde_json::from_str(&text).unwrap_or_default()
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return Vec::new();
+    };
+    values
+        .into_iter()
+        .filter_map(|v| {
+            serde_json::from_value::<WindowRecord>(v.clone())
+                .ok()
+                .or_else(|| lenient_record(&v))
+        })
+        .collect()
+}
+
+/// A record assembled from whichever fields are readable.
+///
+/// The last resort, for an entry a future or past build wrote in a shape this one
+/// does not understand. A window with neither a folder nor an id says nothing
+/// worth keeping, and is dropped.
+fn lenient_record(v: &serde_json::Value) -> Option<WindowRecord> {
+    let id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+    let cwd = v.get("cwd").and_then(|x| x.as_str()).map(PathBuf::from);
+    if id == 0 && cwd.is_none() {
+        return None;
+    }
+    Some(WindowRecord {
+        cwd,
+        id,
+        frame: v.get("frame").and_then(|f| serde_json::from_value(f.clone()).ok()),
+        maximized: v.get("maximized").and_then(|x| x.as_bool()).unwrap_or(false),
+        remote_host: v.get("remote_host").and_then(|h| {
+            serde_json::from_value::<crate::ssh::SshHost>(h.clone()).ok().or_else(|| {
+                h.as_str().filter(|n| !n.is_empty()).map(|name| crate::ssh::SshHost {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+            })
+        }),
+        remote_dir: v.get("remote_dir").and_then(|x| x.as_str()).map(str::to_string),
+        pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        seen: v.get("seen").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
 }
 
 #[cfg(test)]
@@ -740,5 +823,131 @@ mod window_session_tests {
         prune_window_sessions_in(&sessions, &[]);
         assert!(window_session_path_in(&sessions, 42).exists(),
                 "an empty set means the record could not be read, not that nothing is open");
+    }
+}
+
+#[cfg(test)]
+mod schema_tolerance_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("forge-schema-{}-{tag}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Restarting a window onto the *same* build reconnected to the remote;
+    /// restarting onto a new build did not. A restart reads everything it needs
+    /// from this file, and `remote_host` was the host's name for a few builds
+    /// before it became the whole connection — so a file written by the other
+    /// side of that change failed to parse, and the failure was silent.
+    #[test]
+    fn a_record_written_as_a_host_name_still_reconnects() {
+        let path = scratch("older-format");
+        std::fs::write(&path, r#"[{"cwd":"/tmp","id":7,
+            "remote_host":"Admin-1-Tailscale","remote_dir":"/home/sysadmin/code",
+            "pid":999,"seen":1787000000,
+            "frame":{"x":10,"y":20,"w":800,"h":600},"maximized":false}]"#).unwrap();
+
+        let got = load_windows_from(&path);
+        assert_eq!(got.len(), 1, "the record was discarded");
+        let r = &got[0];
+        // The name is enough: the lookup on the way in matches it against the
+        // SSH config, which is what the build that wrote this intended.
+        assert_eq!(r.remote_host.as_ref().map(|h| h.name.as_str()), Some("Admin-1-Tailscale"));
+        assert_eq!(r.remote_dir.as_deref(), Some("/home/sysadmin/code"));
+        // And the geometry, which was going with it — the other half of the
+        // report, where a restarted window came back the wrong size.
+        assert_eq!(r.frame.map(|f| (f.w, f.h)), Some((800, 600)));
+        assert_eq!(r.id, 7);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One entry nobody can read must not take the others with it.
+    /// `from_str::<Vec<_>>` gives up on the whole file at the first entry it
+    /// dislikes, so a single record from a different build erased every window.
+    #[test]
+    fn one_unreadable_entry_does_not_discard_the_file() {
+        let path = scratch("mixed");
+        std::fs::write(&path, r#"[
+            {"cwd":"/a","id":1},
+            {"cwd":"/b","id":2,"remote_host":{"this":"is not a host"}},
+            {"cwd":"/c","id":3}
+        ]"#).unwrap();
+
+        let got = load_windows_from(&path);
+        let ids: Vec<u64> = got.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "a window was lost to its neighbour's record");
+        // The unreadable field is what is lost, not the window.
+        assert!(got[1].remote_host.is_none());
+        assert_eq!(got[1].cwd.as_deref(), Some(Path::new("/b")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A field this build has never heard of is ignored rather than fatal, so a
+    /// window written by a *newer* build still comes back.
+    #[test]
+    fn a_field_from_the_future_is_ignored() {
+        let path = scratch("future");
+        std::fs::write(&path, r#"[{"cwd":"/a","id":4,"something_new":{"nested":[1,2,3]}}]"#).unwrap();
+        let got = load_windows_from(&path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An entry with neither a folder nor an id is kept, and reopens as an empty
+    /// window — which is what it describes.
+    ///
+    /// Every field has a default, so such an entry parses strictly and never
+    /// reaches the lenient path's "nothing worth keeping" check. Left that way
+    /// deliberately: a folderless window written before windows had ids looks
+    /// exactly like this, and dropping it would silently lose a window somebody
+    /// had open.
+    #[test]
+    fn an_entry_with_no_folder_and_no_id_reopens_as_an_empty_window() {
+        let path = scratch("empty-entry");
+        std::fs::write(&path, r#"[{"maximized":true},{"cwd":"/a","id":5}]"#).unwrap();
+        let got = load_windows_from(&path);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, 0);
+        assert!(got[0].cwd.is_none());
+        assert_eq!(got[1].id, 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file that is not a list at all is still nothing, not a panic.
+    #[test]
+    fn a_corrupt_file_is_still_nothing() {
+        let path = scratch("corrupt");
+        std::fs::write(&path, "{ truncated").unwrap();
+        assert!(load_windows_from(&path).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And what this build writes, it reads back unchanged — the round trip that
+    /// matters most, since it is the one every restart depends on.
+    #[test]
+    fn the_current_shape_round_trips() {
+        let path = scratch("round-trip");
+        let host = crate::ssh::SshHost {
+            name: "admin-1".into(), host: "10.0.0.1".into(), port: 2222,
+            user: "me".into(), key_path: "/k".into(), remote_dir: "~".into(),
+        };
+        let rec = WindowRecord {
+            cwd: Some(PathBuf::from("/w")), id: 9,
+            remote_host: Some(host.clone()),
+            remote_dir: Some("/w/on/remote".into()),
+            frame: Some(WindowFrame { x: 1, y: 2, w: 3, h: 4 }),
+            maximized: true, ..Default::default()
+        };
+        save_windows_to(&path, &[rec], 42, 1_787_000_000);
+
+        let got = load_windows_from(&path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].remote_host, Some(host));
+        assert_eq!(got[0].remote_dir.as_deref(), Some("/w/on/remote"));
+        assert_eq!(got[0].pid, 42);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -32,12 +32,12 @@ This means Forge should be treated as a sharp tool. It can be very effective, bu
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│              Bun/Ink TUI Layer (../forge-tui/) — one of two          │
+│              Terminal UI (../forge-tui-rs/) — one of two             │
 │              independent clients; ../forge-ide/ is the other,        │
 │              a Rust/egui code editor with its own implementation     │
-│  - React Ink terminal application                                   │
-│  - Spawns forge-agent --headless through AgentBridge               │
-│  - Validates protocol messages with zod                             │
+│  - Rust terminal application, rendering itself                      │
+│  - Spawns forge-agent --headless through bridge.rs                   │
+│  - Decodes protocol messages with serde                             │
 │  - Owns menus, approvals, plans, sessions, and local UI state       │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓ ↑
@@ -84,15 +84,16 @@ This means Forge should be treated as a sharp tool. It can be very effective, bu
 
 ## Component Details
 
-### UI Layer (`../forge-tui/src/`)
+### UI Layer (`../forge-tui-rs/src/`)
 
-One of two independent clients — see [`../forge-ide/README.md`](../forge-ide/README.md) for the other (a Rust/egui code editor; `src/agent_panel.rs` is its equivalent of `agent-bridge.ts` below).
+One of two independent clients — see [`../forge-ide/README.md`](../forge-ide/README.md) for the other (a Rust/egui code editor; `src/agent_panel.rs` is its equivalent of `bridge.rs` below).
 
-**`agent-bridge.ts`** - `AgentBridge`
+**`bridge.rs`**
 - Spawns `forge-agent --headless` with optional cwd/session flags
 - Reads newline-delimited JSON from stdout
-- Validates every agent message with `AgentMessageSchema`
-- Batches high-volume `assistant_token` events before handing them to React
+- Decodes every agent message with serde, ignoring what it does not know
+- Pipes the agent's stderr rather than inheriting it, so its output cannot paint
+  onto the screen the client is drawing
 - Sends typed `UserMessage` commands to the agent stdin
 
 **`protocol.ts`**

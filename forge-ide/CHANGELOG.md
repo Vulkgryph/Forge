@@ -569,4 +569,5 @@ Prompted by a live reference screenshot (a competing IDE's agent panel) plus fee
 - **Multi-window** — open more than one workspace or remote host at once
 - **Terminal** — PTY with VT100/ANSI support, TERMINAL | OUTPUT tab bar in the bottom panel
 
-See [GAPS.md](GAPS.md) for the full, current breakdown of what's finished versus in progress.
+A fuller breakdown of what was finished versus in progress lived in a working
+file that was never published; this changelog is the record that remains.

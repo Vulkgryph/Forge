@@ -2,7 +2,7 @@
 
 Created by **Vulkgryph LLC**.
 
-An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project — driven by [`forge-tui`](../forge-tui/) (the terminal UI) or [`forge-ide`](../forge-ide/) (a full code editor), both talking to this binary over the same headless JSON protocol. See the [top-level README](../README.md) for how the three fit together.
+An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project — driven by [`forge-tui-rs`](../forge-tui-rs/) (the terminal UI) or [`forge-ide`](../forge-ide/) (a full code editor), both talking to this binary over the same headless JSON protocol. See the [top-level README](../README.md) for how the three fit together.
 
 ![Forge writing a zero-dependency VM runtime in Rust](assets/forge-demo.gif)
 
@@ -306,7 +306,7 @@ forge [--cwd <path>]
 forge-agent --headless [--resume-session <id>] [--dangerously-allow-all]
 ```
 
-`forge` launches the terminal UI wrapper (see [`../forge-tui/`](../forge-tui/) for its keyboard shortcuts and slash commands). `forge-agent` is the Rust agent binary; outside headless mode it exits with a usage message and expects to be driven by a client — either `forge-tui` or [`forge-ide`](../forge-ide/), both of which drive the exact same binary independently.
+`forge` launches the terminal UI wrapper (see [`../forge-tui-rs/`](../forge-tui-rs/) for its keyboard shortcuts and slash commands). `forge-agent` is the Rust agent binary; outside headless mode it exits with a usage message and expects to be driven by a client — either `forge-tui-rs` or [`forge-ide`](../forge-ide/), both of which drive the exact same binary independently.
 
 If `--cwd` is not specified, Forge uses the current directory as the project root.
 
@@ -421,7 +421,7 @@ See [ADDING_TOOLS.md](ADDING_TOOLS.md) for the complete checklist. Every tool re
 
 ## Headless mode
 
-`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types, and either [`../forge-tui/src/agent-bridge.ts`](../forge-tui/src/agent-bridge.ts) or [`../forge-ide/src/agent_panel.rs`](../forge-ide/src/agent_panel.rs) for a reference client implementation. ChatGPT Codex OAuth login is also available through `forge-agent --login-chatgpt`.
+`forge-agent` accepts `--headless` for programmatic use. It speaks a JSON newline protocol on stdin/stdout — see `src/headless.rs` for message types, and either [`../forge-tui-rs/src/bridge.rs`](../forge-tui-rs/src/bridge.rs) or [`../forge-ide/src/agent_panel.rs`](../forge-ide/src/agent_panel.rs) for a reference client implementation. ChatGPT Codex OAuth login is also available through `forge-agent --login-chatgpt`.
 
 ## Contributions
 

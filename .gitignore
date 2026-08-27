@@ -8,12 +8,28 @@
 .forge/
 .agent/
 .opencode/
+.claude/
+.aider*/
+.bob/
+.bobsync/
 
-# TUI (Bun/TypeScript)
+# Anything that could carry a credential. Nothing has ever slipped past — this is
+# insurance against the accident, not a record of one. A key committed to a public
+# repository is not undone by deleting it in the next commit.
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+*_history
 
-# Local scratch screenshots
+# Logs and scratch output
+*.log
 Screenshot*.png
 *.txt
 
-# Claude Code session runtime state (not project content)
-.claude/
+# Dependency trees from other ecosystems, in case anything is ever prototyped here
+node_modules/
+.venv/
+__pycache__/

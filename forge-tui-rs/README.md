@@ -2,7 +2,8 @@
 
 The terminal client, installed as `forge`. It spawns `forge-agent --headless` and drives it over the JSON-newline protocol in [`forge-agent-proto`](../forge-agent-proto/) — the same protocol [`forge-ide`](../forge-ide/)'s agent panel speaks, independently. No agent logic lives here.
 
-It replaced an earlier TypeScript client, [`forge-tui`](../forge-tui/), which is retired and no longer built.
+It replaced an earlier TypeScript client, `forge-tui`, which is retired and no
+longer part of this repository.
 
 ## Running it
 

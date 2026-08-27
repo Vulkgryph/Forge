@@ -15048,7 +15048,7 @@ mod elide_tests {
     fn the_file_name_survives_when_the_path_does_not() {
         // The whole point: egui truncates the tail, which on a path throws away
         // the only part that says which file it was.
-        let text = "Edited /Users/someone/CascadeProjects/NN-Revival/paper/note.md";
+        let text = "Edited /Users/someone/projects/a-long-project-name/paper/note.md";
         let out = elide_path_head_by(text, 30.0, fits(30.0));
         assert!(out.starts_with("Edited …/"), "got {out:?}");
         assert!(out.ends_with("note.md"), "the name must survive: {out:?}");

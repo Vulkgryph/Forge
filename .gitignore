@@ -28,6 +28,10 @@ id_ed25519
 *.log
 Screenshot*.png
 *.txt
+# Third-party licence texts are not scratch output. They have to travel with the
+# binary that embeds the fonts they cover (see NOTICE), and the blanket *.txt
+# above would have quietly dropped them from a clone.
+!licenses/*.txt
 
 # Dependency trees from other ecosystems, in case anything is ever prototyped here
 node_modules/

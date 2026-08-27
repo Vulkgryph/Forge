@@ -20,15 +20,61 @@ and limitations under the License.
 THIRD-PARTY NOTICES
 --------------------------------------------------------------------------
 
-Forge distributes no third-party binaries. The macOS application bundle
-contains only Vulkgryph LLC's own executable and generated resources; GPU
-rendering goes through Apple's Metal framework, which is part of the
-operating system.
+Forge redistributes no third-party executables or shared libraries. GPU
+rendering goes through Apple's Metal framework, which is part of the operating
+system. The application binary does statically embed third-party code, and this
+section itemises it: four font files, and C libraries compiled from source.
 
-Forge does link third-party Rust crates, predominantly under the MIT and
-Apache-2.0 licenses, along with libgit2 and OpenSSL compiled from source.
-These are declared in the Cargo.toml of each workspace member and pinned in
-Cargo.lock, which together are the authoritative dependency list.
+Fonts
+-----
+
+Four fonts are compiled into the binary by way of the `epaint_default_fonts`
+crate, which egui's default font set draws on. They remain the fallback for any
+character the system fonts do not cover, so they ship whether or not they are
+the fonts you see.
+
+  Hack — Copyright 2018 Source Foundry Authors, MIT License. Includes Bitstream
+    Vera Sans Mono, Copyright 2003 Bitstream Inc., licensed under the Bitstream
+    Vera License with Reserved Font Names "Bitstream" and "Vera", and work from
+    the DejaVu project committed to the public domain. See licenses/Hack.txt.
+  Noto Emoji — Copyright the Noto Project Authors, SIL Open Font License 1.1.
+    See licenses/OFL-1.1.txt.
+  Ubuntu — Copyright 2010-2011 Canonical Ltd., Ubuntu Font Licence 1.0.
+    See licenses/UFL-1.0.txt.
+  emoji-icon-font — Copyright (c) 2014 John Slegers, MIT License.
+    See licenses/emoji-icon-font-MIT.txt.
+
+C libraries compiled from source
+--------------------------------
+
+  libgit2 — vendored and compiled in via git2's `vendored-libgit2` feature.
+    Licensed GPL-2.0 with a linking exception that grants "unlimited permission
+    to link the compiled version of this library into combinations with other
+    programs, and to distribute those combinations without any restriction".
+    Forge distributes only such a combination, never libgit2's source, so no
+    copyleft obligation reaches Forge's own code. Named here because a licence
+    scanner will report the GPL and the exception is the answer.
+  OpenSSL 3.6.3 — vendored and compiled in via git2's `vendored-openssl`
+    feature, licensed under the Apache License 2.0.
+
+Rust crates
+-----------
+
+Forge links a large number of Rust crates, declared in the Cargo.toml of each
+workspace member and pinned in Cargo.lock, which together are the authoritative
+dependency list. They are predominantly MIT and Apache-2.0. Worth naming
+specifically, because their terms are not those two:
+
+  Mozilla Public License 2.0 — cssparser, cssparser-macros, dtoa-short and
+    selectors (reached through `scraper`), and option-ext (through `dirs`).
+    MPL-2.0 section 3.3 permits distributing the larger work under other terms;
+    section 3.2 asks that recipients of the executable be told how to obtain
+    the source form of those files, which is: from crates.io at the versions
+    pinned in Cargo.lock, or from each project's upstream repository.
+  CDLA-Permissive-2.0 — webpki-roots, carrying Mozilla's CA certificate set.
+  Unicode-3.0 — the ICU crates (icu_*, zerovec and related), whose data files
+    carry Unicode, Inc.'s attribution terms.
+  CC0-1.0 — notify, hexf-parse.
 
 
 Trademarks
@@ -53,16 +99,18 @@ winit 0.30.13 — https://github.com/rust-windowing/winit
 Copyright the winit contributors, licensed under the Apache License 2.0.
 
 A patched copy is vendored at forge-ide/vendor/winit-0.30.13/ and built in
-place of the published crate. Five source files are modified, for two changes,
-and each carries the modification notice Apache 2.0 section 4(b) requires.
+place of the published crate. Six files are modified, for two changes, and each
+carries the modification notice Apache 2.0 section 4(b) requires.
 winit's own LICENSE is retained beside the source it covers.
 
   1. macOS drag-and-drop accepts the modern `NSPasteboardTypeFileURL`
      pasteboard format and not only the legacy `NSFilenamesPboardType`, which
      Apple deprecated in 10.13. Without it a drop that populates only the
      modern type — the thumbnail macOS shows after a screenshot, for one — is
-     refused outright.
+     refused outright. Reading those types needs two objc2 features upstream
+     does not enable, so the vendored manifest differs too.
        src/platform_impl/macos/window_delegate.rs
+       Cargo.toml
 
   2. `ActiveEventLoopExtMacOS::set_dock_menu` is added, so an application can
      supply the menu shown when its Dock icon is right-clicked. AppKit asks

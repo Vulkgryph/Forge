@@ -1983,11 +1983,19 @@ fn draw_model_row(ui: &mut egui::Ui, name: &str, ctx_tokens: u64, is_current: bo
 /// on the text. This gives each one its own padded, full-bar-height hit
 /// area with a hover highlight, so the clickable region is obvious and
 /// comfortably larger than the label itself.
-/// What a status badge costs beyond its text: the padding either side, the gap
-/// before the disclosure triangle, and the triangle itself. Named so the width
-/// test measures the same chrome the badge actually draws.
+/// A status badge's own padding, the gap before its disclosure triangle, and
+/// the triangle's width. Constants rather than literals at each call site
+/// because the width test adds them up, and a test that measures numbers the
+/// drawing code no longer uses would pass while the row wrapped.
+const BADGE_PAD: f32 = 6.0;
+const BADGE_GAP: f32 = 2.0;
+const TRIANGLE_W: f32 = 10.0;
+
+/// What a badge costs beyond its text. Only the width test needs the total —
+/// the drawing code spends it a piece at a time.
+#[cfg(test)]
 fn status_badge_chrome(triangle: bool) -> f32 {
-    if triangle { 6.0 + 2.0 + 10.0 + 6.0 } else { 6.0 + 6.0 }
+    if triangle { BADGE_PAD + BADGE_GAP + TRIANGLE_W + BADGE_PAD } else { BADGE_PAD * 2.0 }
 }
 
 fn draw_status_badge(
@@ -2003,13 +2011,13 @@ fn draw_status_badge(
     let inner = ui.allocate_ui(egui::vec2(0.0, height), |ui| {
         ui.horizontal(|ui| {
             ui.set_height(height);
-            ui.add_space(6.0);
+            ui.add_space(BADGE_PAD);
             ui.label(egui::RichText::new(text).size(10.5).color(color));
             if triangle {
-                ui.add_space(2.0);
+                ui.add_space(BADGE_GAP);
                 paint_disclosure_triangle(ui, expanded, color);
             }
-            ui.add_space(6.0);
+            ui.add_space(BADGE_PAD);
         });
     });
     let rect = inner.response.rect;
@@ -2076,7 +2084,7 @@ fn draw_perm_mode_row(
 /// buttons, since not every glyph (e.g. ▾/▸) is guaranteed to exist in the
 /// loaded font and shows as a missing-glyph box otherwise.
 fn paint_disclosure_triangle(ui: &mut egui::Ui, expanded: bool, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(TRIANGLE_W, 14.0), egui::Sense::hover());
     let c = rect.center();
     let pts = if expanded {
         vec![egui::pos2(c.x - 4.0, c.y - 2.0), egui::pos2(c.x + 4.0, c.y - 2.0), egui::pos2(c.x, c.y + 3.0)]
@@ -14050,7 +14058,23 @@ impl IdeApp {
                     // exactly the one endpoint it was handed, which is what it
                     // did on the first real test.
                     let locals = crate::onboarding::local_endpoints();
-                    let mut routes = crate::model_proxy::Routes::new();
+                    // One secret per session, handed to the remote agent as the
+                    // api_key of every endpoint it is lent. The agent then
+                    // presents it on each request without knowing it is
+                    // authenticating, and the proxy serves nothing that does
+                    // not — loopback on a shared host is reachable by every
+                    // other process on it, and the credential is added here.
+                    let token = match crate::model_proxy::session_token() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            // Reported and then skipped, not worked around: the
+                            // remote session still runs, with the models it has
+                            // of its own rather than an open tunnel to ours.
+                            eprintln!("forge-ide: {e}; not lending endpoints to the remote");
+                            String::new()
+                        }
+                    };
+                    let mut routes = crate::model_proxy::Routes::new(token.clone());
                     let mut lent: Vec<serde_json::Value> = Vec::new();
                     for ep in locals {
                         let kind = ep["endpoint_type"].as_str().unwrap_or("").to_string();
@@ -14069,12 +14093,14 @@ impl IdeApp {
                             extra_headers,
                         });
                         let mut lent_ep = ep.clone();
-                        lent_ep["api_key"] = serde_json::json!("");
+                        lent_ep["api_key"] = serde_json::json!(token);
                         lent_ep["base_url"] = serde_json::json!(prefix);
                         lent.push(lent_ep);
                     }
 
-                    if !routes.is_empty() {
+                    // An empty token means the random read failed, and an
+                    // unauthenticated tunnel is worse than no remote models.
+                    if !routes.is_empty() && !token.is_empty() {
                         match ssh.open_model_proxy(routes) {
                             Ok(port) => {
                                 // The prefix stored above becomes a whole URL
@@ -16934,6 +16960,65 @@ mod build_time_tests {
             rendered.ends_with(&format!("{hh:02}:{mm:02}")),
             "{rendered} does not end in this machine's local time {hh:02}:{mm:02}",
         );
+    }
+}
+
+#[cfg(test)]
+mod embedded_font_attribution {
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    }
+
+    /// egui's default font set is compiled into this binary, so four
+    /// third-party fonts ship inside `forge-ide` whether or not they are the
+    /// fonts anyone sees — they stay as the fallback for characters the system
+    /// fonts do not cover. Three of the four licences (OFL-1.1, UFL-1.0, and
+    /// Bitstream Vera by way of Hack) condition redistribution on the notice
+    /// travelling with the font, so NOTICE has to name them and the texts have
+    /// to be in the tree.
+    ///
+    /// This is a test rather than a comment because the obligation follows the
+    /// dependency: turning off egui's `default_fonts`, or an upgrade changing
+    /// the set, changes what has to be attributed, and nothing else in the
+    /// build would say so.
+    #[test]
+    fn every_embedded_font_is_attributed() {
+        let root = repo_root();
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+        if !lock.contains("name = \"epaint_default_fonts\"") {
+            // The fonts are no longer embedded. Then NOTICE may say so, and
+            // this test has nothing to hold — but say why out loud.
+            eprintln!("epaint_default_fonts is gone from the graph; font attribution is moot");
+            return;
+        }
+
+        let notice = std::fs::read_to_string(root.join("NOTICE")).expect("NOTICE");
+        for font in ["Hack", "Noto Emoji", "Ubuntu", "emoji-icon-font"] {
+            assert!(notice.contains(font), "NOTICE does not name {font}");
+        }
+        // Hack carries Bitstream Vera, with reserved font names, and that
+        // condition is the one most easily dropped when tidying prose.
+        assert!(notice.contains("Bitstream"), "NOTICE drops the Bitstream Vera attribution");
+
+        for licence in ["OFL-1.1.txt", "UFL-1.0.txt", "Hack.txt", "emoji-icon-font-MIT.txt"] {
+            let path = root.join("licenses").join(licence);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("licenses/{licence} is required and unreadable: {e}"));
+            assert!(text.len() > 500, "licenses/{licence} looks truncated ({} bytes)", text.len());
+        }
+    }
+
+    /// The sentence this replaced said the bundle "contains only Vulkgryph
+    /// LLC's own executable and generated resources", which was false the day
+    /// it was written — the fonts were already in the binary. Kept as a test so
+    /// a future tidy-up cannot reintroduce the claim.
+    #[test]
+    fn notice_does_not_claim_there_are_no_third_party_binaries() {
+        let notice = std::fs::read_to_string(repo_root().join("NOTICE")).expect("NOTICE");
+        assert!(!notice.contains("distributes no third-party binaries"),
+            "NOTICE claims no third-party binaries ship; four fonts are linked into forge-ide");
     }
 }
 

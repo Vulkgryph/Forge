@@ -2954,15 +2954,8 @@ impl Agent {
             return;
         }
         self.remote_git_check_pending = true;
-        let install_policy = if self.dangerously_allow_all {
-            "Because --dangerously-allow-all is active, you may install git when needed using the appropriate non-interactive package-manager command."
-        } else {
-            "If git is missing, ask the user for permission before installing it. Do not install git without approval."
-        };
-        self.history.push(Message::system(&format!(
-            "[Hidden remote workspace task: An SSH command was used. If you will inspect or modify files on that remote system, first identify the remote working directory, verify `git --version` works there, and verify the directory is inside a Git worktree with `git rev-parse --is-inside-work-tree`. Forge's remote revert support depends on Git being available in the remote worktree. {} Do not make remote file modifications until this Git check has succeeded or the user explicitly accepts working without remote revert for that path.]",
-            install_policy
-        )));
+        self.history
+            .push(Message::system(remote_git_instruction()));
     }
 
     /// Check status, get output, or kill a background command.
@@ -4203,6 +4196,48 @@ impl Agent {
     }
 }
 
+/// What the agent is told about git the first time it touches a remote system.
+///
+/// Git is how remote revert works, so this is a safety net rather than a
+/// convenience: without it a user cannot undo what the agent did on a machine
+/// they may not own. Three things follow, and the order matters.
+///
+/// If git is there, use it. If it is not, ask before installing it — installing
+/// a package is a change to that machine's installed software, which is a
+/// different kind of act from editing a file in a workspace, and
+/// `--dangerously-allow-all` does not buy consent for it. That flag waives the
+/// user's own approval prompts; it cannot waive the policy of a host that may
+/// belong to their employer or their client.
+///
+/// And if git is unavailable either way, the user is still not left without a
+/// net: Forge snapshots every file its own tools write (see
+/// `record_direct_file_snapshots`), independently of git, so tool edits stay
+/// revertible when git is missing. A file changed by a shell command is not in
+/// that set — which is why the agent is told to prefer the tools and to say so
+/// before working without revert.
+fn remote_git_instruction() -> &'static str {
+    "[Hidden remote workspace task: An SSH command was used. Before you inspect \
+     or modify files on that remote system, identify the remote working \
+     directory and check both `git --version` and `git rev-parse \
+     --is-inside-work-tree` there. Then:\n\
+     \n\
+     - Git present, and inside a worktree: proceed normally. Forge's remote \
+     revert uses git, so the user can undo what you do there, including changes \
+     made by shell commands.\n\
+     - Git missing, or the directory is not a worktree: stop and tell the user \
+     before modifying anything. Ask for explicit permission before installing \
+     git or running any package manager, and do not install it without that \
+     permission. This holds even when --dangerously-allow-all is active: that \
+     flag bypasses tool approvals, not consent to change the installed software \
+     on a machine the user may not own.\n\
+     - Permission declined, or git cannot be installed: you may still work, but \
+     say plainly first that remote revert is unavailable for that path. Then \
+     prefer Forge's file tools (write_file, edit_file, apply_patch) over shell \
+     commands that modify files — Forge snapshots every file those tools touch, \
+     so that work stays revertible without git, while a file changed by a shell \
+     command cannot be recovered.]"
+}
+
 fn looks_like_tool_intent_without_action(content: Option<&str>) -> bool {
     let text = match content {
         Some(t) => t.trim(),
@@ -4533,7 +4568,7 @@ File writing (ALWAYS use these to create or modify files):
 
 Other:
 - shell_exec: Execute shell commands for building, testing, linting, and system tasks. Do NOT use this for file creation or modification — always use the file writing tools above instead. Use wait=true for build/test/compiler commands when you need the final result before continuing; set timeout_secs high enough for legitimate long audits. Forge emits progress heartbeats every 5 minutes for long foreground commands. Use run_in_background=true for servers, watchers, daemons, and expensive audits you can check later with background_id.
-- Remote shell policy: Do not open an interactive SSH session inside shell_exec. Use non-interactive SSH commands only, e.g. ssh host 'cd /path/to/repo && command'. Once you identify a remote directory where you will inspect or modify files, verify git is installed (`git --version`) and that the directory is inside a Git worktree (`git rev-parse --is-inside-work-tree`) before making remote file changes. If git is missing, ask the user before installing it unless --dangerously-allow-all is active.
+- Remote shell policy: Do not open an interactive SSH session inside shell_exec. Use non-interactive SSH commands only, e.g. ssh host 'cd /path/to/repo && command'. Once you identify a remote directory where you will inspect or modify files, verify git is installed (`git --version`) and that the directory is inside a Git worktree (`git rev-parse --is-inside-work-tree`) before making remote file changes — that is what remote revert runs on. If git is missing, ask the user before installing it or running any package manager, including when --dangerously-allow-all is active; if they decline, say that remote revert is unavailable for that path and prefer the file tools over shell commands that modify files, since Forge snapshots what the tools write and cannot recover what a shell command changes.
 - todo_write: Track your progress on multi-step tasks (add/update/list items)
 - web_search: Search the web for information. Returns titles, URLs, and snippets. Use for documentation, error solutions, library research, whitepapers, GitHub repos.
 - web_fetch: Fetch a web page and extract specific information. Requires a prompt describing what to look for. Returns a focused answer, not raw page text. Use after web_search to read full content, or to fetch any URL directly.
@@ -4617,5 +4652,50 @@ mod tests {
             ssh_invocation("ssh -p 2222 deploy@example.com 'cd /srv/app && git status'"),
             Some("deploy@example.com".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_git_policy_tests {
+    use super::remote_git_instruction;
+
+    /// Git on a remote host is a safety net, not a convenience: it is what
+    /// remote revert runs on. So the agent must check for it before touching
+    /// files, and the instruction has to say all three of what to do when it is
+    /// there, when it is missing, and when it cannot be had.
+    #[test]
+    fn the_agent_is_told_to_check_before_it_writes() {
+        let t = remote_git_instruction();
+        assert!(t.contains("git --version"));
+        assert!(t.contains("git rev-parse --is-inside-work-tree"));
+        assert!(t.contains("before you inspect") || t.contains("Before you inspect"));
+    }
+
+    /// The hole this closed: the old text told the agent it "may install git"
+    /// unattended whenever --dangerously-allow-all was set. That flag waives
+    /// the user's own approval prompts; it cannot waive the policy of a host
+    /// that may belong to their employer. Installing a package is a change to
+    /// the machine, so it is asked for either way.
+    #[test]
+    fn allow_all_does_not_authorize_installing_anything() {
+        let t = remote_git_instruction();
+        assert!(t.contains("even when --dangerously-allow-all is active"),
+            "the instruction does not close the allow-all carve-out");
+        assert!(t.contains("Ask for explicit permission before installing"));
+        assert!(!t.contains("you may install git"),
+            "the old unattended-install wording is back");
+    }
+
+    /// And nobody is left without a net. Forge's own file tools are snapshotted
+    /// independently of git, so when git is unavailable the agent is told to
+    /// prefer them — and to say out loud that revert is gone for that path
+    /// rather than working on quietly.
+    #[test]
+    fn without_git_the_user_is_told_and_the_tools_are_preferred() {
+        let t = remote_git_instruction();
+        assert!(t.contains("remote revert is unavailable"));
+        assert!(t.contains("write_file") && t.contains("apply_patch"));
+        assert!(t.contains("cannot be recovered"),
+            "does not say what a shell-command change costs");
     }
 }

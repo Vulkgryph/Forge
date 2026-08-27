@@ -84,7 +84,9 @@ Click the `><` indicator in the bottom-left of the status bar (or a saved host f
 3. If not, uploads the correct static binary for that machine's architecture via SFTP — no compiler, package manager, or internet access required *on the remote machine*
 4. Starts `forge-server --stdio` over an SSH exec channel and speaks JSON-RPC to it for the rest of the session
 
-Everything — the remote file tree, remote file open/save, and the remote terminal — goes through that one channel. Nothing else touches the remote machine's network.
+Everything — the remote file tree, remote file open/save, and the remote terminal — goes through that one channel.
+
+One thing does open a port over there, and it is worth knowing about: when the agent runs on the remote and this machine lends it a model endpoint, SSH forwards a port on the remote's **loopback** back here, and Forge adds your API credential on this side so the key never reaches that machine. Loopback is not privacy — other processes and other local users on that host can reach it — so each session issues a random token, hands it to the agent as the endpoint's key, and the tunnel refuses any request that does not present it. The token grants use of the tunnel only, is never written to the remote's disk, and dies with the session.
 
 ### What lands on the remote
 
@@ -101,7 +103,9 @@ Two names, one directory, worth knowing about: a *workspace*'s own `.forge/` hol
 
 Where VS Code would use `~/.forge-server/`, this uses `~/.forge/`. Deliberate: renaming it now would re-upload on every remote's first connect and leave the old directory behind, for no behaviour anyone would notice.
 
-No `sudo`, no package manager, no compiler, and nothing written outside `~/.forge/` except a workspace's own `.forge/` when the agent runs there.
+No `sudo`, no compiler, and nothing written outside `~/.forge/` except a workspace's own `.forge/` when the agent runs there. Forge itself never invokes a package manager.
+
+One exception, which is the agent rather than Forge: remote revert runs on git, so before the agent modifies files on a remote host it checks that git is present and that the directory is inside a worktree. If git is missing it must ask you before installing it — including when `--dangerously-allow-all` is active, because that flag waives your approval prompts and not the policy of a machine that may not be yours. Decline and the agent keeps working, but it has to tell you revert is unavailable for that path first, and it is told to prefer the file tools over shell commands: Forge snapshots every file its own tools write, with or without git, and cannot recover a file a shell command changed.
 
 ## Status
 

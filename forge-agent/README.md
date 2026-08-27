@@ -45,7 +45,9 @@ Forge does **not** provide practical isolation from the host machine. Its safety
 
 The project root is the default working directory, not a sandbox. File tools and shell commands can access paths outside the project when the underlying operating system permissions allow it. Use Forge only in workspaces and user accounts where that level of access is acceptable, review commands before approving them, and treat auto-approval modes as trusted-session features.
 
-**Launching with `--dangerously-allow-all` requires an interactive confirmation.** The flag is exactly what it says — every tool approval gate is bypassed for the whole session — so Forge stops before rendering the TUI and asks you to type `yes` to continue. Anything else exits. Set `FORGE_SKIP_DANGEROUS_CONFIRM=1` for scripted / CI use where the operator has already accepted the risk.
+**Launching `forge --dangerously-allow-all` requires an interactive confirmation.** The flag is exactly what it says — every tool approval gate is bypassed for the whole session — so Forge prints what that means and asks you to type `yes` before it starts the agent. Anything else, including an empty line, exits. Set `FORGE_SKIP_DANGEROUS_CONFIRM=1` for scripted / CI use where the operator has already accepted the risk.
+
+The gate belongs to the `forge` command, which is the entry point a person types. `forge-agent --headless` is a protocol server driven by a UI and owns no terminal to ask on, so it takes the flag as given — the UI in front of it is where the asking happens, and the editor confirms before it will switch a tab into *Skip All Permissions*.
 
 ## Offline use
 

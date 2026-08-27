@@ -8,6 +8,8 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ### Fixed
 
+- **The confirmation gate for `--dangerously-allow-all` came back.** It existed (`af3bf96`), in the TypeScript client, and was deleted with that client when it was retired (`f3b3c60`) — while `forge-agent/README.md` went on describing it in detail, down to the `FORGE_SKIP_DANGEROUS_CONFIRM=1` override for CI. That is the worst of the three possible states: not "no gate", but no gate plus a documented promise of one, which is what someone relies on before passing the flag. Ported back with the original's banner text, the same accepted answers (`yes` or `y`, and nothing else — an empty line exits), the same `Cancelled.` and the same exit status, and the same env-var opt-out, treating an empty value as unset the way the JavaScript original did. It now fires *before* the agent is spawned rather than before the UI renders, so a session you cancel never had a process behind it.
+
 - **The agent's last stderr lines could be lost.** `Exited` was sent by the thread
   reading stdout, with no coordination with the thread reading stderr, so the two
   raced — and `main.rs` treats `Exited` as the end of the session and stops

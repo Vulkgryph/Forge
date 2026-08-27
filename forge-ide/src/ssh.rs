@@ -457,15 +457,16 @@ impl SshConnection {
     /// serving whatever arrives against `upstream`.
     ///
     /// Returns the port the remote should send to. Loopback on that machine, so
-    /// nothing off it can reach the tunnel — the port answers only to processes
-    /// on the remote itself, and everything it answers with came from here.
+    /// nothing off it can reach the tunnel — but processes on the remote itself
+    /// can, which is why the tunnel authenticates rather than trusting that
+    /// loopback means the agent.
     ///
     /// Port 0 asks the remote's sshd to choose, avoiding a fixed number that
     /// two sessions to the same host would fight over.
-    /// Not yet called: the agent needs a way to be told its credentials are
-    /// proxied before this can be turned on for a session. See the note in
-    /// `model_proxy`.
-    #[allow(dead_code)]
+    ///
+    /// Loopback is not privacy: anything running on that machine can reach the
+    /// port, so `routes` carries a per-session token and the proxy refuses a
+    /// request that does not present it. See `model_proxy::authorized`.
     pub fn open_model_proxy(
         &self,
         routes: crate::model_proxy::Routes,

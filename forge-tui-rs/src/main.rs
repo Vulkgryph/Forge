@@ -69,6 +69,13 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // Before the agent is spawned, not after: a session the user is about to
+    // cancel should never have had a process behind it.
+    if dangerous_confirm_wanted(&opts.agent_args) && !confirm_dangerous_allow_all() {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
     // Start the agent before taking the terminal, so a spawn failure prints
     // normally rather than onto an alternate screen we then leave.
     let mut bridge = match AgentBridge::spawn(&opts.agent_args, opts.cwd.as_deref()) {
@@ -438,6 +445,62 @@ fn read_terminal(tx: mpsc::Sender<Event>) {
     }
 }
 
+/// `--dangerously-allow-all` bypasses every tool approval gate for the whole
+/// session. The flag name is the warning, but a confirmation that defaults to
+/// no catches the case the name cannot: another tool, or muscle memory, having
+/// launched forge with it when nobody read what it does.
+///
+/// This is a port of the gate the TypeScript client carried (`forge-tui/src/
+/// index.tsx`, added in af3bf96) — the same banner, the same accepted answers,
+/// the same `Cancelled.` and exit status. It was deleted with that client in
+/// f3b3c60 and the README went on describing it, which is the worst of the
+/// three possible states: no gate, and a promise of one.
+fn dangerous_confirm_wanted(agent_args: &[String]) -> bool {
+    agent_args.iter().any(|a| a == "--dangerously-allow-all")
+        && !skip_dangerous_confirm()
+}
+
+/// `FORGE_SKIP_DANGEROUS_CONFIRM=1` opts a pipeline out of the prompt. An empty
+/// value does not count as set — the original tested the variable for JavaScript
+/// truthiness, where `FOO=` is falsy, and a variable someone cleared rather than
+/// unset should mean what it looks like it means.
+fn skip_dangerous_confirm() -> bool {
+    std::env::var_os("FORGE_SKIP_DANGEROUS_CONFIRM")
+        .is_some_and(|v| !v.is_empty())
+}
+
+/// Only `yes` or `y` proceed. Anything else does — deliberately — nothing.
+fn answer_approves(answer: &str) -> bool {
+    let a = answer.trim().to_lowercase();
+    a == "yes" || a == "y"
+}
+
+/// Prints the banner and reads one line. A closed or unreadable stdin is not a
+/// yes: a pipeline that wants no prompt sets the environment variable.
+fn confirm_dangerous_allow_all() -> bool {
+    println!();
+    println!("\x1b[31m\x1b[1mDANGER: --dangerously-allow-all is set.\x1b[0m");
+    println!();
+    println!("This bypasses EVERY tool approval prompt for this entire session.");
+    println!("Forge can read, write, edit, and execute anything on this machine");
+    println!("(within your user's permissions) without asking you first.");
+    println!();
+    println!("Only continue if you are in a sandbox, a VM, or a disposable workspace");
+    println!("where you have already accepted that risk.");
+    println!();
+    println!("To skip this prompt in scripted environments:");
+    println!("    FORGE_SKIP_DANGEROUS_CONFIRM=1 forge --dangerously-allow-all");
+    println!();
+    print!("Type 'yes' to continue, anything else to exit: ");
+    let _ = io::Write::flush(&mut io::stdout());
+
+    let mut answer = String::new();
+    match io::BufRead::read_line(&mut io::stdin().lock(), &mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => answer_approves(&answer),
+    }
+}
+
 fn parse_args() -> Result<Option<Options>, String> {
     let mut cwd = None;
     let mut agent_args = Vec::new();
@@ -543,5 +606,46 @@ mod tests {
         assert!(!looks_pasted(b"\x1b[200~one\rtwo\x1b[201~"), "already bracketed");
         assert!(!looks_pasted(b"\x1b[A"), "an arrow key");
         assert!(!looks_pasted(b"a\x1b[Ab\r c"), "text mixed with a sequence");
+    }
+}
+
+#[cfg(test)]
+mod dangerous_confirm_tests {
+    use super::{answer_approves, dangerous_confirm_wanted};
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The gate exists at all. It is documented in forge-agent's README, it was
+    /// deleted with the TypeScript client that implemented it, and the README
+    /// then described a safety mechanism that no code performed — so what this
+    /// test really pins is that the two cannot drift apart again silently.
+    #[test]
+    fn the_flag_asks_before_anything_runs() {
+        assert!(dangerous_confirm_wanted(&args(&["--dangerously-allow-all"])));
+    }
+
+    /// And only that flag does. A normal session is not interrogated.
+    #[test]
+    fn nothing_else_asks() {
+        assert!(!dangerous_confirm_wanted(&args(&[])));
+        assert!(!dangerous_confirm_wanted(&args(&["--resume-session", "abc"])));
+        assert!(!dangerous_confirm_wanted(&args(&["--login-chatgpt"])));
+        // Near misses are not the flag. A prefix match here would gate on a
+        // future `--dangerously-allow-all-writes` and, worse, not on this one.
+        assert!(!dangerous_confirm_wanted(&args(&["--dangerously-allow"])));
+    }
+
+    /// Yes means yes, and it is the only thing that does. Empty input is the
+    /// case that matters: a prompt answered with Enter must not proceed.
+    #[test]
+    fn only_yes_proceeds() {
+        for ok in ["yes", "y", "YES", "Y", "  yes  ", "Yes\n"] {
+            assert!(answer_approves(ok), "{ok:?} should have been accepted");
+        }
+        for no in ["", "\n", " ", "n", "no", "nope", "yesss", "ye", "yeah", "1", "sure"] {
+            assert!(!answer_approves(no), "{no:?} should NOT have been accepted");
+        }
     }
 }

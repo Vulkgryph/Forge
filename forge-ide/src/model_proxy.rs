@@ -1,8 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Not yet called: the reverse SSH tunnel that hands connections to `serve_one`
-// is the next piece. Kept and tested on its own because it is the part that
-// decides what a credential does and does not travel with, and that is worth
-// pinning before anything depends on it.
 #![allow(dead_code)]
 //! Lending a model endpoint to an agent on another machine, without lending the
 //! credentials.
@@ -15,9 +11,17 @@
 //!
 //! So the request comes here instead. The remote agent is pointed at a port on
 //! its own loopback, which SSH forwards back to this machine; this module adds
-//! the credential and forwards to the real endpoint. The agent sends
-//! unauthenticated requests to localhost and never holds anything secret — not
-//! on disk, not in memory.
+//! the credential and forwards to the real endpoint. The agent never holds a
+//! provider credential — not on disk, not in memory.
+//!
+//! It does hold one secret, and has to: the port is on that machine's loopback,
+//! which every process and every other local user on it can reach, so a tunnel
+//! that served whoever connected would let anything over there spend the user's
+//! tokens without a credential of its own. Each session issues a random token
+//! (`session_token`), hands it to the agent as the api_key of every endpoint it
+//! lends, and serves nothing that does not present it (`authorized`). The token
+//! authorises this tunnel and nothing else, it is marked ephemeral so the agent
+//! does not write it to that machine's config, and it dies with the session.
 //!
 //! This half is the rewriting: what arrives, what is sent on, and what must
 //! never be passed through. It performs no I/O so it can be tested against the
@@ -112,6 +116,62 @@ pub fn parse_head(text: &str) -> Result<RequestHead, String> {
     })
 }
 
+/// A fresh secret for one session's tunnel.
+///
+/// 32 bytes from the system's random device, hex-encoded. Not a provider
+/// credential and not derived from one: it authorises use of this tunnel and
+/// nothing else, it is never written to the remote's disk (the lent endpoint is
+/// marked ephemeral), and it dies when the session does.
+///
+/// `/dev/urandom` rather than a crate, per the project's no-dependencies rule.
+/// A failure to read it is fatal on purpose — the alternative is a predictable
+/// token, and an unauthenticated tunnel is what this exists to prevent.
+pub fn session_token() -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| format!("could not read /dev/urandom for a session token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether a request may be served.
+///
+/// The tunnel listens on the remote's loopback, which sounds private and is
+/// not: every process and every other user on that machine can reach loopback.
+/// Without this check, anything over there could spend the user's tokens
+/// through this proxy while holding no credential of its own — the credential
+/// is added on this side.
+///
+/// The token arrives wherever the agent's endpoint style puts its key, so both
+/// are accepted. Compared in constant time, which costs nothing here and
+/// removes the question.
+pub fn authorized(head: &RequestHead, token: &str) -> bool {
+    if token.is_empty() {
+        // No token means the caller built Routes without one. Refusing is the
+        // only safe reading: an empty expected secret must not match an empty
+        // presented one.
+        return false;
+    }
+    head.headers.iter().any(|(name, value)| {
+        let presented = if name.eq_ignore_ascii_case("authorization") {
+            value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")).unwrap_or(value)
+        } else if name.eq_ignore_ascii_case("x-api-key") {
+            value.as_str()
+        } else {
+            return false;
+        };
+        constant_time_eq(presented.trim().as_bytes(), token.as_bytes())
+    })
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Headers that must not be forwarded upstream.
 ///
 /// `host` is rewritten for the real endpoint. Anything carrying credentials is
@@ -203,22 +263,33 @@ pub struct Upstream {
 /// everything this machine has instead of the single endpoint it was started
 /// with.
 #[derive(Debug, Clone, Default)]
-pub struct Routes(Vec<(String, Upstream)>);
+pub struct Routes {
+    endpoints: Vec<(String, Upstream)>,
+    /// The secret a request must present to be served at all. See
+    /// `session_token` and `authorized`.
+    token: String,
+}
 
 impl Routes {
-    pub fn new() -> Self {
-        Self(Vec::new())
+    pub fn new(token: String) -> Self {
+        Self { endpoints: Vec::new(), token }
     }
 
     /// Add an endpoint and return the prefix the remote should use for it.
     pub fn add(&mut self, upstream: Upstream) -> String {
-        let prefix = format!("/e{}", self.0.len());
-        self.0.push((prefix.clone(), upstream));
+        let prefix = format!("/e{}", self.endpoints.len());
+        self.endpoints.push((prefix.clone(), upstream));
         prefix
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.endpoints.is_empty()
+    }
+
+    /// The token the remote agent is handed as its `api_key`, so it presents it
+    /// on every request without needing to know it is doing so.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// The endpoint a request is for, and the path with its prefix removed.
@@ -227,7 +298,7 @@ impl Routes {
     /// first endpoint, say — would send a request to the wrong provider with
     /// the wrong credential, which is worse than a refusal.
     pub fn route(&self, path: &str) -> Option<(&Upstream, String)> {
-        self.0.iter().find_map(|(prefix, up)| {
+        self.endpoints.iter().find_map(|(prefix, up)| {
             let rest = path.strip_prefix(prefix.as_str())?;
             // `/e1` must not match a request for `/e10`.
             if !rest.is_empty() && !rest.starts_with('/') {
@@ -284,6 +355,19 @@ pub fn serve_one<S: std::io::Read + std::io::Write>(
     let (upstream, path) = routes
         .route(&head.path)
         .ok_or_else(|| format!("no endpoint is lent at {}", head.path))?;
+    // Checked after the request is read so the client gets an answer rather
+    // than a dropped connection, and before anything is forwarded so an
+    // unauthorised request never reaches a provider or a credential.
+    if !authorized(&head, routes.token()) {
+        let body = "{\"error\":{\"message\":\"this tunnel requires the session token Forge issued\"}}";
+        let out = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(out.as_bytes()).map_err(|e| format!("writing 401: {e}"))?;
+        return Err("refused a request with no valid session token".into());
+    }
     let url = upstream_url(&upstream.base_url, &path);
     let mut req = ureq::request(&head.method, &url);
     for (name, value) in upstream_headers(&head, upstream.style, &upstream.credential) {
@@ -342,6 +426,7 @@ pub fn serve_one<S: std::io::Read + std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     const REQ: &str = "POST /v1/chat/completions HTTP/1.1\r\n\
                        host: 127.0.0.1:18791\r\n\
@@ -430,7 +515,7 @@ mod tests {
     }
 
     fn two_endpoints() -> Routes {
-        let mut r = Routes::new();
+        let mut r = Routes::new("t".into());
         for (n, url) in [("a", "https://api.one.test/v1"), ("b", "https://api.two.test/v1")] {
             r.add(Upstream {
                 base_url: url.into(),
@@ -467,7 +552,7 @@ mod tests {
     fn a_prefix_is_not_a_prefix_of_a_longer_one() {
         // /e1 must not answer for /e10, which it would with a plain
         // starts_with.
-        let mut r = Routes::new();
+        let mut r = Routes::new("t".into());
         for i in 0..11 {
             r.add(Upstream {
                 base_url: format!("https://{i}.test"),
@@ -519,6 +604,10 @@ mod tests {
 #[cfg(test)]
 mod io_tests {
     use super::*;
+
+    /// A stand-in for the per-session secret. Long enough that the constant-time
+    /// comparison is exercised over a realistic length.
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     use std::io::{Read, Write};
 
     /// A stand-in for the forwarded connection: the agent's bytes go in, the
@@ -604,12 +693,13 @@ mod io_tests {
         let (base_url, server) = upstream_that_echoes_its_auth();
         let mut pipe = Pipe {
             input: std::io::Cursor::new(
-                b"POST /e0/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1:1\r\ncontent-length: 2\r\n\r\n{}"
-                    .to_vec(),
+                format!("POST /e0/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1:1\r\n\
+                         authorization: Bearer {TEST_TOKEN}\r\ncontent-length: 2\r\n\r\n{{}}")
+                    .into_bytes(),
             ),
             output: Vec::new(),
         };
-        let mut routes = Routes::new();
+        let mut routes = Routes::new(TEST_TOKEN.into());
         let prefix = routes.add(Upstream {
             base_url,
             style: AuthStyle::Bearer,
@@ -642,10 +732,13 @@ mod io_tests {
             );
         });
         let mut pipe = Pipe {
-            input: std::io::Cursor::new(b"POST /e0/v1/x HTTP/1.1\r\ncontent-length: 0\r\n\r\n".to_vec()),
+            input: std::io::Cursor::new(
+                format!("POST /e0/v1/x HTTP/1.1\r\nauthorization: Bearer {TEST_TOKEN}\r\n\
+                         content-length: 0\r\n\r\n").into_bytes(),
+            ),
             output: Vec::new(),
         };
-        let mut routes = Routes::new();
+        let mut routes = Routes::new(TEST_TOKEN.into());
         routes.add(Upstream {
             base_url: format!("http://127.0.0.1:{port}"),
             style: AuthStyle::Bearer,
@@ -657,5 +750,71 @@ mod io_tests {
         let out = String::from_utf8_lossy(&pipe.output);
         assert!(out.starts_with("HTTP/1.1 429"), "got {out:?}");
         assert!(out.ends_with("slow!"), "the body should be relayed: {out:?}");
+    }
+
+    /// The tunnel listens on the remote machine's loopback, which sounds
+    /// private and is not: every process and every other local user on that
+    /// host can reach loopback, and the credential is added on this side. So an
+    /// unauthenticated request used to be enough to spend the user's tokens
+    /// through their own proxy. It is now refused before it reaches a provider.
+    ///
+    /// No upstream is started by this test on purpose — if the refusal ever
+    /// stops working, there is nothing listening to absorb the request, and the
+    /// test fails rather than quietly passing against a live endpoint.
+    #[test]
+    fn a_request_without_the_session_token_is_refused() {
+        let mut pipe = Pipe {
+            input: std::io::Cursor::new(
+                b"POST /e0/v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\n".to_vec(),
+            ),
+            output: Vec::new(),
+        };
+        let mut routes = Routes::new(TEST_TOKEN.into());
+        routes.add(Upstream {
+            base_url: "http://127.0.0.1:1".into(),
+            style: AuthStyle::Bearer,
+            credential: "sk-must-not-be-used".into(),
+            extra_headers: Vec::new(),
+        });
+        let err = serve_one(&mut pipe, &routes).expect_err("an unauthenticated request is refused");
+        assert!(err.contains("session token"), "unexpected error: {err}");
+
+        let out = String::from_utf8_lossy(&pipe.output);
+        assert!(out.starts_with("HTTP/1.1 401 Unauthorized"), "got {out:?}");
+        assert!(!out.contains("sk-must-not-be-used"), "the credential leaked into the refusal");
+    }
+
+    /// A wrong token is not a missing one, and both are refused. The empty
+    /// expected token is the case that would turn the check off wholesale.
+    #[test]
+    fn only_the_issued_token_authorizes() {
+        let head = |name: &str, value: &str| RequestHead {
+            method: "POST".into(),
+            path: "/e0/v1/x".into(),
+            headers: vec![(name.to_string(), value.to_string())],
+        };
+        assert!(authorized(&head("authorization", &format!("Bearer {TEST_TOKEN}")), TEST_TOKEN));
+        assert!(authorized(&head("Authorization", &format!("bearer {TEST_TOKEN}")), TEST_TOKEN));
+        assert!(authorized(&head("x-api-key", TEST_TOKEN), TEST_TOKEN));
+
+        assert!(!authorized(&head("authorization", "Bearer wrong"), TEST_TOKEN));
+        assert!(!authorized(&head("x-api-key", ""), TEST_TOKEN));
+        assert!(!authorized(&head("content-type", TEST_TOKEN), TEST_TOKEN), "any header will do?");
+        assert!(!authorized(&head("authorization", &format!("Bearer {TEST_TOKEN}")), ""),
+            "an empty expected token must never match");
+        // A prefix of the real token is not the real token.
+        let short = &TEST_TOKEN[..TEST_TOKEN.len() - 1];
+        assert!(!authorized(&head("x-api-key", short), TEST_TOKEN));
+    }
+
+    /// Two sessions to the same host must not share a secret, and a token has
+    /// to be unguessable to be worth having.
+    #[test]
+    fn each_session_gets_its_own_unguessable_token() {
+        let a = session_token().expect("/dev/urandom");
+        let b = session_token().expect("/dev/urandom");
+        assert_ne!(a, b, "two sessions were issued the same token");
+        assert_eq!(a.len(), 64, "expected 32 bytes hex-encoded");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

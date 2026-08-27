@@ -83,15 +83,37 @@ fn main() {
 /// value inside it on reconnect transparently redirects every session's
 /// future output to the new connection, with no per-session rewiring.
 #[cfg(unix)]
+/// Bind the daemon's socket so only its owner can connect.
+///
+/// Anything that connects can open a pty, which is code execution as this user.
+/// Connecting to a unix socket requires the write bit, and the mode a `bind`
+/// leaves behind comes from the umask — 0755 under the usual 022, which is safe
+/// only incidentally, because that write bit happens to be the owner's alone.
+/// Under a umask of 000 the same bind yields 0777 and hands execution to every
+/// local user on the machine. So the mode is set rather than inherited, and a
+/// failure to set it refuses to serve: an unreachable daemon is a broken
+/// editor, but a world-writable one is a local privilege-escalation path.
+fn bind_owner_only(socket_path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let _ = std::fs::remove_file(socket_path); // stale socket from a prior run
+    let listener = UnixListener::bind(socket_path)?;
+    if let Err(e) = std::fs::set_permissions(socket_path, PermissionsExt::from_mode(0o600)) {
+        let _ = std::fs::remove_file(socket_path);
+        return Err(std::io::Error::other(format!(
+            "could not restrict {socket_path} to this user: {e}"
+        )));
+    }
+    Ok(listener)
+}
+
 fn listen_forever(
     socket_path:  &str,
     lsp_sessions: Arc<Mutex<HashMap<String, lsp::LspProxy>>>,
     pty_sessions: Arc<Mutex<HashMap<u32, pty::PtySession>>>,
 ) {
-    use std::os::unix::net::UnixListener;
-
-    let _ = std::fs::remove_file(socket_path); // stale socket from a prior run
-    let listener = match UnixListener::bind(socket_path) {
+    let listener = match bind_owner_only(socket_path) {
         Ok(l)  => l,
         Err(e) => { eprintln!("bind {socket_path}: {e}"); return; }
     };
@@ -605,5 +627,44 @@ mod mkdir_tests {
     fn an_unwritable_place_is_reported() {
         let err = fs::mkdir("/this-should-not-be-writable-forge-test").unwrap_err();
         assert!(!err.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod socket_permission_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The daemon's socket grants pty creation, which is code execution as the
+    /// user who owns it. `bind` leaves the mode to the umask: 0755 under the
+    /// usual 022, which is safe only because connecting needs the write bit and
+    /// that one is the owner's. Under a umask of 000 the same bind yields 0777
+    /// and hands execution to every local user on the machine — so the mode is
+    /// set explicitly, and this proves the set takes rather than the umask.
+    #[test]
+    fn the_socket_is_not_reachable_by_other_users() {
+        let dir = std::env::temp_dir().join(format!("forge-sock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sock");
+
+        // The permissive umask is the case worth testing; anything laxer than
+        // this is what the explicit set exists to correct.
+        let previous = unsafe { libc_umask(0o000) };
+        let listener = super::bind_owner_only(path.to_str().unwrap()).unwrap();
+        unsafe { libc_umask(previous) };
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket mode is {mode:o}, reachable beyond its owner");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `umask(2)` directly — the crate takes no dependencies, and this is the
+    /// one call a test needs that std does not expose.
+    unsafe fn libc_umask(mask: u32) -> u32 {
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        unsafe { umask(mask) }
     }
 }

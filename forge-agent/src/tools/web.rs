@@ -4,9 +4,19 @@ use scraper::{Html, Selector};
 
 use crate::api::{ApiClient, Message};
 
+/// What Forge calls itself when it fetches a page.
+///
+/// This used to claim to be Chrome 120 on macOS. Pretending to be a browser is
+/// how a scraper gets served, and it is also a lie told to someone else's
+/// server — the same objection this project raises elsewhere about identifying
+/// as a client you are not. An honest agent identifies itself and takes the
+/// answer it gets; `web_search` is disabled by default and does not work in
+/// practice anyway, so there is nothing to preserve by pretending.
+const FORGE_USER_AGENT: &str = concat!("forge-agent/", env!("CARGO_PKG_VERSION"));
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent(FORGE_USER_AGENT)
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
@@ -65,7 +75,7 @@ async fn fetch_duckduckgo_html(query: &str) -> Result<String> {
         .args(&[
             "-s", "-X", "POST",
             "https://lite.duckduckgo.com/lite/",
-            "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "-H", concat!("User-Agent: ", "forge-agent/", env!("CARGO_PKG_VERSION")),
             "-d", &format!("q={}", urlencod(query)),
             "--max-time", "10",
             "-L",
@@ -603,5 +613,26 @@ mod tests {
             "Should contain web_content wrapper"
         );
         assert!(result.contains("Rust"), "Should contain Rust");
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    /// Forge identifies itself when it fetches a page. It used to claim to be
+    /// Chrome 120 on macOS, in two places — the reqwest client and a `curl`
+    /// fallback — which is how a scraper gets served, and also a lie told to
+    /// someone else's server. This project declines to identify as a client it
+    /// is not elsewhere; the same rule applies here.
+    #[test]
+    fn forge_does_not_claim_to_be_a_browser() {
+        let src = include_str!("web.rs");
+        // Needles assembled rather than written out: a scan for a literal that
+        // this test also spells would find itself and fail forever.
+        for needle in [concat!("Mozilla", "/5.0"), concat!("Chrome", "/1"), concat!("Apple", "WebKit")] {
+            assert!(!src.contains(needle),
+                "a spoofed browser user-agent is back in web.rs ({needle})");
+        }
+        assert!(super::FORGE_USER_AGENT.starts_with("forge-agent/"),
+            "the user-agent should say what this is: {}", super::FORGE_USER_AGENT);
     }
 }

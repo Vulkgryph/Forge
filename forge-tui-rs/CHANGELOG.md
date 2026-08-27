@@ -4,6 +4,17 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+### Fixed
+
+- **The agent's last stderr lines could be lost.** `Exited` was sent by the thread
+  reading stdout, with no coordination with the thread reading stderr, so the two
+  raced — and `main.rs` treats `Exited` as the end of the session and stops
+  listening. The lines this loses are the ones at the end, which is exactly when
+  they matter: during OAuth login the agent prints the URL and instructions to
+  stderr and then exits. The exit is now announced only after stderr has drained,
+  or after half a second if the child is holding stderr open, so it cannot stall
+  the exit either. Found by CI on Linux; macOS scheduling had been hiding it.
+
 ## [0.3.0] — 2026-08-26
 
 First release of the Rust terminal client. It replaces `forge-tui`, the earlier TypeScript one, which is retired and removed from the repository — see the [README](README.md) for why it was rewritten rather than repaired.

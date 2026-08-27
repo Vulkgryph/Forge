@@ -95,10 +95,33 @@ impl AgentBridge {
         // One reader per stream. Threads rather than async: this is two blocking
         // line readers, and a runtime would be the largest dependency in the
         // crate for no gain.
+        // `Exited` has to be the last event, and it is the stdout reader that
+        // notices the stream ending — so it waits for stderr to drain before
+        // announcing it. Without that, the two threads race: a consumer that
+        // treats `Exited` as "nothing more is coming" loses whatever stderr had
+        // not been delivered yet, and `main.rs` does exactly that. It cost
+        // nothing on macOS, where the scheduling happened to favour stderr, and
+        // dropped the line on Linux. The lines that matter most are the ones at
+        // the end: during OAuth login the agent prints the URL and instructions
+        // to stderr and then exits.
+        let stderr_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let out_tx = tx.clone();
+        let out_done = std::sync::Arc::clone(&stderr_done);
         std::thread::Builder::new()
             .name("agent-stdout".into())
-            .spawn(move || read_protocol(BufReader::new(stdout), out_tx))?;
+            .spawn(move || {
+                read_protocol(BufReader::new(stdout), out_tx.clone());
+                // Bounded, so a child that closes stdout while holding stderr
+                // open cannot stall the exit event forever.
+                let deadline = std::time::Instant::now() + STDERR_DRAIN_GRACE;
+                while !out_done.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let _ = out_tx.send(BridgeEvent::Exited(None));
+            })?;
 
         std::thread::Builder::new()
             .name("agent-stderr".into())
@@ -112,6 +135,7 @@ impl AgentBridge {
                         break;
                     }
                 }
+                stderr_done.store(true, std::sync::atomic::Ordering::Release);
             })?;
 
         Ok(Self { child, stdin: Some(stdin), events })
@@ -179,6 +203,13 @@ impl Drop for AgentBridge {
     }
 }
 
+/// How long the stdout reader waits for stderr to finish before sending
+/// `Exited`.
+///
+/// Long enough for lines already written to arrive, short enough that a child
+/// holding stderr open does not hide the fact that it has gone.
+const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Decode the agent's stdout into events until the stream ends.
 fn read_protocol(mut reader: impl BufRead, tx: Sender<BridgeEvent>) {
     let mut line = Vec::new();
@@ -223,7 +254,6 @@ fn read_protocol(mut reader: impl BufRead, tx: Sender<BridgeEvent>) {
         }
     }
 
-    let _ = tx.send(BridgeEvent::Exited(None));
 }
 
 enum ReadOutcome {
@@ -345,6 +375,10 @@ mod tests {
         read_protocol(BufReader::new(io::Cursor::new(input.as_bytes().to_vec())), tx);
         rx.into_iter().collect()
     }
+    // These decode stdout and nothing else: `read_protocol` no longer ends with
+    // an `Exited`, because the process having gone is not something the decoder
+    // knows — it is announced by the thread that also waits for stderr to drain,
+    // so that the exit is genuinely the last event.
 
     fn tags(events: &[BridgeEvent]) -> Vec<String> {
         events
@@ -368,7 +402,7 @@ mod tests {
         );
         assert_eq!(
             tags(&events),
-            vec!["thinking", "assistant_token", "done", "exited"],
+            vec!["thinking", "assistant_token", "done"],
         );
     }
 
@@ -376,13 +410,13 @@ mod tests {
     #[test]
     fn a_final_frame_without_a_newline_is_still_decoded() {
         let events = decode("{\"type\":\"done\"}");
-        assert_eq!(tags(&events), vec!["done", "exited"]);
+        assert_eq!(tags(&events), vec!["done"]);
     }
 
     #[test]
     fn blank_lines_are_skipped() {
         let events = decode("\n\n{\"type\":\"done\"}\n\n");
-        assert_eq!(tags(&events), vec!["done", "exited"]);
+        assert_eq!(tags(&events), vec!["done"]);
     }
 
     /// A frame split across reads must be reassembled — chunk boundaries are
@@ -412,7 +446,7 @@ mod tests {
         );
         assert_eq!(
             tags(&events),
-            vec!["unknown:from_the_future", "done", "exited"],
+            vec!["unknown:from_the_future", "done"],
             "decoding continues past the unknown",
         );
     }
@@ -420,7 +454,7 @@ mod tests {
     #[test]
     fn undecodable_output_is_reported_and_decoding_continues() {
         let events = decode("this is not json\n{\"type\":\"done\"}\n");
-        assert_eq!(tags(&events), vec!["protocol_error", "done", "exited"]);
+        assert_eq!(tags(&events), vec!["protocol_error", "done"]);
     }
 
     /// The cap must hold, and decoding must recover on the next frame rather
@@ -532,6 +566,58 @@ mod tests {
         }
         assert_eq!(protocol, vec!["done"], "protocol stream is clean");
         assert_eq!(stderr, vec!["a warning"], "stderr captured, not printed");
+    }
+
+    /// `Exited` is the last event, so a consumer may treat it as the end.
+    ///
+    /// `main.rs` does exactly that — it breaks out of the session loop — so any
+    /// stderr still in flight when the exit is announced is lost. It was, on
+    /// Linux: the two reader threads raced and macOS's scheduling happened to
+    /// hide it. The lines this loses are the ones at the end, and during OAuth
+    /// login the agent prints the URL and instructions to stderr and then exits.
+    ///
+    /// The script closes stdout, waits, and only then writes to stderr. Without
+    /// the pause this passed on macOS whether or not the fix was present — the
+    /// scheduling there favours stderr — and a test that only fails on somebody
+    /// else's machine is not a test of anything.
+    #[test]
+    fn nothing_arrives_after_the_exit_event() {
+        // stdout closes first, then stderr is written: the ordering that used to
+        // drop the line.
+        let script =
+            r#"printf '{"type":"done"}\n'; exec 1>&-; sleep 0.15; printf 'a warning\n' >&2"#;
+        let bridge = AgentBridge::spawn_command(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), script.to_string()],
+            None,
+        )
+        .expect("spawn");
+
+        let mut order = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match bridge.events().recv_timeout(Duration::from_millis(200)) {
+                Ok(ev) => {
+                    let last = matches!(ev, BridgeEvent::Exited(_));
+                    order.push(match ev {
+                        BridgeEvent::Stderr(_) => "stderr",
+                        BridgeEvent::Exited(_) => "exited",
+                        _ => "message",
+                    });
+                    if last {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(order.last(), Some(&"exited"), "exit was not last: {order:?}");
+        assert!(
+            order.contains(&"stderr"),
+            "stderr was lost behind the exit event: {order:?}",
+        );
     }
 
     /// What the app writes must reach the child's stdin, framed.

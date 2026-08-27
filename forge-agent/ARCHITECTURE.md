@@ -182,7 +182,7 @@ Current built-in tools:
 | `search_code` | Read | Wrapper around ripgrep (`rg`) |
 | `glob_files` | Read | Find files by glob pattern |
 | `todo_write` | Read | Manage task lists |
-| `apply_patch` | Write | Apply unified diffs |
+| `apply_patch` | Write | Apply unified diffs — requires a git repository |
 | `write_file` | Write | Create or overwrite a file |
 | `edit_file` | Write | Replace an exact string |
 | `shell_exec` | Execute | Run shell commands through a PTY/streaming path |
@@ -206,7 +206,10 @@ Remote note: interactive SSH sessions are blocked inside `shell_exec`. Non-inter
 
 **`patch.rs`**
 - `validate_patch()` rejects patches targeting forbidden dirs such as `.git/`, `target/`, and `node_modules/`
-- `apply_patch()` applies unified diffs through `git apply` when possible
+- `apply_patch()` applies unified diffs through `git apply`, and fails outside a
+  git repository — that is the whole of it, there is no fallback. Rarely reached,
+  since the agent initialises a repository the first time a turn changes anything
+  in a project that has none; this is the path when even that could not happen
 - `get_git_diff()` runs `git diff --no-color`
 
 **Custom tools**

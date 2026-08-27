@@ -650,8 +650,11 @@ enum IncomingMessage {
     LoginChatgpt,
     ListSessions,
     ResumeSession {
+        // Accepted and ignored. Resuming happens by restarting the agent with
+        // `--resume-session <id>`, which is what both clients do; the id is read
+        // here so a client that sends this message is not met with a parse
+        // error, and nothing else is done with it.
         #[allow(dead_code)]
-        // resume is wired via --resume-session CLI flag; runtime resume path not yet implemented
         session_id: String,
     },
     Compact,

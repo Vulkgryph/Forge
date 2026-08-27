@@ -66,69 +66,24 @@ pub async fn apply_patch(workspace_root: &str, unified_diff: &str) -> Result<()>
         ));
     }
 
-    // Fallback to manual patch application for non-git repos
-    // Parse the unified diff manually
-    parse_and_apply_diff(workspace_root, unified_diff)
-}
-
-fn parse_and_apply_diff(workspace_root: &str, unified_diff: &str) -> Result<()> {
-    _ = Path::new(workspace_root);
-
-    // Parse unified diff manually
-    // Format: --- old_file\n+++ new_file\n@@ line info @@\n lines
-    let lines: Vec<&str> = unified_diff.lines().collect();
-
-    let mut current_file: Option<String> = None;
-    let mut in_hunk = false;
-    let mut hunk_lines: Vec<String> = Vec::new();
-
-    for line in lines {
-        if line.starts_with("--- ") {
-            // Start of a new file patch
-            current_file = None;
-            in_hunk = false;
-            hunk_lines.clear();
-
-            // Extract filename from --- a/path or --- path
-            if let Some(path) = line.strip_prefix("--- ") {
-                let path = path.trim_start_matches("a/").trim();
-                current_file = Some(path.to_string());
-            }
-        } else if line.starts_with("+++ ") {
-            // Get the new filename
-            if let Some(path) = line.strip_prefix("+++ ") {
-                let path = path.trim_start_matches("b/").trim();
-                if let Some(ref old_file) = current_file {
-                    if old_file != path {
-                        // File was renamed
-                    }
-                }
-                current_file = Some(path.to_string());
-            }
-        } else if line.starts_with("@@ ") {
-            // Start of a hunk
-            in_hunk = true;
-            hunk_lines.clear();
-        } else if in_hunk {
-            if line.starts_with("+") {
-                // Added line
-                hunk_lines.push(line[1..].to_string());
-            } else if line.starts_with("-") {
-                // Removed line - skip (we don't implement deletion)
-                hunk_lines.push(line[1..].to_string());
-            } else if line.starts_with("\\") {
-                // No newline at end
-                continue;
-            } else {
-                // Context line
-                hunk_lines.push(line[1..].to_string());
-            }
-        }
-    }
-
-    // For now, just return an error saying manual patching isn't fully implemented
-    // In production, you'd want to properly implement this
+    // Outside a git repository, this tool does not work.
+    //
+    // It used to parse the diff's hunks here and then return an error
+    // unconditionally — sixty lines of work thrown away, behind a comment
+    // saying manual application was "not fully implemented". The behaviour was
+    // the error; the parsing only made it look like something else was
+    // intended. Failing immediately says the same thing sooner, and the
+    // limitation is now written down where a user reads it rather than left in
+    // a comment for whoever opens this file.
+    //
+    // Rarely reached in practice: the agent initialises a repository the first
+    // time a turn changes anything in a project that has none, so that revert
+    // checkpoints have git behind them. This is the path when even that failed
+    // — no git binary, or a directory nobody may write to.
+    let _ = unified_diff;
     Err(anyhow::anyhow!(
-        "Manual patch application not fully implemented. Use a git repo for reliable patching."
+        "apply_patch needs a git repository: it applies patches with `git apply`, \
+         and this workspace has no .git. Either initialise one, or use edit_file \
+         with an exact unique old_string for the change you want."
     ))
 }

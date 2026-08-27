@@ -99,9 +99,9 @@ Intel Macs are untested. Rosetta is not a substitute for having tried it.
 
 **untested** means literally that. The editor renders through wgpu, which targets
 D3D12 on Windows and Vulkan on Linux, and takes its window from winit, so there
-is no known reason it cannot work — nobody has tried. Windows support is
-intended. Until someone runs it, a report that it does not build is expected
-rather than surprising, and worth filing.
+is no known reason it cannot work — nobody has tried. Until someone runs it, a
+report that it does not build is expected rather than surprising, and worth
+filing.
 
 The macOS app bundle, its signing, and the "add to Dock" option are macOS-only by
 nature. Remote development is exercised from a macOS host to a Linux remote; the
@@ -143,10 +143,9 @@ and tells the agent not to retry, because retrying does not help. Everything
 else — reading files, running commands, git, the editor, remote work — does not
 depend on it, and coding tasks rarely need it.
 
-The intended fix is a real search API behind a key you supply (Brave, Tavily,
-a self-hosted SearxNG), with the scrape kept as a fallback. That is a plan, not
-a promise, and no date is attached to it. If web search matters to you, treat
-this as a gap rather than something about to close.
+If web search matters to you, treat this as a gap. Making it work properly needs
+a real search API behind a key you supply; nothing of the sort is in the tree
+today, and this README makes no claim about when or whether it will be.
 
 `web_fetch` is unaffected: give it a URL and it fetches that page.
 

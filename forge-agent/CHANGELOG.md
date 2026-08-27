@@ -4,7 +4,7 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
-## [0.3.0] — 2026-08-26
+## [0.3.0] — 2026-08-27
 
 ### Added (forced background ceiling on every top-level shell — default 5 minutes)
 

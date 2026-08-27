@@ -4,11 +4,11 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-27
+
 ### Fixed
 
 - **A window restarted onto a *new* build came back without its remote connection, its geometry, or its identity; restarted onto the same build it came back fine.** Everything a restart needs is read from the window record, and reading it was all-or-nothing in two ways. `remote_host` was a host's name for a few builds and is the whole connection now, so a file from either side of that change failed to parse — and `serde_json::from_str::<Vec<_>>` gives up on the entire file at the first entry it dislikes, so one record from a different build erased every window's state. Silently, because the error was discarded. Records are now read one at a time, an entry that will not parse strictly is read field by field, and `remote_host` accepts either shape — a bare name becomes a host with just its name, which is enough, since the lookup on the way in matches by name against the SSH config. A field from a future build is ignored rather than fatal.
-
-## [0.3.0] — 2026-08-26
 
 First public release. Everything below shipped in it; the version was written up
 before it was tagged, and a further week of work landed on top of it, so the two

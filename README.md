@@ -66,24 +66,36 @@ every day, and the only one where any of this has been verified by a person
 using it. Linux and Windows compatibility is unverified — see the table for what
 that means per component.
 
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| `forge-agent` | supported | compiles and passes tests; runs headless on a remote | untested |
-| `forge-server` | n/a — runs on the remote | runs headless on a remote | untested |
-| `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested |
-| `forge-ide` | supported | untested | untested |
+Architecture matters here as much as the operating system, and the two Linux
+columns have never been the same machine: CI runs on x86-64, and the Linux box
+this is actually used against is ARM64.
+
+| | macOS (Apple Silicon) | Linux x86-64 | Linux ARM64 | Windows |
+|---|---|---|---|---|
+| `forge-agent` | supported | compiles and passes tests | runs headless on a remote | untested |
+| `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | untested |
+| `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested | untested |
+| `forge-ide` | supported | untested | untested | untested |
 
 **supported** — used daily, and built and tested in CI on every push.
 
-**compiles and passes tests** — CI builds it on Linux and the test suite passes
-there on every push. Nobody has sat in front of it on a Linux desktop. A build
-that works and a program that behaves are different claims, and only the first
-one is being made.
+**compiles and passes tests** — CI builds it on x86-64 Linux and the test suite
+passes there on every push. Nobody has sat in front of it on a Linux desktop. A
+build that works and a program that behaves are different claims, and only the
+first one is being made.
 
 **runs headless on a remote** — the agent and the file/pty server are uploaded to
-a Linux machine and driven over SSH by remote development, which is exercised
-regularly against an aarch64 Linux host. That is real use, but it is unattended:
-no terminal of its own, no window, no keyboard.
+a Linux machine and driven over SSH by remote development, exercised regularly
+against an **aarch64** host (`Linux 6.11 aarch64`). That is real use, but it is
+unattended: no terminal of its own, no window, no keyboard. It is also the only
+ARM64 Linux evidence there is — nothing on that column has been through CI.
+
+**cross-compiled, never run** — the x86-64 musl binary is built by the packaging
+script and shipped in the app bundle, so an x86-64 remote would receive it, and
+no such remote has ever been connected to.
+
+On macOS, only Apple Silicon: the binary this repository builds is arm64, and
+Intel Macs are untested. Rosetta is not a substitute for having tried it.
 
 **untested** means literally that. The editor renders through wgpu, which targets
 D3D12 on Windows and Vulkan on Linux, and takes its window from winit, so there

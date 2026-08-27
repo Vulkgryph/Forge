@@ -91,10 +91,17 @@ Forge respects a small set of environment variables for users who want to overri
 
 ## Platforms
 
-Developed and used on macOS. On Linux it builds and its tests pass in CI on every
-push, and it is genuinely exercised there — remote development uploads this binary
-to a Linux machine and drives it over SSH — but always headless, with no terminal
-of its own. Windows is untested. See the [platform table](../README.md#platforms).
+Developed and used on macOS (Apple Silicon). On Linux the two architectures have
+different evidence behind them, and neither has been used interactively:
+
+- **x86-64** — CI builds it and the tests pass on every push. Nobody has run it
+  on a Linux desktop.
+- **ARM64** — genuinely exercised, but only headless: remote development uploads
+  this binary to an aarch64 machine and drives it over SSH, with no terminal of
+  its own. Nothing on that architecture goes through CI.
+
+Windows and Intel Macs are untested. See the
+[platform table](../README.md#platforms).
 
 ## Requirements
 

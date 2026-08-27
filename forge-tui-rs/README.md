@@ -20,10 +20,11 @@ cargo run -p forge-tui-rs
 
 ## Platforms
 
-Developed and used on macOS. CI builds it on Linux and the tests pass there on
-every push, but nobody has sat in front of it on a Linux terminal — a build that
-works and a program that behaves are different claims. Windows is untested. See
-the [platform table](../README.md#platforms).
+Developed and used on macOS (Apple Silicon). CI builds it on **x86-64** Linux and
+the tests pass there on every push, but nobody has sat in front of it in a Linux
+terminal — a build that works and a program that behaves are different claims.
+ARM64 Linux, Windows and Intel Macs are untested. See the
+[platform table](../README.md#platforms).
 
 ## What it is, and what it isn't
 

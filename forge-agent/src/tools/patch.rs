@@ -5,6 +5,16 @@ use tempfile;
 
 const MAX_PATCH_SIZE: usize = 512_000; // 500KB
 
+/// Paths `apply_patch` refuses, as a footgun guard and explicitly **not** as a
+/// security boundary.
+///
+/// A patch is a bulk edit generated from a diff, and one that wanders into
+/// `.git/` or `node_modules/` is almost always a mistake rather than a request.
+/// `write_file` and `edit_file` carry no equivalent list on purpose: Forge has
+/// no sandbox and says so — the agent goes where the operating system lets the
+/// user go, and adding a partial block to the direct write tools would suggest
+/// a protection that does not exist. Nothing here is a boundary anyone should
+/// rely on; the match is a plain prefix test, so `./.git/config` passes it.
 const FORBIDDEN_PATHS: &[&str] = &[".git/", "target/", "node_modules/", "__pycache__/", ".env"];
 
 fn validate_patch(unified_diff: &str) -> Result<()> {

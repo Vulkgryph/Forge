@@ -1998,6 +1998,17 @@ fn status_badge_chrome(triangle: bool) -> f32 {
     if triangle { BADGE_PAD + BADGE_GAP + TRIANGLE_W + BADGE_PAD } else { BADGE_PAD * 2.0 }
 }
 
+/// The word the Settings pane requires before *Skip All Permissions* becomes
+/// the default for new agent tabs.
+///
+/// Typed rather than clicked because this setting arms every tab that does not
+/// exist yet, including remote ones: a remote session started under it launches
+/// the agent with `--dangerously-allow-all` on a machine that may not be the
+/// user's. Switching one live tab already confirms; this decides in advance.
+fn skip_all_confirmation_accepts(typed: &str) -> bool {
+    typed.trim().eq_ignore_ascii_case("confirm")
+}
+
 fn draw_status_badge(
     ui: &mut egui::Ui,
     salt: &str,
@@ -4036,6 +4047,10 @@ pub struct IdeApp {
     terminal_height: f32,
     pub settings:    crate::settings::Settings,
     settings_open:   bool,
+    /// Set while the Settings pane is asking the user to type `confirm` before
+    /// *Skip All Permissions* becomes the default for new tabs. `None` when no
+    /// confirmation is open; the string is what has been typed so far.
+    settings_skip_all_confirm: Option<String>,
     /// One-time "want update checks?" prompt — shown once when
     /// `settings.update_check_prompted` is still false.
     show_update_prompt: bool,
@@ -4382,6 +4397,7 @@ impl IdeApp {
             terminal_height: 260.0,
             settings:        crate::settings::load(),
             settings_open:   false,
+            settings_skip_all_confirm: None,
             palette:         crate::theme::Palette::default(),
             theme_picker:    None,
             theme_prev:      None,
@@ -9659,6 +9675,10 @@ impl IdeApp {
         let mut close   = false;
         let mut enable_updates_now = false;
         let mut open_onboarding = false;
+        // What the user has typed into the Skip All confirmation, when one is
+        // open. Taken from `self` here and written back at the end, because the
+        // settings pane borrows `self.settings` mutably for the whole draw.
+        let mut skip_all_confirm = self.settings_skip_all_confirm.take();
 
         // Resizable, with a real default height. It was `fixed_size([w, 0.0])`
         // and not resizable, which worked only while the window grew to its
@@ -10091,13 +10111,72 @@ impl IdeApp {
                         let resp = ui.selectable_label(selected,
                             egui::RichText::new(mode.label()).size(11.0).color(color));
                         if resp.on_hover_text(mode.description()).clicked() && !selected {
-                            s.default_agent_permission_mode = mode;
-                            changed = true;
+                            // Making this the *default* is the one choice here
+                            // that arms every future tab, including remote ones
+                            // — a remote session started under it is launched
+                            // with --dangerously-allow-all on a machine that may
+                            // not be the user's. A single click is too little
+                            // for that, so it is typed out. Switching one live
+                            // tab already confirms; this is the setting that
+                            // decides for tabs that do not exist yet.
+                            if mode == crate::settings::AgentPermissionMode::DangerouslySkipAll {
+                                skip_all_confirm = Some(String::new());
+                            } else {
+                                s.default_agent_permission_mode = mode;
+                                skip_all_confirm = None;
+                                changed = true;
+                            }
                         }
                         ui.add_space(6.0);
                     }
                 });
                 ui.add_space(6.0);
+
+                if let Some(typed) = &mut skip_all_confirm {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(ui.available_width() - 14.0);
+                            ui.label(egui::RichText::new(
+                                "Every new agent tab will skip every approval prompt — writes and \
+                                 shell commands, without asking. A remote session started this way \
+                                 runs with --dangerously-allow-all on that machine.")
+                                .size(10.0).color(egui::Color32::from_rgb(230, 110, 100)));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Type confirm to make it the default.")
+                                .size(10.0).color(egui::Color32::from_gray(150)));
+                        });
+                    });
+                    ui.add_space(4.0);
+                    // Decided inside the row, applied outside it: `typed`
+                    // borrows the confirmation for as long as the field is
+                    // drawn, so clearing it here would be a second borrow.
+                    let mut commit = false;
+                    let mut dismiss = false;
+                    let ready = skip_all_confirmation_accepts(typed);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.add(egui::TextEdit::singleline(typed)
+                            .desired_width(120.0)
+                            .hint_text("confirm"));
+                        ui.add_space(6.0);
+                        if ui.add_enabled(ready, egui::Button::new("Set as default")).clicked() {
+                            commit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if commit {
+                        s.default_agent_permission_mode =
+                            crate::settings::AgentPermissionMode::DangerouslySkipAll;
+                        changed = true;
+                    }
+                    if commit || dismiss {
+                        skip_all_confirm = None;
+                    }
+                }
 
                 ui.separator();
                 ui.add_space(8.0);
@@ -10123,6 +10202,7 @@ impl IdeApp {
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
             });
 
+        self.settings_skip_all_confirm = skip_all_confirm;
         if changed { crate::settings::save(&self.settings); }
         if enable_updates_now { self.update_check_rx = Some(crate::update_check::spawn_check()); }
         if open_onboarding { self.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker); }
@@ -17102,6 +17182,33 @@ mod strip_width_tests {
             let d = super::strip_detail(avail);
             let w = row_width(&ctx, d, "claude-opus-4-6");
             assert!(w <= avail, "{w:.0}pt at {avail:.0}pt ({d:?}) — it wraps");
+        }
+    }
+}
+
+#[cfg(test)]
+mod skip_all_confirmation_tests {
+    use super::skip_all_confirmation_accepts as accepts;
+
+    /// Setting the *default* arms every tab that does not exist yet, including
+    /// remote ones — a remote session started under it launches the agent with
+    /// `--dangerously-allow-all` on a machine that may not be the user's. That
+    /// was one unconfirmed click on a `selectable_label`. Switching a single
+    /// live tab already asked; this is the setting that decides in advance.
+    #[test]
+    fn only_the_typed_word_arms_the_default() {
+        assert!(accepts("confirm"));
+        assert!(accepts("Confirm"));
+        assert!(accepts("  CONFIRM  "));
+    }
+
+    /// Everything else leaves it alone. The empty string matters most: a
+    /// confirmation that accepts an untouched field is a click with extra
+    /// steps, which is what this replaced.
+    #[test]
+    fn anything_else_leaves_the_default_alone() {
+        for typed in ["", " ", "y", "yes", "confirmed", "conf", "ok", "sure", "confirm me"] {
+            assert!(!accepts(typed), "{typed:?} should not arm skip-all");
         }
     }
 }

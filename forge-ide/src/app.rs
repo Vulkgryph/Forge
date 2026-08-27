@@ -16478,7 +16478,7 @@ mod reload_cost_probe {
 
 #[cfg(test)]
 mod command_palette_tests {
-    use super::{COMMANDS, Cmd};
+    use super::COMMANDS;
 
     /// Everything on the Window menu is typeable too. A command reachable only by
     /// hunting through menus is one that has to be remembered by position.

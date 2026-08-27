@@ -36,6 +36,8 @@ pub enum Command {
     Login,
     /// Show the log file's path.
     Log,
+    /// Report which build this is, and which agent it is talking to.
+    Version,
     /// List the commands.
     Help,
     /// Open the menu at a particular page.
@@ -74,6 +76,7 @@ pub const TABLE: &[Entry] = &[
     Entry { command: "/resume",    description: "Resume a saved session", alias: false },
     Entry { command: "/sessions",  description: "Open saved sessions", alias: false },
     Entry { command: "/log",       description: "Show current session log path", alias: false },
+    Entry { command: "/version",   description: "Show the running build and the agent it is talking to", alias: false },
     Entry { command: "/login",     description: "Log in to Claude or ChatGPT", alias: false },
     Entry { command: "/help",      description: "Show command help", alias: false },
     Entry { command: "/exit",      description: "Exit Forge", alias: false },
@@ -84,6 +87,7 @@ pub const TABLE: &[Entry] = &[
     Entry { command: "/think",     description: "Alias for /thinking", alias: true },
     Entry { command: "/reasoning", description: "Alias for /thinking", alias: true },
     Entry { command: "/reconnect", description: "Alias for /restart", alias: true },
+    Entry { command: "/ver",       description: "Alias for /version", alias: true },
 ];
 
 /// True when the input should offer completions.
@@ -133,6 +137,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "/plan" => Command::Plan,
         "/login" => Command::Login,
         "/log" => Command::Log,
+        "/version" | "/ver" => Command::Version,
         "/help" => Command::Help,
         "/model" => Command::OpenMenu(Page::Models),
         "/settings" => Command::OpenMenu(Page::Settings),

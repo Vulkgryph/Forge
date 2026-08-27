@@ -564,6 +564,15 @@ impl App {
                 (Outcome::Continue, Vec::new())
             }
 
+            Command::Version => {
+                let lines = version_report(
+                    &self.session.agent_version,
+                    exe_build_time(),
+                );
+                self.session_mut().push_system(lines);
+                (Outcome::Continue, Vec::new())
+            }
+
             Command::Help => {
                 self.session_mut().push_system(commands::help_text());
                 (Outcome::Continue, Vec::new())
@@ -1657,6 +1666,101 @@ fn restyle(lines: Vec<Line>, style: Style) -> Vec<Line> {
 }
 
 /// Shift lines right by `by` columns.
+/// When this binary was last written, as a local calendar time.
+///
+/// The file's own mtime, which is when it was built. Two builds of the same
+/// commit are otherwise indistinguishable, and telling them apart is most of
+/// the point of `/version` — you have just rebuilt, and want to know whether
+/// the thing you are running is that build.
+fn exe_build_time() -> Option<std::time::SystemTime> {
+    std::env::current_exe().and_then(|p| p.metadata()).and_then(|m| m.modified()).ok()
+}
+
+/// What `/version` prints.
+///
+/// Separated from the command handler so it can be tested: the case that
+/// matters is an agent that reported no version at all, which is what every
+/// agent built before the field existed does — and mixed builds of `forge` and
+/// `forge-agent` are normal, since they are installed as separate binaries.
+fn version_report(agent_version: &str, built: Option<std::time::SystemTime>) -> String {
+    let mut out = format!(
+        "forge {} · commit {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("FORGE_BUILD_COMMIT"),
+    );
+    if let Some(built) = built {
+        out.push_str(&format!(" · built {}", format_build_time(built)));
+    }
+    out.push_str("\nagent ");
+    if agent_version.is_empty() {
+        // Not "unknown": the agent answered, it simply predates the field, and
+        // that is itself the useful fact — it is an older build than this one.
+        out.push_str("did not report a version (a build older than this one)");
+    } else {
+        out.push_str(agent_version);
+        if agent_version != env!("CARGO_PKG_VERSION") {
+            out.push_str(&format!(
+                " — different from forge {}, which is normal: they install separately",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+    }
+    out
+}
+
+/// `YYYY-MM-DD HH:MM` in local time, from a wall-clock instant.
+fn format_build_time(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let local = secs + utc_offset_secs();
+    let (y, mo, d) = civil_from_days(local.div_euclid(86_400));
+    let day = local.rem_euclid(86_400);
+    format!("{y:04}-{mo:02}-{d:02} {:02}:{:02}", day / 3600, (day % 3600) / 60)
+}
+
+/// Seconds east of UTC, from `date +%z`. The system already knows the rules,
+/// including whichever daylight-saving change applies today, and asking it is
+/// cheaper than carrying a timezone database for one line of output.
+fn utc_offset_secs() -> i64 {
+    std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_utc_offset(s.trim()))
+        .unwrap_or(0)
+}
+
+fn parse_utc_offset(s: &str) -> Option<i64> {
+    // `+HHMM` / `-HHMM`.
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours: i64 = s[1..3].parse().ok()?;
+    let minutes: i64 = s[3..5].parse().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+/// Days since the epoch to a calendar date. Howard Hinnant's `civil_from_days`,
+/// which is the standard way to do this without a date library.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 fn indent(lines: Vec<Line>, by: usize, style: Style) -> Vec<Line> {
     lines
         .into_iter()
@@ -4069,4 +4173,74 @@ long enough to wrap, and must stay separated from the first.";
         assert!(matches!(effects.as_slice(), [Effect::Restart { resume: None }]), "{effects:?}");
     }
 
+}
+
+#[cfg(test)]
+mod version_report_tests {
+    use super::{civil_from_days, parse_utc_offset, version_report};
+
+    /// The point of `/version` is to answer "am I running the build I just
+    /// made", which a version number cannot: every build between two releases
+    /// says the same number. So the commit has to be in there.
+    #[test]
+    fn the_report_names_the_commit_not_just_the_version() {
+        let out = version_report("0.3.0", None);
+        assert!(out.contains(env!("CARGO_PKG_VERSION")));
+        assert!(out.contains(env!("FORGE_BUILD_COMMIT")));
+        assert!(out.contains("commit "), "no commit in: {out}");
+    }
+
+    /// `forge` and `forge-agent` are separate binaries installed separately, so
+    /// running two different versions is ordinary rather than broken. Saying
+    /// which two is the whole use of the line; saying it looks wrong is not.
+    #[test]
+    fn a_mismatched_agent_is_reported_without_being_called_an_error() {
+        let out = version_report("0.2.1", None);
+        assert!(out.contains("0.2.1"), "the agent's version is missing: {out}");
+        assert!(out.contains("normal"), "a mismatch should not read as a fault: {out}");
+        for alarming in ["error", "ERROR", "invalid", "incompatible"] {
+            assert!(!out.contains(alarming), "{alarming:?} in: {out}");
+        }
+    }
+
+    /// An agent built before the field existed sends nothing. That is not an
+    /// unknown — it is a dated build, and saying so is more useful than a
+    /// shrug, because it tells the user exactly what to do about it.
+    #[test]
+    fn an_agent_that_predates_the_field_says_so() {
+        let out = version_report("", None);
+        assert!(out.contains("older than this one"), "unhelpful: {out}");
+    }
+
+    /// The build time is what separates two builds of one commit, and it is
+    /// omitted rather than faked when the binary's mtime cannot be read.
+    #[test]
+    fn the_build_time_is_omitted_rather_than_invented() {
+        assert!(!version_report("0.3.0", None).contains("built"));
+        let out = version_report("0.3.0", Some(std::time::UNIX_EPOCH));
+        assert!(out.contains("built 19"), "expected a 19xx/1970 date in: {out}");
+    }
+
+    /// Offsets come from `date +%z`, and a misparse would silently shift the
+    /// reported build time by hours — which is how a stamp starts lying.
+    #[test]
+    fn utc_offsets_parse_or_are_refused() {
+        assert_eq!(parse_utc_offset("+0000"), Some(0));
+        assert_eq!(parse_utc_offset("-0500"), Some(-5 * 3600));
+        assert_eq!(parse_utc_offset("+0530"), Some(5 * 3600 + 1800));
+        assert_eq!(parse_utc_offset("-0930"), Some(-(9 * 3600 + 1800)));
+        for bad in ["", "0500", "+05:00", "+05", "z", "+abcd"] {
+            assert_eq!(parse_utc_offset(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    /// Calendar arithmetic, pinned on the dates that break naive versions:
+    /// the epoch, a leap day, and a century that is not a leap year.
+    #[test]
+    fn days_convert_to_the_right_calendar_date() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(20_513), (2026, 3, 1));
+    }
 }

@@ -270,6 +270,10 @@ pub struct Session {
     pub available_tools: Vec<ToolInfo>,
     pub context_strategy: String,
     pub offline_mode:   bool,
+    /// The agent binary's version, as it reported at startup. Empty when the
+    /// agent predates the field — `forge` and `forge-agent` are installed
+    /// separately and are routinely different builds.
+    pub agent_version:  String,
     pub chatgpt_logged_in: bool,
 
     // ── Turn state ────────────────────────────────────────────────────────
@@ -365,6 +369,7 @@ impl Session {
             available_tools: Vec::new(),
             context_strategy: String::new(),
             offline_mode: false,
+            agent_version: String::new(),
             chatgpt_logged_in: false,
             activity: Activity::Idle,
             permission_mode: PermissionMode::Ask,
@@ -462,6 +467,7 @@ impl Session {
                 self.available_tools = init.available_tools;
                 self.context_strategy = init.context_strategy;
                 self.offline_mode = init.offline_mode;
+                self.agent_version = init.agent_version;
                 self.chatgpt_logged_in = init.chatgpt_logged_in;
                 self.session_id = init.session_id;
                 if init.dangerously_allow_all {

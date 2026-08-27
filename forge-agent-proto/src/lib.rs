@@ -305,6 +305,11 @@ pub struct Init {
     pub context_strategy: String,
     pub chatgpt_logged_in: bool,
     pub offline_mode: bool,
+    /// The agent binary's own version, so a UI can say what it is talking to.
+    /// `serde(default)` because a newer UI has to keep working against an agent
+    /// built before this field existed — an empty string means "did not say".
+    #[serde(default)]
+    pub agent_version: String,
 }
 
 // ── Shared payloads ───────────────────────────────────────────────────────────
@@ -799,6 +804,7 @@ mod tests {
             context_strategy: "compact".into(),
             chatgpt_logged_in: false,
             offline_mode: false,
+            agent_version: "0.0.0-test".into(),
         };
         let line = serde_json::to_string(&AgentMessage::Init(Box::new(init))).unwrap();
         match AgentLine::parse(&line).unwrap() {

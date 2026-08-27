@@ -35,6 +35,10 @@ enum OutgoingMessage {
         context_strategy: String,
         chatgpt_logged_in: bool,
         offline_mode: bool,
+        /// This binary's version. A UI cannot read it any other way, and the
+        /// two are installed separately — a `forge` and a `forge-agent` from
+        /// different builds is a normal state, not a broken one.
+        agent_version: &'static str,
     },
     Thinking,
     Reasoning,
@@ -922,6 +926,7 @@ pub async fn run_headless(
         context_strategy: init_info.context_strategy,
         chatgpt_logged_in: init_info.chatgpt_logged_in,
         offline_mode: init_info.offline_mode,
+        agent_version: env!("CARGO_PKG_VERSION"),
     };
     let json = serde_json::to_string(&init_msg)?;
     stdout.write_all(json.as_bytes()).await?;

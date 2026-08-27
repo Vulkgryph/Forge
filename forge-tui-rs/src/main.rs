@@ -513,7 +513,12 @@ fn parse_args() -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("forge {}", env!("CARGO_PKG_VERSION"));
+                // The commit too: between two releases every build says the
+                // same number, and "which build is this" is the actual question
+                // being asked. `/version` inside the TUI says more, including
+                // which agent it is talking to.
+                println!("forge {} · commit {}",
+                    env!("CARGO_PKG_VERSION"), env!("FORGE_BUILD_COMMIT"));
                 return Ok(None);
             }
             "--cwd" => {
@@ -546,7 +551,7 @@ Usage:
 
 Options:
   -h, --help                 Show this help and exit
-  -V, --version              Show the version and exit
+  -V, --version              Show the version and build commit, then exit
       --cwd <dir>            Run the agent rooted at <dir>
       --resume-session <id>  Resume a previous session
       --dangerously-allow-all

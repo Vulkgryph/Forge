@@ -61,24 +61,39 @@ That installs:
 
 ## Platforms
 
+**macOS is the supported platform.** It is where Forge is developed and used
+every day, and the only one where any of this has been verified by a person
+using it. Linux and Windows compatibility is unverified — see the table for what
+that means per component.
+
 | | macOS | Linux | Windows |
 |---|---|---|---|
-| `forge-agent` | yes | yes | untested |
-| `forge-tui-rs` (`forge`) | yes | yes | untested |
-| `forge-ide` | yes | untested | untested |
+| `forge-agent` | supported | compiles and passes tests; runs headless on a remote | untested |
+| `forge-server` | n/a — runs on the remote | runs headless on a remote | untested |
+| `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested |
+| `forge-ide` | supported | untested | untested |
 
-What "yes" means: CI builds and tests it there on every push — the agent and
-terminal client on Linux and macOS, the editor on macOS — and it is used daily
-on macOS.
+**supported** — used daily, and built and tested in CI on every push.
 
-What "untested" means literally that. The editor's rendering goes through wgpu,
-which targets D3D12 on Windows and Vulkan on Linux, and its windowing goes
-through winit, so there is no known reason it cannot work; nobody has tried.
-Windows support is intended. Until someone has actually run it, a report that
-it does not build is expected rather than surprising.
+**compiles and passes tests** — CI builds it on Linux and the test suite passes
+there on every push. Nobody has sat in front of it on a Linux desktop. A build
+that works and a program that behaves are different claims, and only the first
+one is being made.
 
-The macOS app bundle, its signing, and the "add to Dock" option are macOS-only
-by nature. Remote development is tested from a macOS host to a Linux remote.
+**runs headless on a remote** — the agent and the file/pty server are uploaded to
+a Linux machine and driven over SSH by remote development, which is exercised
+regularly against an aarch64 Linux host. That is real use, but it is unattended:
+no terminal of its own, no window, no keyboard.
+
+**untested** means literally that. The editor renders through wgpu, which targets
+D3D12 on Windows and Vulkan on Linux, and takes its window from winit, so there
+is no known reason it cannot work — nobody has tried. Windows support is
+intended. Until someone runs it, a report that it does not build is expected
+rather than surprising, and worth filing.
+
+The macOS app bundle, its signing, and the "add to Dock" option are macOS-only by
+nature. Remote development is exercised from a macOS host to a Linux remote; the
+reverse has never been run.
 
 ## Model providers
 

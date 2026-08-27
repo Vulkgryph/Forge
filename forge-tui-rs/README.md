@@ -18,6 +18,13 @@ Or from a checkout, without installing:
 cargo run -p forge-tui-rs
 ```
 
+## Platforms
+
+Developed and used on macOS. CI builds it on Linux and the tests pass there on
+every push, but nobody has sat in front of it on a Linux terminal — a build that
+works and a program that behaves are different claims. Windows is untested. See
+the [platform table](../README.md#platforms).
+
 ## What it is, and what it isn't
 
 Rendered from scratch. There is no TUI framework underneath — it decodes its own escape sequences, measures its own text, wraps its own lines, and writes to the terminal directly. The reasons are in the module documentation of [`src/lib.rs`](src/lib.rs), which is the place to start reading, and each one is a failure the previous client had:

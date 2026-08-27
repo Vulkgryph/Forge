@@ -89,6 +89,13 @@ Forge respects a small set of environment variables for users who want to overri
 | `FORGE_RUSTUP_SHA256` / `FORGE_BUN_SHA256` | Pin the expected SHA-256 of the rustup / bun installers when `install.sh` fetches them. If unset, the script prints the hash so you can pin it on a future run. |
 | `FORGE_REPO` / `FORGE_DEST` / `FORGE_BRANCH` | Override defaults in `bootstrap.sh` / `bootstrap.ps1`. |
 
+## Platforms
+
+Developed and used on macOS. On Linux it builds and its tests pass in CI on every
+push, and it is genuinely exercised there — remote development uploads this binary
+to a Linux machine and drives it over SSH — but always headless, with no terminal
+of its own. Windows is untested. See the [platform table](../README.md#platforms).
+
 ## Requirements
 
 - **macOS, Linux, or Windows**

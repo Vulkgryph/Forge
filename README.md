@@ -143,9 +143,18 @@ and tells the agent not to retry, because retrying does not help. Everything
 else — reading files, running commands, git, the editor, remote work — does not
 depend on it, and coding tasks rarely need it.
 
-If web search matters to you, treat this as a gap. Making it work properly needs
-a real search API behind a key you supply; nothing of the sort is in the tree
-today, and this README makes no claim about when or whether it will be.
+So it is **off by default**, and the tools menu in either client turns it on if
+you want it as it stands — that choice is written to the config and kept. A tool
+that usually returns nothing is worse than one that is absent: the model spends a
+turn on it and then reasons about the emptiness as if it meant something.
+
+`web_fetch` is unaffected and stays on. It retrieves a URL it has been given and
+summarises it, which does not depend on search working, and a pasted link is how
+anyone actually asks for a page to be read.
+
+Making search work properly needs a real search API behind a key you supply;
+nothing of the sort is in the tree today, and this README makes no claim about
+when or whether it will be.
 
 `web_fetch` is unaffected: give it a URL and it fetches that page.
 

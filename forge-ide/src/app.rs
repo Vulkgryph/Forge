@@ -2406,6 +2406,37 @@ fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
 ///
 /// Returns the text unchanged when it already fits, or when there is no path in
 /// it to shorten — the caller's `truncate()` is the backstop for that case.
+/// How much of the agent's status strip to show at a given width.
+///
+/// The strip carries four things you click — the model, the permission mode, the
+/// reasoning effort, the context strategy — and three you only read: whether it
+/// is thinking, how full the context is, and whether it is online. Plus `·`
+/// separators, which are decoration.
+///
+/// Narrow, it used to wrap raggedly: the separators are their own widgets, so a
+/// wrap could put one at the *start* of a row, and an item could be split from
+/// the separator that introduced it. Now it gives up the decoration first, then
+/// the things you only read, and keeps what you click for last — the panel gets
+/// narrower in a way somebody chose rather than however the wrap happened to
+/// fall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StripDetail {
+    /// The `·` between items.
+    separators: bool,
+    /// The read-only extras: thinking, context percentage, online/offline.
+    extras: bool,
+}
+
+/// Widths measured from the real strip: below ~430pt the seven items plus
+/// separators no longer sit on one row, and below ~310pt the four badges alone
+/// need it.
+fn strip_detail(avail: f32) -> StripDetail {
+    StripDetail {
+        separators: avail >= 430.0,
+        extras: avail >= 310.0,
+    }
+}
+
 /// How many characters of a host name the status badge shows.
 ///
 /// Long enough for the names people actually use, short enough that the badge
@@ -7750,9 +7781,17 @@ impl IdeApp {
         // Wrapped, so a narrow panel reflows the badges instead of running them
         // off the edge — and, since egui sizes a panel from its contents, so
         // that this row cannot hold the panel open at its own width.
+        let detail = strip_detail(ui.available_width());
         let status_bar = ui.horizontal_wrapped(|ui| {
             ui.set_min_height(status_bar_h);
             ui.add_space(4.0);
+            // Drawn only while there is room for decoration; see `strip_detail`.
+            let sep = |ui: &mut egui::Ui| {
+                if detail.separators {
+                    ui.label(egui::RichText::new("·").size(10.5)
+                        .color(egui::Color32::from_gray(80)));
+                }
+            };
             let model = if tab.session.model.is_empty() { "starting…".to_string() }
                         else { display_model_label(&tab.session.model, &tab.session.endpoints) };
             let has_choices = !tab.session.endpoints.is_empty();
@@ -7769,7 +7808,7 @@ impl IdeApp {
                 ui.label(egui::RichText::new(&model).size(10.5).color(egui::Color32::from_gray(140)));
                 ui.add_space(6.0);
             }
-            ui.label(egui::RichText::new("·").size(10.5).color(egui::Color32::from_gray(80)));
+            sep(ui);
             let perm_color = match tab.permission_mode {
                 crate::settings::AgentPermissionMode::AlwaysAsk          => egui::Color32::from_gray(170),
                 crate::settings::AgentPermissionMode::AutoApprove        => egui::Color32::from_rgb(220, 190, 120),
@@ -7788,7 +7827,7 @@ impl IdeApp {
                 .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(tab.session.model.as_str()))
                 .cloned();
             if let Some(ep) = &current_ep {
-                ui.label(egui::RichText::new("·").size(10.5).color(egui::Color32::from_gray(80)));
+                sep(ui);
                 let reasoning_badge = draw_status_badge(ui, "reasoning_badge", &reasoning_badge_label(ep),
                     egui::Color32::from_gray(140), self.agent_thinking_picker_open, status_bar_h);
                 reasoning_badge_rect = reasoning_badge.rect;
@@ -7797,21 +7836,23 @@ impl IdeApp {
                     self.agent_thinking_picker_frame = 0;
                 }
             }
-            if tab.session.thinking {
-                ui.label(egui::RichText::new("· thinking").size(10.5)
+            if tab.session.thinking && detail.extras {
+                let text = if detail.separators { "· thinking" } else { "thinking" };
+                ui.label(egui::RichText::new(text).size(10.5)
                     .color(egui::Color32::from_rgb(180, 200, 120)));
             }
             let usage = &tab.session.usage;
-            if usage.max_context_tokens > 0 {
+            if usage.max_context_tokens > 0 && detail.extras {
                 let pct = (usage.last_prompt_tokens as f64 / usage.max_context_tokens as f64 * 100.0)
                     .round() as i64;
-                ui.label(egui::RichText::new(format!("· {pct}% ctx")).size(10.5)
+                let dot = if detail.separators { "· " } else { "" };
+                ui.label(egui::RichText::new(format!("{dot}{pct}% ctx")).size(10.5)
                     .color(egui::Color32::from_gray(120)))
                     .on_hover_text(format!("{} / {} tokens (last request)",
                         usage.last_prompt_tokens, usage.max_context_tokens));
             }
             if !tab.session.context_strategy.is_empty() {
-                ui.label(egui::RichText::new("·").size(10.5).color(egui::Color32::from_gray(80)));
+                sep(ui);
                 let label = context_strategy_label(&tab.session.context_strategy);
                 let context_badge = draw_status_badge(ui, "context_strategy_badge", label,
                     egui::Color32::from_gray(140), self.agent_context_picker_open, status_bar_h);
@@ -7821,8 +7862,8 @@ impl IdeApp {
                     self.agent_context_picker_frame = 0;
                 }
             }
-            {
-                ui.label(egui::RichText::new("·").size(10.5).color(egui::Color32::from_gray(80)));
+            if detail.extras {
+                sep(ui);
                 let (label, color, hover) = if tab.session.offline_mode {
                     ("Offline", egui::Color32::from_rgb(140, 180, 140),
                      "No network calls except this session's own model API — click to disable")
@@ -16746,5 +16787,51 @@ mod build_time_tests {
             rendered.ends_with(&format!("{hh:02}:{mm:02}")),
             "{rendered} does not end in this machine's local time {hh:02}:{mm:02}",
         );
+    }
+}
+
+#[cfg(test)]
+mod strip_detail_tests {
+    use super::strip_detail;
+
+    /// Wide, everything shows.
+    #[test]
+    fn a_wide_panel_shows_all_of_it() {
+        let d = strip_detail(700.0);
+        assert!(d.separators && d.extras);
+    }
+
+    /// The first thing given up is decoration. The `·` separators are their own
+    /// widgets, so a wrap could leave one at the start of a row — which is what
+    /// made a narrow panel look broken rather than merely full.
+    #[test]
+    fn decoration_goes_before_content() {
+        let d = strip_detail(360.0);
+        assert!(!d.separators, "kept the separators past the point they fit");
+        assert!(d.extras, "gave up content while decoration was still worth losing");
+    }
+
+    /// Narrower still, what remains is what you click: the model, the permission
+    /// mode, the reasoning effort and the context strategy. The three read-only
+    /// items go, because a status you cannot act on is the cheapest thing to lose.
+    #[test]
+    fn what_you_click_is_kept_for_last() {
+        let d = strip_detail(280.0);
+        assert!(!d.separators && !d.extras);
+    }
+
+    /// Monotonic: getting wider never takes something away. A threshold written
+    /// the wrong way round would flicker items in and out as the splitter moves.
+    #[test]
+    fn widening_never_removes_anything() {
+        let mut w = 100.0_f32;
+        let mut prev = strip_detail(w);
+        while w < 900.0 {
+            w += 5.0;
+            let now = strip_detail(w);
+            assert!(!(prev.separators && !now.separators), "separators vanished at {w}pt");
+            assert!(!(prev.extras && !now.extras), "extras vanished at {w}pt");
+            prev = now;
+        }
     }
 }

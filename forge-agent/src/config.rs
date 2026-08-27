@@ -211,7 +211,17 @@ pub struct AgentConfig {
     #[serde(default)]
     pub subagents: SubagentConfig,
     /// Tool names to exclude from every agent turn. Internal tools are never affected.
-    #[serde(default)]
+    ///
+    /// `web_search` is in here by default. It works by scraping DuckDuckGo's HTML,
+    /// which is not a search API and does not reliably answer — a tool that
+    /// usually returns nothing is worse than one that is absent, because the
+    /// model spends a turn on it and then reasons about the emptiness. Off until
+    /// there is a real search behind it. Turn it on from the tools menu in either
+    /// client if you want it as it stands; that choice is written here and kept.
+    ///
+    /// `web_fetch` stays on: it retrieves a URL it has been given and summarises
+    /// it, which does not depend on search working.
+    #[serde(default = "default_disabled_tools")]
     pub disabled_tools: Vec<String>,
     #[serde(default)]
     pub context_strategy: ContextStrategy,
@@ -249,6 +259,11 @@ fn default_forced_shell_background_secs() -> u64 {
 
 fn default_compact_at_percent() -> u8 {
     80
+}
+
+/// Tools off unless asked for. See `AgentConfig::disabled_tools`.
+fn default_disabled_tools() -> Vec<String> {
+    vec!["web_search".to_string()]
 }
 
 fn default_thinking_mode() -> bool {
@@ -324,7 +339,7 @@ impl Default for AppConfig {
                 compaction_threshold: 150,
                 compact_at_percent: default_compact_at_percent(),
                 subagents: SubagentConfig::default(),
-                disabled_tools: vec![],
+                disabled_tools: default_disabled_tools(),
                 context_strategy: ContextStrategy::Compaction,
                 min_shell_timeout_secs: 0,
                 forced_shell_background_secs: default_forced_shell_background_secs(),
@@ -443,5 +458,72 @@ mod permission_tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod default_tools_tests {
+    use super::*;
+
+    /// `web_search` is off unless asked for.
+    ///
+    /// It scrapes DuckDuckGo's HTML rather than using a search API, and usually
+    /// comes back empty. A tool that usually returns nothing is worse than one
+    /// that is absent: the model spends a turn on it and then reasons about the
+    /// emptiness as if it meant something.
+    #[test]
+    fn web_search_is_off_by_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.agent.disabled_tools.iter().any(|t| t == "web_search"));
+    }
+
+    /// `web_fetch` stays on. It retrieves a URL it has been handed and summarises
+    /// it, which does not depend on search working — and a pasted link is the
+    /// common way anyone wants a page read.
+    #[test]
+    fn web_fetch_is_left_alone() {
+        assert!(!AppConfig::default().agent.disabled_tools.iter().any(|t| t == "web_fetch"));
+    }
+
+    /// A real config file, as the app writes them, with one line changed. The
+    /// minimal hand-written TOML this used to try does not parse — most of
+    /// `[agent]` has no default — and testing against a shape nobody has on disk
+    /// would prove nothing about the upgrade path.
+    fn config_with(disabled_line: Option<&str>) -> AppConfig {
+        let full = toml::to_string_pretty(&AppConfig::default()).expect("serialise");
+        let mut out = String::new();
+        for line in full.lines() {
+            if line.starts_with("disabled_tools") {
+                match disabled_line {
+                    Some(replacement) => out.push_str(replacement),
+                    // Omitted entirely: an existing file from before the setting.
+                    None => continue,
+                }
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        toml::from_str(&out).expect("parse")
+    }
+
+    /// A config that does not mention the setting gets the new default, so the
+    /// change reaches everybody who has never touched it.
+    #[test]
+    fn a_config_without_the_setting_gets_the_default() {
+        assert_eq!(config_with(None).agent.disabled_tools, vec!["web_search".to_string()]);
+    }
+
+    /// And a config that *does* mention it is obeyed, including an empty list —
+    /// somebody who turned web search back on keeps it, which is the whole point
+    /// of it being a default rather than a removal.
+    #[test]
+    fn an_explicit_choice_is_obeyed() {
+        let on = config_with(Some("disabled_tools = []"));
+        assert!(on.agent.disabled_tools.is_empty(), "an explicit opt-in was overridden");
+
+        let other = config_with(Some("disabled_tools = [\"shell_exec\"]"));
+        assert_eq!(other.agent.disabled_tools, vec!["shell_exec".to_string()],
+                   "somebody else\'s disabled list was rewritten");
     }
 }

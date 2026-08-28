@@ -4,6 +4,16 @@ about: A capability or improvement you'd like Forge to have
 labels: enhancement
 ---
 
+## Surface
+
+Which part of Forge would this affect? (Check all that apply.)
+
+- [ ] `forge-agent` — the agent binary itself (model loop, tools, safety gating)
+- [ ] `forge-tui-rs` — the terminal client (`forge` command)
+- [ ] `forge-ide` — the graphical IDE
+- [ ] `forge-server` — the SSH-remote daemon uploaded to remote hosts
+- [ ] Not sure
+
 ## What you want to do
 
 <!-- Describe the workflow or capability you have in mind. -->

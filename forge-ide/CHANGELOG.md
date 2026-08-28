@@ -51,7 +51,7 @@ are one entry rather than a release nobody could install and a sequel to it.
 ### Added (a restarted window says what it restored)
 
 - **Every reason a remote window came back local was invisible from inside the window it happened to**, which is how the same report came back three times. A window now writes what was decided about it before it existed into its OUTPUT panel: that it is reconnecting to a host and which one; that its record named a remote but held no connection to remake; or that there was no record for it at all, so it came back with its folder and nothing else — which is what "it opened a fresh window" looks like from the outside.
-- There is also a live test of the recording path, run against a host from the SSH config, because twice I said a restart *should* reconnect and was wrong both times — each time because something upstream had never written the connection down. It is skipped when the host is not answering, and only ever tries the one it is meant for: connecting is not a read-only act, since it uploads `forge-server` when the remote's copy is out of date.
+- There is also a live test of the recording path, run against a host from the SSH config, because a restart *should* reconnect was claimed twice and was wrong both times — each time because something upstream had never written the connection down. It is skipped when the host is not answering, and only ever tries the one it is meant for: connecting is not a read-only act, since it uploads `forge-server` when the remote's copy is out of date.
 
 ### Fixed (three reasons a restarted window came back wrong)
 

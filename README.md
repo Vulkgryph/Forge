@@ -76,12 +76,11 @@ this is actually used against is ARM64.
 | `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested | untested |
 | `forge-ide` | supported | untested | untested | untested |
 
-**supported** — used daily and interactively on this platform by the person who
-writes it, which is the evidence behind the word. CI coverage is not what it
-rests on and differs by component: `forge-ide` is built and its tests run on a
-macOS runner on every push; `forge-agent` is built on macOS by the packaging job
-but its test suite runs on Linux; `forge-tui-rs` is built and tested on Linux
-only.
+**supported** — developed and used on this platform every day, which is the
+evidence behind the word. CI coverage is not what it rests on, and differs by
+component: `forge-ide` is built and its tests run on a macOS runner on every
+push; `forge-agent` is built on macOS by the packaging job but its test suite
+runs on Linux; `forge-tui-rs` is built and tested on Linux only.
 
 **compiles and passes tests** — CI builds it on x86-64 Linux and the test suite
 passes there on every push. Nobody has sat in front of it on a Linux desktop. A

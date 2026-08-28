@@ -4,6 +4,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-28
+
 ### Fixed
 
 - **A wide character in the first message could crash the session.** Reported live: `end byte index 77 is not a char boundary; it is inside '▎'`, panicking the agent's runtime thread. A session's title is the first message cut to length, and the cut was made by byte index — `&first_msg[..77]` — which panics whenever byte 77 lands inside a multi-byte character. Nothing exotic is required to hit it: an emoji in a prompt, a CJK identifier, an accented word, or the box-drawing characters models reach for when they sketch a diagram. The same pattern turned out to be in seven places across the agent and the editor — session titles, rewind previews, conversation titles in two panels, and three LSP hover truncations — each of them cutting text a person or a model produced, each one crashable. All seven now cut on a character boundary through a shared `truncate_chars`, and count their limits in characters rather than bytes, so a cap of 80 means eighty characters as a reader would expect. A property test walks every cut point of a mixed ASCII/emoji/CJK string and asserts the result is always a valid prefix.
@@ -175,7 +177,8 @@ Initial public release.
 - Five-way setup wizard: local LLM / Claude subscription / ChatGPT Codex subscription / direct API key / skip
 - Cross-platform browser launching for OAuth flows (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows)
 
-[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vulkgryph/Forge/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Vulkgryph/Forge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Vulkgryph/Forge/compare/v0.1.0...v0.2.0

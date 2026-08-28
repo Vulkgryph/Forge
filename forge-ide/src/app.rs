@@ -2007,6 +2007,20 @@ fn status_badge_chrome(triangle: bool) -> f32 {
 /// exist yet, including remote ones: a remote session started under it launches
 /// the agent with `--dangerously-allow-all` on a machine that may not be the
 /// user's. Switching one live tab already confirms; this decides in advance.
+/// What the status bar calls the workspace.
+///
+/// A window with no folder open still has a working directory — `$HOME`, so its
+/// terminal starts somewhere sensible — but naming that in the status bar
+/// claims a folder is open when the explorer says "No folder opened". The name
+/// it used was the home directory's, which is the account name, so it also put
+/// the user's name in the corner of every screenshot taken of an empty window.
+fn workspace_label(cwd: &std::path::Path, has_folder: bool) -> &str {
+    if !has_folder {
+        return "No folder";
+    }
+    cwd.file_name().and_then(|n| n.to_str()).unwrap_or("Forge IDE")
+}
+
 fn skip_all_confirmation_accepts(typed: &str) -> bool {
     typed.trim().eq_ignore_ascii_case("confirm")
 }
@@ -6668,8 +6682,7 @@ impl IdeApp {
                     ui.add_space(6.0);
 
                     // Left: folder name · git branch · status message
-                    let folder = self.cwd.file_name()
-                        .and_then(|n| n.to_str()).unwrap_or("Forge IDE");
+                    let folder = workspace_label(&self.cwd, self.has_folder);
                     ui.label(egui::RichText::new(folder).size(11.0).color(w));
 
                     if let Some(g) = &self.git {
@@ -17185,6 +17198,28 @@ mod strip_width_tests {
             let w = row_width(&ctx, d, "claude-opus-4-6");
             assert!(w <= avail, "{w:.0}pt at {avail:.0}pt ({d:?}) — it wraps");
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_label_tests {
+    use super::workspace_label;
+    use std::path::Path;
+
+    /// With a folder open, the folder is what it is named after.
+    #[test]
+    fn an_open_folder_is_named() {
+        assert_eq!(workspace_label(Path::new("/tmp/forge"), true), "forge");
+        assert_eq!(workspace_label(Path::new("/a/b/my-project"), true), "my-project");
+    }
+
+    /// Without one, it says so. It used to name `$HOME` — the working directory
+    /// a folderless window still has — which claimed a folder was open that was
+    /// not, and put the account name in the corner of every screenshot.
+    #[test]
+    fn no_folder_does_not_borrow_the_home_directory_name() {
+        assert_eq!(workspace_label(Path::new("/Users/someone"), false), "No folder");
+        assert_eq!(workspace_label(Path::new("/home/someone"), false), "No folder");
     }
 }
 

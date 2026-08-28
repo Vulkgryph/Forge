@@ -1739,7 +1739,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge-agent"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "forge-ide"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ash",
  "ash-window",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "forge-tui-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "forge-agent-proto",
  "unicode-segmentation",

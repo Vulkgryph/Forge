@@ -612,8 +612,8 @@ pub struct ResumeRewindCheckpoint {
 
 fn preview_text_for_rewind(text: &str) -> String {
     let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.len() > 72 {
-        format!("{}...", &single_line[..69])
+    if single_line.chars().count() > 72 {
+        format!("{}...", crate::agent::truncate_chars(&single_line, 69))
     } else {
         single_line
     }
@@ -936,4 +936,32 @@ fn reverse_find_record_offset_before(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod title_truncation_tests {
+    /// A session's title is the first message, cut to length. It was cut by
+    /// byte, so a multi-byte character straddling the cut panicked the agent's
+    /// runtime thread and took the session with it — reported live, from a `▎`
+    /// at byte 77 of a first message.
+    #[test]
+    fn a_long_first_message_with_wide_characters_does_not_panic() {
+        for pad in 70..85 {
+            let msg = format!("{}\u{258E} and then some more text", "x".repeat(pad));
+            let title = if msg.chars().count() > 80 {
+                format!("{}...", crate::agent::truncate_chars(&msg, 77))
+            } else {
+                msg.clone()
+            };
+            assert!(msg.starts_with(title.trim_end_matches("...")));
+        }
+    }
+
+    /// The rewind preview has the same shape and the same exposure.
+    #[test]
+    fn a_rewind_preview_survives_wide_characters() {
+        let text = format!("{} \u{1F600} tail", "word ".repeat(30));
+        let preview = super::preview_text_for_rewind(&text);
+        assert!(preview.chars().count() <= 73, "got {}", preview.chars().count());
+    }
 }

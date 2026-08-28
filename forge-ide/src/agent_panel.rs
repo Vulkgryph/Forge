@@ -663,7 +663,9 @@ pub fn save_conversation(session: &AgentSession, id: &str, cwd: &std::path::Path
     let title = session.items.iter().find_map(|i| {
         if let ChatItem::User(t) = i {
             let t = t.trim().to_string();
-            Some(if t.len() > 60 { format!("{}…", &t[..60]) } else { t })
+            Some(if t.chars().count() > 60 {
+                format!("{}…", crate::text::truncate_chars(&t, 60))
+            } else { t })
         } else { None }
     }).unwrap_or_else(|| "New conversation".into());
     let conv = SavedConversation {

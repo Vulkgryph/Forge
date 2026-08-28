@@ -22,6 +22,7 @@ mod plugin;
 mod fmt;
 mod ptyhost;
 mod session;
+mod text;
 mod settings;
 mod ssh;
 mod tasks;

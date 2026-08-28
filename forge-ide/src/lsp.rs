@@ -631,21 +631,25 @@ fn strip_markdown(s: &str) -> String {
     if sig.is_empty() {
         let plain = s.replace(['*', '_', '#'], "");
         let trimmed = plain.trim();
-        return if trimmed.len() > 120 {
-            format!("{}…", &trimmed[..120])
+        return if trimmed.chars().count() > 120 {
+            format!("{}…", crate::text::truncate_chars(trimmed, 120))
         } else {
             trimmed.to_string()
         };
     }
 
     // Truncate the signature if it's very long.
-    let sig_display = if sig.len() > 100 { format!("{}…", &sig[..100]) } else { sig };
+    let sig_display = if sig.chars().count() > 100 {
+        format!("{}…", crate::text::truncate_chars(&sig, 100))
+    } else { sig };
 
     if doc.is_empty() {
         sig_display
     } else {
         // Cap doc line at 80 chars.
-        let doc_display = if doc.len() > 80 { format!("{}…", &doc[..80]) } else { doc };
+        let doc_display = if doc.chars().count() > 80 {
+            format!("{}…", crate::text::truncate_chars(&doc, 80))
+        } else { doc };
         format!("{}\n{}", sig_display, doc_display)
     }
 }

@@ -1411,7 +1411,9 @@ impl AgentTab {
         self.session.items.iter().find_map(|i| {
             if let crate::agent_panel::ChatItem::User(t) = i {
                 let t = t.trim();
-                Some(if t.len() > 22 { format!("{}…", &t[..22]) } else { t.to_string() })
+                Some(if t.chars().count() > 22 {
+                    format!("{}…", crate::text::truncate_chars(t, 22))
+                } else { t.to_string() })
             } else { None }
         }).unwrap_or_else(|| "New Chat".into())
     }

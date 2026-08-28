@@ -2149,8 +2149,8 @@ impl Agent {
     fn ensure_meta(&mut self, first_msg: &str) {
         if !self.meta_written {
             let now = chrono::Utc::now();
-            let title = if first_msg.len() > 80 {
-                format!("{}...", &first_msg[..77])
+            let title = if first_msg.chars().count() > 80 {
+                format!("{}...", crate::agent::truncate_chars(first_msg, 77))
             } else {
                 first_msg.to_string()
             };

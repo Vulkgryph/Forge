@@ -20,22 +20,21 @@ Forge is an autonomous AI coding agent, plus two independent clients that drive 
 What *can* diverge is each client's own view of the wire protocol's shape. The terminal client shares [`forge-agent-proto`](forge-agent-proto/) with the agent, so those two cannot drift; `forge-ide` keeps its own hand-maintained Rust structs, so a protocol change has to be applied there by hand.
 
 ```text
-                    ┌───────────────────────┐
-                    │      forge-agent       │
-                    │  (the model loop,      │
-                    │   tools, safety gate)  │
-                    └───────────┬───────────┘
-                                │  JSON-newline protocol,
-                                │  stdin/stdout
-                ┌───────────────┴───────────────┐
-                │                                │
-      ┌─────────┴─────────┐          ┌───────────┴───────────┐
-      │    forge-tui-rs     │          │       forge-ide        │
-      │  terminal client    │          │  native code editor    │
-      │  (Rust), installed  │          │  (Rust/egui), with its │
-      │  as `forge`         │          │  own editor/git/LSP/   │
-      │                     │          │  SSH-remote features   │
-      └─────────────────────┘          └─────────────────────┘
+                   ┌───────────────────────┐
+                   │      forge-agent      │
+                   │  (the model loop,     │
+                   │  tools, safety gate)  │
+                   └───────────┬───────────┘
+                               │  JSON-newline protocol, stdin/stdout
+               ┌───────────────┴────────────────┐
+               │                                │
+    ┌──────────┴──────────┐        ┌────────────┴────────────┐
+    │    forge-tui-rs     │        │        forge-ide        │
+    │  terminal client    │        │  native code editor     │
+    │  (Rust), installed  │        │  (Rust/egui), with its  │
+    │  as `forge`         │        │  own editor/git/LSP/    │
+    │                     │        │  SSH-remote features    │
+    └─────────────────────┘        └─────────────────────────┘
 ```
 
 ## Install / defaults

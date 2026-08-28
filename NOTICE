@@ -92,6 +92,25 @@ All other trademarks are the property of their respective owners.
 
 ---
 
+What this notice has and has not been checked against
+-----------------------------------------------------
+
+The attributions here cover the dependencies that have been validated against
+their published licences: everything compiled into the binaries Forge
+distributes, and every source tree vendored into this repository.
+
+Cargo.lock also resolves crates for targets Forge does not currently build —
+Windows, Android, WebAssembly, Redox, and other platform-specific graphs. Those
+have not been checked one by one. None of them is linked into anything
+distributed here, and they are conventionally MIT or Apache-2.0, but this
+notice does not assert that, because nobody has confirmed it yet. Checking the
+remainder is outstanding work, and the intention is that this section
+eventually describes an empty set.
+
+If you are relying on this notice for a compliance review, that is the boundary
+of what it currently claims.
+
+
 Artwork
 -------
 

@@ -14,7 +14,7 @@ Forge IDE is built for engineers who want to see and understand the tool they us
 
 **Inspection is the point.** The source is here. If something looks wrong, file an issue. If you want to take it in a different direction, fork it.
 
-**On limitations.** This is young software built by a small team. It has not been used at the scale VS Code has, and it will have rough edges that only real usage surfaces. If something breaks — a keybinding that doesn't fire, a remote connection that hangs, a panel that renders wrong — file an issue with what you were doing. That's the fastest way it gets fixed.
+**On limitations.** This is young software. We have not run it at the scale VS Code has, and it will have rough edges that only real usage surfaces. If something breaks — a keybinding that doesn't fire, a remote connection that hangs, a panel that renders wrong — file an issue with what you were doing. That's the fastest way it gets fixed.
 
 ## Features
 

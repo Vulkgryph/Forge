@@ -4,11 +4,11 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
-### Changed
+## [0.3.0] — 2026-08-27
+
+### Changed (`web_search` is off by default)
 
 - **`web_search` is off by default.** It works by scraping DuckDuckGo's HTML rather than through a search API, and usually comes back empty — a tool that usually returns nothing is worse than one that is absent, because the model spends a turn on it and then reasons about the emptiness as if it meant something. Turn it on from the tools menu in either client if you want it as it stands; that choice is written to the config and kept. `web_fetch` stays on: it retrieves a URL it has been handed and summarises it, which does not depend on search working.
-
-## [0.3.0] — 2026-08-27
 
 ### Added (forced background ceiling on every top-level shell — default 5 minutes)
 

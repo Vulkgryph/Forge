@@ -4,10 +4,6 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-### Changed
-
-- **The agent panel's status strip now narrows deliberately.** It carries four things you click — model, permission mode, reasoning effort, context strategy — and three you only read, plus `·` separators. The separators are their own widgets, so a wrap could leave one at the *start* of a row and split an item from the separator that introduced it, which is what made a narrow panel look broken rather than merely full. It now gives up the decoration first, then the read-only items, and keeps what you click for last.
-
 ## [0.3.0] — 2026-08-27
 
 ### Fixed

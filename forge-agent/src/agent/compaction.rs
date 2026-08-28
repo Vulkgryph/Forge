@@ -412,17 +412,42 @@ pub fn apply_rolling_window(
     let target_tokens = (max_context_tokens as f64 * 0.80) as usize;
     let mut dropped = 0;
 
+    // A message with no text still costs something on the wire (a tool call is
+    // its name and arguments), so an absent body is charged a nominal size
+    // rather than nothing.
+    let msg_chars = |m: &Message| m.content.as_ref().map_or(400, |c| c.len());
+    let total_chars: usize = history.iter().map(&msg_chars).sum();
+
     // Use server-reported token count as ground truth; fall back to char estimate
     let mut current_tokens = if actual_prompt_tokens > 0 {
         actual_prompt_tokens as usize
     } else {
-        history
-            .iter()
-            .map(|m| m.content.as_ref().map(|c| c.len() / 4).unwrap_or(100))
-            .sum()
+        total_chars / 4
     };
 
-    let per_msg = tokens_per_message.max(50) as usize;
+    // What one dropped message is worth, in the same units as `current_tokens`.
+    //
+    // This used to subtract `tokens_per_message` — the *marginal* cost measured
+    // across the last two turns — from a total that is the server's real count.
+    // Those are not the same measure. A session that has just exchanged a few
+    // short messages reports a small marginal cost, while the messages at the
+    // front of the history, which are the ones dropped, are the large ones:
+    // tool results and file dumps. Shedding 20k tokens then looked like it
+    // needed hundreds of drops, and the loop emptied the transcript instead of
+    // trimming it — observed as context falling from about 90% to about 11% in
+    // one step, with the agent left no memory of what it had been doing.
+    //
+    // So each message is charged its own size, converted at the ratio the real
+    // total implies, with the marginal figure kept only as a floor.
+    let per_msg_floor = tokens_per_message.max(50) as usize;
+    let tokens_per_char = if total_chars > 0 && actual_prompt_tokens > 0 {
+        actual_prompt_tokens as f64 / total_chars as f64
+    } else {
+        0.25 // the usual English rule of thumb, when there is nothing better
+    };
+    let cost_of = |m: &Message| {
+        ((msg_chars(m) as f64 * tokens_per_char).ceil() as usize).max(per_msg_floor)
+    };
 
     loop {
         if current_tokens <= target_tokens || history.len() <= 2 {
@@ -434,8 +459,9 @@ pub fn apply_rolling_window(
             }
             let end = context_unit_end(history, idx);
             let removed = end.saturating_sub(idx).max(1);
+            let cost: usize = history[idx..end].iter().map(&cost_of).sum();
             history.drain(idx..end);
-            current_tokens = current_tokens.saturating_sub(per_msg * removed);
+            current_tokens = current_tokens.saturating_sub(cost);
             dropped += removed;
         } else {
             break;
@@ -655,6 +681,57 @@ mod tests {
         assert_eq!(dropped, 2);
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].role, "user");
+    }
+
+    /// A real session lost almost its whole transcript at once: context usage
+    /// fell from about 90% to about 11% in a single step and the agent had no
+    /// memory of what it was doing.
+    ///
+    /// The cause is a unit mismatch. `current_tokens` starts as the server's
+    /// real prompt total, but each dropped message subtracts
+    /// `tokens_per_message` — a *marginal* figure measured from the last two
+    /// turns. A conversation that has just exchanged a few short messages
+    /// reports a small marginal cost, while the messages at the front of the
+    /// history are the large ones (tool results, file dumps). Shedding 20k
+    /// tokens then looks like it needs hundreds of drops, so the loop runs
+    /// until the history is empty rather than until the budget is met.
+    #[test]
+    fn rolling_window_stops_when_the_budget_is_met_not_when_history_runs_out() {
+        // 200k window, sitting at 90% — needs to shed roughly 20k to reach 80%.
+        let max_context = 200_000;
+        let actual = 180_000u32;
+
+        // Twenty turns, each with a large tool result: dropping one or two
+        // units is enough to get under the target.
+        let big = "x".repeat(40_000); // ~10k tokens
+        let mut history = vec![Message::system("system")];
+        for i in 0..20 {
+            history.push(Message::assistant_with_tools(None, vec![tool_call(&format!("t{i}"))]));
+            history.push(Message::tool_result(&format!("t{i}"), "read_file", &big));
+        }
+        history.push(Message::user("carry on with the plan"));
+        let before = history.len();
+
+        // The recent marginal cost: two short messages were just exchanged.
+        let tokens_per_message = 50;
+        let dropped = apply_rolling_window(&mut history, max_context, actual, tokens_per_message);
+
+        // Each turn is worth roughly 10k tokens, so shedding 20k should cost
+        // two or three of them — not the whole conversation.
+        assert!(
+            dropped <= 8,
+            "dropped {dropped} of {before} messages, leaving {} — the transcript was \
+             emptied rather than trimmed",
+            history.len()
+        );
+        // And it has to actually trim: leaving the prompt over budget would
+        // just move the failure to the provider.
+        assert!(dropped >= 2, "dropped only {dropped}, which cannot have freed 20k tokens");
+        assert!(
+            history.iter().any(|m| m.role == "user"),
+            "the pending request itself was dropped"
+        );
+        assert_eq!(history[0].role, "system", "the system prompt must survive");
     }
 
     #[test]

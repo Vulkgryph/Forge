@@ -49,6 +49,17 @@ The project root is the default working directory, not a sandbox. File tools and
 
 The gate belongs to the `forge` command, which is the entry point a person types. `forge-agent --headless` is a protocol server driven by a UI and owns no terminal to ask on, so it takes the flag as given — the UI in front of it is where the asking happens, and the editor confirms before it will switch a tab into *Skip All Permissions*.
 
+### Known defects
+
+- **A watcher started in the background can fail without saying so.** Long-running
+  processes launched with `run_in_background=true` — file watchers, dev servers,
+  anything that is meant to stay up — have been observed dying or never starting
+  while the agent goes on as though they were running. Nothing surfaces in the
+  tool result, so the first sign is that the thing you expected to be watching
+  never reports anything. If you depend on a watcher, verify it yourself
+  (`background_action` to poll it, or check the process) rather than trusting
+  that the call succeeded. Root cause is not yet established.
+
 ## Offline use
 
 Forge runs with no internet when paired with a local LLM. Useful for airgapped environments, secure facilities, weak connections, or anyone who simply doesn't want their code shipped to a cloud provider.

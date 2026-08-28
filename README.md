@@ -183,6 +183,12 @@ Forge is provided **"AS IS"**, without warranty of any kind, and you are
 responsible for what you approve it to do. [LICENSE](LICENSE) is the binding
 document; [SECURITY.md](SECURITY.md) is how to report a vulnerability.
 
+## How this is built
+
+Forge is built with the assistance of AI coding tools, and is directed,
+reviewed and released by Vulkgryph LLC. See [NOTICE](NOTICE) for that and for
+the third-party attributions.
+
 ## License
 
 Everything here is licensed under the [Apache License, Version 2.0](LICENSE), copyright © 2026 Vulkgryph LLC. See each project's own `LICENSE`/`NOTICE` for its own copy, and `SECURITY.md` for how to report a vulnerability in that specific project.

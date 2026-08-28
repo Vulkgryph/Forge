@@ -111,6 +111,18 @@ If you are relying on this notice for a compliance review, that is the boundary
 of what it currently claims.
 
 
+Development
+-----------
+
+Forge is built with the assistance of AI coding tools, which contributed to the
+source, the tests and the documentation throughout. The work is directed,
+reviewed and released by Vulkgryph LLC, which owns it and is responsible for it.
+
+Recorded here rather than per-commit, where it was previously noted as a
+co-author trailer: it is a fact about how the whole project is made, not about
+particular changes.
+
+
 Artwork
 -------
 

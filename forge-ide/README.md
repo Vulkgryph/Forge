@@ -4,6 +4,10 @@ Created by **Vulkgryph LLC**.
 
 A fast, native code editor built in Rust on Vulkan and [egui](https://github.com/emilk/egui). Forge IDE aims to cover the same daily workflow as VS Code — editing, git, language servers, a terminal, and remote development over SSH — in a smaller, more inspectable codebase. Its integrated agent panel spawns [`forge-agent`](../forge-agent/) directly — the same binary [`forge-tui-rs`](../forge-tui-rs/) drives independently. See the [top-level README](../README.md) for how the three projects in this monorepo fit together.
 
+![Forge IDE editing forge-agent, with the agent panel showing tool calls, a diffstat and a rewind checkpoint](assets/forge-ide.png)
+
+> _Forge IDE editing `forge-agent`, with the agent panel mid-task: tool calls folded into a checklist, an edit with its diffstat and an **Open diff** action, and a checkpoint you can rewind to._
+
 ## Philosophy
 
 Forge IDE is built for engineers who want to see and understand the tool they use all day. The rendering pipeline is Vulkan because almost everything runs Vulkan — there's no browser, no Electron, no JavaScript runtime underneath. What you see in the source is what runs on your GPU.

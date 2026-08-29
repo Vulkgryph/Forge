@@ -4,6 +4,10 @@ Created by **Vulkgryph LLC**.
 
 Forge is an autonomous AI coding agent, plus two independent clients that drive it: a terminal UI and a native code editor. This repository hosts them as one monorepo.
 
+![Forge IDE editing forge-agent, with the agent panel showing tool calls, a diffstat and a rewind checkpoint](forge-ide/assets/forge-ide.png)
+
+> _Forge IDE editing `forge-agent`, with the agent panel mid-task: tool calls folded into a checklist, an edit with its diffstat and an **Open diff** action, and a checkpoint you can rewind to._
+
 ## The projects
 
 | Project | What it is | Docs |

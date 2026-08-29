@@ -29,7 +29,12 @@ pub enum Decision {
     Deny,
     /// Free text, or a chosen option's label.
     Answer(String),
-    ApprovePlan { clear_context: bool },
+    ApprovePlan {
+        clear_context: bool,
+        /// Whether approving also approves the edits the plan describes.
+        /// "Approve (manual edits)" is the one path that does not.
+        auto_approve: bool,
+    },
     /// Turn on the provider's priority tier for the endpoint that was refused.
     SwitchToPriorityTier,
     /// Keep the capacity rejection as an ordinary error and move on.
@@ -104,14 +109,23 @@ not Forge."
                 typing: None,
             },
 
-            Pending::Plan { plan_path, content } => Self {
+            // The four options, their order and the default are the TypeScript
+            // client's (`forge-tui/src/components/PlanApproval.tsx`). The plan
+            // itself is not repeated here: it goes into the transcript as
+            // markdown when it arrives, the way the original rendered it in a
+            // box above this question, rather than being flattened into a body
+            // this dialog caps at eight lines.
+            Pending::Plan { plan_path, .. } => Self {
                 kind: Kind::Plan,
-                title: "Plan ready".into(),
-                body: format!("{content}\n\n({plan_path})"),
+                title: "Plan ready. How to proceed?".into(),
+                body: plan_path.clone(),
+                // No descriptions: the original listed four bare labels, and each
+                // one already says what it does.
                 options: vec![
-                    ("Approve".into(), "start work".into()),
-                    ("Approve, clear context".into(), "start fresh".into()),
-                    (OTHER.into(), "reject with feedback".into()),
+                    ("Clear context + auto-approve edits".into(), String::new()),
+                    ("Auto-approve edits".into(), String::new()),
+                    ("Approve (manual edits)".into(), String::new()),
+                    ("Discuss".into(), String::new()),
                 ],
                 selected: 0,
                 checked: Vec::new(),
@@ -271,12 +285,16 @@ not Forge."
             Input::Enter => {
                 let text = buffer.trim().to_string();
                 if text.is_empty() {
-                    return None; // an empty answer is not an answer
+                    // For a plan, an empty answer still means something: the
+                    // original's "Discuss" sent this marker on its own, and the
+                    // agent reads it as "talk about the plan" rather than as a
+                    // rejection. Everywhere else an empty answer is not an answer.
+                    return match self.kind {
+                        Kind::Plan => Some(Decision::Answer("DISCUSS".into())),
+                        _ => None,
+                    };
                 }
-                match self.kind {
-                    Kind::Plan => Some(Decision::Answer(text)), // rejection feedback
-                    _ => Some(Decision::Answer(text)),
-                }
+                Some(Decision::Answer(text))
             }
             Input::Escape => {
                 // Leave the text field, back to the options if there are any.
@@ -295,7 +313,7 @@ not Forge."
     fn confirm(&mut self) -> Option<Decision> {
         let label = self.options.get(self.selected).map(|(l, _)| l.as_str())?;
 
-        if label == OTHER {
+        if label == OTHER || (matches!(self.kind, Kind::Plan) && label == "Discuss") {
             self.typing = Some(String::new());
             return None;
         }
@@ -306,7 +324,15 @@ not Forge."
                 1 => Decision::Approve { remember: true },
                 _ => Decision::Deny,
             }),
-            Kind::Plan => Some(Decision::ApprovePlan { clear_context: self.selected == 1 }),
+            Kind::Plan => Some(match self.selected {
+                0 => Decision::ApprovePlan { clear_context: true,  auto_approve: true },
+                1 => Decision::ApprovePlan { clear_context: false, auto_approve: true },
+                2 => Decision::ApprovePlan { clear_context: false, auto_approve: false },
+                // "Discuss" hands the plan back with a marker the agent reads as
+                // "talk about this", rather than as a rejection. The original
+                // sent exactly this string.
+                _ => Decision::Answer("DISCUSS".into()),
+            }),
             Kind::ProviderBusy => Some(if self.selected == 0 {
                 Decision::SwitchToPriorityTier
             } else {
@@ -354,8 +380,8 @@ not Forge."
             (Kind::Approval { .. }, 'n') => Some(Decision::Deny),
             (Kind::Rewind, 'y') => Some(Decision::Approve { remember: false }),
             (Kind::Rewind, 'n') => Some(Decision::Deny),
-            (Kind::Plan, 'y') => Some(Decision::ApprovePlan { clear_context: false }),
-            (Kind::Plan, 'c') => Some(Decision::ApprovePlan { clear_context: true }),
+            (Kind::Plan, 'y') => Some(Decision::ApprovePlan { clear_context: false, auto_approve: true }),
+            (Kind::Plan, 'c') => Some(Decision::ApprovePlan { clear_context: true, auto_approve: true }),
             // The shortcuts the TypeScript client bound: `p` to switch, `d` to
             // dismiss. Both are easily undone, unlike standing approval.
             (Kind::ProviderBusy, 'p') => Some(Decision::SwitchToPriorityTier),
@@ -459,7 +485,7 @@ not Forge."
         }
         match self.kind {
             Kind::Approval { .. } => "↑↓ move · Enter choose · y/n · Esc denies",
-            Kind::Plan => "↑↓ move · Enter choose · y approve · c clear+approve",
+            Kind::Plan => "↑↓ move · Enter choose · y approve · c clear+approve · Esc discard",
             Kind::Question { multi_select: true } => "↑↓ move · Space tick · Enter send",
             Kind::Question { multi_select: false } => "↑↓ move · 1-9 pick · Enter choose",
             Kind::FreeText => "Enter to send",
@@ -853,12 +879,12 @@ mod tests {
         let mut d = Dialog::for_pending(&plan);
         assert_eq!(
             d.handle(Input::Char('y')),
-            Some(Decision::ApprovePlan { clear_context: false }),
+            Some(Decision::ApprovePlan { clear_context: false, auto_approve: true }),
         );
         let mut d = Dialog::for_pending(&plan);
         assert_eq!(
             d.handle(Input::Char('c')),
-            Some(Decision::ApprovePlan { clear_context: true }),
+            Some(Decision::ApprovePlan { clear_context: true, auto_approve: true }),
         );
     }
 
@@ -867,7 +893,8 @@ mod tests {
         let plan = Pending::Plan { plan_path: "/p.md".into(), content: "steps".into() };
         let mut d = Dialog::for_pending(&plan);
         d.handle(Input::Down);
-        d.handle(Input::Down);           // onto "Other"
+        d.handle(Input::Down);
+        d.handle(Input::Down);           // onto "Discuss"
         d.handle(Input::Enter);
         assert!(d.is_typing());
         for c in "needs detail".chars() {
@@ -879,14 +906,78 @@ mod tests {
         );
     }
 
+    /// The plan itself goes into the transcript, where it renders as markdown at
+    /// full width — the original drew it in a box above this question, and a
+    /// real plan runs to thousands of characters, far past the eight lines a
+    /// dialog body is capped at. What the dialog carries is the question, the
+    /// four choices, and the file the plan was written to.
     #[test]
-    fn a_plan_shows_its_content() {
+    fn a_plan_dialog_asks_the_question_and_names_the_file() {
         let plan = Pending::Plan {
             plan_path: "/p.md".into(),
             content: "step one then step two".into(),
         };
         let d = Dialog::for_pending(&plan);
-        assert!(draw(&d, 60, 16).contains("step one"));
+        let shown = draw(&d, 70, 16);
+        assert!(shown.contains("Plan ready. How to proceed?"), "{shown}");
+        assert!(shown.contains("/p.md"), "{shown}");
+    }
+
+    /// The options, their wording and their order are the original's, and so is
+    /// the default — the most automated choice, which is what a plan approval
+    /// usually wants.
+    /// Not an assertion — prints the dialog so its wording, order and spacing
+    /// can be compared against the original by eye.
+    #[test]
+    #[ignore = "visual check; run with --ignored --nocapture"]
+    fn plan_appearance() {
+        let plan = Pending::Plan {
+            plan_path: "/tmp/forge-demo/.forge/plans/20260829_120000.md".into(),
+            content: "# Goal\n\nCreate a zero-dependency Rust VM runtime.".into(),
+        };
+        let d = Dialog::for_pending(&plan);
+        println!("\n{}", draw(&d, 78, d.height(78)));
+    }
+
+    #[test]
+    fn the_plan_options_match_the_original() {
+        let plan = Pending::Plan { plan_path: "/p.md".into(), content: "steps".into() };
+        let d = Dialog::for_pending(&plan);
+        let labels: Vec<&str> = d.options.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec![
+            "Clear context + auto-approve edits",
+            "Auto-approve edits",
+            "Approve (manual edits)",
+            "Discuss",
+        ]);
+        assert_eq!(d.selected, 0);
+    }
+
+    /// The third option is the one that differs from the first two, and the one
+    /// the TypeScript client only pretended to offer — there it ran the same
+    /// handler as "Auto-approve edits".
+    #[test]
+    fn manual_edits_approves_without_arming_auto_approval() {
+        let plan = Pending::Plan { plan_path: "/p.md".into(), content: "steps".into() };
+        let mut d = Dialog::for_pending(&plan);
+        d.handle(Input::Down);
+        d.handle(Input::Down);           // onto "Approve (manual edits)"
+        assert_eq!(
+            d.handle(Input::Enter),
+            Some(Decision::ApprovePlan { clear_context: false, auto_approve: false }),
+        );
+    }
+
+    /// Discuss opens a field so you can say what you want to discuss; sending it
+    /// empty falls back to the bare marker the original sent.
+    #[test]
+    fn discuss_sends_the_marker_when_nothing_is_typed() {
+        let plan = Pending::Plan { plan_path: "/p.md".into(), content: "steps".into() };
+        let mut d = Dialog::for_pending(&plan);
+        for _ in 0..3 { d.handle(Input::Down); }
+        d.handle(Input::Enter);
+        assert!(d.is_typing());
+        assert_eq!(d.handle(Input::Enter), Some(Decision::Answer("DISCUSS".into())));
     }
 
     // ── Rewind ────────────────────────────────────────────────────────────

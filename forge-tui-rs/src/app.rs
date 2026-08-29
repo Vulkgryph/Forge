@@ -613,7 +613,9 @@ impl App {
             }
             Decision::Deny => self.session.deny("denied by the user"),
             Decision::Answer(text) => self.session.reply(text),
-            Decision::ApprovePlan { clear_context } => self.session.approve_plan(clear_context),
+            Decision::ApprovePlan { clear_context, auto_approve } => {
+                self.session.approve_plan(clear_context, auto_approve)
+            }
             Decision::SwitchToPriorityTier => self.session.switch_to_priority_tier(),
             Decision::DismissProviderBusy => {
                 self.session.dismiss_provider_busy();

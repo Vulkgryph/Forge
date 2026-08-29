@@ -4,6 +4,14 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plan approval is a faithful port again, and the plan is actually readable.** Two things had drifted from the TypeScript client it replaced. The dialog offered three options — *Approve*, *Approve, clear context*, *Other* — where the original offered four, in a different order, with a different default and different wording: *Clear context + auto-approve edits*, *Auto-approve edits*, *Approve (manual edits)*, *Discuss*. Neither of the two approve labels said that approving also auto-approves the edits the plan describes, which is what both of them did. The four are restored, with the original's order, wording, bare labels and default, recovered from `forge-tui/src/components/PlanApproval.tsx` in the history rather than reconstructed from memory.
+
+  One deliberate difference from what the original *did*: there, *Approve (manual edits)* ran the same handler as *Auto-approve edits*, so the label promised a choice the code did not offer. Here it does what it says and approves the plan without arming auto-approval. *Discuss* opens a field so you can say what you want to discuss, and sending it empty falls back to the bare marker the original sent.
+
+  And the plan itself is now visible: it goes into the transcript when it arrives, where it renders as markdown at full width. It had existed only inside the dialog, whose body is capped at eight wrapped lines — a four-kilobyte plan was effectively invisible, and `EntryKind::PlanContent` had a renderer that nothing ever produced an entry for. The dialog now carries the question, the four choices, and the file the plan was written to.
+
 ## [0.3.1] — 2026-08-28
 
 No changes in this component; released with `forge-agent` and `forge-ide`, which share its version.

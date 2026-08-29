@@ -791,6 +791,11 @@ impl Session {
             }
 
             AgentMessage::PlanReady { plan_path, content } => {
+                // Into the transcript first, so it renders as markdown at full
+                // width — the original drew the plan in a bordered box above the
+                // question, and a plan runs to thousands of characters. The
+                // dialog below it asks the question and names the file.
+                self.entries.push(Entry::new(EntryKind::PlanContent, content.clone()));
                 self.pending = Some(Pending::Plan { plan_path, content });
             }
 
@@ -887,16 +892,22 @@ impl Session {
         }
     }
 
-    pub fn approve_plan(&mut self, clear_context: bool) -> Vec<Effect> {
+    /// `auto_approve` is what separates the original's first two options from its
+    /// third. Approving a plan normally approves the edits it describes —
+    /// without that the agent stops for permission on every write in a plan the
+    /// user has just accepted, which is not what "approved" means.
+    ///
+    /// "Approve (manual edits)" is the exception, and it is the one place this
+    /// port deliberately differs from what the TypeScript client *did*: there,
+    /// that option ran the same handler as "Auto-approve edits", so the label
+    /// promised something the code did not do. Here it does what it says.
+    pub fn approve_plan(&mut self, clear_context: bool, auto_approve: bool) -> Vec<Effect> {
         match self.pending.take() {
             Some(Pending::Plan { .. }) => {
-                // Approving a plan approves the edits it describes. Without this the
-                // agent stopped for permission on every single write while working
-                // through a plan the user had just accepted — which is not what
-                // "approved" means, and is not what the TypeScript client did: it
-                // added these three to its approved set on both approve paths.
-                for tool in PLAN_EDIT_TOOLS {
-                    self.approved_tools.insert((*tool).to_string());
+                if auto_approve {
+                    for tool in PLAN_EDIT_TOOLS {
+                        self.approved_tools.insert((*tool).to_string());
+                    }
                 }
                 vec![Effect::Send(if clear_context {
                     ClientMessage::ClearAndApprovePlan
@@ -1892,17 +1903,35 @@ mod tests {
         assert_eq!(s.permission_mode, PermissionMode::Ask);
     }
 
+    /// The plan goes into the transcript when it arrives, so it renders as
+    /// markdown at full width. It used to exist only inside the dialog, whose
+    /// body is capped at eight wrapped lines — a 4KB plan was effectively
+    /// invisible, and `EntryKind::PlanContent` had a renderer that nothing
+    /// ever produced an entry for.
+    #[test]
+    fn a_plan_is_shown_in_the_transcript_when_it_arrives() {
+        let mut s = session();
+        s.apply(AgentMessage::PlanReady {
+            plan_path: "/p.md".into(),
+            content: "# Goal\n\nBuild the thing.\n\n- step one\n- step two".into(),
+        });
+        let plan = s.entries.iter().find(|e| e.kind == EntryKind::PlanContent)
+            .expect("the plan should be in the transcript");
+        assert!(plan.content.contains("step one"));
+        assert!(plan.content.contains("# Goal"), "markdown is kept for the renderer");
+    }
+
     #[test]
     fn approving_a_plan_can_clear_the_context() {
         let mut s = session();
         s.apply(AgentMessage::PlanReady { plan_path: "/p".into(), content: "steps".into() });
         assert_eq!(
-            s.approve_plan(true),
+            s.approve_plan(true, true),
             vec![Effect::Send(ClientMessage::ClearAndApprovePlan)],
         );
 
         s.apply(AgentMessage::PlanReady { plan_path: "/p".into(), content: "steps".into() });
-        assert_eq!(s.approve_plan(false), vec![Effect::Send(ClientMessage::ApprovePlan)]);
+        assert_eq!(s.approve_plan(false, true), vec![Effect::Send(ClientMessage::ApprovePlan)]);
     }
 
     #[test]
@@ -2074,7 +2103,7 @@ mod tests {
             plan_path: "/tmp/plan.md".into(),
             content: "do the thing".into(),
         });
-        let effects = session.approve_plan(false);
+        let effects = session.approve_plan(false, true);
         assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::ApprovePlan)]));
 
         for tool in ["apply_patch", "write_file", "edit_file"] {
@@ -2094,7 +2123,7 @@ mod tests {
             plan_path: "/tmp/plan.md".into(),
             content: "do the thing".into(),
         });
-        session.approve_plan(true);
+        session.approve_plan(true, true);
         for tool in ["execute_command", "run_command", "bash"] {
             assert!(
                 !session.approved_tools.contains(tool),

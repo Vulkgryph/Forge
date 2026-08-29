@@ -22,11 +22,14 @@ pub struct Buffer {
     pub image_bytes: Option<Vec<u8>>,
     /// Lazily decoded/uploaded from `image_bytes` the first time it's drawn —
     /// texture upload needs an `egui::Context`, which load time doesn't have.
-    pub image_tex: Option<egui::TextureHandle>,
+    /// One entry per frame: a still is one, a GIF is however many it has.
+    pub image_frames: Vec<egui::TextureHandle>,
+    /// Each frame's duration in milliseconds, parallel to `image_frames`.
+    pub image_delays: Vec<u32>,
 }
 
 fn is_image_ext(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case("png")
+    crate::img::is_supported_ext(ext)
 }
 
 /// Largest file the editor will load.
@@ -63,7 +66,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self { path: None, lines: vec![String::new()], cursor: (0, 0), modified: false, diff: None,
                undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
-               image_bytes: None, image_tex: None }
+               image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() }
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, String> {
@@ -75,7 +78,7 @@ impl Buffer {
             return Ok(Self {
                 path: Some(path), lines: vec![String::new()], cursor: (0, 0), modified: false,
                 diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
-                image_bytes: Some(bytes), image_tex: None,
+                image_bytes: Some(bytes), image_frames: Vec::new(), image_delays: Vec::new(),
             });
         }
         let text = std::fs::read_to_string(&path)
@@ -88,7 +91,7 @@ impl Buffer {
         };
         Ok(Self { path: Some(path), lines, cursor: (0, 0), modified: false, diff: None,
                   undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline,
-                  image_bytes: None, image_tex: None })
+                  image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() })
     }
 
     /// A read-only diff tab for `path`, holding precomputed diff rows.
@@ -96,7 +99,7 @@ impl Buffer {
         Self { path: Some(path), lines: vec![String::new()], cursor: (0, 0),
                modified: false, diff: Some(rows), undo_stack: Vec::new(),
                redo_stack: Vec::new(), trailing_newline: true,
-               image_bytes: None, image_tex: None }
+               image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() }
     }
 
     /// Full buffer text, plus the trailing newline the file had on disk when
@@ -128,7 +131,9 @@ impl Buffer {
         if self.image_bytes.is_some() {
             self.image_bytes = Some(std::fs::read(&path)
                 .map_err(|e| format!("reload {}: {e}", path.display()))?);
-            self.image_tex = None; // force re-decode/re-upload with the new bytes
+            // force re-decode/re-upload with the new bytes
+            self.image_frames.clear();
+            self.image_delays.clear();
             return Ok(());
         }
         let text = std::fs::read_to_string(&path)

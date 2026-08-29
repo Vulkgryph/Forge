@@ -4,10 +4,6 @@ Created by **Vulkgryph LLC**.
 
 An autonomous AI coding agent that runs locally against OpenAI-compatible, Anthropic, or ChatGPT Codex endpoints. Forge reads, writes, and executes code in your project — driven by [`forge-tui-rs`](../forge-tui-rs/) (the terminal UI) or [`forge-ide`](../forge-ide/) (a full code editor), both talking to this binary over the same headless JSON protocol. See the [top-level README](../README.md) for how the three fit together.
 
-![Forge writing a zero-dependency VM runtime in Rust](assets/forge-demo.gif)
-
-> _Forge writing a zero-dependency VM runtime in Rust — ~2 min 19 sec, played at 2× speed._
-
 ## Philosophy
 
 Forge is built for engineers who want a tool they can rely on, not a tool they chase. The aim is a small, readable codebase with a stable interface — so the command you learn today behaves the same way the next time you use it, and your config file doesn't need to be rewritten between releases.

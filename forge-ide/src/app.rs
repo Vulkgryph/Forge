@@ -1470,10 +1470,9 @@ fn paint_send_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
 fn load_forge_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     // Bundled at the repo root — bytes are embedded so the binary stays standalone.
     let bytes = include_bytes!("../Forge.png");
-    let img   = image::load_from_memory(bytes).ok()?;
-    let rgba  = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut pixels = rgba.into_raw();
+    let decoded = crate::img::png::decode(bytes).ok()?;
+    let (w, h) = (decoded.width, decoded.height);
+    let mut pixels = decoded.rgba;
 
     // The PNG has a solid black background; key it out so the icon blends
     // into whatever color the activity bar uses.  Anything near-black goes
@@ -1483,22 +1482,35 @@ fn load_forge_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
         if lum < 75 { chunk[3] = 0; }
     }
 
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [w as usize, h as usize], &pixels,
-    );
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
     Some(ctx.load_texture("forge_icon", color_image, egui::TextureOptions::LINEAR))
 }
 
 /// Decodes raw image bytes (an open image-tab buffer's file content) and
 /// uploads them as a texture for `draw_image_view` to paint.
-fn load_image_texture(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::TextureHandle> {
-    let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [w as usize, h as usize], &rgba.into_raw(),
-    );
-    Some(ctx.load_texture("buffer_image", color_image, egui::TextureOptions::LINEAR))
+/// Decode an image to textures — one per frame, so an animation can be played.
+///
+/// Uploaded up front rather than lazily per frame: a GIF's frames are already
+/// composited to full size by the decoder, and uploading mid-animation would
+/// stutter on exactly the frame it happened.
+fn load_image_frames(
+    ctx: &egui::Context,
+    bytes: &[u8],
+) -> Option<(Vec<egui::TextureHandle>, Vec<u32>)> {
+    let frames = crate::img::decode(bytes).ok()?;
+    let mut textures = Vec::with_capacity(frames.len());
+    let mut delays = Vec::with_capacity(frames.len());
+    for (i, frame) in frames.iter().enumerate() {
+        let colour = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.image.width, frame.image.height],
+            &frame.image.rgba,
+        );
+        textures.push(ctx.load_texture(
+            format!("buffer_image_{i}"), colour, egui::TextureOptions::LINEAR,
+        ));
+        delays.push(frame.delay_ms);
+    }
+    Some((textures, delays))
 }
 
 /// "Natural" string comparison for the model picker: alphabetical, but a run
@@ -13852,13 +13864,37 @@ impl IdeApp {
         ui.painter().rect_filled(rect, 0.0, self.palette.editor_bg_c());
         let Some(buf) = self.buffers.get_mut(self.active) else { return };
 
-        if buf.image_tex.is_none() {
+        if buf.image_frames.is_empty() {
             if let Some(bytes) = &buf.image_bytes {
-                buf.image_tex = load_image_texture(ui.ctx(), bytes);
+                if let Some((textures, delays)) = load_image_frames(ui.ctx(), bytes) {
+                    buf.image_frames = textures;
+                    buf.image_delays = delays;
+                }
             }
         }
 
-        match &buf.image_tex {
+        // Which frame is due. Driven by wall clock rather than a frame counter,
+        // so the animation runs at its own speed regardless of the repaint rate,
+        // and a repaint is requested only while there is more than one frame.
+        let frame_index = if buf.image_frames.len() > 1 {
+            let total: u32 = buf.image_delays.iter().sum::<u32>().max(1);
+            let elapsed = ui.input(|i| i.time);
+            let mut at = ((elapsed * 1000.0) as u64 % total as u64) as u32;
+            let mut which = 0;
+            for (i, d) in buf.image_delays.iter().enumerate() {
+                if at < *d { which = i; break; }
+                at -= *d;
+                which = i;
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                (*buf.image_delays.get(which).unwrap_or(&100)).max(16) as u64,
+            ));
+            which
+        } else {
+            0
+        };
+
+        match buf.image_frames.get(frame_index) {
             Some(tex) => {
                 let tex_size = tex.size_vec2();
                 let avail = (rect.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(1.0, 1.0));

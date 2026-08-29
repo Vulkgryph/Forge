@@ -4,6 +4,16 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- **GIFs open, and animate — and the image dependency is gone.** Opening a `.gif` failed with "stream did not contain valid UTF-8": the editor treated only `.png` as an image, while the file tree already gave gif, jpg and webp an image icon, so it showed a picture icon for a file it then refused to open. The `image` crate it used was compiled with PNG support only.
+
+  Rather than enable more of that crate, Forge now decodes images itself: DEFLATE and zlib (RFC 1951 and 1950), PNG (RFC 2083) across all five colour types, bit depths 1 through 16, every scanline filter, palette transparency and Adam7 interlacing, and GIF89a including LZW, interlacing and all four frame-disposal methods. About a thousand lines, decode-only. Six crates left the dependency graph — `image`, `png`, `bytemuck`, `byteorder-lite`, `moxcms` and `num-traits` — taking the workspace from 682 to 676.
+
+  The decoders were checked against the crate they replaced before it was removed: our output and its output were compared byte for byte over the 3024×2088 screenshot in this repository — twenty-five megabytes of RGBA, not one byte different — and over three hand-built fixtures covering greyscale, a 4-bit palette with `tRNS`, and 16-bit samples with the Paeth filter. Those digests are recorded in the tests, so what they assert is what an independent implementation produced and this one agreed with, rather than what this one happens to produce.
+
+  Animated GIFs play at their own speed: every frame is composited to full size at decode time, and the frame shown is chosen by wall clock rather than by repaint count, with a repaint requested only while a file actually has more than one frame — so an open still costs nothing.
+
 ## [0.3.1] — 2026-08-28
 
 ### Fixed

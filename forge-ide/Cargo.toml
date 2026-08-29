@@ -40,7 +40,6 @@ portable-pty      = "0.8"
 rfd               = "0.14"
 serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
-image             = { version = "0.25", default-features = false, features = ["png"] }
 git2              = { version = "0.20", default-features = false, features = ["vendored-libgit2", "vendored-openssl", "ssh", "https"] }
 russh             = { version = "0.62", features = ["rsa"] }
 russh-sftp        = "2.4"

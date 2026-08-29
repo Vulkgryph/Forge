@@ -15,6 +15,7 @@ mod gfx;
 mod gfx_wgpu;
 mod git;
 mod icons;
+mod img;
 mod lsp;
 mod model_proxy;
 mod onboarding;

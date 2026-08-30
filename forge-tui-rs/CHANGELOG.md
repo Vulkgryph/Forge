@@ -4,6 +4,14 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+- **The transcript no longer redraws itself eight times a second.** Every spinner tick erased the whole live block and reprinted it — status line, transcript tail, input box — because one character had changed. Measured on a real session: 11.2 KB/s of escape sequences, sustained, for the length of the run. It now rewrites only the lines that differ, and writes nothing at all when a frame is identical. Redrawing everything for one turning character is what a terminal shows as jitter.
+
+  Patching is refused, and the frame drawn the whole way, whenever anything below a changed line would move — a different number of lines, or a line whose wrapped height changed. The block's own bookkeeping is kept in step, since a following erase climbs from where the caret is, and getting that wrong is what once stranded copies of the status bar down the screen.
+
+- **A dialog no longer leaves a caret blinking in the bottom left.** A plan card or an approval prompt asks for no cursor; the new patching path revealed one anyway and parked it at the end of the block.
+
+- **Two glyphs no font on macOS has.** The permission-mode line used `⏵` and `⏸`, which are in none of the fonts the system ships — they drew as empty boxes for anyone in auto-accept or plan mode. Now `▶▶` and `❙❙`, both of which are in Menlo and in Apple Symbols.
+
 ### Fixed
 
 - **Plan approval is a faithful port again, and the plan is actually readable.** Two things had drifted from the TypeScript client it replaced. The dialog offered three options — *Approve*, *Approve, clear context*, *Other* — where the original offered four, in a different order, with a different default and different wording: *Clear context + auto-approve edits*, *Auto-approve edits*, *Approve (manual edits)*, *Discuss*. Neither of the two approve labels said that approving also auto-approves the edits the plan describes, which is what both of them did. The four are restored, with the original's order, wording, bare labels and default, recovered from `forge-tui/src/components/PlanApproval.tsx` in the history rather than reconstructed from memory.

@@ -927,17 +927,36 @@ impl App {
         } else {
             live_from.min(streaming)
         };
+        // Nothing new to commit: the frame is only the live block, so try to
+        // rewrite just the lines that changed. It is redrawn on every spinner
+        // tick and is almost entirely identical each time — erasing and
+        // reprinting all of it for one turning character is what a terminal
+        // shows as jitter.
+        //
+        // Attempted before `begin_frame`, because that erases the very region a
+        // patch would edit. `patch_live` refuses whenever anything below a
+        // changed line would move, and the frame is then drawn the whole way.
+        if settled <= self.committed {
+            let live = self.live_lines(inline, cols);
+            let cursor = self.cursor_in(&live, cols);
+            if inline.patch_live(out, &live.lines, cursor)? {
+                return Ok(());
+            }
+            inline.begin_frame(out)?;
+            return inline.draw_live(out, &live.lines, cursor);
+        }
+
         // Clear what is on screen once, then print: everything below happens in
         // the space this frees, so a commit can never land underneath a live line
         // that is still there.
         inline.begin_frame(out)?;
 
-        if settled > self.committed {
-            let lines = self.lines_for(self.committed..settled, cols);
-            inline.commit(out, &lines)?;
-            self.committed = settled;
-        }
+        let lines = self.lines_for(self.committed..settled, cols);
+        inline.commit(out, &lines)?;
+        self.committed = settled;
 
+        // Computed only now: `live_lines` is relative to what has been
+        // committed, so asking before the commit describes a different screen.
         let live = self.live_lines(inline, cols);
         let cursor = self.cursor_in(&live, cols);
         inline.draw_live(out, &live.lines, cursor)
@@ -1617,11 +1636,13 @@ impl App {
             style: dim,
         }];
         let (label, colour) = match self.session.permission_mode {
-            PermissionMode::AutoAccept => (Some("⏵⏵ auto-accept edits"), palette::GREEN),
+            // `▶` rather than `⏵`: U+23F5 is in no font macOS ships, so it drew
+            // as an empty box. U+25B6 is in Menlo and in Apple Symbols.
+            PermissionMode::AutoAccept => (Some("▶▶ auto-accept edits"), palette::GREEN),
             // Says what it does. This label used to read "auto-accept edits",
             // which understated a mode that approves commands as well.
-            PermissionMode::AllowAll => (Some("⏵⏵ approving everything"), palette::RED),
-            PermissionMode::Plan => (Some("⏸ plan mode"), palette::YELLOW),
+            PermissionMode::AllowAll => (Some("▶▶ approving everything"), palette::RED),
+            PermissionMode::Plan => (Some("❙❙ plan mode"), palette::YELLOW),
             PermissionMode::Ask => (None, palette::GRAY),
         };
         if let Some(label) = label {

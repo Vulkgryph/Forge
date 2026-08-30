@@ -63,6 +63,9 @@ pub struct Inline {
     /// terminal re-wraps any of them that no longer fit, and the block covers more
     /// rows than it was printed with.
     drawn_widths: Vec<usize>,
+    /// Each live line as it was last written to the terminal, so the next frame
+    /// can rewrite only the ones that differ.
+    drawn_lines: Vec<String>,
     /// Column the caret was parked at, needed for the same recomputation: after a
     /// re-wrap the caret sits `col / cols` rows further down than its row started.
     cursor_col: usize,
@@ -71,7 +74,7 @@ pub struct Inline {
 impl Inline {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self { cols, rows, live_rows: 0, cursor_row: 0,
-               drawn_widths: Vec::new(), cursor_col: 0 }
+               drawn_widths: Vec::new(), drawn_lines: Vec::new(), cursor_col: 0 }
     }
 
     pub fn cols(&self) -> usize {
@@ -139,6 +142,7 @@ impl Inline {
         self.live_rows = 0;
         self.cursor_row = 0;
         self.drawn_widths.clear();
+        self.drawn_lines.clear();
         self.cursor_col = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
@@ -157,6 +161,7 @@ impl Inline {
         self.live_rows = 0;
         self.cursor_row = 0;
         self.drawn_widths.clear();
+        self.drawn_lines.clear();
         self.cursor_col = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
@@ -177,8 +182,12 @@ impl Inline {
         // doc comment for why there is exactly one.
 
         self.drawn_widths.clear();
+        self.drawn_lines.clear();
         for (i, line) in lines.iter().enumerate() {
-            self.drawn_widths.push(encode(line, &mut buf, self.cols));
+            let mut encoded = String::new();
+            self.drawn_widths.push(encode(line, &mut encoded, self.cols));
+            buf.push_str(&encoded);
+            self.drawn_lines.push(encoded);
             // No trailing newline on the last line: it would scroll the screen
             // and leave a blank row below the prompt that grows on every redraw.
             if i + 1 < lines.len() {
@@ -215,6 +224,104 @@ impl Inline {
         out.flush()
     }
 
+    /// Rewrite only the live lines that changed, leaving the rest untouched.
+    ///
+    /// The live block is redrawn on every spinner tick — eight times a second —
+    /// and almost all of it is identical each time: the same input box, the same
+    /// status line, one turning character. Erasing and reprinting the whole
+    /// block for that is eleven kilobytes a second of escape sequences, and it
+    /// is what a terminal shows as jitter.
+    ///
+    /// Returns `false` when the frame cannot be patched, and the caller falls
+    /// back to erasing and redrawing. That happens whenever anything below a
+    /// changed line would move: a different number of lines, or a line whose
+    /// wrapped height changed. Patching in those cases would leave the rows
+    /// beneath it wrong, which is worse than redrawing.
+    pub fn patch_live(
+        &mut self,
+        out: &mut impl Write,
+        lines: &[Line],
+        cursor: Option<(usize, usize)>,
+    ) -> io::Result<bool> {
+        if self.drawn_lines.is_empty() || self.drawn_lines.len() != lines.len() {
+            return Ok(false);
+        }
+        let cols = self.cols.max(1);
+        let rows_for = |w: usize| w.max(1).div_ceil(cols).max(1);
+
+        let mut encoded = Vec::with_capacity(lines.len());
+        let mut widths = Vec::with_capacity(lines.len());
+        for line in lines {
+            let mut buf = String::new();
+            widths.push(encode(line, &mut buf, self.cols));
+            encoded.push(buf);
+        }
+        // A line that now occupies a different number of terminal rows shifts
+        // everything below it.
+        if widths.iter().zip(&self.drawn_widths).any(|(a, b)| rows_for(*a) != rows_for(*b)) {
+            return Ok(false);
+        }
+
+        let changed: Vec<usize> = (0..lines.len())
+            .filter(|&i| encoded[i] != self.drawn_lines[i])
+            .collect();
+
+        // The row each live line starts on, counting wrapped rows.
+        let row_of = |i: usize| -> usize {
+            widths[..i].iter().map(|&w| rows_for(w)).sum()
+        };
+        let target_row = cursor.map(|(r, _)| r.min(lines.len().saturating_sub(1)));
+        let want_col = cursor.map(|(_, c)| c);
+
+        if changed.is_empty()
+            && target_row.map(row_of) == Some(self.cursor_row)
+            && want_col == Some(self.cursor_col)
+        {
+            return Ok(true); // nothing at all to say
+        }
+
+        let mut buf = String::from(SYNC_BEGIN);
+        buf.push_str(HIDE_CURSOR);
+        let mut at = self.cursor_row;
+
+        for i in changed {
+            let row = row_of(i);
+            move_to_row(&mut buf, at, row);
+            buf.push('\r');
+            buf.push_str("\x1b[K");
+            buf.push_str(&encoded[i]);
+            // Printing leaves the caret at the end of what was written, which
+            // for a wrapped line is its last row.
+            at = row + rows_for(widths[i]).saturating_sub(1);
+        }
+
+        // Park the caret where the frame wants it.
+        let park = target_row.map(row_of).unwrap_or_else(|| {
+            widths.iter().map(|&w| rows_for(w)).sum::<usize>().saturating_sub(1)
+        });
+        move_to_row(&mut buf, at, park);
+        buf.push('\r');
+        if let Some(col) = want_col.filter(|&c| c > 0) {
+            buf.push_str(&format!("\x1b[{col}C"));
+        }
+        // Only reveal the caret if the frame asked for one. A dialog — a plan
+        // card, an approval — owns the screen and wants no caret; showing it
+        // anyway parks a blinking block at the end of the block, in the bottom
+        // left, under a dialog that has no text field.
+        if cursor.is_some() {
+            buf.push_str(SHOW_CURSOR);
+        }
+        buf.push_str(SYNC_END);
+
+        self.drawn_lines = encoded;
+        self.drawn_widths = widths;
+        self.cursor_row = park;
+        self.cursor_col = want_col.unwrap_or(0);
+        out.write_all(buf.as_bytes())?;
+        out.flush()?;
+        Ok(true)
+    }
+
     /// Move to the start of the live region and erase it.
     ///
     /// Climbs from where the cursor actually is, which is not necessarily the
@@ -249,6 +356,7 @@ impl Inline {
         self.live_rows = 0;
         self.cursor_row = 0;
         self.drawn_widths.clear();
+        self.drawn_lines.clear();
         self.cursor_col = 0;
         out.write_all(buf.as_bytes())?;
         out.flush()
@@ -637,6 +745,124 @@ mod tests {
         assert_eq!(inline.cursor_row, 1);
     }
 
+    /// The spinner case, which is most of what this program ever draws: eight
+    /// frames a second in which one character changes. Redrawing the whole
+    /// block for that is what a terminal shows as jitter.
+    #[test]
+    fn only_the_line_that_changed_is_rewritten() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        // A live block the size the client actually draws: transcript tail,
+        // status, input box.
+        let mut before: Vec<Line> = (0..10).map(|i| line(&format!("transcript line {i}"))).collect();
+        before.push(line("⠋ working"));
+        before.push(line("› prompt"));
+        inline.draw_live(&mut out, &before, Some((11, 2))).unwrap();
+        let full = text(&out).len();
+
+        out.clear();
+        let mut after = before.clone();
+        after[10] = line("⠙ working");
+        assert!(inline.patch_live(&mut out, &after, Some((11, 2))).unwrap());
+        let patched = text(&out);
+
+        assert!(patched.contains("⠙ working"), "the changed line is written");
+        assert!(!patched.contains("transcript line 4"), "unchanged lines are not");
+        assert!(!patched.contains("› prompt"), "nor the one below it");
+        assert!(
+            patched.len() * 2 < full,
+            "patch was {} bytes against a full redraw of {full}", patched.len(),
+        );
+    }
+
+    /// A dialog owns the screen and asks for no caret. Revealing one anyway
+    /// leaves a blinking block in the bottom left, under a plan card that has
+    /// no text field — which is what the patch path did when it showed the
+    /// cursor unconditionally.
+    #[test]
+    fn a_frame_that_wants_no_cursor_does_not_reveal_one() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line("plan card"), line("options")], None).unwrap();
+        out.clear();
+        assert!(inline.patch_live(&mut out, &[line("plan card"), line("choices")], None).unwrap());
+        let got = text(&out);
+        assert!(!got.contains(SHOW_CURSOR), "revealed the caret: {got:?}");
+        assert!(got.contains(HIDE_CURSOR), "and it should still be hidden");
+    }
+
+    /// When one *is* asked for, it is shown and placed.
+    #[test]
+    fn a_frame_that_wants_a_cursor_gets_one() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line("a"), line("› ")], Some((1, 2))).unwrap();
+        out.clear();
+        assert!(inline.patch_live(&mut out, &[line("a"), line("› x")], Some((1, 3))).unwrap());
+        assert!(text(&out).contains(SHOW_CURSOR));
+    }
+
+    /// Nothing changed at all: say nothing. This is the idle case, and any
+    /// output here would be a redraw the user can see for no reason.
+    #[test]
+    fn an_identical_frame_writes_nothing() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        let lines = [line("one"), line("two")];
+        inline.draw_live(&mut out, &lines, Some((1, 0))).unwrap();
+        out.clear();
+        assert!(inline.patch_live(&mut out, &lines, Some((1, 0))).unwrap());
+        assert!(out.is_empty(), "wrote {:?}", text(&out));
+    }
+
+    /// A different number of lines moves everything below, so patching is
+    /// refused and the caller redraws.
+    #[test]
+    fn a_different_line_count_is_refused() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line("one"), line("two")], None).unwrap();
+        out.clear();
+        assert!(!inline.patch_live(&mut out, &[line("one")], None).unwrap());
+        assert!(out.is_empty(), "a refusal must not write anything");
+    }
+
+    /// A line longer than the terminal is clipped by `encode`, not wrapped —
+    /// one line is always one row here — so replacing a short line with a long
+    /// one moves nothing below it and can still be patched. The height guard in
+    /// `patch_live` is insurance against that ceasing to be true.
+    #[test]
+    fn a_longer_line_is_clipped_and_still_patchable() {
+        let mut inline = Inline::new(20, 24);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line("short"), line("tail")], None).unwrap();
+        out.clear();
+        let long = "x".repeat(45);
+        assert!(inline.patch_live(&mut out, &[line(&long), line("tail")], None).unwrap());
+        assert!(!text(&out).contains("tail"), "the row below was not touched");
+        assert_eq!(inline.live_rows, 2, "still two rows on screen");
+    }
+
+    /// After a patch the block's bookkeeping has to describe what is on screen,
+    /// or the next erase climbs the wrong number of rows — the failure that
+    /// used to strand copies of the status bar in the scrollback.
+    #[test]
+    fn the_cursor_is_where_the_next_frame_expects_it() {
+        let mut inline = Inline::new(80, 24);
+        let mut out = sink();
+        inline.draw_live(&mut out, &[line("a"), line("b"), line("c")], Some((0, 0))).unwrap();
+        assert_eq!(inline.cursor_row, 0);
+
+        out.clear();
+        assert!(inline.patch_live(&mut out, &[line("a"), line("B"), line("c")], Some((2, 3))).unwrap());
+        assert_eq!(inline.cursor_row, 2, "parked where the frame asked");
+        assert_eq!(inline.cursor_col, 3);
+
+        out.clear();
+        inline.begin_frame(&mut out).unwrap();
+        assert!(text(&out).contains("\x1b[2A"), "climbs two rows: {:?}", text(&out));
+    }
+
     /// A resize must still erase the old block, or every resize leaves debris.
     ///
     /// Safe because nothing printed was ever wrapped by the terminal: autowrap is
@@ -771,4 +997,13 @@ mod tests {
         assert!(crate::width::str_width(&with) <= crate::width::str_width("a\n\n\n\nb"));
     }
 
+}
+
+/// Move the caret from one row of the live block to another.
+fn move_to_row(buf: &mut String, from: usize, to: usize) {
+    if to > from {
+        buf.push_str(&format!("\x1b[{}B", to - from));
+    } else if from > to {
+        buf.push_str(&format!("\x1b[{}A", from - to));
+    }
 }

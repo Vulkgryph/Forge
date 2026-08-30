@@ -6,6 +6,24 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Added
 
+- **Animated images play, and can be scrubbed like video.** A GIF used to be decoded whole before anything appeared: every frame composited to full size and uploaded as its own texture. For the two-thousand-frame terminal recording in this repository that is 3.7 GB of pixels and 2,258 GPU textures, which is why it took so long to open. Frames are now composited one at a time into a single reused canvas and a single reused texture — about 7 MB whatever the length — and the picture appears immediately.
+
+  The viewer gained a transport: rewind, play/pause, and a scrub bar with a frame counter. Because a GIF frame is a patch over the one before it, seeking backwards would mean recompositing from the beginning on every pixel of movement, so saved canvases are kept at intervals chosen from a memory budget rather than a fixed count — bounding any seek to a fixed amount of work whatever the recording's length. A test plays the whole animation, then jumps around out of order and demands identical pixels: a wrong resume point produces a *plausible* picture rather than an error, which is the failure that would otherwise ship unnoticed.
+
+  Playback advances by real elapsed time, so a late repaint does not make it drift, and a paused or still image asks for no repaints at all.
+
+- **The playback controls stay on screen when the pane is short.** The picture was sized to the whole pane and the controls placed beneath it, so shortening the pane pushed them out of view — exactly when scrubbing by eye is hardest. The bottom strip is now reserved before the picture is sized, and gives up the caption and then the transport as the pane shrinks, rather than clipping.
+
+- **An open image comes back after a restart.** Image tabs were skipped when the session was recorded, alongside diff tabs, as "derived views". A diff is derived and has nothing to reopen; an image is a file you opened, and now restores like any other.
+
+- **Windows say what they are.** The title is the file and the folder — `app.rs — forge` — with `[SSH: host]` on a remote one, so several windows are distinguishable in the Dock and in Mission Control instead of all reading "Forge IDE". A window with no folder open still says "Forge IDE" rather than naming the home directory, which would put the account name in the title bar.
+
+- **A window that polls without stopping now says why.** Eighteen conditions can hold the 20Hz redraw tier open, and one stuck true costs about a percent of a core on a window that looks idle — visible only in Activity Monitor, with nothing to say which condition it was. After a minute of unbroken polling the window names the reason in the OUTPUT panel.
+
+- **Glyphs the terminal draws are in a font that is loaded.** Apple Symbols was loaded only for the UI family and Menlo only for the code font, and between them each family lacked what the other had: no Braille in the monospace family, so every TUI spinner drew as a row of empty boxes, and no `✔` in the proportional one. Each is now the other's fallback. A test asks egui what it can actually render rather than reading `cmap` tables, because a font file containing a glyph says nothing about whether the file was loaded — Menlo is a TrueType collection, and the previous check could not parse those at all.
+
+### Added
+
 - **GIFs open, and animate — and the image dependency is gone.** Opening a `.gif` failed with "stream did not contain valid UTF-8": the editor treated only `.png` as an image, while the file tree already gave gif, jpg and webp an image icon, so it showed a picture icon for a file it then refused to open. The `image` crate it used was compiled with PNG support only.
 
   Rather than enable more of that crate, Forge now decodes images itself: DEFLATE and zlib (RFC 1951 and 1950), PNG (RFC 2083) across all five colour types, bit depths 1 through 16, every scanline filter, palette transparency and Adam7 interlacing, and GIF89a including LZW, interlacing and all four frame-disposal methods. About a thousand lines, decode-only. Six crates left the dependency graph — `image`, `png`, `bytemuck`, `byteorder-lite`, `moxcms` and `num-traits` — taking the workspace from 682 to 676.

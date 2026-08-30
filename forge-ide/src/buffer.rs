@@ -20,12 +20,10 @@ pub struct Buffer {
     /// Raw file bytes when this is an image preview tab (`lines` is unused
     /// in that case, same as `diff`). Set at load time; never edited.
     pub image_bytes: Option<Vec<u8>>,
-    /// Lazily decoded/uploaded from `image_bytes` the first time it's drawn —
-    /// texture upload needs an `egui::Context`, which load time doesn't have.
-    /// One entry per frame: a still is one, a GIF is however many it has.
-    pub image_frames: Vec<egui::TextureHandle>,
-    /// Each frame's duration in milliseconds, parallel to `image_frames`.
-    pub image_delays: Vec<u32>,
+    /// Lazily decoded from `image_bytes` the first time it's drawn — texture
+    /// upload needs an `egui::Context`, which load time doesn't have. Holds one
+    /// texture, reused: an animation composites into it frame by frame.
+    pub image_view: Option<crate::app::ImageView>,
 }
 
 fn is_image_ext(ext: &str) -> bool {
@@ -66,7 +64,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self { path: None, lines: vec![String::new()], cursor: (0, 0), modified: false, diff: None,
                undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
-               image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() }
+               image_bytes: None, image_view: None }
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, String> {
@@ -78,7 +76,7 @@ impl Buffer {
             return Ok(Self {
                 path: Some(path), lines: vec![String::new()], cursor: (0, 0), modified: false,
                 diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
-                image_bytes: Some(bytes), image_frames: Vec::new(), image_delays: Vec::new(),
+                image_bytes: Some(bytes), image_view: None,
             });
         }
         let text = std::fs::read_to_string(&path)
@@ -91,7 +89,7 @@ impl Buffer {
         };
         Ok(Self { path: Some(path), lines, cursor: (0, 0), modified: false, diff: None,
                   undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline,
-                  image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() })
+                  image_bytes: None, image_view: None })
     }
 
     /// A read-only diff tab for `path`, holding precomputed diff rows.
@@ -99,7 +97,7 @@ impl Buffer {
         Self { path: Some(path), lines: vec![String::new()], cursor: (0, 0),
                modified: false, diff: Some(rows), undo_stack: Vec::new(),
                redo_stack: Vec::new(), trailing_newline: true,
-               image_bytes: None, image_frames: Vec::new(), image_delays: Vec::new() }
+               image_bytes: None, image_view: None }
     }
 
     /// Full buffer text, plus the trailing newline the file had on disk when
@@ -132,8 +130,7 @@ impl Buffer {
             self.image_bytes = Some(std::fs::read(&path)
                 .map_err(|e| format!("reload {}: {e}", path.display()))?);
             // force re-decode/re-upload with the new bytes
-            self.image_frames.clear();
-            self.image_delays.clear();
+            self.image_view = None;
             return Ok(());
         }
         let text = std::fs::read_to_string(&path)

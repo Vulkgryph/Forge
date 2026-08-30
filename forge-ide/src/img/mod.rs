@@ -24,13 +24,14 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// One frame of an animation, already composited to full size.
-#[derive(Clone)]
-pub struct Frame {
-    pub image: Image,
-    /// How long to show it. Zero delays are normalised to 100ms, which is what
-    /// browsers do with the many GIFs that ask for zero.
-    pub delay_ms: u32,
+pub use gif::Animation;
+
+/// What a file turned out to be.
+pub enum Decoded {
+    Still(Image),
+    /// Parsed, but not yet drawn: frames are composited on demand. Decoding
+    /// every frame of a screen recording up front would cost gigabytes.
+    Animated(Animation),
 }
 
 /// Whether Forge can show this file, by extension.
@@ -40,12 +41,12 @@ pub fn is_supported_ext(ext: &str) -> bool {
 
 /// Decode by content rather than by extension, so a mislabelled file still
 /// opens and a `.png` that is really a GIF does the right thing.
-pub fn decode(bytes: &[u8]) -> Result<Vec<Frame>, String> {
+pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     if png::looks_like_png(bytes) {
-        return Ok(vec![Frame { image: png::decode(bytes)?, delay_ms: 0 }]);
+        return Ok(Decoded::Still(png::decode(bytes)?));
     }
     if gif::looks_like_gif(bytes) {
-        return gif::decode(bytes);
+        return Ok(Decoded::Animated(gif::parse(bytes)?));
     }
     Err("unrecognised image format (Forge decodes PNG and GIF)".into())
 }
@@ -107,7 +108,7 @@ mod tests {
         assert!(decode(b"not an image at all").is_err());
         // A valid signature followed by nothing.
         assert!(png::decode(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).is_err());
-        assert!(gif::decode(b"GIF89a").is_err());
+        assert!(gif::parse(b"GIF89a").is_err());
         // A truncated PNG: real header, body cut off mid-stream.
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let full = std::fs::read(root.join("assets/forge-ide.png")).unwrap();
@@ -124,15 +125,84 @@ mod tests {
             eprintln!("no demo gif in the tree; skipping");
             return;
         };
-        let frames = gif::decode(&bytes).expect("our decoder");
-        assert!(frames.len() > 100, "only {} frames", frames.len());
-        let (w, h) = (frames[0].image.width, frames[0].image.height);
-        assert_eq!((w, h), (896, 454));
-        for (i, f) in frames.iter().enumerate() {
-            assert_eq!((f.image.width, f.image.height), (w, h), "frame {i} is a different size");
-            assert_eq!(f.image.rgba.len(), w * h * 4, "frame {i} is not fully composited");
-            assert!(f.delay_ms > 0, "frame {i} has no delay");
+        let mut anim = gif::parse(&bytes).expect("our decoder");
+        assert!(anim.frame_count() > 100, "only {} frames", anim.frame_count());
+        assert_eq!((anim.width, anim.height), (896, 454));
+
+        // Walk the whole animation, one frame at a time. The canvas is reused,
+        // so this holds one frame's worth of pixels however many there are —
+        // decoding them all at once would be gigabytes.
+        let count = anim.frame_count();
+        for i in 0..count {
+            let canvas = anim.seek(i).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(canvas.len(), anim.width * anim.height * 4, "frame {i} is not full size");
+            assert!(anim.delay_ms(i) > 0, "frame {i} has no delay");
         }
+
+        // Seeking backwards replays from the start rather than showing a
+        // half-composited picture.
+        let first_again = anim.seek(0).expect("rewind").to_vec();
+        let first = { let mut a = gif::parse(&bytes).unwrap(); a.seek(0).unwrap().to_vec() };
+        assert_eq!(first_again, first, "seeking backwards did not reproduce frame 0");
+    }
+
+    /// Scrubbing backwards has to land on exactly the picture that playing
+    /// forwards would show. A GIF frame is a patch over its predecessor, so a
+    /// seek that resumes from the wrong saved state produces a plausible but
+    /// wrong image — smeared remnants of frames that should have been disposed
+    /// of — and nothing about it looks like an error.
+    ///
+    /// So: play forwards recording what each frame looks like, then jump around
+    /// out of order and demand the same pixels back.
+    #[test]
+    fn seeking_backwards_matches_playing_forwards() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.parent().unwrap().join("forge-tui-rs/assets/forge-tui-demo.gif");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("no demo gif in the tree; skipping");
+            return;
+        };
+
+        // Forward pass: the truth, one frame at a time.
+        let mut forward = gif::parse(&bytes).expect("parse");
+        let count = forward.frame_count();
+        let probes: Vec<usize> = vec![0, 1, 7, count / 4, count / 2, count - 2, count - 1];
+        let mut expected = std::collections::HashMap::new();
+        for i in 0..count {
+            let canvas = forward.seek(i).expect("forward");
+            if probes.contains(&i) {
+                expected.insert(i, digest(canvas));
+            }
+        }
+
+        // Now jump about: backwards, forwards, and repeated.
+        let mut scrub = gif::parse(&bytes).expect("parse");
+        let order = [count - 1, 0, count / 2, 7, count - 2, 1, count / 4, 0, count / 2];
+        for &i in &order {
+            let got = digest(scrub.seek(i).expect("seek"));
+            if let Some(&want) = expected.get(&i) {
+                assert_eq!(got, want, "frame {i} differs when reached by seeking");
+            }
+        }
+    }
+
+    /// The cache has to stay bounded: it exists so a long recording can be
+    /// scrubbed, not so a long recording can exhaust memory.
+    #[test]
+    fn the_keyframe_cache_is_bounded() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.parent().unwrap().join("forge-tui-rs/assets/forge-tui-demo.gif");
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let mut anim = gif::parse(&bytes).expect("parse");
+        let count = anim.frame_count();
+        for i in 0..count {
+            anim.seek(i).expect("play through");
+        }
+        let held = anim.keyframe_bytes();
+        assert!(
+            held <= 32 * 1024 * 1024,
+            "keyframes hold {:.1} MB after playing {count} frames", held as f64 / 1e6,
+        );
     }
 
     /// Round-trip through our own inflate: a stored block, and a compressed one.

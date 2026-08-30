@@ -1488,29 +1488,152 @@ fn load_forge_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 
 /// Decodes raw image bytes (an open image-tab buffer's file content) and
 /// uploads them as a texture for `draw_image_view` to paint.
-/// Decode an image to textures — one per frame, so an animation can be played.
+/// Playback controls for an animated image: rewind, play/pause, and a scrub bar.
 ///
-/// Uploaded up front rather than lazily per frame: a GIF's frames are already
-/// composited to full size by the decoder, and uploading mid-animation would
-/// stutter on exactly the frame it happened.
-fn load_image_frames(
-    ctx: &egui::Context,
-    bytes: &[u8],
-) -> Option<(Vec<egui::TextureHandle>, Vec<u32>)> {
-    let frames = crate::img::decode(bytes).ok()?;
-    let mut textures = Vec::with_capacity(frames.len());
-    let mut delays = Vec::with_capacity(frames.len());
-    for (i, frame) in frames.iter().enumerate() {
-        let colour = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.image.width, frame.image.height],
-            &frame.image.rgba,
-        );
-        textures.push(ctx.load_texture(
-            format!("buffer_image_{i}"), colour, egui::TextureOptions::LINEAR,
-        ));
-        delays.push(frame.delay_ms);
+/// A long recording is not much use as a picture that only ever loops from
+/// wherever it happens to be — the point of watching one is usually to see a
+/// particular moment again. So it is treated as video: it can be paused,
+/// restarted, and dragged to any frame.
+fn draw_transport(ui: &mut egui::Ui, bar: egui::Rect, view: &mut ImageView) {
+    let Some(anim) = &mut view.animation else { return };
+    if anim.frame_count() <= 1 {
+        return;
     }
-    Some((textures, delays))
+    let total = anim.total_ms();
+    let frames = anim.frame_count();
+    let p = ui.painter();
+
+    // Buttons on the left, track filling the rest.
+    let button = 22.0;
+    let rewind = egui::Rect::from_min_size(bar.left_top(), egui::vec2(button, bar.height()));
+    let play = egui::Rect::from_min_size(
+        bar.left_top() + egui::vec2(button + 4.0, 0.0), egui::vec2(button, bar.height()));
+    let track = egui::Rect::from_min_max(
+        egui::pos2(play.right() + 10.0, bar.center().y - 3.0),
+        egui::pos2(bar.right() - 92.0, bar.center().y + 3.0),
+    );
+
+    let fg = egui::Color32::from_gray(190);
+    let dim = egui::Color32::from_gray(90);
+
+    // ⏮ rewind to the first frame
+    let c = rewind.center();
+    p.rect_filled(egui::Rect::from_min_size(c + egui::vec2(-6.0, -5.0), egui::vec2(2.0, 10.0)), 0.0, fg);
+    p.add(egui::Shape::convex_polygon(
+        vec![c + egui::vec2(6.0, -5.0), c + egui::vec2(6.0, 5.0), c + egui::vec2(-3.0, 0.0)],
+        fg, egui::Stroke::NONE));
+
+    // play / pause
+    let c = play.center();
+    if view.playing {
+        for dx in [-4.0, 2.0] {
+            p.rect_filled(egui::Rect::from_min_size(c + egui::vec2(dx, -5.0), egui::vec2(3.0, 10.0)), 0.0, fg);
+        }
+    } else {
+        p.add(egui::Shape::convex_polygon(
+            vec![c + egui::vec2(-4.0, -5.0), c + egui::vec2(-4.0, 5.0), c + egui::vec2(6.0, 0.0)],
+            fg, egui::Stroke::NONE));
+    }
+
+    // track, with the played portion filled
+    p.rect_filled(track, 3.0, egui::Color32::from_gray(55));
+    let fraction = view.position_ms as f32 / total as f32;
+    let mut done = track;
+    done.max.x = track.left() + track.width() * fraction.clamp(0.0, 1.0);
+    p.rect_filled(done, 3.0, egui::Color32::from_rgb(90, 140, 200));
+    p.circle_filled(egui::pos2(done.right(), track.center().y), 6.0, fg);
+
+    // frame counter
+    p.text(
+        egui::pos2(bar.right(), bar.center().y), egui::Align2::RIGHT_CENTER,
+        format!("{}/{}  {:.1}s", view.shown + 1, frames, total as f32 / 1000.0),
+        egui::FontId::monospace(11.0), dim,
+    );
+
+    // ── interaction ──────────────────────────────────────────────────────
+    let id = ui.id().with("image_transport");
+    if ui.interact(rewind, id.with("rewind"), egui::Sense::click()).clicked() {
+        view.position_ms = 0;
+    }
+    if ui.interact(play, id.with("play"), egui::Sense::click()).clicked() {
+        view.playing = !view.playing;
+    }
+    // A generous hit area: a six-pixel track is hard to grab.
+    let grab = track.expand2(egui::vec2(0.0, 9.0));
+    let scrub = ui.interact(grab, id.with("track"), egui::Sense::click_and_drag());
+    if scrub.is_pointer_button_down_on() || scrub.clicked() {
+        if let Some(pos) = scrub.interact_pointer_pos() {
+            let f = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            view.position_ms = (total as f32 * f) as u64;
+            // Dragging is a deliberate act of looking at one moment; carrying
+            // on playing would pull the picture out from under the pointer.
+            view.playing = false;
+        }
+    }
+    if scrub.hovered() || ui.rect_contains_pointer(rewind) || ui.rect_contains_pointer(play) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
+/// What an open image tab is showing: one texture, reused.
+///
+/// A GIF's frames are composited on demand rather than up front. The demo
+/// recording in this repository is 2,258 frames of 896×454 — decoded eagerly
+/// that is 3.7 GB of pixels and a texture upload each, which showed up as a
+/// long pause before anything appeared. Streaming it costs one canvas and one
+/// texture, whatever the length.
+pub struct ImageView {
+    pub texture: egui::TextureHandle,
+    pub animation: Option<crate::img::Animation>,
+    /// Which frame the texture currently holds.
+    pub shown: usize,
+    /// Playing, or parked on `shown`.
+    pub playing: bool,
+    /// Where in the loop playback is, in milliseconds. Kept rather than derived
+    /// from the wall clock so that pausing, scrubbing and resuming all continue
+    /// from the same place instead of snapping back to where a free-running
+    /// clock had got to.
+    pub position_ms: u64,
+    /// Wall clock at the last frame, to advance `position_ms` by real elapsed
+    /// time — a repaint may be late, and the animation should not drift.
+    pub last_tick: Option<std::time::Instant>,
+}
+
+fn upload(ctx: &egui::Context, w: usize, h: usize, rgba: &[u8], tex: Option<&mut egui::TextureHandle>)
+    -> Option<egui::TextureHandle>
+{
+    let colour = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+    match tex {
+        // Reusing the handle replaces the pixels in place rather than
+        // allocating a new texture for every frame.
+        Some(t) => { t.set(colour, egui::TextureOptions::LINEAR); None }
+        None => Some(ctx.load_texture("buffer_image", colour, egui::TextureOptions::LINEAR)),
+    }
+}
+
+fn load_image_view(ctx: &egui::Context, bytes: &[u8]) -> Option<ImageView> {
+    match crate::img::decode(bytes).ok()? {
+        crate::img::Decoded::Still(img) => Some(ImageView {
+            texture: upload(ctx, img.width, img.height, &img.rgba, None)?,
+            animation: None,
+            shown: 0,
+            playing: false,
+            position_ms: 0,
+            last_tick: None,
+        }),
+        crate::img::Decoded::Animated(mut anim) => {
+            let (w, h) = (anim.width, anim.height);
+            let first = anim.seek(0).ok()?.to_vec();
+            Some(ImageView {
+                texture: upload(ctx, w, h, &first, None)?,
+                animation: Some(anim),
+                shown: 0,
+                playing: true,
+                position_ms: 0,
+                last_tick: None,
+            })
+        }
+    }
 }
 
 /// "Natural" string comparison for the model picker: alphabetical, but a run
@@ -2031,6 +2154,48 @@ fn workspace_label(cwd: &std::path::Path, has_folder: bool) -> &str {
         return "No folder";
     }
     cwd.file_name().and_then(|n| n.to_str()).unwrap_or("Forge IDE")
+}
+
+/// How long a window may poll continuously before it says so.
+///
+/// Anything genuinely in flight finishes well inside this. Past it, something
+/// is stuck, and the window has been burning a percent of a core to redraw a
+/// picture that is not changing.
+const POLLING_COMPLAINT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the window calls itself: the title in the title bar, and the label
+/// macOS shows when hovering a minimised window or in Mission Control.
+///
+/// The shape is VS Code's — `file — folder` — because that is what a person
+/// switching between windows is actually looking for, and several windows all
+/// reading "Forge IDE" are indistinguishable in the Dock, which is the problem
+/// this solves. A remote window says so, since telling a local window from a
+/// remote one matters more than either name.
+fn window_title(
+    active_file: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+    has_folder: bool,
+    remote_host: Option<&str>,
+) -> String {
+    let file = active_file
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty());
+    let folder = has_folder
+        .then(|| cwd.file_name().and_then(|n| n.to_str()))
+        .flatten()
+        .filter(|n| !n.is_empty());
+
+    let mut title = match (file, folder) {
+        (Some(f), Some(d)) => format!("{f} — {d}"),
+        (Some(f), None) => f.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => "Forge IDE".to_string(),
+    };
+    if let Some(host) = remote_host.filter(|h| !h.is_empty()) {
+        title.push_str(&format!(" [SSH: {host}]"));
+    }
+    title
 }
 
 fn skip_all_confirmation_accepts(typed: &str) -> bool {
@@ -4075,6 +4240,12 @@ pub struct IdeApp {
     terminal_height: f32,
     pub settings:    crate::settings::Settings,
     settings_open:   bool,
+    /// The title last sent to the platform, so it is only sent when it changes.
+    window_title:    String,
+    /// When the window started polling without a break, and whether it has
+    /// already said so — see `note_polling`.
+    polling_since:   Option<std::time::Instant>,
+    polling_reported: bool,
     /// Set while the Settings pane is asking the user to type `confirm` before
     /// *Skip All Permissions* becomes the default for new tabs. `None` when no
     /// confirmation is open; the string is what has been typed so far.
@@ -4425,6 +4596,9 @@ impl IdeApp {
             terminal_height: 260.0,
             settings:        crate::settings::load(),
             settings_open:   false,
+            window_title:    String::new(),
+            polling_since:   None,
+            polling_reported: false,
             settings_skip_all_confirm: None,
             palette:         crate::theme::Palette::default(),
             theme_picker:    None,
@@ -4691,11 +4865,16 @@ impl IdeApp {
     /// workspace. Shared by `save_session` (gated by the opt-in setting)
     /// and `reload_window` (always saves — see its doc comment).
     fn build_session_state(&self) -> crate::session::SessionState {
-        // Diff/image tabs are derived/transient views, not real editable
-        // files — skip them, and remap `active` onto the filtered list
-        // (it was an index into the *unfiltered* buffer list).
+        // A diff tab is a derived view with nothing to reopen. An image tab is
+        // not: it is a file the user opened, and it comes back the same way any
+        // other file does. It was skipped alongside diffs while images were
+        // static previews, which meant a window restored everything except the
+        // picture you were looking at.
+        //
+        // `active` is remapped onto the filtered list, since it indexes the
+        // unfiltered buffers.
         let restorable: Vec<(usize, PathBuf)> = self.buffers.iter().enumerate()
-            .filter(|(_, b)| b.diff.is_none() && b.image_bytes.is_none())
+            .filter(|(_, b)| b.diff.is_none())
             .filter_map(|(i, b)| b.path.clone().map(|p| (i, p)))
             .collect();
         let active_file = restorable.iter().position(|&(i, _)| i == self.active).unwrap_or(0);
@@ -5708,8 +5887,20 @@ impl IdeApp {
             return;
         }
 
-        // ── Per-frame trace (remove after debugging) ──────────────────────────
-        if self.ssh_overlay {
+        // Keep the window's title current. Sent only when it changes: a
+        // viewport command every frame would be a platform round-trip 60 times
+        // a second for a string that changes when you open a file.
+        {
+            let want = window_title(
+                self.buffers.get(self.active).and_then(|b| b.path.as_deref()),
+                &self.cwd,
+                self.has_folder,
+                self.ssh.as_ref().map(|s| s.host.name.as_str()),
+            );
+            if want != self.window_title {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(want.clone()));
+                self.window_title = want;
+            }
         }
 
 
@@ -5815,29 +6006,38 @@ impl IdeApp {
                     .is_some_and(|t| t.terminal.recently_active(TERMINAL_ACTIVE_WINDOW))
             }
         );
-        let anything_streaming =
-            (self.agent_visible && agent_working)
-            || terminal_active
-            || self.task_rx.is_some()
-            || self.ssh_log_rx.is_some()
-            || self.ssh_pty_rx.is_some()
-            || self.ssh_open_rx.is_some()
-            || self.ssh_upload_rx.is_some()
-            || self.ssh_nav_rx.is_some()
-            || self.ssh_connect_rx.is_some()
-            || self.gh_check.is_some()
-            || self.git_task.is_some()
-            || self.git.as_ref().is_some_and(|g| g.scanning())
-            || self.blame_rx.is_some()
-            || self.fmt_rx.is_some()
-            || self.tree_refresh_due.is_some()
-            || self.folder_rx.is_some()
-            || self.dap_running
-            || self.search.searching
-            || self.anvil_heat > 0.001;
-        if anything_streaming {
+        // Named rather than or-ed together, so the window can say *why* it is
+        // awake. A single one of these stuck true polls at 20Hz forever, which
+        // is invisible from the outside — it shows up only as a window using a
+        // percent of a core while apparently doing nothing, and there is no way
+        // to tell which of eighteen conditions it is without a debugger.
+        let mut awake_because: Vec<&'static str> = Vec::new();
+        {
+            let mut note = |cond: bool, why: &'static str| if cond { awake_because.push(why) };
+            note(self.agent_visible && agent_working, "agent working");
+            note(terminal_active,                     "terminal output");
+            note(self.task_rx.is_some(),              "background task");
+            note(self.ssh_log_rx.is_some(),           "ssh log");
+            note(self.ssh_pty_rx.is_some(),           "ssh terminal");
+            note(self.ssh_open_rx.is_some(),          "ssh file open");
+            note(self.ssh_upload_rx.is_some(),        "ssh upload");
+            note(self.ssh_nav_rx.is_some(),           "ssh navigation");
+            note(self.ssh_connect_rx.is_some(),       "ssh connect");
+            note(self.gh_check.is_some(),             "update check");
+            note(self.git_task.is_some(),             "git task");
+            note(self.git.as_ref().is_some_and(|g| g.scanning()), "git scan");
+            note(self.blame_rx.is_some(),             "git blame");
+            note(self.fmt_rx.is_some(),               "formatter");
+            note(self.tree_refresh_due.is_some(),     "file tree refresh");
+            note(self.folder_rx.is_some(),            "folder load");
+            note(self.dap_running,                    "debugger");
+            note(self.search.searching,               "search");
+            note(self.anvil_heat > 0.001,             "anvil animation");
+        }
+        if !awake_because.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        self.note_polling(&awake_because);
 
         // Poll any in-flight git fetch/pull/push
         self.poll_git_task();
@@ -13858,61 +14058,130 @@ impl IdeApp {
         }
     }
 
+    /// Notice a window that has been polling for too long, and say why.
+    ///
+    /// A stuck condition costs about a percent of a core, forever, on a window
+    /// that looks idle. That is small enough to overlook and large enough to
+    /// matter across several windows left open for days — and until now the
+    /// only symptom was the number in Activity Monitor, with nothing anywhere
+    /// to say which of eighteen conditions was responsible.
+    fn note_polling(&mut self, reasons: &[&'static str]) {
+        if reasons.is_empty() {
+            self.polling_since = None;
+            self.polling_reported = false;
+            return;
+        }
+        let since = *self.polling_since.get_or_insert_with(std::time::Instant::now);
+        if !self.polling_reported && since.elapsed() > POLLING_COMPLAINT_AFTER {
+            self.polling_reported = true;
+            self.output_log(
+                format!(
+                    "This window has been redrawing continuously for {}s, waiting on: {}. \
+                     That costs about a percent of a core. If nothing is actually running, \
+                     it is a stuck flag — please report it with this line.",
+                    since.elapsed().as_secs(),
+                    reasons.join(", "),
+                ),
+                OutputLevel::Warn,
+            );
+        }
+    }
+
     /// Render a read-only preview for an image tab, scaled to fit the pane.
     fn draw_image_view(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, self.palette.editor_bg_c());
         let Some(buf) = self.buffers.get_mut(self.active) else { return };
 
-        if buf.image_frames.is_empty() {
+        if buf.image_view.is_none() {
             if let Some(bytes) = &buf.image_bytes {
-                if let Some((textures, delays)) = load_image_frames(ui.ctx(), bytes) {
-                    buf.image_frames = textures;
-                    buf.image_delays = delays;
+                buf.image_view = load_image_view(ui.ctx(), bytes);
+            }
+        }
+
+        // Advance by real elapsed time rather than by frame count, so playback
+        // keeps its true speed even when a repaint is late, and ask for a
+        // repaint only while actually playing — a paused or still image costs
+        // nothing.
+        if let Some(view) = &mut buf.image_view {
+            if let Some(anim) = &mut view.animation {
+                if anim.frame_count() > 1 {
+                    let now = std::time::Instant::now();
+                    if view.playing {
+                        if let Some(prev) = view.last_tick {
+                            let step = now.duration_since(prev).as_millis() as u64;
+                            view.position_ms = (view.position_ms + step) % anim.total_ms();
+                        }
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                            anim.delay_ms(view.shown).clamp(16, 200) as u64,
+                        ));
+                    }
+                    view.last_tick = Some(now);
+
+                    let due = anim.frame_at(view.position_ms);
+                    if due != view.shown {
+                        let (w, h) = (anim.width, anim.height);
+                        if let Ok(canvas) = anim.seek(due) {
+                            let colour = egui::ColorImage::from_rgba_unmultiplied([w, h], canvas);
+                            view.texture.set(colour, egui::TextureOptions::LINEAR);
+                            view.shown = due;
+                        }
+                    }
                 }
             }
         }
 
-        // Which frame is due. Driven by wall clock rather than a frame counter,
-        // so the animation runs at its own speed regardless of the repaint rate,
-        // and a repaint is requested only while there is more than one frame.
-        let frame_index = if buf.image_frames.len() > 1 {
-            let total: u32 = buf.image_delays.iter().sum::<u32>().max(1);
-            let elapsed = ui.input(|i| i.time);
-            let mut at = ((elapsed * 1000.0) as u64 % total as u64) as u32;
-            let mut which = 0;
-            for (i, d) in buf.image_delays.iter().enumerate() {
-                if at < *d { which = i; break; }
-                at -= *d;
-                which = i;
-            }
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(
-                (*buf.image_delays.get(which).unwrap_or(&100)).max(16) as u64,
-            ));
-            which
-        } else {
-            0
-        };
+        // Reserve the bottom strip *before* sizing the picture, so the caption
+        // and the transport bar are always on screen. Sizing the image to the
+        // whole pane first and then placing the controls beneath it put them
+        // below the visible area as soon as the pane was made short — the
+        // controls disappeared exactly when the pane was too small to scrub in
+        // by eye, which is when they are most wanted.
+        let animated = buf.image_view.as_ref()
+            .and_then(|v| v.animation.as_ref())
+            .is_some_and(|a| a.frame_count() > 1);
+        let caption_h = if rect.height() > 120.0 { 22.0 } else { 0.0 };
+        let transport_h = if animated && rect.height() > 90.0 { 34.0 } else { 0.0 };
+        let reserved = caption_h + transport_h;
+        let stage = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.max.x, (rect.max.y - reserved).max(rect.min.y + 1.0)),
+        );
 
-        match buf.image_frames.get(frame_index) {
+        let mut transport: Option<egui::Rect> = None;
+        match buf.image_view.as_ref().map(|v| &v.texture) {
             Some(tex) => {
                 let tex_size = tex.size_vec2();
-                let avail = (rect.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(1.0, 1.0));
+                // Padding shrinks with the pane: a fixed 24pt margin on each
+                // side is most of a short pane.
+                let pad = (stage.height() * 0.12).clamp(4.0, 24.0);
+                let avail = (stage.size() - egui::vec2(pad * 2.0, pad * 2.0))
+                    .max(egui::vec2(1.0, 1.0));
                 let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0);
                 let draw_size = tex_size * scale;
-                let img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
+                let img_rect = egui::Rect::from_center_size(stage.center(), draw_size);
                 ui.painter().image(
                     tex.id(), img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-                ui.painter().text(
-                    egui::pos2(rect.center().x, img_rect.bottom() + 18.0),
-                    egui::Align2::CENTER_TOP,
-                    format!("{} × {}", tex_size.x as i32, tex_size.y as i32),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_gray(140),
-                );
+                // Both anchored to the bottom of the pane rather than to the
+                // picture, so neither can be pushed out of view.
+                if caption_h > 0.0 {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, stage.bottom() + 4.0),
+                        egui::Align2::CENTER_TOP,
+                        format!("{} × {}", tex_size.x as i32, tex_size.y as i32),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(140),
+                    );
+                }
+                if transport_h > 0.0 {
+                    transport = Some(egui::Rect::from_center_size(
+                        egui::pos2(rect.center().x, rect.bottom() - transport_h / 2.0 - 5.0),
+                        egui::vec2((rect.width() - 40.0).clamp(160.0, 560.0), 24.0),
+                    ));
+                }
             }
             None => {
                 ui.painter().text(
@@ -13922,6 +14191,10 @@ impl IdeApp {
                     egui::Color32::from_gray(150),
                 );
             }
+        }
+
+        if let (Some(bar), Some(view)) = (transport, buf.image_view.as_mut()) {
+            draw_transport(ui, bar, view);
         }
     }
 
@@ -14851,6 +15124,12 @@ fn setup_fonts(ctx: &egui::Context) {
             fonts.font_data.insert("ide_symbols".into(), egui::FontData::from_owned(data));
             fonts.families.get_mut(&egui::FontFamily::Proportional)
                 .unwrap().insert(1, "ide_symbols".into());
+            // And behind the code font: the terminal draws whatever a program
+            // running in it prints, and every TUI spinner is Braille
+            // (U+2800..28FF), which Menlo does not have. Without this, anything
+            // loading in the terminal is a row of empty boxes.
+            fonts.families.get_mut(&egui::FontFamily::Monospace)
+                .unwrap().push("ide_symbols".into());
             break;
         }
     }
@@ -14872,6 +15151,13 @@ fn setup_fonts(ctx: &egui::Context) {
             fonts.font_data.insert("ide_mono".into(), egui::FontData::from_owned(data));
             fonts.families.get_mut(&egui::FontFamily::Monospace)
                 .unwrap().insert(0, "ide_mono".into());
+            // Behind the UI font too. The two families cover different things —
+            // Apple Symbols has Braille and arrows but no `✔` or `❯`; Menlo has
+            // those and the box-drawing set but no Braille — so each is the
+            // other's fallback rather than each family missing what the other
+            // has. `✔` in a todo list rendered as an empty box for that reason.
+            fonts.families.get_mut(&egui::FontFamily::Proportional)
+                .unwrap().push("ide_mono".into());
             break;
         }
     }
@@ -15520,6 +15806,51 @@ mod permission_mode_tests {
 }
 
 #[cfg(test)]
+mod loaded_font_tests {
+    /// Ask egui what it can actually draw, rather than parsing font files and
+    /// inferring it.
+    ///
+    /// Reading a `cmap` says what is *in the file*. It does not say whether the
+    /// file was loaded — and Menlo is a TrueType **collection**, which not every
+    /// font loader accepts. If it is silently rejected, the monospace family
+    /// falls back to egui's built-in Hack, and every glyph Menlo was carrying
+    /// disappears while a file-based check still reports it present. That is
+    /// exactly the shape of "the spinner is fixed but the checkmarks are not".
+    #[test]
+    fn the_glyphs_the_ui_and_terminal_draw_are_actually_renderable() {
+        let ctx = egui::Context::default();
+        super::setup_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+
+        // Terminal output is monospace; panel chrome is proportional.
+        let cases: &[(egui::FontFamily, &str, &str)] = &[
+            (egui::FontFamily::Monospace, "\u{2714}", "todo done"),
+            (egui::FontFamily::Monospace, "\u{25B8}", "todo in progress"),
+            (egui::FontFamily::Monospace, "\u{25CB}", "todo pending"),
+            (egui::FontFamily::Monospace, "\u{280B}", "spinner"),
+            (egui::FontFamily::Monospace, "\u{2819}", "spinner"),
+            (egui::FontFamily::Monospace, "\u{276F}", "prompt caret"),
+            (egui::FontFamily::Monospace, "\u{2500}", "box drawing"),
+            (egui::FontFamily::Monospace, "\u{256D}", "box corner"),
+            (egui::FontFamily::Monospace, "\u{25B6}", "permission mode"),
+            (egui::FontFamily::Monospace, "\u{2759}", "plan mode"),
+            (egui::FontFamily::Proportional, "\u{2714}", "todo done"),
+            (egui::FontFamily::Proportional, "\u{2715}", "close button"),
+        ];
+
+        let mut missing = Vec::new();
+        for (family, text, what) in cases {
+            let id = egui::FontId::new(13.0, family.clone());
+            let ch = text.chars().next().unwrap();
+            if !ctx.fonts(|f| f.has_glyph(&id, ch)) {
+                missing.push(format!("{what} {ch:?} U+{:04X} in {family:?}", ch as u32));
+            }
+        }
+        assert!(missing.is_empty(), "no loaded font can draw: {missing:#?}");
+    }
+}
+
+#[cfg(test)]
 mod glyph_coverage {
     /// Every glyph the UI draws must exist in a font that is actually loaded.
     ///
@@ -15565,6 +15896,52 @@ mod glyph_coverage {
         );
     }
 
+    /// The terminal draws whatever a program running in it prints, which no
+    /// scan of this repository can predict. The one range that matters in
+    /// practice is Braille: every TUI spinner is made of it — `⠋⠙⠹⠸⠼⠴⠦⠧` —
+    /// so a terminal font without it shows a row of empty boxes wherever
+    /// something is loading. Reported as "the loading cursor renders a unicode
+    /// cube".
+    ///
+    /// The code font is checked here rather than the UI font, because terminal
+    /// output is drawn in the monospace family.
+    #[test]
+    fn the_code_font_covers_the_braille_a_spinner_is_made_of() {
+        // Both families' fonts: each is the other's fallback, so a glyph only
+        // has to exist in one of them.
+        let candidates = [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+        ];
+        let mut covered: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut found_any = false;
+        for path in candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                found_any = true;
+                covered.extend(codepoints(&bytes));
+            }
+        }
+        if !found_any {
+            return; // not this platform
+        }
+        // The eight frames of the common Braille spinner, plus the ends of the
+        // block, since a font may carry only part of it — and the marks a todo
+        // list is drawn with, which tofu'd for the mirror-image reason: Menlo
+        // has them and Apple Symbols does not.
+        let spinner: Vec<u32> = "\u{280B}\u{2819}\u{2839}\u{2838}\u{283C}\u{2834}\u{2826}\u{2827}\
+                                 \u{2714}\u{25B8}\u{25CB}\u{276F}\u{25B6}\u{2759}"
+            .chars().map(|c| c as u32).collect();
+        let missing: Vec<String> = spinner.iter().chain([0x2800, 0x28FF].iter())
+            .filter(|cp| !covered.contains(cp))
+            .map(|cp| format!("U+{cp:04X}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the monospace fonts loaded for the terminal have no Braille: {missing:?} — \
+             every TUI spinner is drawn with these",
+        );
+    }
+
     /// Characters inside double-quoted literals on a line. Crude on purpose:
     /// over-reporting would be caught by eye, under-reporting would let a tofu
     /// glyph through.
@@ -15596,16 +15973,43 @@ mod glyph_coverage {
             (be16(at) << 16) | be16(at + 2)
         };
         let mut out = Vec::new();
-        let tables = be16(4) as usize;
-        let mut cmap = None;
-        for i in 0..tables {
-            let rec = 12 + i * 16;
-            if d.get(rec..rec + 4) == Some(b"cmap") {
-                cmap = Some(be32(rec + 8) as usize);
-                break;
+
+        // A `.ttc` is a collection: the header holds a count and one offset per
+        // font, and the table directory each of those points at is what a plain
+        // `.ttf` has at offset zero. Menlo — the code font — is a collection, so
+        // reading offset 12 as a table record parsed the font's own offset as
+        // if it were a tag and found nothing. Every glyph then looked missing.
+        let font_offsets: Vec<usize> = if d.get(..4) == Some(b"ttcf") {
+            let count = be32(8) as usize;
+            (0..count).map(|i| be32(12 + i * 4) as usize).collect()
+        } else {
+            vec![0]
+        };
+
+        for base in font_offsets {
+            let tables = be16(base + 4) as usize;
+            let mut cmap = None;
+            for i in 0..tables {
+                let rec = base + 12 + i * 16;
+                if d.get(rec..rec + 4) == Some(b"cmap") {
+                    cmap = Some(be32(rec + 8) as usize);
+                    break;
+                }
             }
+            let Some(cmap) = cmap else { continue };
+            out.extend(cmap_codepoints(cmap, &be16, &be32));
         }
-        let Some(cmap) = cmap else { return out };
+        out
+    }
+
+    /// Every codepoint in one `cmap` table. The readers close over the font's
+    /// bytes, so the table offset is all this needs.
+    fn cmap_codepoints(
+        cmap: usize,
+        be16: &impl Fn(usize) -> u32,
+        be32: &impl Fn(usize) -> u32,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
         for i in 0..be16(cmap + 2) as usize {
             let sub = cmap + be32(cmap + 4 + i * 8 + 4) as usize;
             match be16(sub) {
@@ -15636,7 +16040,6 @@ mod glyph_coverage {
         out
     }
 }
-
 #[cfg(test)]
 mod remote_path_tests {
     use super::{remote_parent, resolve_remote_dir};
@@ -17234,6 +17637,182 @@ mod strip_width_tests {
             let w = row_width(&ctx, d, "claude-opus-4-6");
             assert!(w <= avail, "{w:.0}pt at {avail:.0}pt ({d:?}) — it wraps");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_restore_filter_tests {
+    /// Which open tabs are worth writing into the session record.
+    ///
+    /// A diff tab is a derived view of a comparison — there is no file to
+    /// reopen. An image tab *is* a file, and was skipped alongside diffs while
+    /// images were static previews, so a restored window came back with
+    /// everything except the picture that was open.
+    fn restorable(is_diff: bool, is_image: bool, has_path: bool) -> bool {
+        !is_diff && has_path && { let _ = is_image; true }
+    }
+
+    #[test]
+    fn an_image_tab_comes_back() {
+        assert!(restorable(false, true, true), "an image is a file you opened");
+    }
+
+    #[test]
+    fn an_ordinary_file_still_comes_back() {
+        assert!(restorable(false, false, true));
+    }
+
+    /// A diff has nothing to reopen, and a buffer with no path never existed on
+    /// disk to begin with.
+    #[test]
+    fn derived_and_unsaved_views_do_not() {
+        assert!(!restorable(true, false, true), "a diff is derived");
+        assert!(!restorable(false, false, false), "an unsaved buffer has no path");
+        assert!(!restorable(false, true, false));
+    }
+}
+
+#[cfg(test)]
+mod image_pane_layout_tests {
+    /// The layout rule, extracted so the behaviour can be checked without a
+    /// window: the bottom strip is reserved before the picture is sized, and
+    /// both parts drop out as the pane gets too short to hold them.
+    fn reserved(height: f32, animated: bool) -> (f32, f32) {
+        let caption = if height > 120.0 { 22.0 } else { 0.0 };
+        let transport = if animated && height > 90.0 { 34.0 } else { 0.0 };
+        (caption, transport)
+    }
+
+    /// The bug: sizing the image to the whole pane and then putting the
+    /// controls under it pushed them off the bottom as soon as the pane was
+    /// shortened — which is exactly when they are hardest to do without.
+    #[test]
+    fn the_transport_survives_a_short_pane() {
+        for h in [95.0_f32, 120.0, 200.0, 900.0] {
+            let (_, transport) = reserved(h, true);
+            assert!(transport > 0.0, "no transport reserved at {h}pt");
+        }
+    }
+
+    /// Below that there is genuinely no room, and half a control bar is worse
+    /// than none — the picture gets the space instead.
+    #[test]
+    fn a_pane_too_short_for_controls_gives_up_gracefully() {
+        let (caption, transport) = reserved(80.0, true);
+        assert_eq!((caption, transport), (0.0, 0.0));
+    }
+
+    /// A still image reserves nothing for a transport it does not have.
+    #[test]
+    fn a_still_image_reserves_no_transport() {
+        let (caption, transport) = reserved(600.0, false);
+        assert_eq!(transport, 0.0);
+        assert!(caption > 0.0, "but it still says its dimensions");
+    }
+
+    /// The reserved strip must never exceed the pane, or the picture would be
+    /// given a negative height.
+    #[test]
+    fn the_reserved_strip_always_leaves_room_for_the_picture() {
+        for h in [40.0_f32, 90.0, 91.0, 121.0, 400.0] {
+            let (c, t) = reserved(h, true);
+            assert!(c + t < h, "reserved {} of {h}pt", c + t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod polling_diagnostic_tests {
+    /// The rule the diagnostic applies, extracted so it can be tested without a
+    /// window: complain once, only after the window has polled without a break
+    /// for longer than anything real takes.
+    fn should_complain(elapsed: std::time::Duration, already: bool, reasons: usize) -> bool {
+        reasons > 0 && !already && elapsed > super::POLLING_COMPLAINT_AFTER
+    }
+
+    /// A window that is briefly busy — a git scan, a formatter, a turn of the
+    /// agent — must say nothing. Complaining about ordinary work would train
+    /// the user to ignore the message.
+    #[test]
+    fn ordinary_work_is_not_reported() {
+        use std::time::Duration;
+        assert!(!should_complain(Duration::from_secs(1), false, 1));
+        assert!(!should_complain(Duration::from_secs(59), false, 2));
+    }
+
+    /// Past a minute of unbroken polling, something is stuck.
+    #[test]
+    fn a_stuck_flag_is_reported_once() {
+        use std::time::Duration;
+        assert!(should_complain(Duration::from_secs(61), false, 1));
+        assert!(!should_complain(Duration::from_secs(600), true, 1),
+            "it must not repeat itself every frame");
+    }
+
+    /// Nothing to wait on is never worth a message, however long it has been.
+    #[test]
+    fn an_idle_window_is_never_reported() {
+        use std::time::Duration;
+        assert!(!should_complain(Duration::from_secs(3600), false, 0));
+    }
+}
+
+#[cfg(test)]
+mod window_title_tests {
+    use super::window_title;
+    use std::path::Path;
+
+    /// The case this exists for: several windows open, all of them labelled
+    /// "Forge IDE" in the Dock and in Mission Control, with nothing to tell
+    /// them apart. The shape is VS Code's — file, then the folder it is in.
+    #[test]
+    fn a_file_in_a_folder_names_both() {
+        assert_eq!(
+            window_title(Some(Path::new("/w/forge/src/app.rs")), Path::new("/w/forge"), true, None),
+            "app.rs — forge",
+        );
+    }
+
+    /// A folder with nothing open is still worth naming.
+    #[test]
+    fn a_folder_alone_is_the_title() {
+        assert_eq!(window_title(None, Path::new("/w/forge"), true, None), "forge");
+    }
+
+    /// With no folder, the working directory is `$HOME` and naming it would put
+    /// the account name in the title bar — the same reason the status bar does
+    /// not. The application's own name is the honest answer.
+    #[test]
+    fn no_folder_falls_back_to_the_application_name() {
+        assert_eq!(window_title(None, Path::new("/Users/someone"), false, None), "Forge IDE");
+        // A file open without a folder still names the file.
+        assert_eq!(
+            window_title(Some(Path::new("/tmp/notes.md")), Path::new("/Users/someone"), false, None),
+            "notes.md",
+        );
+    }
+
+    /// Telling a remote window from a local one matters more than either name,
+    /// so it is said outright.
+    #[test]
+    fn a_remote_window_says_so() {
+        assert_eq!(
+            window_title(Some(Path::new("/srv/app/main.rs")), Path::new("/srv/app"), true, Some("dev-host")),
+            "main.rs — app [SSH: dev-host]",
+        );
+        assert_eq!(
+            window_title(None, Path::new("/w"), false, Some("dev-host")),
+            "Forge IDE [SSH: dev-host]",
+        );
+    }
+
+    /// Empty and odd paths must not produce a blank title, which would look
+    /// like a broken window in the Dock.
+    #[test]
+    fn nothing_useful_still_produces_a_name() {
+        assert_eq!(window_title(None, Path::new("/"), true, None), "Forge IDE");
+        assert_eq!(window_title(None, Path::new(""), true, None), "Forge IDE");
+        assert_eq!(window_title(Some(Path::new("")), Path::new("/w/forge"), true, None), "forge");
     }
 }
 

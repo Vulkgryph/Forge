@@ -4,6 +4,8 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-08-30
+
 - **The transcript no longer redraws itself eight times a second.** Every spinner tick erased the whole live block and reprinted it — status line, transcript tail, input box — because one character had changed. Measured on a real session: 11.2 KB/s of escape sequences, sustained, for the length of the run. It now rewrites only the lines that differ, and writes nothing at all when a frame is identical. Redrawing everything for one turning character is what a terminal shows as jitter.
 
   Patching is refused, and the frame drawn the whole way, whenever anything below a changed line would move — a different number of lines, or a line whose wrapped height changed. The block's own bookkeeping is kept in step, since a following erase climbs from where the caret is, and getting that wrong is what once stranded copies of the status bar down the screen.

@@ -4,6 +4,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-08-30
+
 ### Added
 
 - **Animated images play, and can be scrubbed like video.** A GIF used to be decoded whole before anything appeared: every frame composited to full size and uploaded as its own texture. For the two-thousand-frame terminal recording in this repository that is 3.7 GB of pixels and 2,258 GPU textures, which is why it took so long to open. Frames are now composited one at a time into a single reused canvas and a single reused texture — about 7 MB whatever the length — and the picture appears immediately.

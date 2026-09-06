@@ -40,6 +40,10 @@ pub struct FileTree {
     pub selected: Option<PathBuf>,
     creating:     Option<Creating>,
     create_name:  String,
+    /// Set when the name box is opened, cleared once it has been given focus.
+    /// See `draw_create_row` for why this cannot simply be asked for on every
+    /// frame.
+    create_focus: bool,
 }
 
 struct Entry { path: PathBuf, depth: usize, is_dir: bool }
@@ -49,7 +53,7 @@ impl FileTree {
         let mut tree = Self {
             root: root.clone(), extra_roots: Vec::new(), entries: Vec::new(),
             expanded: HashSet::new(), selected: None,
-            creating: None, create_name: String::new(),
+            creating: None, create_name: String::new(), create_focus: false,
         };
         tree.expanded.insert(root);
         tree.refresh();
@@ -128,6 +132,16 @@ impl FileTree {
         else             { path.parent().unwrap_or(path).to_path_buf() }
     }
 
+    /// Opens the inline name box for a new file or folder.
+    ///
+    /// The one way in, so that the keyboard focus the box needs cannot be
+    /// forgotten by a new caller — there are already four.
+    fn begin_create(&mut self, what: Creating) {
+        self.creating = Some(what);
+        self.create_name = String::new();
+        self.create_focus = true;
+    }
+
     /// Renders the inline "new file/folder" name box if `self.creating`
     /// targets `target` — as a would-be first child, indented to
     /// `child_depth`. Shared by the root-level case (called once, right
@@ -160,11 +174,28 @@ impl FileTree {
                     .desired_width(140.0)
                     .hint_text(if is_new_folder { "folder name" } else { "file name" })
             );
-            resp.request_focus();
+            // Focus the box once, when it opens — not on every frame.
+            //
+            // Asking every frame made the name box impossible to leave *or*
+            // finish. Enter is committed by watching for the focus the widget
+            // surrenders when it handles that key; re-requesting focus
+            // immediately afterwards, in the same frame and before
+            // `lost_focus()` is read, put it straight back, so the commit was
+            // never seen and the row simply sat there. It also held the
+            // keyboard against every other widget for as long as it was open.
+            if self.create_focus {
+                resp.request_focus();
+                self.create_focus = false;
+            }
 
             let commit = resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape))
+                // Clicked away from an empty box: there is nothing to keep, and
+                // leaving the row open would be leaving a control the user has
+                // already walked away from. A box with a name in it stays, so a
+                // stray click cannot silently drop what was typed.
+                || (resp.lost_focus() && self.create_name.is_empty());
 
             if commit && !self.create_name.is_empty() {
                 let new_path = parent.join(&self.create_name);
@@ -222,14 +253,12 @@ impl FileTree {
             ui.set_min_width(180.0);
             if ui.button("New File…").clicked() {
                 self.expanded.insert(self.root.clone());
-                self.creating    = Some(Creating::File(self.root.clone()));
-                self.create_name = String::new();
+                self.begin_create(Creating::File(self.root.clone()));
                 ui.close_menu();
             }
             if ui.button("New Folder…").clicked() {
                 self.expanded.insert(self.root.clone());
-                self.creating    = Some(Creating::Folder(self.root.clone()));
-                self.create_name = String::new();
+                self.begin_create(Creating::Folder(self.root.clone()));
                 ui.close_menu();
             }
             ui.separator();
@@ -436,14 +465,12 @@ impl FileTree {
 
                         if ui.button("New File…").clicked() {
                             self.expanded.insert(dir.clone());
-                            self.creating    = Some(Creating::File(dir.clone()));
-                            self.create_name = String::new();
+                            self.begin_create(Creating::File(dir.clone()));
                             ui.close_menu();
                         }
                         if ui.button("New Folder…").clicked() {
                             self.expanded.insert(dir.clone());
-                            self.creating    = Some(Creating::Folder(dir.clone()));
-                            self.create_name = String::new();
+                            self.begin_create(Creating::Folder(dir.clone()));
                             ui.close_menu();
                         }
 
@@ -635,5 +662,101 @@ mod walk_bench {
             let tree = super::FileTree::new(p);
             eprintln!("FileTree::new({d}): {:?} ({} rows)", t.elapsed(), tree.entries.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod create_row_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-filetree-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Types `name` into the new-file box and presses Enter, returning whether
+    /// the box committed. Drives real egui frames, because the bug lived
+    /// entirely in the focus bookkeeping between them.
+    fn create_via_box(tree: &mut FileTree, root: &Path, name: &str) -> bool {
+        let ctx = egui::Context::default();
+        let mut created = false;
+
+        for frame in 0..2 {
+            let mut input = egui::RawInput::default();
+            if frame == 1 {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if frame == 1 {
+                        tree.create_name = name.to_string();
+                    }
+                    let mut action = None;
+                    let mut refresh = false;
+                    tree.draw_create_row(ui, &mut action, &mut refresh, root, 0);
+                    if refresh {
+                        created = true;
+                    }
+                });
+            });
+        }
+        created
+    }
+
+    /// Enter creates the file.
+    ///
+    /// It did not: the box asked for keyboard focus on every frame, including
+    /// the frame in which Enter had just made the widget surrender it. Focus
+    /// went straight back before `lost_focus()` was read, so the commit was
+    /// never seen — the name box could not be finished, cancelled by clicking
+    /// away, or left, and it held the keyboard the whole time.
+    #[test]
+    fn enter_creates_the_file() {
+        let root = scratch("enter-commits");
+        let mut tree = FileTree::new(root.clone());
+        tree.begin_create(Creating::File(root.clone()));
+
+        assert!(create_via_box(&mut tree, &root, "notes.md"), "the box never committed");
+        assert!(root.join("notes.md").is_file(), "no file on disk");
+        assert!(tree.creating.is_none(), "the name box is still open");
+        assert!(tree.create_name.is_empty(), "the typed name was left behind");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same for a folder, which takes the other branch.
+    #[test]
+    fn enter_creates_the_folder() {
+        let root = scratch("enter-folder");
+        let mut tree = FileTree::new(root.clone());
+        tree.begin_create(Creating::Folder(root.clone()));
+
+        assert!(create_via_box(&mut tree, &root, "src"), "the box never committed");
+        assert!(root.join("src").is_dir(), "no directory on disk");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Opening the box always asks for focus, however it was opened — a box
+    /// that never gets focus cannot be typed into at all.
+    #[test]
+    fn opening_the_box_asks_for_focus() {
+        let root = scratch("focus-flag");
+        let mut tree = FileTree::new(root.clone());
+        assert!(!tree.create_focus, "nothing is being created yet");
+
+        tree.begin_create(Creating::File(root.clone()));
+        assert!(tree.create_focus, "the box opened without asking for focus");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

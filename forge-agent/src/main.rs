@@ -352,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let workspace_root = std::env::current_dir()?.to_string_lossy().to_string();
     let workspace_root_path = PathBuf::from(&workspace_root);
-    let executor = tools::ToolExecutor::new(workspace_root.clone().into());
+    let mut executor = tools::ToolExecutor::new(workspace_root.clone().into());
     let available_tools: Vec<headless::ToolInfo> = executor
         .toggleable_tool_names()
         .into_iter()
@@ -400,6 +400,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let log_path = conversation_log::session_log_path(&workspace_root_path, &session_id);
         (session_id, log_path, None)
     };
+
+    // ── The agent's own working area ────────────────────────────────────
+    // Created once the session has an id, since the lab is named after it.
+    // Everything here is best-effort: a machine with an unwritable temporary
+    // directory should still run an agent, just without a scratchpad.
+    if app_config.agent.scratchpad.enabled {
+        // Sweep first. Sessions end in every way a process can, so labs are
+        // cleaned up by age at startup rather than on the way out — a lab that
+        // is only deleted on a clean exit is a lab that accumulates.
+        if let Some(keep) = app_config.agent.scratchpad.keep() {
+            let removed = tools::scratchpad::sweep(
+                &tools::scratchpad::base_dir(),
+                keep,
+                std::time::SystemTime::now(),
+            );
+            if removed > 0 {
+                tracing::debug!("swept {removed} stale scratchpad(s)");
+            }
+        }
+        match tools::Scratchpad::create(&hl_session_id) {
+            Ok(pad) => {
+                tracing::debug!("scratchpad at {}", pad.root().display());
+                executor.set_scratchpad(Some(pad));
+            }
+            Err(e) => tracing::warn!("no scratchpad this session: {e}"),
+        }
+    }
 
     // On resume, prefer the session's stored model over the global default.
     let (client, model_id, max_context_tokens) = if let Some(ref meta) = hl_resume_meta {

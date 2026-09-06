@@ -73,6 +73,9 @@ pub struct SubagentRunner {
     same_error_count: u32,
     /// When true, Write tools are blocked until the agent produces a diagnosis.
     analyze_mode: bool,
+    /// The parent's working area, shared rather than duplicated — one agent's
+    /// scratch work is exactly what the next may need to pick up.
+    scratchpad: Option<crate::tools::Scratchpad>,
 }
 
 impl SubagentRunner {
@@ -115,7 +118,16 @@ impl SubagentRunner {
             last_error_sig: None,
             same_error_count: 0,
             analyze_mode: false,
+            scratchpad: None,
         }
+    }
+
+    /// Hands this subagent the same working area as the agent that spawned it.
+    ///
+    /// A builder rather than another parameter: `new` already takes seventeen.
+    pub fn with_scratchpad(mut self, pad: Option<crate::tools::Scratchpad>) -> Self {
+        self.scratchpad = pad;
+        self
     }
 
     /// Public entry point — owns the receiver, called by tokio::spawn from Agent
@@ -138,7 +150,8 @@ impl SubagentRunner {
         approval_rx: &mut mpsc::UnboundedReceiver<UserAction>,
         existing_history: Option<Vec<Message>>,
     ) -> Result<(String, Vec<Message>, usize)> {
-        let executor = ToolExecutor::new(self.project_root.clone());
+        let mut executor = ToolExecutor::new(self.project_root.clone());
+        executor.set_scratchpad(self.scratchpad.clone());
 
         // Build filtered tool list
         let mut tools = executor.tool_definitions_filtered(&self.agent_def.tools);
@@ -386,7 +399,23 @@ impl SubagentRunner {
                         } else {
                             match kind {
                                 ToolKind::Write => {
-                                    !self.app_config.agent.auto_approve_writes
+                                    // Same exemption as the parent agent — see
+                                    // `handle_tool_call` in `core.rs`. A
+                                    // subagent shares its parent's lab, so
+                                    // scratch work carries between them.
+                                    let into_scratchpad = self
+                                        .app_config
+                                        .agent
+                                        .scratchpad
+                                        .auto_approve_writes
+                                        && serde_json::from_str::<serde_json::Value>(
+                                            &tc.function.arguments,
+                                        )
+                                        .is_ok_and(|args| {
+                                            executor.writes_only_to_scratchpad(&tool_name, &args)
+                                        });
+                                    !into_scratchpad
+                                        && !self.app_config.agent.auto_approve_writes
                                         && !self.auto_mode
                                 }
                                 ToolKind::Execute => !self.auto_mode,
@@ -763,6 +792,7 @@ impl SubagentRunner {
 
         // Pass the parent's status_tx so nested ToolRunning/ToolDone events
         // flow through the existing forwarding task in core.rs → SubagentStatus
+        let nested_scratchpad = self.scratchpad.clone();
         let mut nested_runner = SubagentRunner::new(
             def,
             client,
@@ -780,7 +810,8 @@ impl SubagentRunner {
             nested_id.clone(),
             self.dangerously_allow_all,
             self.auto_mode,
-        );
+        )
+        .with_scratchpad(nested_scratchpad);
 
         // Run nested with borrowed approval_rx — no new channel, no forwarding
         let (result, _history, _turns) =

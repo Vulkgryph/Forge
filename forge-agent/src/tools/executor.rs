@@ -57,6 +57,8 @@ pub struct ToolExecutor {
     project_root: PathBuf,
     custom_tools: Vec<CustomTool>,
     todos: Mutex<Vec<TodoItem>>,
+    /// The agent's own working area, when it has one. See `tools::scratchpad`.
+    scratchpad: Option<crate::tools::scratchpad::Scratchpad>,
 }
 
 /// Whether `candidate` is the todo the model meant by `wanted`.
@@ -80,7 +82,46 @@ impl ToolExecutor {
             custom_tools: load_custom_tools(&project_root),
             project_root,
             todos: Mutex::new(Vec::new()),
+            scratchpad: None,
         }
+    }
+
+    /// Gives the executor the session's working area.
+    ///
+    /// Separate from `new` because the lab is per *session* while the executor
+    /// is built from the workspace, and because a subagent is handed the same
+    /// lab as its parent rather than making one of its own — one agent's
+    /// scratch work is exactly what another may need to pick up.
+    pub fn set_scratchpad(&mut self, pad: Option<crate::tools::scratchpad::Scratchpad>) {
+        self.scratchpad = pad;
+    }
+
+    pub fn scratchpad(&self) -> Option<&crate::tools::scratchpad::Scratchpad> {
+        self.scratchpad.as_ref()
+    }
+
+    /// Whether this call only writes inside the lab, and so can be approved
+    /// without asking.
+    ///
+    /// Deliberately narrow. It answers for `write_file` and `edit_file`, whose
+    /// target is a single named path that can be checked. `apply_patch` names
+    /// its files inside the diff and can carry several at once, so it is not
+    /// exempted — a patch is approved the way it always was. Anything it cannot
+    /// read as a path in the lab returns false, so a malformed or unexpected
+    /// call prompts rather than slipping through.
+    pub fn writes_only_to_scratchpad(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        let Some(pad) = &self.scratchpad else {
+            return false;
+        };
+        if !matches!(tool_name, "write_file" | "edit_file") {
+            return false;
+        }
+        let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
+            return false;
+        };
+        // Through `resolve_path`, so a relative path is judged from the same
+        // place the write will actually land.
+        self.resolve_path(path).is_ok_and(|p| pad.contains(&p))
     }
 
     pub fn project_root(&self) -> &Path {
@@ -1628,6 +1669,31 @@ mod todo_tests {
 
     async fn todo(ex: &ToolExecutor, args: serde_json::Value) -> String {
         ex.execute("todo_write", &args, None).await.unwrap()
+    }
+
+    /// The rendered list is a wire format, not just text for the model.
+    ///
+    /// Forge IDE's agent panel and the TUI both parse these markers to draw the
+    /// list as a checklist, and neither can import this function — they match on
+    /// `[x]`, `[~]` and `[ ]` by hand. Changing the markers or the indentation
+    /// here silently turns both back into flat grey text, so the exact shape is
+    /// pinned. See `todo_rows` in `forge-ide/src/app.rs` and `todo_line` in
+    /// `forge-tui-rs/src/app.rs`.
+    #[tokio::test]
+    async fn the_rendered_list_keeps_the_shape_its_readers_parse() {
+        let ex = executor();
+        todo(&ex, json!({"action":"add","text":"write the parser"})).await;
+        todo(&ex, json!({"action":"add","text":"wire it into the card"})).await;
+        todo(&ex, json!({"action":"add","text":"test it"})).await;
+        todo(&ex, json!({"action":"update","text":"write the parser","status":"done"})).await;
+        todo(&ex, json!({"action":"update","text":"wire it","status":"in_progress"})).await;
+
+        let listed = todo(&ex, json!({"action":"list"})).await;
+        assert_eq!(
+            listed,
+            "Todos (3 items, 1 done):\n  [x] write the parser\n  [~] wire it into the card\n  [ ] test it\n",
+            "the format the IDE and TUI parse has changed"
+        );
     }
 
     #[tokio::test]

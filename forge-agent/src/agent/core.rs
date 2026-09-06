@@ -613,6 +613,7 @@ impl Agent {
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
+            executor.scratchpad().map(|p| p.root()),
         );
 
         let mut history = Vec::new();
@@ -689,6 +690,7 @@ impl Agent {
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
+            executor.scratchpad().map(|p| p.root()),
         );
         let loaded = log.load_from_last_compaction()?;
         let rewind_checkpoints = log
@@ -1731,7 +1733,8 @@ impl Agent {
                                     id.clone(),
                                     self.dangerously_allow_all,
                                     self.auto_mode,
-                                );
+                                )
+                                .with_scratchpad(self.executor.scratchpad().cloned());
 
                                 // Spawn the runner, tagging with the index so we can match results
                                 let captured_idx = idx;
@@ -2762,16 +2765,29 @@ impl Agent {
         // Determine if we need permission — computed before the ToolRequest
         // send so the event can tell a client whether this call will
         // actually wait, rather than the client guessing from `kind` alone.
-        let needs_approval = if self.dangerously_allow_all {
-            false
-        } else {
-            match kind {
-                ToolKind::Read => !self.config.auto_approve_reads && !self.auto_mode,
-                ToolKind::Write => !self.config.auto_approve_writes && !self.auto_mode,
-                ToolKind::Execute => !self.auto_mode,
-                ToolKind::Unknown => true,
-            }
-        };
+        // A write that lands inside the agent's own working area is approved
+        // without asking, when the config allows it: nothing in there is the
+        // user's, and a scratch area that prompts for every throwaway file is
+        // not one. The exemption covers writes *into* the lab only — copying a
+        // file back out into a real directory is an ordinary write.
+        let into_scratchpad = self.config.scratchpad.auto_approve_writes
+            && matches!(kind, ToolKind::Write)
+            && serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                .is_ok_and(|args| {
+                    self.executor
+                        .writes_only_to_scratchpad(&tc.function.name, &args)
+                });
+
+        let needs_approval = approval_needed(
+            kind,
+            &ApprovalContext {
+                dangerously_allow_all: self.dangerously_allow_all,
+                auto_mode: self.auto_mode,
+                auto_approve_reads: self.config.auto_approve_reads,
+                auto_approve_writes: self.config.auto_approve_writes,
+                into_scratchpad,
+            },
+        );
 
         let _ = self.event_tx.send(AgentEvent::ToolRequest {
             tool_name: tc.function.name.clone(),
@@ -4543,8 +4559,13 @@ PLAN MODE ACTIVE — You are in planning mode.
 - When your plan is complete, call exit_plan_mode to submit it for user approval
 - Structure your plan with: Goal, Files to modify, Implementation steps, Verification";
 
-fn build_system_prompt(project_root: &str, max_concurrent: usize, max_depth: usize) -> String {
-    format!(
+fn build_system_prompt(
+    project_root: &str,
+    max_concurrent: usize,
+    max_depth: usize,
+    scratchpad: Option<&std::path::Path>,
+) -> String {
+    let base = format!(
         r#"You are an autonomous codebase agent. Your primary workspace is: {}
 
 You can access any file or directory on the system — you are not restricted to the workspace.
@@ -4612,6 +4633,77 @@ Subagent delegation (delegate_task):
 
 Be concise and direct in your responses. Focus on actionable feedback."#,
         project_root, max_concurrent, max_depth
+    );
+
+    // Only described when there is one, so an agent running without a lab is
+    // never told about a directory that does not exist.
+    match scratchpad {
+        None => base,
+        Some(lab) => format!(
+            "{base}\n\n{}",
+            scratchpad_section(&lab.to_string_lossy())
+        ),
+    }
+}
+
+/// Everything the approval decision depends on besides the tool's kind.
+pub(crate) struct ApprovalContext {
+    pub dangerously_allow_all: bool,
+    pub auto_mode: bool,
+    pub auto_approve_reads: bool,
+    pub auto_approve_writes: bool,
+    /// This call only writes inside the agent's own working area, and the
+    /// config allows that to skip the prompt. See `writes_only_to_scratchpad`.
+    pub into_scratchpad: bool,
+}
+
+/// Whether a tool call has to be put to the user before it runs.
+///
+/// Pulled out of `handle_tool_call` so it can be tested. It decides whether the
+/// user is asked before the agent touches their machine, and it was previously
+/// a expression buried in the middle of a six-hundred-line function with no
+/// test of its own — the scratchpad exemption in particular could have been
+/// inverted and nothing would have caught it.
+pub(crate) fn approval_needed(kind: ToolKind, ctx: &ApprovalContext) -> bool {
+    if ctx.dangerously_allow_all {
+        return false;
+    }
+    // Scoped to writes here as well as at the call site. The exemption is
+    // justified by *where the bytes land*, which is only knowable for a write
+    // to a named path — a command is free to go anywhere once it is running.
+    // Relying on the caller to check that would put the whole argument for the
+    // exemption somewhere other than the code that acts on it.
+    if ctx.into_scratchpad && matches!(kind, ToolKind::Write) {
+        return false;
+    }
+    match kind {
+        ToolKind::Read => !ctx.auto_approve_reads && !ctx.auto_mode,
+        ToolKind::Write => !ctx.auto_approve_writes && !ctx.auto_mode,
+        ToolKind::Execute => !ctx.auto_mode,
+        ToolKind::Unknown => true,
+    }
+}
+
+/// What the agent is told about its own working area.
+///
+/// Written as instructions about *where things go*, not as a new capability:
+/// the tools that reach it are the ones it already has, and the only new fact
+/// is that this directory exists and is its own.
+fn scratchpad_section(lab: &str) -> String {
+    format!(
+        r#"Your working area (scratchpad): {lab}
+
+This directory is yours. Use it for anything that should not become part of the user's project:
+- Throwaway scripts you want to run — probes, one-off checks, experiments
+- Intermediate output, scratch copies of files, notes to yourself across a long task
+- Test harnesses and reproductions you are not being asked to keep
+
+Rules:
+- Write here with write_file/edit_file using the absolute path above. Writes inside this directory are approved automatically; writes anywhere else are not.
+- It is created for you and swept automatically after it goes unused. Nothing here is permanent — do not leave anything the user asked for in it.
+- Never put work the user asked for here. Deliverables go in their workspace.
+- Copying a file out of here into the user's workspace is an ordinary write and needs their approval like any other.
+- Prefer it over writing scratch files into the user's project. A probe script in their repository is litter; the same script here is not."#
     )
 }
 
@@ -4697,5 +4789,104 @@ mod remote_git_policy_tests {
         assert!(t.contains("write_file") && t.contains("apply_patch"));
         assert!(t.contains("cannot be recovered"),
             "does not say what a shell-command change costs");
+    }
+}
+
+#[cfg(test)]
+mod scratchpad_prompt_tests {
+    use super::build_system_prompt;
+    use std::path::Path;
+
+    #[test]
+    fn the_agent_is_told_where_its_working_area_is() {
+        let lab = Path::new("/tmp/forge-lab/session-123");
+        let prompt = build_system_prompt("/work", 4, 4, Some(lab));
+        assert!(
+            prompt.contains("/tmp/forge-lab/session-123"),
+            "the path is the one thing it cannot infer"
+        );
+        // The limits matter as much as the location.
+        assert!(prompt.contains("approved automatically"), "no mention of the exemption");
+        assert!(prompt.contains("Deliverables go in their workspace."));
+    }
+
+    /// An agent without a lab must not be told about a directory that does not
+    /// exist — it would write there and the writes would prompt like any other.
+    #[test]
+    fn without_a_working_area_it_is_not_mentioned() {
+        let prompt = build_system_prompt("/work", 4, 4, None);
+        assert!(!prompt.to_lowercase().contains("scratchpad"), "{prompt}");
+        assert!(!prompt.contains("forge-lab"));
+        // The rest of the prompt is unaffected.
+        assert!(prompt.contains("You are an autonomous codebase agent"));
+    }
+}
+
+#[cfg(test)]
+mod approval_decision_tests {
+    use super::{approval_needed, ApprovalContext};
+    use crate::tools::ToolKind;
+
+    /// Nothing auto-approved: the state a cautious user runs in.
+    fn strict() -> ApprovalContext {
+        ApprovalContext {
+            dangerously_allow_all: false,
+            auto_mode: false,
+            auto_approve_reads: false,
+            auto_approve_writes: false,
+            into_scratchpad: false,
+        }
+    }
+
+    #[test]
+    fn a_write_to_the_users_project_is_always_put_to_them() {
+        assert!(approval_needed(ToolKind::Write, &strict()));
+        assert!(approval_needed(ToolKind::Execute, &strict()));
+        assert!(approval_needed(ToolKind::Read, &strict()));
+        assert!(approval_needed(ToolKind::Unknown, &strict()));
+    }
+
+    /// The exemption: same strict settings, but the write lands in the lab.
+    #[test]
+    fn a_write_into_the_lab_is_not() {
+        let ctx = ApprovalContext { into_scratchpad: true, ..strict() };
+        assert!(!approval_needed(ToolKind::Write, &ctx));
+    }
+
+    /// Turning the config switch off must restore the prompt. Without a test
+    /// here the switch could do nothing and look like it worked.
+    #[test]
+    fn turning_the_switch_off_restores_the_prompt() {
+        // `into_scratchpad` is only ever true when the config allows it — this
+        // is what the caller computes when `auto_approve_writes` is false.
+        let ctx = ApprovalContext { into_scratchpad: false, ..strict() };
+        assert!(approval_needed(ToolKind::Write, &ctx));
+    }
+
+    /// The exemption is for writes. It must not quietly widen to commands: a
+    /// shell command is free to go anywhere once it is running.
+    #[test]
+    fn the_exemption_never_covers_commands() {
+        let ctx = ApprovalContext { into_scratchpad: true, ..strict() };
+        assert!(
+            approval_needed(ToolKind::Execute, &ctx),
+            "a command was auto-approved because a write would have been"
+        );
+        assert!(approval_needed(ToolKind::Unknown, &ctx));
+    }
+
+    /// The pre-existing rules are unchanged by any of this.
+    #[test]
+    fn the_existing_rules_still_hold() {
+        let auto = ApprovalContext { auto_mode: true, ..strict() };
+        assert!(!approval_needed(ToolKind::Write, &auto));
+        assert!(!approval_needed(ToolKind::Execute, &auto));
+
+        let all = ApprovalContext { dangerously_allow_all: true, ..strict() };
+        assert!(!approval_needed(ToolKind::Unknown, &all));
+
+        let writes = ApprovalContext { auto_approve_writes: true, ..strict() };
+        assert!(!approval_needed(ToolKind::Write, &writes));
+        assert!(approval_needed(ToolKind::Execute, &writes), "writes must not imply commands");
     }
 }

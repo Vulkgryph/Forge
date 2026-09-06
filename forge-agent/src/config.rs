@@ -210,6 +210,8 @@ pub struct AgentConfig {
     pub compact_at_percent: u8,
     #[serde(default)]
     pub subagents: SubagentConfig,
+    #[serde(default)]
+    pub scratchpad: ScratchpadConfig,
     /// Tool names to exclude from every agent turn. Internal tools are never affected.
     ///
     /// `web_search` is in here by default. It works by scraping DuckDuckGo's HTML,
@@ -303,6 +305,60 @@ fn default_max_delegate_secs() -> u64 {
     1800
 }
 
+/// The agent's own working area — see `tools::scratchpad`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadConfig {
+    /// Whether the agent is given a lab at all. Off means it behaves exactly as
+    /// it did before there was one.
+    #[serde(default = "default_scratchpad_on")]
+    pub enabled: bool,
+    /// Whether writing inside the lab skips the approval prompt.
+    ///
+    /// On by default: nothing in the lab is the user's, and a scratch area that
+    /// asks permission for every throwaway file is not a scratch area. Turning
+    /// this off keeps the lab and its cleanup, and approves writes to it the
+    /// same way as writes anywhere else.
+    ///
+    /// It only ever exempts writes *into* the lab. Copying a file out of it
+    /// into a real directory is an ordinary write and is approved like one, and
+    /// `shell_exec` is unaffected either way.
+    #[serde(default = "default_scratchpad_on")]
+    pub auto_approve_writes: bool,
+    /// How long a lab survives without being touched.
+    #[serde(default = "default_scratchpad_keep_days")]
+    pub keep_days: u64,
+}
+
+fn default_scratchpad_keep_days() -> u64 {
+    7
+}
+
+/// For scratchpad switches that are on unless a config says otherwise.
+fn default_scratchpad_on() -> bool {
+    true
+}
+
+impl Default for ScratchpadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_approve_writes: true,
+            keep_days: default_scratchpad_keep_days(),
+        }
+    }
+}
+
+impl ScratchpadConfig {
+    /// The age at which an untouched lab is swept.
+    ///
+    /// `0` would mean "delete every lab the moment it is looked at", including
+    /// the one in use, so it is read as "never sweep" instead.
+    pub fn keep(&self) -> Option<std::time::Duration> {
+        (self.keep_days > 0)
+            .then(|| std::time::Duration::from_secs(self.keep_days * 24 * 60 * 60))
+    }
+}
+
 impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
@@ -347,6 +403,7 @@ impl Default for AppConfig {
                 compaction_threshold: 150,
                 compact_at_percent: default_compact_at_percent(),
                 subagents: SubagentConfig::default(),
+                scratchpad: ScratchpadConfig::default(),
                 disabled_tools: default_disabled_tools(),
                 context_strategy: ContextStrategy::Compaction,
                 min_shell_timeout_secs: 0,
@@ -533,5 +590,42 @@ mod default_tools_tests {
         let other = config_with(Some("disabled_tools = [\"shell_exec\"]"));
         assert_eq!(other.agent.disabled_tools, vec!["shell_exec".to_string()],
                    "somebody else\'s disabled list was rewritten");
+    }
+}
+
+#[cfg(test)]
+mod scratchpad_config_tests {
+    use super::{AgentConfig, ScratchpadConfig};
+
+    #[test]
+    fn the_defaults_are_on_and_a_week() {
+        let c = ScratchpadConfig::default();
+        assert!(c.enabled);
+        assert!(c.auto_approve_writes);
+        assert_eq!(c.keep_days, 7);
+        assert_eq!(c.keep(), Some(std::time::Duration::from_secs(7 * 86400)));
+    }
+
+    /// Zero would otherwise mean "sweep every lab on sight", including the one
+    /// currently in use.
+    #[test]
+    fn zero_days_means_never_sweep() {
+        let c = ScratchpadConfig { keep_days: 0, ..Default::default() };
+        assert_eq!(c.keep(), None);
+    }
+
+    /// A config file written before the scratchpad existed must still parse,
+    /// and must come up with the feature in its default state.
+    #[test]
+    fn an_older_config_file_still_loads() {
+        let toml = r#"
+auto_approve_reads = true
+auto_approve_writes = false
+max_history_messages = 50
+compaction_threshold = 100
+"#;
+        let c: AgentConfig = toml::from_str(toml).expect("older config should still parse");
+        assert!(c.scratchpad.enabled);
+        assert_eq!(c.scratchpad.keep_days, 7);
     }
 }

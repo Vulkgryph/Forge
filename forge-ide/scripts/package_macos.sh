@@ -67,9 +67,23 @@ echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$BUILD_DIR/forge-ide" "$APP/Contents/MacOS/forge-ide"
-cp "$BUILD_DIR/forge-agent" "$APP/Contents/MacOS/forge-agent"
-cp "$BUILD_DIR/forge-server" "$APP/Contents/MacOS/forge-server"
+# Unlink before copying, never overwrite in place.
+#
+# macOS pages executable code in lazily and checks each page against the
+# signature recorded when the file was mapped. Writing over a binary that a
+# process is currently running changes the file under that mapping, and the next
+# page it faults in fails the check: the kernel kills it with
+# "CODESIGNING / Invalid Page". Packaging while a window is open would take that
+# window down — and the crash names a code-signing fault, which reads like a
+# signing bug rather than a file that moved under it.
+#
+# Removing the path first leaves the running process holding the old, now
+# unlinked inode. It keeps running from it happily and the new build lands
+# beside it.
+for exe in forge-ide forge-agent forge-server; do
+    rm -f "$APP/Contents/MacOS/$exe"
+    cp "$BUILD_DIR/$exe" "$APP/Contents/MacOS/$exe"
+done
 # Resources, not MacOS: these are Linux ELF binaries for another machine, not
 # executables of this app. `local_server_binary` looks for them by this name.
 for target in $REMOTE_TARGETS; do

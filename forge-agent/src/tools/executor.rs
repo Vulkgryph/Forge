@@ -1719,3 +1719,82 @@ mod todo_tests {
         assert!(out.contains("a task"));
     }
 }
+
+#[cfg(test)]
+mod scratchpad_approval_tests {
+    use super::ToolExecutor;
+    use crate::tools::scratchpad::Scratchpad;
+    use serde_json::json;
+
+    /// A workspace and a lab that are genuinely different directories.
+    fn executor_with_lab() -> (ToolExecutor, tempfile::TempDir, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let lab = tempfile::tempdir().expect("tempdir");
+        let mut ex = ToolExecutor::new(workspace.path().to_path_buf());
+        ex.set_scratchpad(Some(Scratchpad::at(lab.path().to_path_buf())));
+        (ex, workspace, lab)
+    }
+
+    #[test]
+    fn a_write_into_the_lab_is_exempt() {
+        let (ex, _ws, lab) = executor_with_lab();
+        let path = lab.path().join("probe.py");
+        assert!(ex.writes_only_to_scratchpad(
+            "write_file",
+            &json!({ "path": path.to_string_lossy(), "content": "print()" })
+        ));
+        assert!(ex.writes_only_to_scratchpad(
+            "edit_file",
+            &json!({ "path": lab.path().join("deep/notes.md").to_string_lossy() })
+        ));
+    }
+
+    /// The exemption must not reach the user's project — that is the whole
+    /// distinction it exists to draw.
+    #[test]
+    fn a_write_into_the_workspace_is_not_exempt() {
+        let (ex, ws, _lab) = executor_with_lab();
+        assert!(!ex.writes_only_to_scratchpad(
+            "write_file",
+            &json!({ "path": ws.path().join("src/main.rs").to_string_lossy() })
+        ));
+        // Relative paths resolve against the workspace, not the lab.
+        assert!(!ex.writes_only_to_scratchpad("write_file", &json!({ "path": "src/main.rs" })));
+        assert!(!ex.writes_only_to_scratchpad("write_file", &json!({ "path": "/etc/hosts" })));
+    }
+
+    /// A path that starts inside the lab as text but climbs out of it.
+    #[test]
+    fn escaping_the_lab_is_not_exempt() {
+        let (ex, _ws, lab) = executor_with_lab();
+        let escape = lab.path().join("../../etc/passwd");
+        assert!(!ex.writes_only_to_scratchpad(
+            "write_file",
+            &json!({ "path": escape.to_string_lossy() })
+        ));
+    }
+
+    /// `apply_patch` names its files inside the diff and can carry several at
+    /// once, so it is approved the way it always was.
+    #[test]
+    fn only_single_path_writes_are_exempt() {
+        let (ex, _ws, lab) = executor_with_lab();
+        let inside = json!({ "path": lab.path().join("x.rs").to_string_lossy() });
+        assert!(!ex.writes_only_to_scratchpad("apply_patch", &inside));
+        assert!(!ex.writes_only_to_scratchpad("shell_exec", &inside));
+        // Nothing recognisable as a path: prompt rather than guess.
+        assert!(!ex.writes_only_to_scratchpad("write_file", &json!({ "content": "x" })));
+    }
+
+    /// With no lab, nothing is exempt — the agent behaves as it did before.
+    #[test]
+    fn without_a_lab_nothing_is_exempt() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let ex = ToolExecutor::new(workspace.path().to_path_buf());
+        assert!(ex.scratchpad().is_none());
+        assert!(!ex.writes_only_to_scratchpad(
+            "write_file",
+            &json!({ "path": std::env::temp_dir().join("anything").to_string_lossy() })
+        ));
+    }
+}

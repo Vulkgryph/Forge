@@ -2055,6 +2055,87 @@ fn paint_ring(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_stroke(rect.center(), 3.2, egui::Stroke::new(1.3_f32, color));
 }
 
+/// The state of one task in the agent's list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TodoStatus {
+    Done,
+    Active,
+    Pending,
+}
+
+/// Pulls the checklist out of a `todo_write` result.
+///
+/// The agent renders its list as `  [x] text`, `  [~] text`, `  [ ] text`, and
+/// the panel printed that verbatim in flat grey — so what was finished, what
+/// was running and what was waiting were all the same colour, and the state of
+/// the work had to be read character by character.
+///
+/// Only `todo_write` is parsed. The markers are ordinary enough that a file
+/// being read, or a command's output, could open a line with one, and turning
+/// somebody's text into a checklist because of that is worse than leaving the
+/// list plain. Results that are not a list — `add` and `update` answer with a
+/// single sentence — give nothing back and render as before.
+pub(crate) fn todo_rows(name: &str, content: &str) -> Vec<(TodoStatus, String)> {
+    if name != "todo_write" {
+        return Vec::new();
+    }
+    content
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let (status, rest) = if let Some(r) = t.strip_prefix("[x]") {
+                (TodoStatus::Done, r)
+            } else if let Some(r) = t.strip_prefix("[~]") {
+                (TodoStatus::Active, r)
+            } else if let Some(r) = t.strip_prefix("[ ]") {
+                (TodoStatus::Pending, r)
+            } else {
+                return None;
+            };
+            let text = rest.trim();
+            (!text.is_empty()).then(|| (status, text.to_string()))
+        })
+        .collect()
+}
+
+/// Draws a task list as a checklist rather than as text.
+///
+/// The markers are painted rather than typed. `✔` and `○` are glyphs the font
+/// in use may simply not have, and when it doesn't they arrive as empty boxes —
+/// which is what a checkmark in this panel actually looked like. Painting has
+/// no such dependency, which is why the status marks beside every card are
+/// drawn this way too.
+///
+/// Only the task in flight is left at full brightness: finished work is dimmed
+/// because it no longer needs attention, and the point of the list is to show
+/// what is happening now and what is still owed.
+fn draw_todo_list(ui: &mut egui::Ui, rows: &[(TodoStatus, String)]) {
+    for (status, text) in rows {
+        ui.horizontal_top(|ui| {
+            let text_color = match status {
+                TodoStatus::Done => egui::Color32::from_gray(125),
+                TodoStatus::Active => egui::Color32::from_gray(228),
+                TodoStatus::Pending => egui::Color32::from_gray(165),
+            };
+            match status {
+                TodoStatus::Done => paint_checkmark(ui, egui::Color32::from_rgb(110, 190, 110)),
+                TodoStatus::Active => paint_dot(ui, egui::Color32::from_rgb(110, 150, 220)),
+                TodoStatus::Pending => paint_ring(ui, egui::Color32::from_gray(120)),
+            }
+            // A top-down sub-layout so a long task wraps instead of being cut:
+            // labels do not wrap inside a horizontal row.
+            let avail = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(avail, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.label(egui::RichText::new(text).size(11.5).color(text_color));
+                },
+            );
+        });
+    }
+}
+
 /// Small X — "denied"/"error", font-independent (see `paint_checkmark_at`).
 fn paint_cross(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -3018,7 +3099,14 @@ fn draw_write_card(
                     });
 
                     let mut click_target = header.response.clone();
-                    if diff.is_none() {
+                    let todos = content.map_or_else(Vec::new, |c| todo_rows(name, c));
+                    if !todos.is_empty() {
+                        // Shown whether or not the card is expanded: the list
+                        // *is* the result, so hiding it behind a click leaves
+                        // the card saying only that a list was updated.
+                        ui.add_space(4.0);
+                        draw_todo_list(ui, &todos);
+                    } else if diff.is_none() {
                         if !expanded {
                             if let Some(c) = content {
                                 let first_line: String = strip_ansi(c.trim()).lines().next().unwrap_or("").chars().take(70).collect();
@@ -18409,5 +18497,46 @@ mod tab_key_tests {
         assert_eq!(tab_insertion(false, true, true, 4), None);
         // Ctrl+Tab belongs to whatever cycles tabs, not to the text.
         assert_eq!(tab_insertion(true, false, true, 4), None);
+    }
+}
+
+#[cfg(test)]
+mod todo_list_tests {
+    use super::*;
+
+    /// Exactly what `todo_write` returns — see `render_todos` in
+    /// `forge-agent/src/tools/executor.rs`, which is what the panel is reading.
+    const AGENT_OUTPUT: &str = "Todos (3 items, 1 done):\n  [x] write the parser\n  [~] wire it into the card\n  [ ] test it\n";
+
+    #[test]
+    fn a_task_list_is_read_as_a_checklist() {
+        let rows = todo_rows("todo_write", AGENT_OUTPUT);
+        assert_eq!(
+            rows,
+            vec![
+                (TodoStatus::Done, "write the parser".to_string()),
+                (TodoStatus::Active, "wire it into the card".to_string()),
+                (TodoStatus::Pending, "test it".to_string()),
+            ],
+            "the agent's own list format did not parse"
+        );
+    }
+
+    /// `add` and `update` answer with a sentence, not a list. Those must keep
+    /// rendering as text rather than becoming an empty checklist.
+    #[test]
+    fn a_one_line_answer_is_not_a_checklist() {
+        assert!(todo_rows("todo_write", "Added todo: ship the release").is_empty());
+        assert!(todo_rows("todo_write", "Updated → done: ship the release").is_empty());
+        assert!(todo_rows("todo_write", "No todos yet.").is_empty());
+    }
+
+    /// The markers are ordinary text. A file being read, or a command's output,
+    /// can open a line with one, and redrawing that as a checklist would be
+    /// rewriting content the tool did not mean as a task list.
+    #[test]
+    fn only_the_todo_tool_is_parsed() {
+        assert!(todo_rows("read_file", AGENT_OUTPUT).is_empty());
+        assert!(todo_rows("shell_exec", AGENT_OUTPUT).is_empty());
     }
 }

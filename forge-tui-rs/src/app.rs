@@ -725,7 +725,12 @@ impl App {
                         Some(false) => Style::fg(palette::RED),
                         _ => Style::fg(palette::GREEN),
                     };
-                    let mut lines = entry.content.lines();
+                    // A command writes for a terminal; this is not one. Strip
+                    // its escape sequences before anything is measured or
+                    // wrapped, or the widths are wrong too.
+                    let content = strip_ansi(&entry.content);
+                    let tint = looks_like_diff(&content);
+                    let mut lines = content.lines();
                     if let Some(first) = lines.next() {
                         // The glyph occupies the first row; the text wraps under
                         // it rather than being cut off.
@@ -753,7 +758,7 @@ impl App {
                     }
                     // The head line is drawn above; what follows is the body.
                     let rest: Vec<&str> = lines.collect();
-                    let head = entry.content.lines().next().unwrap_or("");
+                    let head = content.lines().next().unwrap_or("");
                     let joined = rest.join("\n");
 
                     if is_file_listing(head, joined.trim_start()) {
@@ -769,13 +774,13 @@ impl App {
                                         Span { text: text.trim_end().to_string(), style },
                                     ],
                                 }),
-                                None => out.extend(diff_lines(line, cols, dim)),
+                                None => out.extend(diff_lines(line, cols, dim, tint)),
                             }
                         }
                     } else {
                         let shown = rest.len().min(RESULT_BODY_LINES);
                         for line in &rest[..shown] {
-                            out.extend(diff_lines(line, cols, dim));
+                            out.extend(diff_lines(line, cols, dim, tint));
                         }
                         if rest.len() > shown {
                             let hidden = rest.len() - shown;
@@ -794,8 +799,12 @@ impl App {
                 }
 
                 EntryKind::ToolOutput => {
-                    for line in entry.content.lines() {
-                        out.extend(diff_lines(line, cols, dim));
+                    // Streaming output from a running command: the same
+                    // treatment, for the same reasons.
+                    let content = strip_ansi(&entry.content);
+                    let tint = looks_like_diff(&content);
+                    for line in content.lines() {
+                        out.extend(diff_lines(line, cols, dim, tint));
                     }
                 }
 
@@ -1853,13 +1862,74 @@ fn todo_line(line: &str) -> Option<(String, Style)> {
     Some((marker, style))
 }
 
-fn diff_lines(line: &str, cols: usize, dim: Style) -> Vec<Line> {
+/// Whether a tool result is a diff, and so whether its `+`/`-` lines mean
+/// added and removed.
+///
+/// Applied to everything, this tinting turned ordinary command output into a
+/// diff: a line of `cargo` or `git` output beginning with `-` was drawn as a
+/// deletion, complete with a red background. A compiler flag, a negative
+/// number, a bullet list — all of them read as removed lines.
+///
+/// A real diff announces itself: the agent's edit tools prefix theirs with
+/// `DIFF:`, and a raw unified diff carries a `@@` hunk header or `---`/`+++`
+/// file headers.
+fn looks_like_diff(body: &str) -> bool {
+    body.starts_with("DIFF:")
+        || body.lines().take(40).any(|l| {
+            let t = l.trim_start();
+            t.starts_with("@@ ") || t.starts_with("--- ") || t.starts_with("+++ ")
+        })
+}
+
+/// Remove terminal escape sequences from text that is about to be drawn as
+/// plain content.
+///
+/// A command run through `shell_exec` writes for a terminal: colour, cursor
+/// movement, alternate-screen switches. Printed literally those are noise —
+/// and the `ESC` itself is invisible, so what a user sees is the wreckage,
+/// `[32m+++[m` and `[?1h=`, which reads like corruption rather than colour.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                // CSI: parameters, then a final letter (or `~`).
+                Some('[') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if c2.is_ascii_alphabetic() || c2 == '~' { break; }
+                    }
+                }
+                // OSC: runs to BEL or to the start of another escape.
+                Some(']') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if c2 == '\x07' || c2 == '\x1b' { break; }
+                    }
+                }
+                // Charset designation takes one more byte: `ESC ( B`.
+                Some('(') | Some(')') => { chars.next(); chars.next(); }
+                // Everything else is two bytes: `ESC =`, `ESC >`, `ESC M`.
+                Some(_) => { chars.next(); }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\r' { continue; }
+        if (c as u32) < 0x20 && c != '\n' && c != '\t' { continue; }
+        out.push(c);
+    }
+    out
+}
+
+fn diff_lines(line: &str, cols: usize, dim: Style, tint: bool) -> Vec<Line> {
     let trimmed = line.trim_start();
     let style = match trimmed.chars().next() {
-        Some('+') if !trimmed.starts_with("+++") => {
+        Some('+') if tint && !trimmed.starts_with("+++") => {
             Style::fg(palette::GREEN).bg(palette::DIFF_ADD_BG)
         }
-        Some('-') if !trimmed.starts_with("---") => {
+        Some('-') if tint && !trimmed.starts_with("---") => {
             Style::fg(palette::RED).bg(palette::DIFF_DEL_BG)
         }
         _ => dim,
@@ -3307,11 +3377,15 @@ mod tests {
         let mut app = App::new();
         app.session_mut().apply(AgentMessage::ToolOutput {
             tool_name: "apply_patch".into(),
-            content: format!("+{}", "added text ".repeat(12)),
+            // A hunk header, so this is recognisably a diff rather than a
+            // command that happened to print a line starting with `+`.
+            content: format!("@@ -1 +1 @@\n+{}", "added text ".repeat(12)),
         });
         let lines = app.build_lines(30);
-        assert!(lines.len() > 1, "wrapped: {:?}", lines.len());
-        for line in &lines {
+        // Every row carrying the added text — not the hunk header above it.
+        let rows: Vec<_> = lines.iter().filter(|l| l.plain().contains("added text")).collect();
+        assert!(rows.len() > 1, "did not wrap: {:?}", rows.len());
+        for line in rows {
             let tinted = line.spans.iter().any(|s| s.style.bg == Some(palette::DIFF_ADD_BG));
             assert!(tinted, "row not tinted: {:?}", line.plain());
         }
@@ -3626,6 +3700,45 @@ mod tests {
                 assert!(line.width() <= cols, "{:?} overflows {cols}", line.plain());
             }
         }
+    }
+
+    /// Ordinary command output is not a diff, and must not be drawn as one.
+    ///
+    /// Reported from a real session: a `shell_exec` result was rendered with a
+    /// red `-2` chip, as though a line had been deleted. Every tool result was
+    /// passed through the diff tinting, so any output line starting with `-`
+    /// or `+` — a compiler flag, a negative number, a bullet — became a change.
+    #[test]
+    fn command_output_is_not_tinted_as_a_diff() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "shell_exec".into(),
+            content: "-2\n 1 file changed, 3 insertions(+), 2 deletions(-)\n-o flag".into(),
+        });
+        let lines = app.build_lines(60);
+        for line in &lines {
+            let tinted = line.spans.iter().any(|s| {
+                s.style.bg == Some(palette::DIFF_DEL_BG) || s.style.bg == Some(palette::DIFF_ADD_BG)
+            });
+            assert!(!tinted, "command output drawn as a diff: {:?}", line.plain());
+        }
+    }
+
+    /// Escape sequences from a command are removed rather than printed. The
+    /// `ESC` itself is invisible, so leaving them shows the wreckage —
+    /// `[32m+++[m`, `[?1h=` — which reads as corruption.
+    #[test]
+    fn terminal_escape_sequences_are_stripped_from_output() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "shell_exec".into(),
+            content: "\x1b[?1h\x1b= file.rs | 5 \x1b[32m+++\x1b[m\x1b[31m--\x1b[m\n\x1b[K\x1b[?1l\x1b>".into(),
+        });
+        let text: String = app.build_lines(80).iter().map(|l| l.plain()).collect();
+        for leak in ["[32m", "[31m", "[?1h", "[?1l", "[K", "\x1b"] {
+            assert!(!text.contains(leak), "{leak:?} survived: {text:?}");
+        }
+        assert!(text.contains("file.rs | 5 +++--"), "the actual output was lost: {text:?}");
     }
 
     /// Diff lines are tinted, not just coloured — the reason Style needed a

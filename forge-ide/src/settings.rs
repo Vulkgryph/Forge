@@ -87,6 +87,17 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub restore_windows: bool,
 
+    /// Write modified files to disk periodically, so a crash or a power cut
+    /// costs minutes rather than a session. On by default: losing work is
+    /// worse than an unexpected write, and the one surprising case — a file
+    /// you have not chosen a name for — is written to a temporary directory
+    /// and announced rather than saved somewhere silently.
+    #[serde(default = "default_true")]
+    pub auto_save: bool,
+    /// How often, in seconds.
+    #[serde(default = "default_auto_save_secs")]
+    pub auto_save_secs: u64,
+
     // Updates
     /// Check GitHub Releases for a newer Forge IDE version on startup. Off
     /// by default — this is the one network call Forge IDE makes on its
@@ -128,6 +139,10 @@ pub struct Settings {
     pub default_agent_permission_mode: AgentPermissionMode,
 }
 
+/// Five minutes. Long enough that it is never in the way of typing, short
+/// enough that what a crash costs is a coffee break rather than an afternoon.
+fn default_auto_save_secs() -> u64 { 300 }
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -141,6 +156,8 @@ impl Default for Settings {
             theme:              "Dark+".into(),
             restore_session:    true,
             restore_windows:    true,
+            auto_save:          true,
+            auto_save_secs:     default_auto_save_secs(),
             check_for_updates:  false,
             update_check_prompted: false,
             onboarding_skipped: false,

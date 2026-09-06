@@ -4260,6 +4260,13 @@ pub struct IdeApp {
     /// already said so — see `note_polling`.
     polling_since:   Option<std::time::Instant>,
     polling_reported: bool,
+    /// When the last automatic save ran.
+    last_auto_save:  Option<std::time::Instant>,
+    /// A buffer just written to the temporary directory, waiting for the user to
+    /// say whether they want it somewhere permanent.
+    temp_save_prompt: Option<PathBuf>,
+    /// A save-location dialog in flight, and the file it is for.
+    save_as_rx:      Option<(std::sync::mpsc::Receiver<Option<PathBuf>>, PathBuf)>,
     /// Set while the Settings pane is asking the user to type `confirm` before
     /// *Skip All Permissions* becomes the default for new tabs. `None` when no
     /// confirmation is open; the string is what has been typed so far.
@@ -4614,6 +4621,9 @@ impl IdeApp {
             polling_since:   None,
             polling_reported: false,
             settings_skip_all_confirm: None,
+            last_auto_save:  None,
+            temp_save_prompt: None,
+            save_as_rx:      None,
             palette:         crate::theme::Palette::default(),
             theme_picker:    None,
             theme_prev:      None,
@@ -6044,6 +6054,7 @@ impl IdeApp {
             note(self.fmt_rx.is_some(),               "formatter");
             note(self.tree_refresh_due.is_some(),     "file tree refresh");
             note(self.folder_rx.is_some(),            "folder load");
+            note(self.save_as_rx.is_some(),           "save-location dialog");
             note(self.dap_running,                    "debugger");
             note(self.search.searching,               "search");
             note(self.anvil_heat > 0.001,             "anvil animation");
@@ -6052,6 +6063,10 @@ impl IdeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.note_polling(&awake_because);
+
+        self.auto_save(ctx);
+        self.draw_temp_save_prompt(ctx);
+        self.poll_save_as();
 
         // Poll any in-flight git fetch/pull/push
         self.poll_git_task();
@@ -10142,6 +10157,38 @@ impl IdeApp {
 
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
+                    lbl(ui, "Auto-save Open Files");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        let old = s.auto_save;
+                        ui.checkbox(&mut s.auto_save, "");
+                        if s.auto_save != old { changed = true; }
+                        if s.auto_save {
+                            let mut minutes = (s.auto_save_secs / 60).max(1);
+                            let before = minutes;
+                            ui.add(egui::DragValue::new(&mut minutes)
+                                .range(1..=60).suffix(" min").speed(0.2));
+                            if minutes != before {
+                                s.auto_save_secs = minutes * 60;
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.label(egui::RichText::new(
+                            "Writes files that already have a name. A tab you have never \
+                             saved is left alone — use Save to give it a home first.")
+                            .size(10.0).color(egui::Color32::from_gray(100)));
+                    });
+                });
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
                     lbl(ui, "Restore Tabs & Terminals on Startup");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
@@ -14097,6 +14144,76 @@ impl IdeApp {
         }
     }
 
+    /// Write modified files to disk on a timer, so a crash costs minutes.
+    ///
+    /// Only touches files that already have a name: a buffer the user has not
+    /// saved even once is theirs to place, and inventing a file for it behind
+    /// their back is a bigger surprise than losing an unnamed scratch buffer.
+    /// `Cmd+S` on such a buffer offers a temporary file explicitly.
+    ///
+    /// Remote files are left alone too — writing them means a blocking SFTP
+    /// round trip on the event-loop thread, and a hitch every five minutes is a
+    /// poor trade for a save the user did not ask for.
+    fn auto_save(&mut self, ctx: &egui::Context) {
+        if !self.settings.auto_save || self.settings.auto_save_secs == 0 {
+            return;
+        }
+        let every = std::time::Duration::from_secs(self.settings.auto_save_secs);
+        let due_in = match self.last_auto_save {
+            Some(at) => every.checked_sub(at.elapsed()).unwrap_or_default(),
+            None => { self.last_auto_save = Some(std::time::Instant::now()); every }
+        };
+
+        // Anything worth saving keeps a wakeup scheduled. Without this a window
+        // sitting idle draws no frames at all — by design — and the timer would
+        // never come round, which is exactly the state a long editing session
+        // ends in before someone walks away from it.
+        let dirty = self.buffers.iter().any(|b| self.is_auto_savable(b));
+        if dirty && !due_in.is_zero() {
+            ctx.request_repaint_after(due_in);
+        }
+        if !due_in.is_zero() {
+            return;
+        }
+        self.last_auto_save = Some(std::time::Instant::now());
+        if !dirty {
+            return;
+        }
+
+        // The same condition the wakeup was scheduled on. It matters that these
+        // agree: `Buffer::save` writes to a local path, and a remote buffer's
+        // path is a path on the *other* machine — saving one here would create
+        // a file of that name locally, or overwrite one.
+        let remote = self.ssh.is_some();
+        let mut saved = 0usize;
+        let mut failed: Option<String> = None;
+        for buf in self.buffers.iter_mut().filter(|b| {
+            !remote && b.modified && b.path.is_some()
+                && b.diff.is_none() && b.image_bytes.is_none()
+        }) {
+            match buf.save() {
+                Ok(()) => saved += 1,
+                Err(e) => failed = Some(e),
+            }
+        }
+        if saved > 0 {
+            self.status = match saved {
+                1 => "Auto-saved 1 file".into(),
+                n => format!("Auto-saved {n} files"),
+            };
+            if let Some(g) = &mut self.git { g.refresh(); }
+        }
+        if let Some(e) = failed {
+            self.output_log(format!("Auto-save failed: {e}"), OutputLevel::Warn);
+        }
+    }
+
+    /// Whether this buffer is one auto-save would write.
+    fn is_auto_savable(&self, b: &crate::buffer::Buffer) -> bool {
+        b.modified && b.path.is_some() && b.diff.is_none() && b.image_bytes.is_none()
+            && self.ssh.is_none()
+    }
+
     /// Notice a window that has been polling for too long, and say why.
     ///
     /// A stuck condition costs about a percent of a core, forever, on a window
@@ -14760,6 +14877,24 @@ impl IdeApp {
     }
 
     fn save_active(&mut self) {
+        // An untitled buffer had no path, so saving returned "no path" into the
+        // status bar and wrote nothing at all. It now gets a file in the
+        // system's temporary directory — the work is on disk either way — and
+        // the user is told it is not permanent and offered somewhere better.
+        let mut adopted: Option<PathBuf> = None;
+        if let Some(buf) = self.buffers.get_mut(self.active) {
+            let untitled = buf.path.is_none()
+                && buf.diff.is_none()
+                && buf.image_bytes.is_none();
+            if untitled {
+                let name = format!("untitled-{}", self.active + 1);
+                match buf.adopt_temp_path(&name) {
+                    Ok(path) => adopted = Some(path),
+                    Err(e) => { self.status = e; return; }
+                }
+            }
+        }
+
         if let Some(buf) = self.buffers.get_mut(self.active) {
             if buf.image_bytes.is_some() { return; } // read-only preview
             // Remote save via SFTP when connected.
@@ -14773,10 +14908,116 @@ impl IdeApp {
                     return;
 }
             }
+            let temporary = buf.is_temporary();
             match buf.save() {
-                Ok(())  => { self.status = "Saved".into(); if let Some(g) = &mut self.git { g.refresh(); } },
-                Err(e)  => self.status = e,
+                Ok(()) => {
+                    // Said every time, not just the first: a file in the
+                    // temporary directory stays temporary until it is moved,
+                    // and one reminder at creation is easy to forget.
+                    self.status = if temporary {
+                        "Saved — temporary file".into()
+                    } else {
+                        "Saved".into()
+                    };
+                    if let Some(g) = &mut self.git { g.refresh(); }
+                }
+                Err(e) => self.status = e,
             }
+        }
+
+        if let Some(path) = adopted {
+            self.status = format!("Saved to a temporary file — {}", path.display());
+            self.output_log(
+                format!(
+                    "This tab had no file, so it was saved to {} — a temporary                      directory the system clears periodically. Choose a permanent                      location to keep it.",
+                    path.display(),
+                ),
+                OutputLevel::Warn,
+            );
+            self.temp_save_prompt = Some(path);
+        }
+    }
+
+    /// Offer somewhere permanent for a buffer that was saved to the temporary
+    /// directory. Declining is a real answer: the file stays where it is, and
+    /// the offer is not made again for that tab.
+    fn draw_temp_save_prompt(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.temp_save_prompt.clone() else { return };
+        let mut close = false;
+        let mut choose = false;
+        egui::Window::new("Saved to a temporary file")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(egui::RichText::new(
+                    "This tab had no file of its own, so it was written to the                      system's temporary directory. Your work is saved, but that                      directory is cleared periodically.")
+                    .size(12.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(path.display().to_string())
+                    .monospace().size(11.0).color(egui::Color32::from_gray(150)));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Choose a permanent location…").clicked() {
+                        choose = true;
+                        close = true;
+                    }
+                    if ui.button("Keep it here").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if choose {
+            self.pick_permanent_home(path);
+        }
+        if close {
+            self.temp_save_prompt = None;
+        }
+    }
+
+    /// Ask for a destination, off the event-loop thread, and move the file there.
+    fn pick_permanent_home(&mut self, from: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.save_as_rx = Some((rx, from.clone()));
+        let suggested = from.file_name().map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled.txt".into());
+        let start = self.has_folder.then(|| self.cwd.clone());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_file_name(&suggested);
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            let _ = tx.send(dialog.save_file());
+        });
+    }
+
+    /// Apply a chosen destination: move the temporary file, and point the tab
+    /// at its new home.
+    fn poll_save_as(&mut self) {
+        let Some((rx, from)) = &self.save_as_rx else { return };
+        let (from, chosen) = match rx.try_recv() {
+            Ok(chosen) => (from.clone(), chosen),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => { self.save_as_rx = None; return }
+        };
+        self.save_as_rx = None;
+        let Some(dest) = chosen else { return }; // cancelled: it stays in the temporary file
+
+        // Rename where possible, copy across filesystems — the temporary
+        // directory is often on a different volume from the user's home.
+        let moved = std::fs::rename(&from, &dest).or_else(|_| {
+            std::fs::copy(&from, &dest).map(|_| ()).and_then(|_| std::fs::remove_file(&from))
+        });
+        match moved {
+            Ok(()) => {
+                if let Some(buf) = self.buffers.iter_mut().find(|b| b.path.as_deref() == Some(from.as_path())) {
+                    buf.path = Some(dest.clone());
+                }
+                self.status = format!("Moved to {}", dest.display());
+                if let Some(g) = &mut self.git { g.refresh(); }
+            }
+            Err(e) => self.status = format!("could not move {}: {e}", from.display()),
         }
     }
 }
@@ -17676,6 +17917,51 @@ mod strip_width_tests {
             let w = row_width(&ctx, d, "claude-opus-4-6");
             assert!(w <= avail, "{w:.0}pt at {avail:.0}pt ({d:?}) — it wraps");
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_save_tests {
+    /// Which buffers an automatic save is allowed to write.
+    ///
+    /// Extracted so the rule can be checked without a window. The exclusions
+    /// are the point: a buffer with no name is the user's to place, a diff and
+    /// an image are read-only views, and a remote buffer's path belongs to
+    /// another machine — writing it here would create or overwrite a local file
+    /// of that name.
+    fn savable(modified: bool, has_path: bool, is_diff: bool, is_image: bool, remote: bool) -> bool {
+        !remote && modified && has_path && !is_diff && !is_image
+    }
+
+    #[test]
+    fn a_modified_file_is_written() {
+        assert!(savable(true, true, false, false, false));
+    }
+
+    #[test]
+    fn an_unchanged_file_is_left_alone() {
+        assert!(!savable(false, true, false, false, false));
+    }
+
+    /// A buffer that has never been saved has no name to save to, and picking
+    /// one silently is a bigger surprise than losing a scratch buffer. Cmd+S
+    /// offers a temporary file explicitly instead.
+    #[test]
+    fn an_unnamed_buffer_is_not_given_a_file_behind_the_users_back() {
+        assert!(!savable(true, false, false, false, false));
+    }
+
+    /// Read-only views have nothing to write.
+    #[test]
+    fn derived_views_are_never_written() {
+        assert!(!savable(true, true, true, false, false), "a diff");
+        assert!(!savable(true, true, false, true, false), "an image");
+    }
+
+    /// The dangerous one: a remote buffer's path is a path over there.
+    #[test]
+    fn a_remote_buffer_is_never_written_locally() {
+        assert!(!savable(true, true, false, false, true));
     }
 }
 

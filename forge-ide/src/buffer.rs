@@ -17,6 +17,9 @@ pub struct Buffer {
     /// (rustfmt included) that enforces one. Only load/reload touch this;
     /// in-session edits don't toggle it.
     trailing_newline: bool,
+    /// When the last edit landed, so a burst of typing becomes one undo entry
+    /// rather than one per character.
+    last_edit_at: Option<std::time::Instant>,
     /// Raw file bytes when this is an image preview tab (`lines` is unused
     /// in that case, same as `diff`). Set at load time; never edited.
     pub image_bytes: Option<Vec<u8>>,
@@ -63,7 +66,7 @@ fn check_size(path: &std::path::Path) -> Result<(), String> {
 impl Buffer {
     pub fn new() -> Self {
         Self { path: None, lines: vec![String::new()], cursor: (0, 0), modified: false, diff: None,
-               undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
+               undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
                image_bytes: None, image_view: None }
     }
 
@@ -75,7 +78,7 @@ impl Buffer {
                 .map_err(|e| format!("read {}: {e}", path.display()))?;
             return Ok(Self {
                 path: Some(path), lines: vec![String::new()], cursor: (0, 0), modified: false,
-                diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true,
+                diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
                 image_bytes: Some(bytes), image_view: None,
             });
         }
@@ -88,7 +91,7 @@ impl Buffer {
             text.lines().map(String::from).collect()
         };
         Ok(Self { path: Some(path), lines, cursor: (0, 0), modified: false, diff: None,
-                  undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline,
+                  undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline, last_edit_at: None,
                   image_bytes: None, image_view: None })
     }
 
@@ -96,7 +99,7 @@ impl Buffer {
     pub fn diff_view(path: PathBuf, rows: Vec<crate::git::DiffRow>) -> Self {
         Self { path: Some(path), lines: vec![String::new()], cursor: (0, 0),
                modified: false, diff: Some(rows), undo_stack: Vec::new(),
-               redo_stack: Vec::new(), trailing_newline: true,
+               redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
                image_bytes: None, image_view: None }
     }
 
@@ -114,6 +117,37 @@ impl Buffer {
         std::fs::write(path, self.text_for_disk()).map_err(|e| format!("write: {e}"))?;
         self.modified = false;
         Ok(())
+    }
+
+    /// Give an untitled buffer somewhere to live: a file in the system's
+    /// temporary directory, named after the tab.
+    ///
+    /// Chosen over refusing to save at all, which is what happened before — the
+    /// status bar said "no path" and the keystrokes went nowhere. Somewhere
+    /// temporary is not somewhere good, but it is recoverable, and the caller
+    /// says so and offers to move it.
+    pub fn adopt_temp_path(&mut self, name: &str) -> Result<PathBuf, String> {
+        let dir = std::env::temp_dir().join("forge-untitled");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+        // Never overwrite an existing file: two untitled tabs saved in one
+        // session would otherwise land on each other.
+        let stem = name.trim().replace('/', "-");
+        let stem = if stem.is_empty() { "untitled" } else { &stem };
+        let mut candidate = dir.join(format!("{stem}.txt"));
+        let mut n = 2;
+        while candidate.exists() {
+            candidate = dir.join(format!("{stem}-{n}.txt"));
+            n += 1;
+        }
+        self.path = Some(candidate.clone());
+        Ok(candidate)
+    }
+
+    /// Whether this buffer lives in the temporary directory rather than
+    /// somewhere the user chose.
+    pub fn is_temporary(&self) -> bool {
+        self.path.as_ref().is_some_and(|p| p.starts_with(std::env::temp_dir().join("forge-untitled")))
     }
 
     /// Re-read this buffer's content from disk, discarding in-memory state.
@@ -157,17 +191,45 @@ impl Buffer {
         }
     }
 
-    pub fn insert_char(&mut self, ch: char) {
-        self.snapshot();
-        let (row, col) = self.cursor;
-        if ch == '\n' {
-            let rest = self.lines[row].split_off(col);
-            self.lines.insert(row + 1, rest);
-            self.cursor = (row + 1, 0);
-        } else {
-            self.lines[row].insert(col, ch);
-            self.cursor.1 += ch.len_utf8();
+    /// Take the editor widget's text back into the buffer's lines.
+    ///
+    /// `split('\n')`, not `lines()`. The two differ on exactly one input, and
+    /// it is the one that matters: text ending in a newline. `lines()` drops
+    /// the trailing empty element, so pressing Enter at the end of a line —
+    /// which is how you add a blank line, and how you add any line at the end
+    /// of a file — produced text whose new line was then thrown away. Enter
+    /// looked like it did nothing.
+    ///
+    /// The trailing newline a file had on disk is not represented in `lines` at
+    /// all; it is remembered separately and re-added by `text_for_disk`, so
+    /// splitting here cannot double it.
+    pub fn set_text_from_editor(&mut self, text: &str) {
+        let mut next: Vec<String> = text.split('\n').map(String::from).collect();
+        if next.is_empty() {
+            next.push(String::new());
         }
+        if next == self.lines {
+            return;
+        }
+
+        // Undo used to capture nothing typed: `snapshot` was reached only from
+        // `insert_char`, which only the Tab key called, so Ctrl+Z did nothing
+        // after ordinary editing.
+        //
+        // Snapshotting every keystroke would be correct and useless — a
+        // hundred-entry stack would hold a hundred characters. So bursts of
+        // typing coalesce into one entry, and anything structural (a line
+        // added or removed, a paste, a deletion) always starts a new one, which
+        // is where a person expects undo to stop.
+        let structural = next.len() != self.lines.len();
+        let stale = self.last_edit_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(600));
+        if structural || stale {
+            self.snapshot();
+        }
+        self.last_edit_at = Some(std::time::Instant::now());
+
+        self.lines = next;
         self.modified = true;
     }
 
@@ -279,5 +341,180 @@ mod size_cap_tests {
         // Buffer keeps its previous contents rather than being clobbered.
         assert_eq!(buf.lines, vec!["small"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod editor_text_tests {
+    use super::Buffer;
+
+    fn buf(lines: &[&str]) -> Buffer {
+        let mut b = Buffer::new();
+        b.lines = lines.iter().map(|s| s.to_string()).collect();
+        b
+    }
+
+    /// The reported bug: Enter at the end of a line did nothing. The editor
+    /// hands back text ending in a newline, and `lines()` discards its final
+    /// empty element — so the line the user had just made was dropped before
+    /// it was ever stored.
+    #[test]
+    fn enter_at_the_end_of_a_line_adds_a_line() {
+        let mut b = buf(&["a", "b"]);
+        // What the widget contains after the caret is at the end and Enter is pressed.
+        b.set_text_from_editor("a\nb\n");
+        assert_eq!(b.lines, vec!["a", "b", ""], "the new empty line was dropped");
+    }
+
+    /// And repeatedly, since a run of blank lines is the case that made it
+    /// obvious.
+    #[test]
+    fn several_blank_lines_in_a_row_all_survive() {
+        let mut b = buf(&["a"]);
+        b.set_text_from_editor("a\n\n\n");
+        assert_eq!(b.lines, vec!["a", "", "", ""]);
+    }
+
+    /// Enter in the middle still splits, which always worked and must keep
+    /// working.
+    #[test]
+    fn enter_in_the_middle_splits_the_line() {
+        let mut b = buf(&["hello world"]);
+        b.set_text_from_editor("hello \nworld");
+        assert_eq!(b.lines, vec!["hello ", "world"]);
+    }
+
+    /// Emptied entirely, a buffer still has one line to put a caret on.
+    #[test]
+    fn an_empty_buffer_keeps_one_line() {
+        let mut b = buf(&["a", "b"]);
+        b.set_text_from_editor("");
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    /// Splitting must not double the newline a file ended with on disk: that
+    /// one is remembered separately, not stored as a line.
+    #[test]
+    fn the_file_s_own_trailing_newline_is_not_doubled() {
+        let mut b = buf(&["a", "b"]);
+        assert!(b.trailing_newline, "a fresh buffer assumes one");
+        b.set_text_from_editor("a\nb");
+        assert_eq!(b.text_for_disk(), "a\nb\n");
+        // Now the user adds a blank line at the end.
+        b.set_text_from_editor("a\nb\n");
+        assert_eq!(b.text_for_disk(), "a\nb\n\n", "the added line reaches disk");
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::Buffer;
+
+    fn buf(lines: &[&str]) -> Buffer {
+        let mut b = Buffer::new();
+        b.lines = lines.iter().map(|s| s.to_string()).collect();
+        b
+    }
+
+    /// Undo captured nothing that was typed: the only path that snapshotted was
+    /// `insert_char`, which only the Tab key used. Ctrl+Z after ordinary
+    /// editing did nothing at all.
+    #[test]
+    fn undo_takes_back_an_edit() {
+        let mut b = buf(&["hello"]);
+        b.set_text_from_editor("hello world");
+        b.undo();
+        assert_eq!(b.lines, vec!["hello"], "the edit was never recorded");
+    }
+
+    /// Adding a line is structural, so it always starts its own entry — undo
+    /// after Enter puts the line back, whatever the timing.
+    #[test]
+    fn adding_a_line_is_its_own_undo_step() {
+        let mut b = buf(&["a"]);
+        b.set_text_from_editor("a\n");
+        assert_eq!(b.lines, vec!["a", ""]);
+        b.undo();
+        assert_eq!(b.lines, vec!["a"]);
+    }
+
+    /// A burst of typing coalesces. Snapshotting per keystroke would fill a
+    /// hundred-entry stack with a hundred characters and undo would reach back
+    /// about one word.
+    #[test]
+    fn a_burst_of_typing_is_one_step() {
+        let mut b = buf(&[""]);
+        for text in ["h", "he", "hel", "hell", "hello"] {
+            b.set_text_from_editor(text);
+        }
+        assert_eq!(b.lines, vec!["hello"]);
+        b.undo();
+        assert_eq!(b.lines, vec![""], "each keystroke became its own entry");
+    }
+
+    /// Redo still works across the new path.
+    #[test]
+    fn redo_puts_it_back() {
+        let mut b = buf(&["a"]);
+        b.set_text_from_editor("a\nb");
+        b.undo();
+        assert_eq!(b.lines, vec!["a"]);
+        b.redo();
+        assert_eq!(b.lines, vec!["a", "b"]);
+    }
+
+    /// A frame that reports a change but changes nothing must not consume an
+    /// undo step — the editor's layouter runs constantly.
+    #[test]
+    fn an_identical_frame_records_nothing() {
+        let mut b = buf(&["a"]);
+        b.set_text_from_editor("a");
+        b.set_text_from_editor("a");
+        assert!(!b.modified, "nothing changed, so nothing was modified");
+    }
+}
+
+#[cfg(test)]
+mod temp_save_tests {
+    use super::Buffer;
+
+    /// An untitled buffer used to refuse to save at all: `save()` returned
+    /// "no path" and the keystrokes went nowhere. It now gets a real file.
+    #[test]
+    fn an_untitled_buffer_gets_a_file() {
+        let mut b = Buffer::new();
+        assert!(b.save().is_err(), "with no path there is nowhere to write");
+        let path = b.adopt_temp_path("untitled-1").expect("a temporary path");
+        b.lines = vec!["hello".into()];
+        b.save().expect("saves now");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        assert!(b.is_temporary(), "and it knows the file is not permanent");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two untitled tabs saved in one session must not land on each other.
+    #[test]
+    fn a_second_buffer_does_not_overwrite_the_first() {
+        let mut a = Buffer::new();
+        let mut b = Buffer::new();
+        let pa = a.adopt_temp_path("collide").unwrap();
+        a.lines = vec!["first".into()];
+        a.save().unwrap();
+        let pb = b.adopt_temp_path("collide").unwrap();
+        b.lines = vec!["second".into()];
+        b.save().unwrap();
+        assert_ne!(pa, pb, "the second buffer reused the first one's path");
+        assert_eq!(std::fs::read_to_string(&pa).unwrap(), "first\n");
+        assert_eq!(std::fs::read_to_string(&pb).unwrap(), "second\n");
+        let _ = std::fs::remove_file(pa);
+        let _ = std::fs::remove_file(pb);
+    }
+
+    /// A file the user chose is not temporary, so nothing warns about it.
+    #[test]
+    fn a_real_path_is_not_temporary() {
+        let mut b = Buffer::new();
+        b.path = Some(std::path::PathBuf::from("/Users/someone/notes.md"));
+        assert!(!b.is_temporary());
     }
 }

@@ -2142,6 +2142,20 @@ fn status_badge_chrome(triangle: bool) -> f32 {
 /// exist yet, including remote ones: a remote session started under it launches
 /// the agent with `--dangerously-allow-all` on a machine that may not be the
 /// user's. Switching one live tab already confirms; this decides in advance.
+/// What a Tab keypress should insert into the editor, or `None` to leave the
+/// key to `TextEdit`.
+///
+/// `TextEdit` already does the right thing for a literal tab and for Shift+Tab
+/// (de-indent), so those are delegated rather than reimplemented. Only the
+/// spaces case needs us, because the widget hard-codes `\t` and honours no
+/// settings of ours.
+fn tab_insertion(ctrl: bool, shift: bool, insert_spaces: bool, tab_width: u8) -> Option<String> {
+    if ctrl || shift || !insert_spaces {
+        return None;
+    }
+    Some(" ".repeat(tab_width as usize))
+}
+
 /// What the status bar calls the workspace.
 ///
 /// A window with no folder open still has a working directory — `$HOME`, so its
@@ -7613,15 +7627,14 @@ impl IdeApp {
             .show(ui, |ui| {
                 let out = egui::TextEdit::multiline(&mut text)
                     .font(font_id)
+                    .lock_focus(true) // Tab indents, as in the main editor.
                     .desired_rows(30)
                     .desired_width(if word_wrap { ui.available_width() } else { f32::INFINITY })
                     .frame(false)
                     .layouter(&mut layouter)
                     .show(ui);
                 if out.response.changed() {
-                    buf.lines = text.lines().map(String::from).collect();
-                    if buf.lines.is_empty() { buf.lines.push(String::new()); }
-                    buf.modified = true;
+                    buf.set_text_from_editor(&text);
                 }
             });
     }
@@ -12518,16 +12531,36 @@ impl IdeApp {
         if ctrl && ui.input(|i| i.key_pressed(egui::Key::Y)) { buf.redo(); }
 
         // Tab key: insert spaces or a tab character based on settings.
-        // Consume the event before TextEdit sees it. Gated on the editor
-        // actually having focus — see the comment on `editor_focused` above.
-        if editor_focused && !ctrl && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-            if self.settings.insert_spaces {
-                let spaces = " ".repeat(self.settings.tab_width as usize);
-                for ch in spaces.chars() { buf.insert_char(ch); }
-            } else {
-                buf.insert_char('\t');
-            }
-            ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. })));
+        //
+        // Two separate things have to be got right, and getting only one of
+        // them is what made this look fixed when it wasn't.
+        //
+        // First, focus. egui decides whether Tab means "move to the next
+        // widget" in `begin_pass`, before any of this function runs, so
+        // deleting the event here was always too late — focus had already left
+        // the editor, which is why the caret vanished and typing went nowhere
+        // until the editor was clicked again. The only thing that suppresses
+        // that is the focused widget's own event filter, set by
+        // `TextEdit::lock_focus(true)` where the editor is built above.
+        //
+        // Second, the text. With focus held, `TextEdit` handles Tab itself —
+        // but it always inserts a literal `\t`, and honours no settings. So
+        // when spaces are wanted, swap the key event for the text it should
+        // produce and let the widget apply it: `TextEdit` owns the caret, and
+        // an edit made behind its back leaves that caret describing text that
+        // no longer exists.
+        //
+        // Everything else is left to the widget: a real tab needs no
+        // substitution, and Shift+Tab is its de-indent, which has no
+        // equivalent here.
+        let insertion = tab_insertion(ctrl, shift, self.settings.insert_spaces, self.settings.tab_width);
+        if let Some(insertion) = insertion.filter(|_| editor_focused)
+            && ui.input(|i| i.key_pressed(egui::Key::Tab))
+        {
+            ui.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }));
+                i.events.push(egui::Event::Text(insertion));
+            });
         }
 
         // Ctrl+Space → completions
@@ -12882,6 +12915,10 @@ impl IdeApp {
 
                     let te_out = egui::TextEdit::multiline(&mut text)
                         .font(font_id.clone())
+                        // Tab indents here; it does not move focus. Without
+                        // this, egui claims Tab for focus navigation before any
+                        // of our own key handling runs — see the Tab handler.
+                        .lock_focus(true)
                         .desired_rows(n_lines.max(30))
                         .desired_width(if word_wrap { ui.available_width() } else { f32::INFINITY })
                         .frame(false)
@@ -13078,9 +13115,11 @@ impl IdeApp {
     }
 
                     if te_out.response.changed() {
-                        buf.lines = text.lines().map(String::from).collect();
-                        if buf.lines.is_empty() { buf.lines.push(String::new()); }
-                        buf.modified = true;
+                        buf.set_text_from_editor(&text);
+                        // Any edit invalidates a completion list: it was
+                        // requested for a prefix that no longer exists, and
+                        // while it is non-empty it takes Enter for itself.
+                        self.comp_items.clear();
                         if let Some(fb) = &mut self.find_bar { fb.dirty = true; }
                         self.gutter_dirty = true; // refresh diff bars after an edit
                         // Notify the language server of the edit.
@@ -17925,5 +17964,79 @@ mod strip_detail_tests {
             assert!(!(d.separators && d.compact), "at {w}pt: decoration beside cut labels");
             w += 5.0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_key_tests {
+    use super::*;
+
+    /// Tab must not move focus out of the editor.
+    ///
+    /// egui resolves Tab into focus navigation in `begin_pass`, before any of
+    /// our key handling runs, so removing the event in our own code was always
+    /// too late: focus had already left, the caret vanished, and typing went
+    /// nowhere until the editor was clicked again. The only thing that stops it
+    /// is the focused widget's own event filter, which `lock_focus(true)` sets.
+    ///
+    /// The control run asserts egui really does steal Tab without it, so this
+    /// test fails if `lock_focus` is dropped from the editor — and would be
+    /// worthless if it passed either way.
+    fn focus_survives_tab(lock: bool) -> bool {
+        let ctx = egui::Context::default();
+        let mut text = String::from("indent me");
+        let mut neighbour = String::new();
+        let editor = egui::Id::new("editor_under_test");
+
+        for frame in 0..4 {
+            let mut input = egui::RawInput::default();
+            if frame == 3 {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Somewhere for focus to go, or there is nothing to lose it to.
+                    ui.add(egui::TextEdit::singleline(&mut neighbour));
+                    let te = egui::TextEdit::multiline(&mut text).id(editor);
+                    if lock { te.lock_focus(true) } else { te }.show(ui);
+                });
+            });
+            if frame == 0 {
+                ctx.memory_mut(|m| m.request_focus(editor));
+            }
+        }
+        ctx.memory(|m| m.focused()) == Some(editor)
+    }
+
+    #[test]
+    fn tab_keeps_focus_in_the_editor() {
+        assert!(
+            !focus_survives_tab(false),
+            "control failed: egui no longer steals Tab, so this test proves nothing"
+        );
+        assert!(
+            focus_survives_tab(true),
+            "Tab moved focus out of the editor — the caret would disappear"
+        );
+    }
+
+    /// With focus held, `TextEdit` inserts a literal tab, so the settings-aware
+    /// cases are the only ones we take over.
+    #[test]
+    fn only_the_spaces_case_is_intercepted() {
+        assert_eq!(tab_insertion(false, false, true, 4).as_deref(), Some("    "));
+        assert_eq!(tab_insertion(false, false, true, 2).as_deref(), Some("  "));
+        // A real tab: the widget's own behaviour is already right.
+        assert_eq!(tab_insertion(false, false, false, 4), None);
+        // Shift+Tab is the widget's de-indent, which we have no equivalent for.
+        assert_eq!(tab_insertion(false, true, true, 4), None);
+        // Ctrl+Tab belongs to whatever cycles tabs, not to the text.
+        assert_eq!(tab_insertion(true, false, true, 4), None);
     }
 }

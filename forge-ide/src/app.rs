@@ -2635,6 +2635,36 @@ fn minimap_span(left: f32, first_col: f32, cols: f32, points_per_col: f32) -> (f
     (x0, x0 + cols.max(1.0) * points_per_col)
 }
 
+/// Width of the minimap strip, and the clear space kept either side of it.
+const MINIMAP_W: f32 = 90.0;
+const MINIMAP_MARGIN: f32 = 8.0;
+
+/// Splits the editor area into the part the text may use and the strip the
+/// minimap sits in.
+///
+/// The minimap used to be painted over the editor after the fact, while the
+/// text area still believed it had the full width. A line long enough to reach
+/// the right-hand edge therefore ran underneath it and could not be read, and
+/// no amount of scrolling helped: the text simply arrived beneath the overlay.
+/// Taking the strip out of the area first means the visible field *ends* where
+/// the minimap begins — so the sideways scroll range, word wrap and the
+/// horizontal scrollbar are all measured against the width the text really has.
+///
+/// Returns the full rect and `None` when the minimap is switched off, so
+/// turning it off gives the width straight back.
+fn split_for_minimap(editor: egui::Rect, enabled: bool) -> (egui::Rect, Option<egui::Rect>) {
+    if !enabled {
+        return (editor, None);
+    }
+    let strip = egui::Rect::from_min_max(
+        egui::pos2(editor.right() - MINIMAP_W - MINIMAP_MARGIN, editor.top()),
+        egui::pos2(editor.right() - MINIMAP_MARGIN, editor.bottom()),
+    );
+    let mut text = editor;
+    text.max.x = strip.left() - MINIMAP_MARGIN;
+    (text, Some(strip))
+}
+
 fn tool_call_has_result(items: &[ChatItem], i: usize) -> bool {
     i + 1 < items.len() && matches!(items[i + 1], ChatItem::ToolResult { .. })
 }
@@ -12742,6 +12772,20 @@ impl IdeApp {
         // of all tabs sharing one persisted scroll state.
         let scroll_key = buf.path.as_ref().map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("untitled-{}", self.active));
+        // The text gets the area left over once the minimap has taken its
+        // strip — see `split_for_minimap`. Built as a child ui rather than by
+        // shrinking the content, because it is the *viewport* that has to end
+        // at the minimap's edge: a full-width viewport draws the text under it
+        // however narrow the content is told it is.
+        // `available_rect_before_wrap`, not `max_rect`: the latter ignores how
+        // far down the ui has already got, so anything drawn above the editor
+        // would end up underneath it.
+        let (text_rect, _) =
+            split_for_minimap(ui.available_rect_before_wrap(), self.settings.minimap);
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new().max_rect(text_rect).layout(*ui.layout()),
+        );
+        let ui = &mut text_ui;
         let scroll_out = scroll_area
             .id_salt(("editor_scroll", scroll_key))
             .auto_shrink([false, false])
@@ -13400,11 +13444,9 @@ impl IdeApp {
         // ── Minimap ────────────────────────────────────────────────
         if self.settings.minimap {
             let Some(buf) = self.buffers.get(self.active) else { return };
-            let mm_w = 90.0;
-            let mm_rect = egui::Rect::from_min_max(
-                egui::pos2(editor_rect.right() - mm_w - 8.0, editor_rect.top()),
-                egui::pos2(editor_rect.right() - 8.0,        editor_rect.bottom()),
-            );
+            // The same split the text area was measured against, so the strip
+            // cannot drift away from the width that was reserved for it.
+            let Some(mm_rect) = split_for_minimap(editor_rect, true).1 else { return };
             let p = ui.painter_at(mm_rect);
             let bg = self.palette.editor_bg_c();
             p.rect_filled(mm_rect, 0.0, egui::Color32::from_rgba_unmultiplied(
@@ -16018,7 +16060,50 @@ mod wrap_run_tests {
 
 #[cfg(test)]
 mod minimap_tests {
-    use super::minimap_span;
+    use super::{minimap_span, split_for_minimap, MINIMAP_W};
+
+    fn editor() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 600.0))
+    }
+
+    /// The whole point: text and minimap cannot share a column.
+    ///
+    /// The minimap was painted over the editor while the text area still had
+    /// the full width, so a line long enough to reach the right-hand edge went
+    /// under it and could not be read at all.
+    #[test]
+    fn the_text_area_stops_before_the_minimap() {
+        let (text, strip) = split_for_minimap(editor(), true);
+        let strip = strip.expect("the minimap is on");
+        assert!(
+            text.right() <= strip.left(),
+            "text runs under the minimap: text ends at {}, minimap starts at {}",
+            text.right(),
+            strip.left()
+        );
+        assert!(strip.right() <= editor().right(), "the minimap hangs off the edge");
+        assert!(strip.width() >= MINIMAP_W, "the strip is narrower than the minimap");
+    }
+
+    /// Turning it off gives the width back rather than leaving a dead margin.
+    #[test]
+    fn no_minimap_means_no_reservation() {
+        let (text, strip) = split_for_minimap(editor(), false);
+        assert_eq!(text, editor());
+        assert!(strip.is_none());
+    }
+
+    /// The reservation costs real width, or nothing was reserved at all.
+    #[test]
+    fn the_strip_is_taken_out_of_the_text_area() {
+        let full = split_for_minimap(editor(), false).0.width();
+        let narrowed = split_for_minimap(editor(), true).0.width();
+        assert!(
+            narrowed < full - MINIMAP_W,
+            "reserved {} of {MINIMAP_W}+ points",
+            full - narrowed
+        );
+    }
 
     /// The minimap's scale: points per character across it.
     const SCALE: f32 = 0.7;

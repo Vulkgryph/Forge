@@ -4,9 +4,15 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-## [0.3.2] — 2026-08-30
+## [0.4.0] — 2026-09-06
 
 ### Added
+
+- **Open files are saved on a timer.** An interruption now costs minutes rather than a session. Only files that already have a name are written: a buffer never saved is the user's to place, and inventing a file for it behind their back is a bigger surprise than losing an unnamed scratch buffer. Five minutes by default, and configurable.
+
+- **Untitled files have somewhere to go.** Saving one used to return "no path" to the status bar and write nothing at all, so the work was simply not on disk. It now gets a file in the system's temporary directory — the work survives either way — and the user is told it is not permanent and offered somewhere better. Declining keeps it where it is, and the reminder repeats on every save, because a file in the temporary directory stays temporary until it is moved.
+
+- **The agent's task list is drawn as a checklist.** `todo_write` results were printed as the raw `[x]` / `[~]` / `[ ]` lines in flat grey, so what was finished, what was running and what was waiting all looked the same. The markers are painted rather than typed: `✔` and `○` are glyphs the font may not have, and when it does not they arrive as empty boxes — which is what a checkmark in this panel actually looked like.
 
 - **Animated images play, and can be scrubbed like video.** A GIF used to be decoded whole before anything appeared: every frame composited to full size and uploaded as its own texture. For the two-thousand-frame terminal recording in this repository that is 3.7 GB of pixels and 2,258 GPU textures, which is why it took so long to open. Frames are now composited one at a time into a single reused canvas and a single reused texture — about 7 MB whatever the length — and the picture appears immediately.
 
@@ -24,8 +30,6 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 - **Glyphs the terminal draws are in a font that is loaded.** Apple Symbols was loaded only for the UI family and Menlo only for the code font, and between them each family lacked what the other had: no Braille in the monospace family, so every TUI spinner drew as a row of empty boxes, and no `✔` in the proportional one. Each is now the other's fallback. A test asks egui what it can actually render rather than reading `cmap` tables, because a font file containing a glyph says nothing about whether the file was loaded — Menlo is a TrueType collection, and the previous check could not parse those at all.
 
-### Added
-
 - **GIFs open, and animate — and the image dependency is gone.** Opening a `.gif` failed with "stream did not contain valid UTF-8": the editor treated only `.png` as an image, while the file tree already gave gif, jpg and webp an image icon, so it showed a picture icon for a file it then refused to open. The `image` crate it used was compiled with PNG support only.
 
   Rather than enable more of that crate, Forge now decodes images itself: DEFLATE and zlib (RFC 1951 and 1950), PNG (RFC 2083) across all five colour types, bit depths 1 through 16, every scanline filter, palette transparency and Adam7 interlacing, and GIF89a including LZW, interlacing and all four frame-disposal methods. About a thousand lines, decode-only. Six crates left the dependency graph — `image`, `png`, `bytemuck`, `byteorder-lite`, `moxcms` and `num-traits` — taking the workspace from 682 to 676.
@@ -33,6 +37,20 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
   The decoders were checked against the crate they replaced before it was removed: our output and its output were compared byte for byte over the 3024×2088 screenshot in this repository — twenty-five megabytes of RGBA, not one byte different — and over three hand-built fixtures covering greyscale, a 4-bit palette with `tRNS`, and 16-bit samples with the Paeth filter. Those digests are recorded in the tests, so what they assert is what an independent implementation produced and this one agreed with, rather than what this one happens to produce.
 
   Animated GIFs play at their own speed: every frame is composited to full size at decode time, and the frame shown is chosen by wall clock rather than by repaint count, with a repaint requested only while a file actually has more than one frame — so an open still costs nothing.
+
+### Fixed
+
+- **Enter inserts a newline.** Writing the editor's text back to the buffer split it with `str::lines()`, which drops the trailing empty element, so a new empty line was discarded the moment it was made.
+
+- **Undo steps back through typing.** The snapshot was only taken on a path whose sole caller was the Tab handler, so ordinary typing was never recorded. Rapid keystrokes are coalesced, so one undo does not step back a character at a time.
+
+- **Tab indents without losing the caret.** It inserted its spacing and then left the editor unable to accept typing until it was clicked. egui resolves Tab into focus navigation before any of our key handling runs, so removing the event afterwards was always too late — focus had already left the editor.
+
+- **The explorer's new-file box can be finished.** Pressing Enter did nothing and the box could not be left. It asked for keyboard focus on every frame, including the frame in which Enter had just made the widget surrender it, so the commit was never seen — and it held the keyboard against every other widget for as long as it was open.
+
+- **The minimap no longer covers the code.** It was painted over the editor while the text area still believed it had the full width, so a line long enough to reach the right-hand edge ran underneath it and could not be read. The editor area is now split before either is drawn, and turning the minimap off returns that width rather than leaving a dead margin.
+
+- **Installing a build no longer kills running windows.** Copying over a running executable reuses its inode while the kernel's cached signature still describes the old contents, so the next page faulted in fails its check and the process is killed — `CODESIGNING, Invalid Page`. The destination is now removed first, leaving a running process holding its old, unlinked inode.
 
 ## [0.3.1] — 2026-08-28
 

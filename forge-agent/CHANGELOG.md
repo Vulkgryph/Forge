@@ -4,9 +4,23 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
-## [0.3.2] — 2026-08-30
+## [0.4.0] — 2026-09-06
 
-No changes in this component; released with `forge-ide` and `forge-tui-rs`, which share its version.
+### Added
+
+- **The agent has a working area of its own.** Everything it wrote previously landed in the user's project, so a throwaway probe script, a scratch copy of a file, or a one-off reproduction either became litter in a real repository or did not get written at all. Each session now gets a directory under the system's temporary directory, created on demand and named after the session, and the model is told where it is. Subagents are handed the same one rather than making their own, so scratch work carries between them.
+
+  Writes into it skip the approval prompt — a scratch area that asks permission for every throwaway file is not a scratch area — and the exemption is deliberately narrow. It covers `write_file` and `edit_file`, whose target is a single named path that can be checked. `apply_patch` names its files inside the diff and can carry several at once, so it is approved as before, and `shell_exec` is untouched: a command is free to go anywhere once it is running. Copying a file *out* of the area into a real directory is an ordinary write and is approved like one.
+
+  The containment check is the whole boundary, so it resolves paths rather than comparing strings — `lab/../../etc/passwd` starts with the area's path as text while naming somewhere else entirely — and compares by path component, so a sibling directory named `forge-lab-old` is not inside `forge-lab`.
+
+  On Linux the base is usually `/tmp`, shared with every account on the machine, which matters more here than for an ordinary temporary file because writes land without asking. The directories are created `0700`, and one that is a symlink or belongs to another user is refused outright: left alone, a pre-planted symlink would redirect every auto-approved write the agent makes. Verified on Linux as well as macOS.
+
+  Areas are removed by age at startup rather than on exit, because a session ends in every way a process can and one cleaned up only on a clean exit accumulates. Age is read from the newest file inside, since a directory's own mtime does not move while its contents are edited. Seven days by default; all three switches live under `[agent.scratchpad]`, and older config files still parse.
+
+### Fixed
+
+- **The rendered task list is pinned by a test.** Forge IDE and the TUI both parse `todo_write`'s output to draw it as a checklist, and neither can import the function that writes it. Changing the markers or the indentation would have quietly turned both back into flat grey text.
 
 ## [0.3.1] — 2026-08-28
 

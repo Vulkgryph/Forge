@@ -16317,6 +16317,7 @@ mod loaded_font_tests {
 
         // Terminal output is monospace; panel chrome is proportional.
         let cases: &[(egui::FontFamily, &str, &str)] = &[
+            (egui::FontFamily::Monospace, "\u{25CF}", "tool-call dot"),
             (egui::FontFamily::Monospace, "\u{2714}", "todo done"),
             (egui::FontFamily::Monospace, "\u{25B8}", "todo in progress"),
             (egui::FontFamily::Monospace, "\u{25CB}", "todo pending"),

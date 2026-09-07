@@ -4,11 +4,15 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
-## [0.4.0] — 2026-09-06
+## [0.4.0] — 2026-09-07
 
 _Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
 
 ### Fixed
+
+- **The dot on every tool call is a circle again, not an emoji.** It was `⏺` (U+23FA, "black circle for record"), which has `Emoji_Presentation=Yes` and appears in neither Menlo nor Apple Symbols — so it fell through to the colour emoji font, which draws its own glyph in its own colour and discards the one the transcript asked for. That colour is the whole point of the dot: it is what separates a call that is running from one that finished and one that failed. Now `●` (U+25CF), which both fonts have and which takes the colour it is given.
+
+  This has been the same mistake three times — `⏵` and `⏸` in the permission-mode line before it — because the media-control glyphs in `U+23E9`–`U+23FA` look like plain geometric shapes in an editor and arrive as emoji in a terminal. So there is now a test that renders the transcript and the status line and fails on any of them, rather than a third fix.
 
 - **Approving a plan with auto-accept switches the mode, rather than quietly allowing three tools.** Choosing *Auto-approve edits* added `write_file`, `edit_file` and `apply_patch` to a per-tool allowlist. The edits did land without prompting, but nothing else agreed: the status line still read "Normal mode", so the one indicator of what the session will do without asking said the opposite of what it did. The allowlist was also never consulted against the permission mode, so cycling back to Normal with Shift-Tab left every edit still landing unprompted — the choice could be made but not unmade.
 

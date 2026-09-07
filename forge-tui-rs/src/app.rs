@@ -712,7 +712,15 @@ impl App {
                     // a category of its own.)
                     let mut spans = vec![
                         Span { text: "    ".into(), style: dim },
-                        Span { text: "⏺ ".into(), style: Style::fg(palette::TOOL) },
+                        // `●` (U+25CF), not `⏺` (U+23FA). The record circle
+                        // has Emoji_Presentation=Yes and is in neither Menlo
+                        // nor Apple Symbols, so it fell through to the colour
+                        // emoji font — which draws its own glyph in its own
+                        // colour and discards the one set here. The dot's
+                        // colour is what separates a call that is running from
+                        // one that finished or failed, so losing it loses the
+                        // only thing the glyph was for.
+                        Span { text: "● ".into(), style: Style::fg(palette::TOOL) },
                     ];
                     spans.push(Span { text: entry.content.clone(), style: Style::default() });
                     out.push(Line { spans });
@@ -4378,5 +4386,90 @@ mod version_report_tests {
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(20_513), (2026, 3, 1));
+    }
+}
+
+#[cfg(test)]
+mod glyph_presentation_tests {
+    use super::*;
+    use forge_agent_proto::AgentMessage;
+
+    /// Codepoints that draw themselves in their own colour, or that no font on
+    /// macOS ships at all.
+    ///
+    /// Anything with `Emoji_Presentation=Yes` is rendered by the colour emoji
+    /// font, which discards the colour the transcript asked for — and colour is
+    /// how a running call is told from a finished or failed one. The media
+    /// controls in `U+23E9..U+23FA` are the trap: they look like plain
+    /// geometric shapes in a code editor and arrive as emoji in a terminal.
+    /// Neither Menlo nor Apple Symbols contains any of them.
+    ///
+    /// This has now been the cause three times: `⏵`/`⏸` in the permission-mode
+    /// line, and `⏺` on every tool call. Hence a test rather than a third fix.
+    const NOT_TEXT_GLYPHS: &[(char, &str)] = &[
+        ('\u{23E9}', "black right-pointing double triangle"),
+        ('\u{23EA}', "black left-pointing double triangle"),
+        ('\u{23EF}', "black right-pointing triangle with double vertical bar"),
+        ('\u{23F1}', "stopwatch"),
+        ('\u{23F5}', "black medium right-pointing triangle"),
+        ('\u{23F8}', "double vertical bar"),
+        ('\u{23F9}', "black square for stop"),
+        ('\u{23FA}', "black circle for record"),
+        ('\u{1F534}', "large red circle"),
+        ('\u{1F535}', "large blue circle"),
+        ('\u{26AB}', "medium black circle"),
+        ('\u{26AA}', "medium white circle"),
+    ];
+
+    /// Renders a session that exercises the glyphs the transcript draws, and
+    /// checks none of them is one the terminal will colour for itself.
+    #[test]
+    fn nothing_the_transcript_draws_is_an_emoji() {
+        let mut app = App::new();
+        app.session_mut().apply(AgentMessage::ToolRequest {
+            tool_name: "write_file".into(),
+            tool_args: "{\"path\":\"src/lib.rs\"}".into(),
+            tool_id: "c1".into(),
+            kind: "write".into(),
+            subagent_id: None,
+            needs_approval: false,
+        });
+        app.session_mut().apply(AgentMessage::ToolResult {
+            tool_name: "write_file".into(),
+            result: "WRITE:src/lib.rs\n3 lines".into(),
+            success: true,
+            subagent_id: None,
+        });
+        app.session_mut().apply(AgentMessage::ToolOutput {
+            tool_name: "shell_exec".into(),
+            content: "  [x] done\n  [~] in flight\n  [ ] waiting".into(),
+        });
+
+        let drawn: String = app.build_lines(100).iter().map(|l| l.plain()).collect();
+        for (ch, name) in NOT_TEXT_GLYPHS {
+            assert!(
+                !drawn.contains(*ch),
+                "U+{:04X} ({name}) is drawn by the emoji font, which discards the colour set for it",
+                *ch as u32
+            );
+        }
+    }
+
+    /// The status line and the permission modes too — that is where two of
+    /// these were found before.
+    #[test]
+    fn nothing_in_the_status_line_is_an_emoji() {
+        let mut app = App::new();
+        for mode in [PermissionMode::Ask, PermissionMode::AutoAccept, PermissionMode::Plan] {
+            app.session_mut().set_permission_mode(mode);
+            let drawn: String = app.build_lines(100).iter().map(|l| l.plain()).collect();
+            for (ch, name) in NOT_TEXT_GLYPHS {
+                assert!(
+                    !drawn.contains(*ch),
+                    "U+{:04X} ({name}) in the status line for {mode:?}",
+                    *ch as u32
+                );
+            }
+        }
     }
 }

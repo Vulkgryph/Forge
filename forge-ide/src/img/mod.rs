@@ -127,7 +127,22 @@ mod tests {
         };
         let mut anim = gif::parse(&bytes).expect("our decoder");
         assert!(anim.frame_count() > 100, "only {} frames", anim.frame_count());
-        assert_eq!((anim.width, anim.height), (896, 454));
+
+        // Checked against the file's own header rather than a remembered pair
+        // of numbers. This fixture is the README's demo recording, so it
+        // changes size whenever the demo is recorded again — and a hardcoded
+        // size turns that into a failing test in the decoder, which is not what
+        // broke. What is worth asserting is that the decoder agrees with the
+        // file about how big it is.
+        let (want_w, want_h) = (
+            u16::from_le_bytes([bytes[6], bytes[7]]) as usize,
+            u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
+        );
+        assert_eq!(
+            (anim.width, anim.height),
+            (want_w, want_h),
+            "the decoder disagrees with the file's own logical screen size"
+        );
 
         // Walk the whole animation, one frame at a time. The canvas is reused,
         // so this holds one frame's worth of pixels however many there are —

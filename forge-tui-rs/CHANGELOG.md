@@ -6,6 +6,8 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [0.4.0] — 2026-09-06
 
+_Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
+
 ### Fixed
 
 - **Escape sequences no longer print as wreckage.** Nothing stripped terminal control sequences from tool output, and `ESC` itself is invisible — so what reached the screen was `[32m+++[m` and `[?1h=`, which reads as corruption rather than as colour.

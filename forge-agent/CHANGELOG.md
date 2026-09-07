@@ -6,6 +6,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [0.4.0] — 2026-09-06
 
+_Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
+
 ### Added
 
 - **The agent has a working area of its own.** Everything it wrote previously landed in the user's project, so a throwaway probe script, a scratch copy of a file, or a one-off reproduction either became litter in a real repository or did not get written at all. Each session now gets a directory under the system's temporary directory, created on demand and named after the session, and the model is told where it is. Subagents are handed the same one rather than making their own, so scratch work carries between them.

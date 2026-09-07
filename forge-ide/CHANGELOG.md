@@ -6,6 +6,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [0.4.0] — 2026-09-06
 
+_Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
+
 ### Added
 
 - **Open files are saved on a timer.** An interruption now costs minutes rather than a session. Only files that already have a name are written: a buffer never saved is the user's to place, and inventing a file for it behind their back is a bigger surprise than losing an unnamed scratch buffer. Five minutes by default, and configurable.

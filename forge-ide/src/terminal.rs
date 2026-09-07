@@ -1105,6 +1105,29 @@ pub fn mono_advance(ui: &egui::Ui, font: &egui::FontId) -> f32 {
     }).max(1.0)
 }
 
+/// The height one row of text *actually* occupies once laid out.
+///
+/// Not `Fonts::row_height`, which is derived from the font's own metrics and
+/// does not have to agree with what layout produces: for Menlo at 13pt it
+/// reports 15.13 while every laid-out row is exactly 15.0. Dividing the panel
+/// height by the larger figure undercounts how many rows fit, so the shell was
+/// told it had one row fewer than the panel was drawing — and at heights near a
+/// row boundary that left a stale row at the bottom, or a galley slightly
+/// taller than its region with the last line clipped. Which of the two you got
+/// depended on where a drag happened to stop, so raising or lowering the
+/// terminal produced a duplicated or a cut line.
+///
+/// Measured the same way as `mono_advance`, and in one place for the same
+/// reason: the row count, the cursor and the text must not hold different
+/// opinions about how tall a line is.
+pub fn mono_row_height(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap("Xg".to_string(), font.clone(), egui::Color32::WHITE)
+            .rect.height()
+    })
+    .max(1.0)
+}
+
 impl Terminal {
     /// True while this terminal has keyboard focus (clicked into). Used by
     /// the app to suppress global keyboard shortcuts so typing shell
@@ -1360,7 +1383,7 @@ impl Terminal {
     pub fn draw(&mut self, ui: &mut egui::Ui) { self.draw_sized(ui, 13.0); }
     pub fn draw_sized(&mut self, ui: &mut egui::Ui, font_size: f32) {
         let font_id = egui::FontId::monospace(font_size);
-        let row_h   = ui.fonts(|f| f.row_height(&font_id));
+        let row_h   = mono_row_height(ui, &font_id);
         let char_w  = mono_advance(ui, &font_id);
 
         let visible_rows = (ui.available_height() / row_h).floor().max(1.0) as u16;
@@ -2583,5 +2606,112 @@ mod column_width_tests {
             "the space advance no longer drifts ({drift:.2}px) — if egui stopped \
              snapping advances, this test has nothing left to say",
         );
+    }
+}
+
+#[cfg(test)]
+mod row_height_tests {
+    use super::{mono_advance, mono_row_height};
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx
+    }
+
+    /// The measured row height is what layout actually produces, and
+    /// `row_height` is not.
+    ///
+    /// This is the whole bug: the row count was divided out of the metric
+    /// figure while the text occupied the laid-out one. The control assertion
+    /// is that the two genuinely differ — if they ever agree, this test is
+    /// worthless and should say so rather than pass quietly.
+    #[test]
+    fn the_measured_row_height_is_the_one_layout_uses() {
+        let ctx = ctx();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font = egui::FontId::monospace(13.0);
+                let measured = mono_row_height(ui, &font);
+                let reported = ui.fonts(|f| f.row_height(&font));
+
+                // What ten rows of text really occupy.
+                let mut job = egui::text::LayoutJob::default();
+                for _ in 0..10 {
+                    job.append("line\n", 0.0, egui::TextFormat { font_id: font.clone(), ..Default::default() });
+                }
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let actual = galley.rows[0].rect.height();
+
+                assert!(
+                    (measured - actual).abs() < 0.01,
+                    "measured {measured} but layout produces {actual}"
+                );
+                assert!(
+                    (reported - actual).abs() > 0.01,
+                    "control failed: row_height now agrees with layout ({reported} vs {actual}), \
+                     so dividing by it is no longer a bug and this test proves nothing"
+                );
+            });
+        });
+    }
+
+    /// Rows counted from the measured height always fit the space they were
+    /// counted out of — and one more never would.
+    ///
+    /// Swept across a range of heights because the fault only showed near a row
+    /// boundary, which is exactly what dragging the panel walks through.
+    #[test]
+    fn every_counted_row_fits_the_panel() {
+        let ctx = ctx();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font = egui::FontId::monospace(13.0);
+                let row_h = mono_row_height(ui, &font);
+                let mut disagreements = 0;
+
+                for tenths in 1000..4000 {
+                    let height = tenths as f32 / 10.0;
+                    let rows = (height / row_h).floor().max(1.0);
+
+                    assert!(
+                        rows * row_h <= height + 0.001 || rows == 1.0,
+                        "{rows} rows of {row_h} do not fit in {height}"
+                    );
+                    assert!(
+                        (rows + 1.0) * row_h > height,
+                        "another row would have fitted in {height}: {rows} counted"
+                    );
+
+                    // How often the old formula would have disagreed.
+                    let old = (height / ui.fonts(|f| f.row_height(&font))).floor().max(1.0);
+                    if old != rows {
+                        disagreements += 1;
+                    }
+                }
+
+                assert!(
+                    disagreements > 0,
+                    "the old and new counts never differ, so nothing was fixed"
+                );
+                eprintln!("the old formula disagreed at {disagreements} of 3000 heights");
+            });
+        });
+    }
+
+    /// Width is measured the same way, and both must stay positive whatever
+    /// font size the terminal is drawn at.
+    #[test]
+    fn both_measurements_hold_at_every_size() {
+        let ctx = ctx();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for size in [8.0_f32, 10.0, 13.0, 16.0, 24.0, 32.0] {
+                    let font = egui::FontId::monospace(size);
+                    assert!(mono_row_height(ui, &font) >= 1.0, "row height at {size}");
+                    assert!(mono_advance(ui, &font) >= 1.0, "advance at {size}");
+                }
+            });
+        });
     }
 }

@@ -613,48 +613,97 @@ fn parse_start_sleep(args: &[String]) -> Option<std::time::Duration> {
 pub fn activity_phrase(name: &str, args: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    // Long arguments are cut here rather than by the label: this line sits above
-    // the input box, where a wrapped command would push the box down the screen.
-    let clip = |t: String| -> String {
-        let one: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
-        if one.chars().count() > 48 {
-            format!("{}…", one.chars().take(48).collect::<String>())
-        } else {
-            one
-        }
+    // Whichever argument carries the thing being acted on. `phrase_for` turns
+    // it into words and is shared with the subagent path, which arrives with
+    // the subject already extracted and so cannot read these keys itself.
+    let subject = match name {
+        "read_file" | "write_file" | "edit_file" => base_name(&s("path")),
+        "list_directory" => clip_arg(&s("path")),
+        "search_code" | "web_search" => clip_arg(&s("query")),
+        "glob_files" => clip_arg(&s("pattern")),
+        "web_fetch" => clip_arg(&s("url")),
+        "shell_exec" => clip_arg(&s("command")),
+        "delegate_task" => s("agent_type"),
+        _ => String::new(),
     };
-    let path = |k: &str| {
-        let p = s(k);
-        p.rsplit('/').next().unwrap_or(&p).to_string()
-    };
+    phrase_for(name, &subject)
+}
 
+/// What a subagent is doing right now, in the same words as the main agent.
+///
+/// Returns `None` once the tool has finished — the agent reports completion
+/// through the same channel, marking it in `detail` — so a chip does not sit
+/// claiming to be writing a file it has already written.
+///
+/// The detail is `summarize_args`' pick of `command`/`path`/`query`/`prompt`,
+/// which is the same argument `activity_phrase` would have read, so the two
+/// agree on wording without the subagent path needing the raw arguments.
+pub fn subagent_activity_phrase(tool_name: &str, detail: &str) -> Option<String> {
+    if tool_name.is_empty() || detail.starts_with("[ok]") || detail.starts_with("[err]") {
+        return None;
+    }
+    let subject = match tool_name {
+        "read_file" | "write_file" | "edit_file" => base_name(detail),
+        _ => clip_arg(detail),
+    };
+    Some(phrase_for(tool_name, &subject))
+}
+
+/// Present tense, because this describes what is happening as it happens.
+///
+/// `subject` is already shortened; an empty one means the tool takes no
+/// argument worth naming, or none was given.
+fn phrase_for(name: &str, subject: &str) -> String {
     match name {
-        "read_file"      => format!("Reading {}…", path("path")),
+        "read_file" => format!("Reading {subject}…"),
         "list_directory" => {
-            let p = s("path");
-            if p.is_empty() || p == "." { "Listing the project root…".into() }
-            else { format!("Listing {}…", clip(p)) }
+            if subject.is_empty() || subject == "." {
+                "Listing the project root…".into()
+            } else {
+                format!("Listing {subject}…")
+            }
         }
-        "search_code"    => format!("Searching for {}…", clip(s("query"))),
-        "glob_files"     => format!("Looking for files matching {}…", clip(s("pattern"))),
-        "todo_write"     => "Updating the task list…".into(),
-        "web_search"     => format!("Searching the web for {}…", clip(s("query"))),
-        "web_fetch"      => format!("Fetching {}…", clip(s("url"))),
-        "write_file"     => format!("Writing {}…", path("path")),
-        "edit_file"      => format!("Editing {}…", path("path")),
-        "apply_patch"    => "Applying a patch…".into(),
-        "shell_exec"     => {
-            let cmd = clip(s("command"));
-            if cmd.is_empty() { "Running a command…".into() } else { format!("Running {cmd}") }
+        "search_code" => format!("Searching for {subject}…"),
+        "glob_files" => format!("Looking for files matching {subject}…"),
+        "todo_write" => "Updating the task list…".into(),
+        "web_search" => format!("Searching the web for {subject}…"),
+        "web_fetch" => format!("Fetching {subject}…"),
+        "write_file" => format!("Writing {subject}…"),
+        "edit_file" => format!("Editing {subject}…"),
+        "apply_patch" => "Applying a patch…".into(),
+        "shell_exec" => {
+            if subject.is_empty() {
+                "Running a command…".into()
+            } else {
+                format!("Running {subject}")
+            }
         }
-        "delegate_task"  => {
-            let who = s("agent_type");
-            if who.is_empty() { "Delegating a task…".into() } else { format!("Waiting on the {who} subagent…") }
+        "delegate_task" => {
+            if subject.is_empty() {
+                "Delegating a task…".into()
+            } else {
+                format!("Waiting on the {subject} subagent…")
+            }
         }
         "enter_plan_mode" => "Entering plan mode…".into(),
-        "ask_question"    => "Asking a question…".into(),
+        "ask_question" => "Asking a question…".into(),
         other => format!("Running {}…", other.replace('_', " ")),
     }
+}
+
+/// Long arguments are cut here rather than by the label: this text sits above
+/// the input box, where a wrapped command would push the box down the screen.
+fn clip_arg(t: &str) -> String {
+    let one: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() > 48 {
+        format!("{}…", one.chars().take(48).collect::<String>())
+    } else {
+        one
+    }
+}
+
+fn base_name(p: &str) -> String {
+    p.rsplit('/').next().unwrap_or(p).to_string()
 }
 
 pub fn save_conversation(session: &AgentSession, id: &str, cwd: &std::path::Path) {
@@ -1406,9 +1455,26 @@ impl AgentSession {
                 }
             }
             AgentMsg::SubagentStatus { id, tool_name, detail } => {
-                if let Some(ChatItem::Subagent { current_tool, detail: d, .. }) = find_subagent_mut(&mut self.items, &id) {
-                    *current_tool = tool_name;
-                    *d = detail;
+                // Also raised to the activity line above the input box. A
+                // subagent doing the work used to leave that line reading
+                // "Waiting on the explore subagent…" for as long as it ran, so
+                // the one moment worth seeing — a file being written — was
+                // visible only to someone who had expanded the right chip.
+                let mut raise: Option<String> = None;
+                if let Some(ChatItem::Subagent {
+                    current_tool, detail: d, agent_type, finished, ..
+                }) = find_subagent_mut(&mut self.items, &id)
+                {
+                    *current_tool = tool_name.clone();
+                    *d = detail.clone();
+                    if !*finished {
+                        if let Some(phrase) = subagent_activity_phrase(&tool_name, &detail) {
+                            raise = Some(format!("{agent_type}: {phrase}"));
+                        }
+                    }
+                }
+                if let Some(text) = raise {
+                    self.set_activity(text, None);
                 }
             }
             AgentMsg::SubagentFinished { id, summary, .. } => {

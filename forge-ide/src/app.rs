@@ -3950,6 +3950,7 @@ fn draw_provider_busy_card(
 /// (e.g. `[2]` for a top-level one, `[2, 0]` for one it nested itself) —
 /// threaded through so a click deep inside a recursively-nested subagent's
 /// panel can still be applied back at the right spot.
+#[allow(clippy::too_many_arguments)]
 fn draw_subagent_strip_entry(
     ui: &mut egui::Ui,
     path: &[usize],
@@ -3957,9 +3958,15 @@ fn draw_subagent_strip_entry(
     prompt: &str,
     expanded: bool,
     items: &[ChatItem],
+    // The tool this subagent is running now, and the argument it is running
+    // on — empty once it has finished. Shown in place of the prompt, which
+    // does not change and so says nothing about progress.
+    current_tool: &str,
+    detail: &str,
     pending_action: &mut Option<(Vec<usize>, bool)>,
     toggle_expand: &mut Option<Vec<usize>>,
 ) {
+    let activity = crate::agent_panel::subagent_activity_phrase(current_tool, detail);
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(28, 26, 40))
         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 84, 92)))
@@ -3969,7 +3976,15 @@ fn draw_subagent_strip_entry(
             ui.vertical(|ui| {
                 let header = ui.horizontal(|ui| {
                     paint_disclosure_triangle(ui, expanded, egui::Color32::from_gray(150));
-                    paint_dot(ui, egui::Color32::from_rgb(150, 170, 255));
+                    // Breathing while a tool is running. Colour alone cannot
+                    // distinguish a subagent working from one that has stalled;
+                    // movement can, and it is the same signal the tool cards
+                    // already use.
+                    if activity.is_some() {
+                        paint_running_dot(ui, egui::Color32::from_rgb(150, 170, 255));
+                    } else {
+                        paint_dot(ui, egui::Color32::from_rgb(150, 170, 255));
+                    }
                     ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
                         .color(egui::Color32::from_rgb(150, 205, 210)));
                     // Same reservation as the checkpoint row: an approval count
@@ -3983,11 +3998,21 @@ fn draw_subagent_strip_entry(
                     } else {
                         0.0
                     };
-                    let preview: String = prompt.chars().take(50).collect();
+                    // What it is doing now, when it is doing something; the
+                    // prompt it was given otherwise. The prompt is fixed for
+                    // the subagent's whole life, so while work is happening it
+                    // is the less informative of the two.
+                    let (line, colour) = match &activity {
+                        Some(a) => (a.clone(), egui::Color32::from_rgb(150, 205, 210)),
+                        None => (
+                            prompt.chars().take(50).collect::<String>(),
+                            egui::Color32::from_gray(150),
+                        ),
+                    };
                     ui.add_sized(
                         egui::vec2((ui.available_width() - reserved).max(16.0), 16.0),
-                        egui::Label::new(egui::RichText::new(preview).size(10.5)
-                            .color(egui::Color32::from_gray(150))).truncate(),
+                        egui::Label::new(egui::RichText::new(line).size(10.5).color(colour))
+                            .truncate(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pending_count = items.iter()
@@ -4032,12 +4057,12 @@ fn draw_subagent_strip_entry(
                                     // it's genuinely paused waiting on this, so
                                     // render it as its own recursive panel
                                     // rather than a flat sibling.
-                                    ChatItem::Subagent { agent_type: cat, prompt: cprompt, finished: false, expanded: cexp, items: nested, .. } => {
+                                    ChatItem::Subagent { agent_type: cat, prompt: cprompt, finished: false, expanded: cexp, items: nested, current_tool: ctool, detail: cdetail, .. } => {
                                         let mut child_path = path.to_vec();
                                         child_path.push(i);
                                         draw_subagent_strip_entry(
                                             ui, &child_path, cat, cprompt, *cexp, nested,
-                                            pending_action, toggle_expand,
+                                            ctool, cdetail, pending_action, toggle_expand,
                                         );
                                         i += 1;
                                     }
@@ -4145,6 +4170,15 @@ fn draw_subagent_block(
     toggle_expand:  &mut Option<Vec<usize>>,
 ) {
     const RULE: egui::Color32 = egui::Color32::from_rgb(72, 132, 142);
+    // The same words the main agent's activity line uses — "Writing lib.rs…"
+    // rather than "write_file · /a/b/src/lib.rs". A tool name and a raw path
+    // are what the agent calls the work, not what a reader does, and this is
+    // the one line that says a file is being written right now.
+    let live_phrase = if finished {
+        None
+    } else {
+        crate::agent_panel::subagent_activity_phrase(current_tool, detail)
+    };
     const NAME: egui::Color32 = egui::Color32::from_rgb(150, 205, 210);
 
     ui.add_space(6.0);
@@ -4160,7 +4194,16 @@ fn draw_subagent_block(
                 ui.vertical(|ui| {
                     let header = ui.horizontal(|ui| {
                         paint_disclosure_triangle(ui, expanded, egui::Color32::from_gray(150));
-                        if finished { paint_checkmark(ui, NAME); } else { paint_dot(ui, NAME); }
+                        // Breathing while a tool is actually running, so a
+                        // subagent at work is distinguishable from one that has
+                        // stalled — colour alone cannot carry that.
+                        if finished {
+                            paint_checkmark(ui, NAME);
+                        } else if live_phrase.is_some() {
+                            paint_running_dot(ui, NAME);
+                        } else {
+                            paint_dot(ui, NAME);
+                        }
                         ui.label(egui::RichText::new("subagent").size(11.0)
                             .color(egui::Color32::from_gray(140)));
                         ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
@@ -4176,12 +4219,7 @@ fn draw_subagent_block(
                         // makes the whole transcript wider than the panel it is
                         // in — and then every line in it is clipped at the right
                         // edge. `add_sized` cannot push the row wider.
-                        if !finished && !current_tool.is_empty() {
-                            let live = if detail.is_empty() {
-                                current_tool.to_string()
-                            } else {
-                                format!("{current_tool} · {detail}")
-                            };
+                        if let Some(live) = live_phrase.clone() {
                             let font = egui::FontId::monospace(10.0);
                             let room = ui.available_width();
                             if room > 24.0 {
@@ -9130,10 +9168,12 @@ impl IdeApp {
                         .show(ui, |ui| {
                             for (idx, item) in tab.session.items.iter().enumerate() {
                                 if !subagent_awaiting_approval(item) { continue; }
-                                let ChatItem::Subagent { agent_type, prompt, expanded, items, .. } = item
-                                    else { continue };
+                                let ChatItem::Subagent {
+                                    agent_type, prompt, expanded, items, current_tool, detail, ..
+                                } = item else { continue };
                                 draw_subagent_strip_entry(
                                     ui, &[idx], agent_type, prompt, *expanded, items,
+                                    current_tool, detail,
                                     &mut subagent_pending_action, &mut subagent_toggle_expand,
                                 );
                             }
@@ -16834,7 +16874,13 @@ mod subagent_block_tests {
         assert!(all.contains("cargo build"), "its tool calls are missing: {all}");
         assert!(!all.contains("see below"), "still pointing somewhere else: {all}");
         // And what it is doing right now, which the card never used to show.
-        assert!(all.contains("read_file"), "no live activity: {all}");
+        //
+        // In words, not as a tool name and a path: "Reading cascor.rs…" rather
+        // than "read_file · /a/b/src/cascor.rs". This is the one line that says
+        // a subagent is touching a file at this moment, so it reads the way the
+        // main agent's own activity line does.
+        assert!(all.contains("Reading cascor.rs…"), "no live activity: {all}");
+        assert!(!all.contains("read_file"), "still showing the raw tool name: {all}");
     }
 
     /// The rule down the left edge is what separates the subagent's lines from
@@ -18538,5 +18584,65 @@ mod todo_list_tests {
     fn only_the_todo_tool_is_parsed() {
         assert!(todo_rows("read_file", AGENT_OUTPUT).is_empty());
         assert!(todo_rows("shell_exec", AGENT_OUTPUT).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod subagent_visibility_tests {
+    use crate::agent_panel::{activity_phrase, subagent_activity_phrase};
+
+    /// A subagent's work is described in the same words as the main agent's.
+    /// Two vocabularies for the same event is how a panel starts reading as
+    /// two different programs.
+    #[test]
+    fn a_subagent_is_described_like_the_main_agent() {
+        let cases = [
+            ("write_file", "/a/b/src/lib.rs", r#"{"path":"/a/b/src/lib.rs"}"#),
+            ("edit_file", "src/app.rs", r#"{"path":"src/app.rs"}"#),
+            ("read_file", "notes.md", r#"{"path":"notes.md"}"#),
+            ("shell_exec", "cargo test", r#"{"command":"cargo test"}"#),
+            ("search_code", "TODO", r#"{"query":"TODO"}"#),
+        ];
+        for (tool, detail, args) in cases {
+            assert_eq!(
+                subagent_activity_phrase(tool, detail).as_deref(),
+                Some(activity_phrase(tool, args).as_str()),
+                "{tool} reads differently for a subagent"
+            );
+        }
+    }
+
+    /// Writing a file is the thing worth seeing, so check the actual words.
+    #[test]
+    fn writing_a_file_says_so_and_names_it() {
+        assert_eq!(
+            subagent_activity_phrase("write_file", "/long/path/to/parser.rs").as_deref(),
+            Some("Writing parser.rs…")
+        );
+        assert_eq!(
+            subagent_activity_phrase("edit_file", "/long/path/to/parser.rs").as_deref(),
+            Some("Editing parser.rs…")
+        );
+    }
+
+    /// Completion arrives through the same channel, marked in the detail. A
+    /// chip that ignored that would sit claiming to write a file it has
+    /// already written — worse than showing nothing, because it looks stuck.
+    #[test]
+    fn a_finished_tool_is_not_still_running() {
+        assert_eq!(subagent_activity_phrase("write_file", "[ok] wrote 40 lines"), None);
+        assert_eq!(subagent_activity_phrase("shell_exec", "[err] exit 1"), None);
+        // Nothing running at all.
+        assert_eq!(subagent_activity_phrase("", ""), None);
+    }
+
+    /// An unknown tool still produces something readable rather than nothing:
+    /// silence is indistinguishable from a stall.
+    #[test]
+    fn an_unfamiliar_tool_still_says_something() {
+        assert_eq!(
+            subagent_activity_phrase("some_new_tool", "x").as_deref(),
+            Some("Running some new tool…")
+        );
     }
 }

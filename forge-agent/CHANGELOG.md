@@ -40,7 +40,7 @@ _Includes everything prepared for 0.3.2. That version was written up and its man
 
 - **A wide character in the first message could crash the session.** Reported live: `end byte index 77 is not a char boundary; it is inside '▎'`, panicking the agent's runtime thread. A session's title is the first message cut to length, and the cut was made by byte index — `&first_msg[..77]` — which panics whenever byte 77 lands inside a multi-byte character. Nothing exotic is required to hit it: an emoji in a prompt, a CJK identifier, an accented word, or the box-drawing characters models reach for when they sketch a diagram. The same pattern turned out to be in seven places across the agent and the editor — session titles, rewind previews, conversation titles in two panels, and three LSP hover truncations — each of them cutting text a person or a model produced, each one crashable. All seven now cut on a character boundary through a shared `truncate_chars`, and count their limits in characters rather than bytes, so a cap of 80 means eighty characters as a reader would expect. A property test walks every cut point of a mixed ASCII/emoji/CJK string and asserts the result is always a valid prefix.
 
-## [0.3.0] — 2026-08-27
+## [0.3.0] — 2026-08-28
 
 ### Changed (`web_search` is off by default)
 
@@ -180,7 +180,7 @@ _Includes everything prepared for 0.3.2. That version was written up and its man
 - **Compatibility with strict OpenAI-compatible servers.** Forge injects some system-role messages mid-conversation (continuation nudges, plan-mode notes, etc.). Servers that require the system message to come first — notably `mlx_lm` — rejected those turns with `System message must be at the beginning`. Forge now keeps the leading system prompt and relocates later ones, so these servers work.
 - Ctrl-key shortcuts (e.g. **Ctrl+F** copy mode, **Ctrl+T** expand reasoning) no longer leak their letter into the message input.
 
-## [0.1.0] — 2026-06-18
+## [0.1.0] — 2026-06-19
 
 Initial public release.
 

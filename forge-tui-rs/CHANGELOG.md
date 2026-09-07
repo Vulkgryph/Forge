@@ -42,7 +42,7 @@ _Includes everything prepared for 0.3.2. That version was written up and its man
 
 No changes in this component; released with `forge-agent` and `forge-ide`, which share its version.
 
-## [0.3.0] — 2026-08-27
+## [0.3.0] — 2026-08-28
 
 ### Fixed
 

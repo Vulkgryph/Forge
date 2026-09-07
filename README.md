@@ -8,6 +8,10 @@ Forge is an autonomous AI coding agent, plus two independent clients that drive 
 
 > _Forge IDE editing `forge-agent`, with the agent panel mid-task: tool calls folded into a checklist, an edit with its diffstat and an **Open diff** action, and a checkpoint you can rewind to._
 
+![Forge's terminal client building a no_std Rust VM from scratch: plan mode, an approved plan, then the crate written and its tests run](forge-tui-rs/assets/forge-tui-demo.gif)
+
+_Forge building a `no_std` Rust VM from an empty directory: it asks what kind of VM is wanted, plans in plan mode, and — once the plan is approved with auto-accept — writes the crate, runs `cargo fmt`, `cargo test` and `cargo run`, and reports what it verified._
+
 ## The projects
 
 | Project | What it is | Docs |

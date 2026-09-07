@@ -2,6 +2,10 @@
 
 The terminal client, installed as `forge`. It spawns `forge-agent --headless` and drives it over the JSON-newline protocol in [`forge-agent-proto`](../forge-agent-proto/) — the same protocol [`forge-ide`](../forge-ide/)'s agent panel speaks, independently. No agent logic lives here.
 
+![Forge's terminal client building a no_std Rust VM from scratch: plan mode, an approved plan, then the crate written and its tests run](assets/forge-tui-demo.gif)
+
+_Forge building a `no_std` Rust VM from an empty directory: it asks what kind of VM is wanted, plans in plan mode, and — once the plan is approved with auto-accept — writes the crate, runs `cargo fmt`, `cargo test` and `cargo run`, and reports what it verified._
+
 It replaced an earlier TypeScript client, `forge-tui`, which is retired and no
 longer part of this repository.
 

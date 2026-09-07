@@ -4,7 +4,7 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-## [0.4.0] — 2026-09-06
+## [0.4.0] — 2026-09-07
 
 _Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
 

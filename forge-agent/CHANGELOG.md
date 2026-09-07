@@ -20,6 +20,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **Running a test suite is no longer mistaken for a REPL.** The guard that stops an interactive program being started inside a tool call asked whether a command matched a short list of things that counted as work — `-c`, `--version`, or an argument ending in `.py`, `.rb` or `.js`. Everything else was called a REPL and refused, which caught a great deal of ordinary work: `python3 -m unittest discover -s tests` matches none of those patterns, so an agent asked to fix a failing test was told its own test command was interactive and could not verify the fix. `python3 manage.py`, `ruby -e`, and the same commands with `< /dev/null` already on them failed the same way.
+
+  The question is now asked the other way round: an interpreter is a REPL when it is given *no* work — no module, no program, no script — and `-i` still asks for a prompt on purpose. Naming the ways an interpreter is given work is a closed set; naming the ways work can look is not.
+
 - **The rendered task list is pinned by a test.** Forge IDE and the TUI both parse `todo_write`'s output to draw it as a checklist, and neither can import the function that writes it. Changing the markers or the indentation would have quietly turned both back into flat grey text.
 
 ## [0.3.1] — 2026-08-28

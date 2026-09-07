@@ -4422,25 +4422,54 @@ fn blocked_inline_interactive_command(command: &str) -> Option<(String, &'static
             }
         }
 
-        if matches!(file_name, "python" | "python3" | "ruby" | "irb" | "node") {
-            let has_script_or_version = args.iter().any(|t| {
-                t == "--version"
-                    || t == "-V"
-                    || t == "-c"
-                    || t.ends_with(".py")
-                    || t.ends_with(".rb")
-                    || t.ends_with(".js")
-            });
-            if !has_script_or_version {
-                return Some((
-                    segment.trim().to_string(),
-                    "This looks like a REPL and would wait for interactive input.",
-                ));
-            }
+        if matches!(file_name, "python" | "python3" | "ruby" | "irb" | "node")
+            && is_repl_invocation(file_name, &args)
+        {
+            return Some((
+                segment.trim().to_string(),
+                "This looks like a REPL and would wait for interactive input.",
+            ));
         }
     }
 
     None
+}
+
+/// Whether an interpreter was started with nothing to do, and so will sit
+/// waiting for someone to type at it.
+///
+/// The test used to be the other way round: a short list of things that counted
+/// as work — `-c`, `--version`, or an argument ending in `.py`, `.rb` or `.js`.
+/// Anything not on the list was called a REPL and refused, which caught a great
+/// deal of ordinary work. `python3 -m unittest discover -s tests` is the one
+/// that turned up: running a test suite by module name matches none of those
+/// patterns, so the agent was told its test command was interactive and could
+/// not verify its own change. `python3 manage.py` and `ruby -e` failed the same
+/// way, and so did the same command with `< /dev/null` already on it.
+///
+/// Asking the opposite question is both correct and smaller. An interpreter is
+/// a REPL when it is given no work: no module, no program, no script. Naming
+/// the ways it *is* given work is a closed set, where naming the ways work can
+/// look is not.
+fn is_repl_invocation(program: &str, args: &[String]) -> bool {
+    // `-i` asks for the prompt explicitly, even with a script.
+    if args.iter().any(|a| a == "-i") {
+        return true;
+    }
+    // `irb` is a REPL by definition; only asking it about itself is not.
+    if program == "irb" {
+        return !args.iter().any(|a| a.starts_with("--version") || a == "-v" || a == "--help");
+    }
+    !args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            // Work named on the command line.
+            "-c" | "-m" | "-e" | "-r"
+            // Asking it about itself, which answers and exits.
+            | "-V" | "-v" | "--version" | "--help" | "-h" | "--check"
+        // Anything that is not a flag: a script path, whatever it is called.
+        ) || !a.starts_with('-')
+    })
 }
 
 fn ssh_invocation(command: &str) -> Option<String> {
@@ -4888,5 +4917,69 @@ mod approval_decision_tests {
         let writes = ApprovalContext { auto_approve_writes: true, ..strict() };
         assert!(!approval_needed(ToolKind::Write, &writes));
         assert!(approval_needed(ToolKind::Execute, &writes), "writes must not imply commands");
+    }
+}
+
+#[cfg(test)]
+mod repl_guard_tests {
+    use super::blocked_inline_interactive_command as blocked;
+
+    fn refused(cmd: &str) -> bool {
+        blocked(cmd).is_some()
+    }
+
+    /// The commands that were actually refused during a recorded session. The
+    /// agent had diagnosed the bug correctly and could not run the test suite
+    /// to confirm its fix.
+    #[test]
+    fn running_a_test_suite_by_module_is_not_a_repl() {
+        assert!(!refused("python3 -m unittest discover -s tests -v"));
+        assert!(!refused("env python3 -m unittest discover -s tests -v </dev/null"));
+        assert!(!refused("python3 -m pytest -q"));
+        assert!(!refused("python -m http.server 8000"));
+    }
+
+    /// A script is work whatever it is called — the old rule only recognised
+    /// `.py`, `.rb` and `.js`.
+    #[test]
+    fn a_script_is_work_whatever_its_name() {
+        assert!(!refused("python3 manage.py migrate"));
+        assert!(!refused("python3 ./scripts/build"));
+        assert!(!refused("ruby -e 'puts 1'"));
+        assert!(!refused("node server.mjs"));
+    }
+
+    /// The thing the guard is actually for: an interpreter with nothing to do
+    /// sits waiting for someone to type at it, and inside a tool call nobody
+    /// can.
+    #[test]
+    fn a_bare_interpreter_is_still_refused() {
+        assert!(refused("python3"));
+        assert!(refused("python"));
+        assert!(refused("ruby"));
+        assert!(refused("irb"));
+        assert!(refused("env python3"));
+    }
+
+    /// `-i` asks for the prompt on purpose, script or not.
+    #[test]
+    fn asking_for_the_prompt_is_still_refused() {
+        assert!(refused("python3 -i"));
+        assert!(refused("python3 -i script.py"));
+    }
+
+    /// Asking an interpreter about itself answers and exits.
+    #[test]
+    fn version_checks_are_allowed() {
+        assert!(!refused("python3 --version"));
+        assert!(!refused("irb --version"));
+    }
+
+    /// The guard inspects each part of a compound command, so a REPL cannot be
+    /// smuggled in behind something harmless.
+    #[test]
+    fn each_part_of_a_compound_command_is_checked() {
+        assert!(refused("echo hi && python3"));
+        assert!(!refused("echo hi && python3 -m unittest"));
     }
 }

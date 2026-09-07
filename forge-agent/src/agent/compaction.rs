@@ -471,6 +471,188 @@ pub fn apply_rolling_window(
     dropped
 }
 
+/// Shorten a single tool result to `max_tokens`, keeping both ends.
+///
+/// Applied as the result enters the conversation, so no one call can put the
+/// history over the window on its own. Returns the text unchanged when it
+/// already fits, which is the overwhelming majority of results.
+pub fn clamp_tool_result(tool_name: &str, result: &str, max_tokens: usize) -> String {
+    let max_bytes = max_tokens.saturating_mul(4);
+    if max_bytes == 0 || result.len() <= max_bytes {
+        return result.to_string();
+    }
+    // The notice counts against the budget too, or the result comes back over
+    // the cap it was supposed to be brought under.
+    let notice = format!(
+        "[{tool_name} returned {} bytes; shortened to fit the context window. \
+         Read a specific range if you need the rest.]\n",
+        result.len()
+    );
+    let room = max_bytes.saturating_sub(notice.len());
+    format!("{notice}{}", elide_middle(result, room))
+}
+
+/// What `fit_history_to_window` had to do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FitReport {
+    /// Messages removed from the front.
+    pub dropped: usize,
+    /// Messages whose content was shortened because dropping was not enough.
+    pub truncated: usize,
+}
+
+impl FitReport {
+    /// Whether the history is any smaller than it was. A retry is only worth
+    /// making if something actually came off.
+    pub fn changed(&self) -> bool {
+        self.dropped > 0 || self.truncated > 0
+    }
+}
+
+/// Roughly what a message costs, from its own text.
+///
+/// Deliberately independent of anything the server reported. This is used when
+/// the server's number cannot be trusted — either because the request it
+/// described was rejected, or because history has grown since — so taking that
+/// number as the starting point is the mistake being corrected.
+fn estimated_tokens(msg: &Message) -> usize {
+    let content = msg.content.as_ref().map_or(0, |c| c.len());
+    let calls = msg.tool_calls.as_ref().map_or(0, |cs| {
+        cs.iter()
+            .map(|tc| tc.function.name.len() + tc.function.arguments.len() + 32)
+            .sum::<usize>()
+    });
+    // Four characters to a token, and never free: an empty tool message still
+    // costs its role and id on the wire.
+    ((content + calls) / 4).max(8)
+}
+
+/// The whole history's estimated cost.
+pub fn estimate_history_tokens(history: &[Message]) -> usize {
+    history.iter().map(estimated_tokens).sum()
+}
+
+/// Bring `history` down to `budget_tokens`, however far over it is.
+///
+/// Oldest context units go first, so what survives is the most recent
+/// conversation — the part still being worked on. When dropping is not enough
+/// on its own, the largest message left is shortened rather than the history
+/// emptied: a single tool result can be many times the whole window (a
+/// `read_file` on a large file has no cap), and no amount of dropping fixes
+/// that when the oversized message is also the newest one.
+///
+/// Sized from the history's own text rather than from a reported token count.
+/// The emergency path used to pass the count from the last *successful*
+/// request, which is by definition the size before the thing that overflowed:
+/// at 14x the window it read as comfortably under budget and shed nothing at
+/// all, so the turn failed and the oversized message stayed in history, and
+/// every turn after it failed the same way.
+pub fn fit_history_to_window(history: &mut Vec<Message>, budget_tokens: usize) -> FitReport {
+    let mut report = FitReport::default();
+    if budget_tokens == 0 {
+        return report;
+    }
+
+    // Drop oldest whole units while there is something droppable left.
+    while estimate_history_tokens(history) > budget_tokens {
+        let Some(idx) = history.iter().position(|m| m.role != "system") else {
+            break;
+        };
+        // Keep the last user turn: an agent that cannot see what it was asked
+        // is worse than one with a shortened transcript.
+        if history[idx].role != "tool" && conversational_anchor_count(history) <= 1 {
+            break;
+        }
+        let end = context_unit_end(history, idx);
+        report.dropped += end.saturating_sub(idx).max(1);
+        history.drain(idx..end);
+    }
+
+    // Still over: shorten the biggest thing left, repeatedly, since a history
+    // can hold more than one oversized message.
+    while estimate_history_tokens(history) > budget_tokens {
+        let Some((idx, _)) = history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system" && m.content.is_some())
+            .max_by_key(|(_, m)| estimated_tokens(m))
+        else {
+            break;
+        };
+
+        let others: usize = history
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, m)| estimated_tokens(m))
+            .sum();
+        let allowance = budget_tokens.saturating_sub(others);
+        let before = estimated_tokens(&history[idx]);
+        let content = history[idx].content.as_ref().expect("filtered on is_some");
+        let shortened = elide_middle(content, allowance.saturating_mul(4));
+        if shortened.len() >= content.len() {
+            // Nothing more to give: the fixed costs alone exceed the budget.
+            break;
+        }
+        history[idx].content = Some(shortened);
+        report.truncated += 1;
+        if estimated_tokens(&history[idx]) >= before {
+            break;
+        }
+    }
+
+    report
+}
+
+/// Shorten `text` to about `max_bytes`, keeping both ends.
+///
+/// The head and the tail are both worth keeping and for different reasons: a
+/// file or a diff identifies itself at the top, while a command's verdict —
+/// the error, the test count — is at the bottom. Cutting from one end only
+/// would reliably lose one of the two. What was removed is said plainly, so
+/// the model treats what it has as a fragment rather than the whole.
+fn elide_middle(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker_room = 96;
+    let keep = max_bytes.saturating_sub(marker_room);
+    if keep < 200 {
+        // No room to keep anything useful from both ends; say so and stop.
+        return format!("[{} bytes of output omitted: no room left in context]", text.len());
+    }
+    let head_len = keep * 2 / 5;
+    let tail_len = keep - head_len;
+    let head_end = floor_char_boundary(text, head_len);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_len));
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n\n[... {} bytes omitted to fit the context window ...]\n\n{}",
+        &text[..head_end],
+        omitted,
+        &text[tail_start..]
+    )
+}
+
+/// `str::floor_char_boundary` is unstable, and slicing a multi-byte character
+/// in half panics.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
+
 /// Retain the user-approved plan as non-droppable rolling-window context.
 ///
 /// Unlike the old heuristic working-state anchor, this preserves only the plan
@@ -665,6 +847,175 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    /// Build a history a given percentage over the window.
+    fn oversized_history(window: usize, percent: usize) -> Vec<Message> {
+        // Enough conversation to be worth keeping some of, plus one tool result
+        // large enough to put the whole thing `percent` of the way over.
+        let mut history = vec![Message::system("sys")];
+        for i in 0..30 {
+            history.push(Message::user(&format!("turn {i}")));
+            history.push(Message::assistant(&format!("reply {i}")));
+        }
+        history.push(Message::user("read the big file and tell me what it does"));
+        let target_tokens = window * percent / 100;
+        let have: usize = estimate_history_tokens(&history);
+        let need_chars = target_tokens.saturating_sub(have) * 4;
+        history.push(Message::tool_result("t1", "read_file", &"x".repeat(need_chars)));
+        history
+    }
+
+    /// An ordinary result is passed through untouched — the cap must not tax
+    /// the common case.
+    #[test]
+    fn a_normal_tool_result_is_not_touched() {
+        let body = "File: src/lib.rs (240 lines total)\n".to_string() + &"line\n".repeat(240);
+        assert_eq!(clamp_tool_result("read_file", &body, 50_000), body);
+    }
+
+    /// A whole-file read of something enormous is bounded before it can put the
+    /// conversation over the window.
+    #[test]
+    fn an_enormous_tool_result_is_capped_on_the_way_in() {
+        let window = 200_000usize;
+        let cap = window / 4;
+        let body = format!("FIRST\n{}\nLAST", "junk\n".repeat(2_000_000));
+        let out = clamp_tool_result("read_file", &body, cap);
+
+        assert!(out.len() < body.len() / 10, "barely shortened: {} bytes", out.len());
+        assert!(estimate_history_tokens(&[Message::tool_result("t", "read_file", &out)]) <= cap);
+        // The model is told, so it does not mistake a fragment for the file.
+        assert!(out.contains("shortened to fit the context window"));
+        assert!(out.contains("Read a specific range"));
+        assert!(out.contains("FIRST") && out.contains("LAST"), "both ends kept");
+    }
+
+    /// Why the size has to come from the history and not from the last bill.
+    ///
+    /// `apply_rolling_window` believes the token count it is given. Handed the
+    /// figure from the last *successful* request — which describes the
+    /// conversation before the thing that overflowed it — it decides a history
+    /// 14x over the window is comfortably under budget and sheds nothing. That
+    /// is what left a session unable to make any request at all: the turn
+    /// failed, the oversized message stayed, and every turn after it failed the
+    /// same way.
+    #[test]
+    fn a_stale_token_count_sheds_nothing() {
+        let window = 200_000usize;
+
+        let mut history = oversized_history(window, 1432);
+        let stale = (window / 4) as u32; // last good request: a quarter full
+        let dropped = apply_rolling_window(&mut history, window, stale, 500);
+        assert_eq!(dropped, 0, "the stale figure is supposed to look harmless");
+        assert!(
+            estimate_history_tokens(&history) > window,
+            "history should still be over the window"
+        );
+
+        // The same history, sized from its own text, comes back under.
+        let mut history = oversized_history(window, 1432);
+        let report = fit_history_to_window(&mut history, (window as f64 * 0.80) as usize);
+        assert!(report.changed());
+        assert!(estimate_history_tokens(&history) <= (window as f64 * 0.80) as usize);
+    }
+
+    /// The case this was written for: a conversation 1432% of the window.
+    ///
+    /// Dropping messages cannot fix it on its own — the oversized message is
+    /// the newest one — so the largest remaining message is shortened until the
+    /// history fits.
+    #[test]
+    fn a_history_far_over_the_window_is_brought_back_under_it() {
+        let window = 200_000usize;
+        let mut history = oversized_history(window, 1432);
+        let before = estimate_history_tokens(&history);
+        assert!(before > window * 14, "fixture is only {}% of the window", before * 100 / window);
+
+        let budget = (window as f64 * 0.80) as usize;
+        let report = fit_history_to_window(&mut history, budget);
+
+        assert!(report.changed(), "nothing was shed from a history 14x over");
+        let after = estimate_history_tokens(&history);
+        assert!(after <= budget, "still {after} tokens against a budget of {budget}");
+        // The conversation survives: this is a trim, not a reset.
+        assert!(history.len() > 2, "history was emptied: {} left", history.len());
+        assert_eq!(history[0].role, "system", "the system prompt must be kept");
+        assert!(
+            history.iter().any(|m| m.role == "user"),
+            "no user turn left — the agent cannot see what it was asked"
+        );
+    }
+
+    /// What survives is the *recent* conversation, since that is what is still
+    /// being worked on.
+    #[test]
+    fn the_newest_turns_are_the_ones_kept() {
+        let window = 100_000usize;
+        let mut history = oversized_history(window, 400);
+        fit_history_to_window(&mut history, (window as f64 * 0.80) as usize);
+
+        let text: String = history
+            .iter()
+            .filter_map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("read the big file"), "the latest request was dropped");
+        assert!(!text.contains("turn 0"), "the oldest turn was kept: {}", &text[..80.min(text.len())]);
+    }
+
+    /// A single message bigger than the whole window is the shape that used to
+    /// wedge a session permanently, because there was nothing left to drop.
+    #[test]
+    fn one_message_larger_than_the_window_is_shortened() {
+        let window = 50_000usize;
+        let mut history = vec![
+            Message::system("sys"),
+            Message::user("read it"),
+            Message::tool_result("t1", "read_file", &"y".repeat(window * 4 * 8)),
+        ];
+        let budget = (window as f64 * 0.80) as usize;
+        let report = fit_history_to_window(&mut history, budget);
+
+        assert_eq!(report.truncated, 1, "the oversized message was not shortened");
+        assert!(estimate_history_tokens(&history) <= budget);
+        let kept = history.last().unwrap().content.as_ref().unwrap();
+        assert!(kept.contains("omitted to fit the context window"), "the cut is not declared");
+    }
+
+    /// Both ends are kept: a file says what it is at the top, a command run
+    /// says whether it passed at the bottom.
+    #[test]
+    fn shortening_keeps_the_head_and_the_tail() {
+        let body = format!("FIRST LINE\n{}\nLAST LINE", "middle\n".repeat(50_000));
+        let out = elide_middle(&body, 4_000);
+        assert!(out.starts_with("FIRST LINE"), "head lost");
+        assert!(out.ends_with("LAST LINE"), "tail lost");
+        assert!(out.len() <= 4_000, "still {} bytes", out.len());
+    }
+
+    /// A history that already fits is left exactly as it is.
+    #[test]
+    fn a_history_within_budget_is_untouched() {
+        let mut history = vec![
+            Message::system("sys"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+        ];
+        let before = history.clone();
+        let report = fit_history_to_window(&mut history, 100_000);
+        assert!(!report.changed());
+        assert_eq!(history.len(), before.len());
+        assert_eq!(history[1].content, before[1].content);
+    }
+
+    /// Multi-byte text must not be sliced through a character.
+    #[test]
+    fn shortening_does_not_split_a_character() {
+        let body = "日本語のテキスト".repeat(5_000);
+        let out = elide_middle(&body, 1_000);
+        assert!(out.len() <= 1_000);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
     #[test]

@@ -8,7 +8,8 @@ extern crate libc;
 
 use super::agent_def::{AgentDefinition, AgentModel};
 use super::compaction::{
-    apply_rolling_window, ensure_rolling_plan_context, extract_rolling_plan_context,
+    apply_rolling_window, ensure_rolling_plan_context, estimate_history_tokens,
+    clamp_tool_result, extract_rolling_plan_context, fit_history_to_window,
     perform_compaction, remove_rolling_plan_context, should_compact,
 };
 use super::conversation_log::ConversationLog;
@@ -389,6 +390,13 @@ fn normalized_model_override(value: &str) -> Option<String> {
         Some(trimmed.to_string())
     }
 }
+
+/// How much of the window the recovery path aims to leave the history at.
+///
+/// Not 99%: the reply, and the next tool result, both have to fit alongside
+/// whatever is kept. Trimming to just under the limit means the turn after the
+/// recovery overflows again, which is a slower version of the same failure.
+const OVERFLOW_RECOVERY_FRACTION: f64 = 0.80;
 
 fn estimate_prompt_tokens_from_history(history: &[Message]) -> u32 {
     let chars: usize = history
@@ -1153,7 +1161,7 @@ impl Agent {
 
             // Check if compaction should be triggered (context 99% full)
             if should_compact(
-                self.last_prompt_tokens,
+                self.current_context_tokens(),
                 self.max_context_tokens,
                 self.app_config.agent.compact_at_percent,
             ) {
@@ -1346,17 +1354,27 @@ impl Agent {
 
                 if is_context_overflow {
                     self.refresh_rolling_plan_context();
-                    let tpm_est = self.tokens_per_message_estimate();
-                    let dropped = apply_rolling_window(
+                    // Sized from the history itself. The rejected request is
+                    // the one that was too large, so the server never reported
+                    // its size — and the previous request's figure describes
+                    // the conversation *before* whatever overflowed it. Passing
+                    // that here is how a history many times over the window
+                    // came to shed nothing and fail on every following turn.
+                    let report = fit_history_to_window(
                         &mut self.history,
-                        self.max_context_tokens,
-                        self.last_prompt_tokens,
-                        tpm_est,
+                        (self.max_context_tokens as f64 * OVERFLOW_RECOVERY_FRACTION) as usize,
                     );
-                    if dropped > 0 {
+                    if report.changed() {
+                        self.last_prompt_tokens = self.current_context_tokens();
+                        self.rewind_checkpoints.clear();
                         let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
-                            "[Context overflow — dropped {} oldest messages, retrying]",
-                            dropped
+                            "[Context overflow — dropped {} oldest messages{}, retrying]",
+                            report.dropped,
+                            if report.truncated > 0 {
+                                format!(" and shortened {}", report.truncated)
+                            } else {
+                                String::new()
+                            }
                         )));
                         continue;
                     }
@@ -1554,6 +1572,7 @@ impl Agent {
                     }
                     self.maybe_notice_plan_completed(&tc.function.name, &result);
 
+                    let result = self.clamp_result_to_context(&tc.function.name, &result);
                     let tool_msg = Message::tool_result(&tc.id, &tc.function.name, &result);
                     let _ = self.log.log_message(&tool_msg);
                     self.history.push(tool_msg);
@@ -1673,7 +1692,8 @@ impl Agent {
 
                     // Push denied/error results to history
                     for (tc, result) in &denied_results {
-                        let tool_msg = Message::tool_result(&tc.id, &tc.function.name, result);
+                        let result = self.clamp_result_to_context(&tc.function.name, result);
+                        let tool_msg = Message::tool_result(&tc.id, &tc.function.name, &result);
                         let _ = self.log.log_message(&tool_msg);
                         self.history.push(tool_msg);
                     }
@@ -1971,7 +1991,7 @@ impl Agent {
                 // Check if context is getting full during tool execution.
                 // Set pending — it will execute at the top of the next iteration.
                 if should_compact(
-                self.last_prompt_tokens,
+                self.current_context_tokens(),
                 self.max_context_tokens,
                 self.app_config.agent.compact_at_percent,
             ) {
@@ -2118,6 +2138,40 @@ impl Agent {
     /// Write session meta on first user message, or update it.
     /// Estimate average tokens per history message using server-reported snapshots.
     /// Falls back to chars/4 if not enough data yet.
+    /// The best available figure for the conversation's current size.
+    ///
+    /// `last_prompt_tokens` is what the server charged for the last request it
+    /// accepted. It is authoritative about the past and says nothing about the
+    /// present: a tool result appended since — a file read with no line range has
+    /// no cap — can put the history many times over the window while that number
+    /// still reads comfortably low. Taking the larger of the two means the server's
+    /// count is used when history has not grown, and the estimate takes over the
+    /// moment it has.
+    fn current_context_tokens(&self) -> u32 {
+        let estimated = estimate_history_tokens(&self.history).min(u32::MAX as usize) as u32;
+        self.last_prompt_tokens.max(estimated)
+    }
+
+    /// Bound one tool result before it becomes part of the conversation.
+    ///
+    /// Nothing else caps these. `read_file` with no line range returns the
+    /// whole file, and a command's output is capped in characters rather than
+    /// against the model's window, so one call can put the history several
+    /// times over the limit — after which no request can be made at all until
+    /// the recovery path shortens it back. Bounding it here means that never
+    /// happens, and the recovery path stays a backstop rather than the thing
+    /// that keeps the session alive.
+    ///
+    /// A quarter of the window: large enough that ordinary reads and test runs
+    /// arrive whole, small enough that four of them in a row still leave room
+    /// for the conversation around them. Both ends of the text are kept —
+    /// `clamp_tool_result` says how much went missing, so the model knows it is
+    /// holding a fragment and can read the rest by range if it needs to.
+    fn clamp_result_to_context(&self, tool_name: &str, result: &str) -> String {
+        let cap = self.max_context_tokens / 4;
+        clamp_tool_result(tool_name, result, cap)
+    }
+
     fn tokens_per_message_estimate(&self) -> u32 {
         if self.token_snapshots.len() >= 2 {
             // Use the two most recent snapshots to compute the marginal cost
@@ -2638,12 +2692,25 @@ impl Agent {
             ContextStrategy::RollingWindow => {
                 self.refresh_rolling_plan_context();
                 let tpm_est = self.tokens_per_message_estimate();
+                // `current_context_tokens`, not the last reported figure: the
+                // rolling window is often reached with a tool result appended
+                // since the last request, which is exactly what it is meant to
+                // shed.
+                let now_tokens = self.current_context_tokens();
                 let dropped = apply_rolling_window(
                     &mut self.history,
                     self.max_context_tokens,
-                    self.last_prompt_tokens,
+                    now_tokens,
                     tpm_est,
                 );
+                // Dropping whole messages cannot help when the oversized one is
+                // the newest. Anything still over the window after the window
+                // has done its work gets shortened.
+                let report = fit_history_to_window(
+                    &mut self.history,
+                    (self.max_context_tokens as f64 * OVERFLOW_RECOVERY_FRACTION) as usize,
+                );
+                let dropped = dropped + report.dropped;
                 let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
                     "[Rolling window: dropped {} oldest messages]",
                     dropped
@@ -2668,8 +2735,24 @@ impl Agent {
                 )
                 .await
                 {
-                    Ok(new_history) => {
+                    Ok(mut new_history) => {
+                        // The summary is small, but the rolling window kept
+                        // alongside it is whatever the recent messages were —
+                        // and if one of those is the oversized tool result that
+                        // caused this, compaction alone leaves the conversation
+                        // exactly as unusable as it was.
+                        let report = fit_history_to_window(
+                            &mut new_history,
+                            (self.max_context_tokens as f64 * OVERFLOW_RECOVERY_FRACTION) as usize,
+                        );
+                        if report.changed() {
+                            let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                                "[Kept the most recent context that fits: dropped {}, shortened {}]",
+                                report.dropped, report.truncated
+                            )));
+                        }
                         self.history = new_history;
+                        self.last_prompt_tokens = self.current_context_tokens();
                         self.compaction_count += 1;
                         self.rewind_checkpoints.clear();
                         self.update_meta();

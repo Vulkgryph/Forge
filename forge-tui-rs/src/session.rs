@@ -352,7 +352,6 @@ plan mode (Shift+Tab cycles permission modes) or to confirm how they want to pro
 /// The edit tools only. Approving a plan is not a blanket approval: running
 /// commands still asks, since a plan describing an edit is not consent to execute
 /// anything.
-const PLAN_EDIT_TOOLS: &[&str] = &["apply_patch", "write_file", "edit_file"];
 
 impl Session {
     pub fn new() -> Self {
@@ -783,7 +782,13 @@ impl Session {
 
             AgentMessage::PlanModeExited { reason } => {
                 self.plan_mode = false;
-                self.permission_mode = PermissionMode::Ask;
+                // Leaving plan mode means stop being in plan mode — not discard
+                // whatever the user chose on the way out. Approving a plan with
+                // auto-accept sets that mode before this event arrives, and
+                // forcing `Ask` here overwrote it.
+                if self.permission_mode == PermissionMode::Plan {
+                    self.permission_mode = PermissionMode::Ask;
+                }
                 self.entries.push(Entry::new(
                     EntryKind::PlanStatus,
                     format!("left plan mode: {reason}"),
@@ -905,9 +910,25 @@ impl Session {
         match self.pending.take() {
             Some(Pending::Plan { .. }) => {
                 if auto_approve {
-                    for tool in PLAN_EDIT_TOOLS {
-                        self.approved_tools.insert((*tool).to_string());
-                    }
+                    // The mode, not a list of tool names.
+                    //
+                    // This used to add the edit tools to `approved_tools`, which
+                    // approved them for the rest of the session no matter what
+                    // the user did afterwards: cycling back to Normal mode with
+                    // Shift-Tab left every edit still landing without a prompt,
+                    // because that set is never consulted against the mode. It
+                    // also left the status line reading "Normal mode" while
+                    // edits sailed through, so the one indicator of what the
+                    // session would do without asking disagreed with what it
+                    // actually did.
+                    //
+                    // Auto-accept is a mode the user can see and can leave, and
+                    // it is the same state Shift-Tab reaches, so approving a
+                    // plan this way now means exactly what choosing it by hand
+                    // means. It also settles the ordering: an edit arriving
+                    // before the agent's own "left plan mode" event is judged by
+                    // this mode rather than refused by the plan-mode gate.
+                    self.set_permission_mode(PermissionMode::AutoAccept);
                 }
                 vec![Effect::Send(if clear_context {
                     ClientMessage::ClearAndApprovePlan
@@ -2096,40 +2117,118 @@ mod tests {
     /// Approving a plan approves the edits it describes. Without this the agent
     /// stopped for permission on every write while working through a plan the user
     /// had just accepted.
-    #[test]
-    fn approving_a_plan_approves_the_edit_tools() {
+    /// A helper for "the agent asks to do X" — the only way to see what the
+    /// gate actually does with it.
+    fn request(session: &mut Session, tool: &str, kind: &str) -> Vec<Effect> {
+        session.apply(AgentMessage::ToolRequest {
+            tool_name: tool.into(),
+            tool_args: "{\"path\":\"src/lib.rs\"}".into(),
+            tool_id: format!("call-{tool}"),
+            kind: kind.into(),
+            subagent_id: None,
+            needs_approval: true,
+        })
+    }
+
+    fn plan_approved_with_auto_accept() -> Session {
         let mut session = Session::new();
+        // As it happens when the user asks for plan mode in words.
+        session.apply(AgentMessage::PlanModeEntered { plan_path: "/tmp/plan.md".into() });
         session.apply(AgentMessage::PlanReady {
             plan_path: "/tmp/plan.md".into(),
             content: "do the thing".into(),
         });
-        let effects = session.approve_plan(false, true);
-        assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::ApprovePlan)]));
+        session.approve_plan(false, true);
+        session
+    }
 
-        for tool in ["apply_patch", "write_file", "edit_file"] {
+    /// Choosing auto-approve on a plan puts the session in auto-accept mode.
+    ///
+    /// It used to add the edit tools to a per-tool allowlist instead. The edits
+    /// did land without prompting, but the status line still read "Normal
+    /// mode" — so the one indicator of what the session will do without asking
+    /// disagreed with what it did.
+    #[test]
+    fn approving_a_plan_with_auto_accept_switches_mode() {
+        let session = plan_approved_with_auto_accept();
+        assert_eq!(
+            session.permission_mode,
+            PermissionMode::AutoAccept,
+            "the mode does not say the session is auto-accepting edits"
+        );
+        assert!(
+            session.entries.iter().any(|e| e.content.contains("Auto-accept edits")),
+            "the transcript does not record the change"
+        );
+    }
+
+    /// And the edits actually land without a prompt.
+    #[test]
+    fn an_approved_plans_edits_are_not_put_to_the_user() {
+        let mut session = plan_approved_with_auto_accept();
+        session.apply(AgentMessage::PlanModeExited { reason: "approved".into() });
+
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            let effects = request(&mut session, tool, "write");
             assert!(
-                session.approved_tools.contains(tool),
-                "{tool} still needs approval after the plan was approved",
+                matches!(effects.as_slice(), [Effect::Send(ClientMessage::ApproveAction { .. })]),
+                "{tool} was not auto-approved: {effects:?}"
             );
+            assert!(session.pending.is_none(), "{tool} still asked the user");
         }
     }
 
-    /// It is not a blanket approval: a plan describing an edit is not consent to
-    /// run commands.
+    /// It is not a blanket approval: a plan describing an edit is not consent
+    /// to run commands.
     #[test]
     fn approving_a_plan_does_not_approve_running_commands() {
-        let mut session = Session::new();
-        session.apply(AgentMessage::PlanReady {
-            plan_path: "/tmp/plan.md".into(),
-            content: "do the thing".into(),
-        });
-        session.approve_plan(true, true);
-        for tool in ["execute_command", "run_command", "bash"] {
-            assert!(
-                !session.approved_tools.contains(tool),
-                "{tool} was approved by a plan, which it must not be",
-            );
-        }
+        let mut session = plan_approved_with_auto_accept();
+        session.apply(AgentMessage::PlanModeExited { reason: "approved".into() });
+
+        request(&mut session, "shell_exec", "execute");
+        assert!(
+            session.pending.is_some(),
+            "a command ran without being put to the user"
+        );
+    }
+
+    /// Leaving plan mode means stop being in plan mode — not discard what the
+    /// user chose on the way out. The agent's own "left plan mode" event
+    /// arrives after the approval and used to force the mode back to Normal.
+    #[test]
+    fn leaving_plan_mode_keeps_the_mode_the_user_chose() {
+        let mut session = plan_approved_with_auto_accept();
+        session.apply(AgentMessage::PlanModeExited { reason: "approved".into() });
+        assert_eq!(session.permission_mode, PermissionMode::AutoAccept);
+    }
+
+    /// An edit that arrives before that event is judged by the chosen mode, not
+    /// refused by the plan-mode gate. Nothing orders those two, so the client
+    /// cannot assume the event lands first.
+    #[test]
+    fn an_edit_arriving_before_the_exit_event_is_not_refused() {
+        let mut session = plan_approved_with_auto_accept();
+        let effects = request(&mut session, "write_file", "write");
+        assert!(
+            matches!(effects.as_slice(), [Effect::Send(ClientMessage::ApproveAction { .. })]),
+            "the edit was refused right after the plan was approved: {effects:?}"
+        );
+    }
+
+    /// Auto-accept can be left again, which is the whole reason for making it a
+    /// mode. The allowlist it replaced was never consulted against the mode, so
+    /// cycling back to Normal left every edit still landing unprompted.
+    #[test]
+    fn cycling_out_of_auto_accept_restores_the_prompt() {
+        let mut session = plan_approved_with_auto_accept();
+        session.apply(AgentMessage::PlanModeExited { reason: "approved".into() });
+        session.set_permission_mode(PermissionMode::Ask);
+
+        request(&mut session, "write_file", "write");
+        assert!(
+            session.pending.is_some(),
+            "back in Normal mode and an edit still went through unprompted"
+        );
     }
 
     /// Shift-Tab walks the three modes the TypeScript client cycled, and says which

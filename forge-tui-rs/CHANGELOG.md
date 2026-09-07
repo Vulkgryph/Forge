@@ -10,6 +10,12 @@ _Includes everything prepared for 0.3.2. That version was written up and its man
 
 ### Fixed
 
+- **Approving a plan with auto-accept switches the mode, rather than quietly allowing three tools.** Choosing *Auto-approve edits* added `write_file`, `edit_file` and `apply_patch` to a per-tool allowlist. The edits did land without prompting, but nothing else agreed: the status line still read "Normal mode", so the one indicator of what the session will do without asking said the opposite of what it did. The allowlist was also never consulted against the permission mode, so cycling back to Normal with Shift-Tab left every edit still landing unprompted — the choice could be made but not unmade.
+
+  It now sets auto-accept, the same state Shift-Tab reaches, so approving a plan that way means exactly what choosing it by hand means: it shows in the status line, it is recorded in the transcript, and it can be left again. Leaving plan mode no longer discards it either — the agent's own "left plan mode" event arrives after the approval and used to force the mode back to Normal.
+
+  That also settles an ordering hazard. The plan-mode gate refuses anything that is not a read before the allowlist is consulted, so an edit arriving before that event was denied outright, and the model was told retrying would be refused again. Nothing orders those two messages; now the mode is already set when the edit arrives, so it does not matter which lands first.
+
 - **Escape sequences no longer print as wreckage.** Nothing stripped terminal control sequences from tool output, and `ESC` itself is invisible — so what reached the screen was `[32m+++[m` and `[?1h=`, which reads as corruption rather than as colour.
 
 - **Command output is no longer drawn as a diff.** Every tool result was passed through the diff renderer, so any line opening with `-` or `+` was rendered as a change complete with a red background: a compiler flag, a negative number, a bullet list. A `shell_exec` result beginning `-2` appeared as a deleted line. Tinting is now gated on the content announcing itself as a diff — the edit tools' `DIFF:` prefix, or a `@@` hunk or `---`/`+++` file header.

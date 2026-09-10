@@ -12,6 +12,61 @@ Forge is an autonomous AI coding agent, plus two independent clients that drive 
 
 _Forge building a `no_std` Rust VM from an empty directory: it asks what kind of VM is wanted, plans in plan mode, and — once the plan is approved with auto-accept — writes the crate, runs `cargo fmt`, `cargo test` and `cargo run`, and reports what it verified._
 
+## Why this rather than something else
+
+Forge exists because the alternatives make a different trade, not because they
+are bad. What is different here:
+
+**The agent is a separate program, not a feature of an editor.** `forge-agent`
+runs headless and speaks a documented JSON-lines protocol
+([`forge-agent-proto`](forge-agent-proto/)). The terminal client and the editor
+are two independent programs that drive it, and neither embeds the other — the
+[diagram below](#how-they-fit-together) is the real architecture, not a
+description of modules. So the same agent is available over SSH in a terminal
+and in a window with a file tree, you can script it directly, and a third
+client is a protocol away rather than a fork.
+
+**The editor is written, not forked.** `forge-ide` is a native Rust application
+using egui — not a VS Code fork and not Electron. That has costs, and they are
+listed honestly in [Platforms](#platforms): one supported platform, and a
+smaller feature surface than an editor with a decade of extensions behind it.
+What it buys is no upstream to track, and an agent panel that is part of the
+editor rather than an extension in a sandbox — checkpoints, diffs and rewind
+reach the buffers directly.
+
+**Dependencies are decisions here.** The terminal client has two third-party
+crates, both Unicode tables: every part of its rendering, wrapping, markdown
+and diffing is in this repository. The editor decodes PNG and GIF with decoders
+written for it, which replaced the `image` crate and six transitive crates. No
+third-party binary ships in this repository at all — even MoltenVK, for the
+optional Vulkan renderer, you install yourself.
+
+**Permission is the design, not a setting.** Every tool call is approvable;
+plan mode is read-only until you approve a plan; auto-accept is a mode the
+status bar shows and you can leave; the agent gets a scratchpad of its own so
+throwaway work does not land in your project; and a rewind checkpoint lets you
+put a file back after the agent has edited it. The failure mode being designed
+against is an agent that has already done something you would not have allowed.
+
+**Your keys, your machine.** Any OpenAI-compatible endpoint works, nothing is
+routed through a Vulkgryph service, and offline mode turns off the tools that
+reach the network. The only first-party network call in the whole system is a
+GitHub releases check for updates.
+
+**It tells you what does not work.** There is a section below titled
+[Web search does not really work](#web-search-does-not-really-work), about a
+tool shipped in this repository. Platform support is a table of what has and
+has not been run by a person, not a list of logos. That is the standard the
+rest of the documentation is held to as well.
+
+### Where it is the wrong choice
+
+If you want an editor with a mature extension ecosystem, a team workflow with
+pull requests, or Windows and Linux support for the GUI, this is not it —
+contributions are closed, and only macOS is verified. The agent and the
+terminal client are more portable than the editor; the table in
+[Platforms](#platforms) says exactly how far each has been taken.
+
 ## The projects
 
 | Project | What it is | Docs |

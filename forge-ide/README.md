@@ -63,16 +63,26 @@ cargo build -p forge-ide --release
 cargo run -p forge-ide --release
 ```
 
-### The app bundle is not notarized
+### Notarization: the release download is, a local build is not
 
-`scripts/package_macos.sh` signs the bundle with a Developer ID if one is in
-your keychain and ad-hoc signs it otherwise. Neither is notarized by Apple.
+The `.dmg` attached to a [release](https://github.com/Vulkgryph/Forge/releases)
+is signed with Vulkgryph LLC's Developer ID and notarized by Apple, with the
+ticket stapled to both the disk image and the app inside it. It opens normally,
+and because the ticket is stapled rather than fetched, it opens normally
+offline too.
 
-A bundle you did not build yourself will therefore be refused on first open —
-*"cannot be opened because the developer cannot be verified"*. Right-click →
-**Open**, or **System Settings → Privacy & Security → Open Anyway**, allows it.
-If that is not a trade you want to make, build from source: it is the two
-`cargo build` commands above.
+A bundle you build yourself is a different matter.
+`scripts/package_macos.sh` signs with a Developer ID if one is in your keychain
+and ad-hoc signs it otherwise; neither is notarized, because notarizing means
+uploading the build to Apple under a paid developer account. So a bundle
+*someone else* built and sent you is refused on first open — *"cannot be opened
+because the developer cannot be verified"*. Right-click → **Open**, or
+**System Settings → Privacy & Security → Open Anyway**, allows it.
+
+If you have a Developer ID and notarization credentials of your own,
+`scripts/sign_notarize_dmg.sh` does the whole sequence — sign, submit, staple,
+build the `.dmg`, and notarize that too. It works on a copy of the bundle, so
+it is safe to run with the IDE open.
 
 ### Build the remote server (optional — only needed for SSH Remote)
 

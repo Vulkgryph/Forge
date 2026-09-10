@@ -4,6 +4,14 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- **Restart Window brings the window back as itself, even when its record is missing.** A window's saved session — open files, terminals, the agent conversation — is stored under the window's id, and that id travels in the restarted process's arguments. When the shared window record no longer held an entry for it, the fallback reopened the window from its folder and dropped the id, so the new window minted a fresh one and found nothing under it. A megabyte of saved state sat on disk under the old id while the window came back apparently new. The id is carried regardless now; only the geometry and the remote connection depend on the record, and the window says so if it lost them.
+
+  The record can go missing for an ordinary reason: it is shared between every Forge process, and the last one to write it wins, so a window restarted while another process rewrites the file finds no entry for itself.
+
+  Windows are also planned one at a time. They were matched against the record as a set, so one absent entry sent *every* window down the folder-only path — and if some entries were present while others were not, the windows without them were dropped from the plan and never reopened at all. Restarting several windows for a rebuild is the ordinary case, which made that the ordinary case too.
+
 ## [0.4.0] — 2026-09-07
 
 _Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._

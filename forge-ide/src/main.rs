@@ -332,26 +332,50 @@ fn plan_initial_windows(
     // remote host come from the record, like any reload — argv has nowhere to put
     // a frame, and nowhere to put a connection.
     if !only.is_empty() {
-        let mine: Vec<session::WindowRecord> =
-            remembered().into_iter().filter(|r| only.contains(&r.id)).collect();
-        let specs = if mine.is_empty() {
-            // No record for it (never written, or pruned). The folder was passed
-            // alongside precisely for this, so the window still opens on the
-            // right workspace rather than not at all — but it comes back without
-            // its geometry or its connection, and looking like a brand new window
-            // is exactly what that felt like from the outside.
-            let mut specs = from_paths(cwds, true);
-            if let Some(first) = specs.first_mut() {
-                first.notes.push(format!(
-                    "No saved record for window {} — reopened from its folder only, \
-                     without its size or any remote connection",
-                    only.first().copied().unwrap_or(0),
-                ));
-            }
-            specs
+        let records = remembered();
+        let hosts = if records.iter().any(|r| r.remote_host.is_some()) {
+            ssh::load_hosts()
         } else {
-            from_records(mine, true)
+            Vec::new()
         };
+        // Per requested window, so one missing record does not decide the fate of
+        // the others. Matching them as a set meant a single absent record sent
+        // *every* window down the folder-only path, and any window whose record
+        // was present while another's was missing simply never reopened.
+        let mut specs: Vec<NewWindowSpec> = Vec::new();
+        for (n, id) in only.iter().enumerate() {
+            match records.iter().find(|r| r.id == *id) {
+                Some(rec) => {
+                    specs.extend(specs_from_records(vec![rec.clone()], true, &hosts));
+                }
+                None => {
+                    // No record (never written, or pruned, or overwritten by
+                    // another Forge process — the record is shared, and the last
+                    // process to write it wins). The folder was passed alongside
+                    // precisely for this.
+                    //
+                    // `window_id` is carried regardless. It names the window's
+                    // saved session, it arrived in argv, and it does not depend
+                    // on the record existing — leaving it at the default made the
+                    // window mint a fresh id, which orphaned its open files, its
+                    // terminals and its agent conversation on disk under the old
+                    // one. That is a window coming back empty, which is what a
+                    // missing record used to cost. Geometry and the remote
+                    // connection are the only things genuinely lost with the
+                    // record.
+                    specs.push(NewWindowSpec {
+                        cwd: cwds.get(n).cloned().flatten(),
+                        is_reload: true,
+                        window_id: *id,
+                        notes: vec![format!(
+                            "No saved record for window {id} — its files and terminals \
+                             are restored, but not its size or any remote connection"
+                        )],
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         return if specs.is_empty() {
             vec![NewWindowSpec { is_reload: true, ..Default::default() }]
         } else {
@@ -1862,5 +1886,74 @@ mod restore_notes_tests {
             specs[0].notes.iter().any(|n| n.contains("No saved record for window 42")),
             "came back stateless without saying so: {:?}", specs[0].notes,
         );
+    }
+
+    /// A window with no record still comes back *as itself*.
+    ///
+    /// The id names the window's saved session — its open files, its terminals
+    /// and its agent conversation — and it arrives in argv, so it does not
+    /// depend on the record existing. It used to be dropped here, leaving the
+    /// window to mint a fresh id and find nothing under it, while a megabyte of
+    /// state sat on disk under the old one. Observed as a restart that came back
+    /// with no files, no terminal, no agent and no folder.
+    #[test]
+    fn a_window_with_no_record_keeps_its_identity() {
+        let dir = std::env::temp_dir();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "42".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        let specs = plan_initial_windows(
+            parse_window_args(&argv),
+            || vec![session::WindowRecord { cwd: Some(dir.clone()), id: 9, ..Default::default() }],
+            false,
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].window_id, 42,
+            "the window was given a new identity, so its saved session is unreachable"
+        );
+        assert_eq!(specs[0].cwd.as_deref(), Some(dir.as_path()), "and it lost its folder");
+        assert!(specs[0].is_reload, "a restart is a reload");
+    }
+
+    /// One missing record must not decide the fate of the others.
+    ///
+    /// The records were matched as a set: if none matched, every window went
+    /// down the folder-only path, and if *some* matched, the windows whose
+    /// records were missing were dropped from the plan and never reopened at
+    /// all. Restarting several windows at once is the ordinary case for a
+    /// rebuild, so this was the ordinary case too.
+    #[test]
+    fn a_missing_record_does_not_take_the_other_windows_with_it() {
+        // Real directories: a record naming a folder that no longer exists is
+        // filtered out, which would make this test pass for the wrong reason.
+        let a = std::env::temp_dir().join(format!("forge-plan-a-{}", std::process::id()));
+        let b = std::env::temp_dir().join(format!("forge-plan-b-{}", std::process::id()));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let argv = vec![
+            "--reload".to_string(),
+            RELOAD_WINDOW.to_string(), "1".to_string(),
+            RELOAD_WINDOW.to_string(), "2".to_string(),
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        // Only the first window is in the record.
+        let rec_cwd = a.clone();
+        let specs = plan_initial_windows(
+            parse_window_args(&argv),
+            move || vec![session::WindowRecord { cwd: Some(rec_cwd), id: 1, ..Default::default() }],
+            false,
+        );
+        assert_eq!(specs.len(), 2, "a window was dropped from the plan: {specs:#?}");
+        let ids: Vec<u64> = specs.iter().map(|s| s.window_id).collect();
+        assert_eq!(ids, vec![1, 2], "both windows must come back as themselves");
+        // The one without a record still gets its folder, from argv, by position.
+        assert_eq!(specs[1].cwd.as_deref(), Some(b.as_path()));
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

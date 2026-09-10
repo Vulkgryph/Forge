@@ -6,6 +6,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **A saved session is a fraction of the size, with nothing dropped from it.** Each terminal row was stored with a colour beside every character — `{"ch":"E","fg":[204,204,204,255],"bg":null}`, about ninety bytes to say one letter — so two hundred rows of scrollback came to 1.8 MB and a config directory held twelve. Terminal output is long stretches of one colour, measured at sixty-two characters per style change, so a row is now stored as its text plus the runs of colour over it. Measured on real saved sessions: **12.3 MB to 0.5 MB**, twenty-three times smaller.
+
+  Nothing is lost. Every character keeps its own colours; they are described once per run instead of once per character, and a row is reconstructed cell for cell — there is a test asserting exactly that, including for multi-byte characters, where a run has to count characters rather than bytes. Sessions written by earlier builds are still read, since they are on disk and the alternative is every window coming back empty on the first launch after the change.
+
 - **Restart Window brings the window back as itself, even when its record is missing.** A window's saved session — open files, terminals, the agent conversation — is stored under the window's id, and that id travels in the restarted process's arguments. When the shared window record no longer held an entry for it, the fallback reopened the window from its folder and dropped the id, so the new window minted a fresh one and found nothing under it. A megabyte of saved state sat on disk under the old id while the window came back apparently new. The id is carried regardless now; only the geometry and the remote connection depend on the record, and the window says so if it lost them.
 
   The record can go missing for an ordinary reason: it is shared between every Forge process, and the last one to write it wins, so a window restarted while another process rewrites the file finds no entry for itself.

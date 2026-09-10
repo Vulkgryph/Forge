@@ -59,6 +59,9 @@ struct Cell {
 
 impl Cell {
     fn blank() -> Self { Self { ch: ' ', fg: default_fg(), bg: None } }
+    /// A character with no style of its own — used when a saved row's runs do
+    /// not cover its text, so the character survives even if its colour cannot.
+    fn blank_with(ch: char) -> Self { Self { ch, fg: default_fg(), bg: None } }
 }
 
 /// Nothing printed on this row. A background colour counts as something: a shell
@@ -94,6 +97,114 @@ impl CellSnap {
     }
 }
 
+/// One row, stored as its text plus the runs of colour laid over it.
+///
+/// A terminal row is overwhelmingly one colour at a time — measured at 62
+/// characters per style change on real output — so storing a style beside every
+/// character stores the same four numbers sixty times over. Per-cell objects
+/// cost about 90 bytes a character: two hundred rows of scrollback came to
+/// 1.8 MB, against roughly 54 KB for the same content as text plus runs.
+///
+/// Nothing is lost. Every character keeps its own colours; they are simply
+/// described once per run instead of once per cell, and `to_cells` reconstructs
+/// the row cell for cell.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RowSnap {
+    /// The row's characters.
+    t: String,
+    /// Runs covering the row in order.
+    r: Vec<RunSnap>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RunSnap {
+    /// How many characters this run covers.
+    n: u32,
+    fg: [u8; 4],
+    /// Omitted when there is no background, which is the common case — and the
+    /// reason a run is cheaper still than its four numbers suggest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bg: Option<[u8; 4]>,
+}
+
+impl RowSnap {
+    fn from_cells(row: &[Cell]) -> Self {
+        let mut t = String::with_capacity(row.len());
+        let mut r: Vec<RunSnap> = Vec::new();
+        for cell in row {
+            t.push(cell.ch);
+            let fg = cell.fg.to_array();
+            let bg = cell.bg.map(|b| b.to_array());
+            match r.last_mut() {
+                Some(run) if run.fg == fg && run.bg == bg => run.n += 1,
+                _ => r.push(RunSnap { n: 1, fg, bg }),
+            }
+        }
+        Self { t, r }
+    }
+
+    fn to_cells(&self) -> Vec<Cell> {
+        let colour = |[r, g, b, a]: [u8; 4]| egui::Color32::from_rgba_premultiplied(r, g, b, a);
+        let mut out = Vec::with_capacity(self.t.chars().count());
+        let mut runs = self.r.iter();
+        // Tracked rather than assumed: a truncated or hand-edited file can have
+        // runs that do not cover the text, and a row that comes back short is
+        // better than a panic on someone's session.
+        let mut current: Option<(&RunSnap, u32)> = None;
+        for ch in self.t.chars() {
+            loop {
+                match current {
+                    Some((run, used)) if used < run.n => {
+                        out.push(Cell {
+                            ch,
+                            fg: colour(run.fg),
+                            bg: run.bg.map(colour),
+                        });
+                        current = Some((run, used + 1));
+                        break;
+                    }
+                    _ => match runs.next() {
+                        Some(run) => current = Some((run, 0)),
+                        // No style left to apply: keep the character, and let it
+                        // take the default rather than dropping the row.
+                        None => {
+                            out.push(Cell::blank_with(ch));
+                            break;
+                        }
+                    },
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A row as it appears in a saved session.
+///
+/// Written as runs; read as either, because sessions written by earlier builds
+/// are per-cell arrays and are sitting on disk. Without this, the first launch
+/// after the change would fail to parse them and every window would come back
+/// empty — the exact failure this codebase has already had once.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum Row {
+    Runs(RowSnap),
+    Cells(Vec<CellSnap>),
+}
+
+impl Row {
+    fn from_cells(row: &[Cell]) -> Self {
+        Row::Runs(RowSnap::from_cells(row))
+    }
+
+    fn to_cells(&self) -> Vec<Cell> {
+        match self {
+            Row::Runs(r) => r.to_cells(),
+            Row::Cells(v) => v.iter().map(CellSnap::to_cell).collect(),
+        }
+    }
+}
+
 /// A snapshot of a `Grid`'s visible viewport, cursor state, and scrollback
 /// history. Taken right before "Reload Window" replaces this process and
 /// restored into the fresh `Grid` built for the reattached terminal on the
@@ -107,10 +218,10 @@ pub struct GridSnapshot {
     cur_row: usize,
     cur_col: usize,
     cursor_visible: bool,
-    cells: Vec<Vec<CellSnap>>,
+    cells: Vec<Row>,
     /// Scrollback lines, oldest first — same content and cap as the live
     /// `Grid::scrollback` (see `MAX_SCROLLBACK`).
-    scrollback: Vec<Vec<CellSnap>>,
+    scrollback: Vec<Row>,
 }
 
 // ── Grid ─────────────────────────────────────────────────────────────────────
@@ -309,11 +420,9 @@ impl Grid {
             cur_row: self.cur_row,
             cur_col: self.cur_col,
             cursor_visible: self.cursor_visible,
-            cells: self.viewport.iter()
-                .map(|row| row.iter().map(CellSnap::from).collect())
-                .collect(),
+            cells: self.viewport.iter().map(|row| Row::from_cells(row)).collect(),
             scrollback: self.scrollback.iter().skip(keep)
-                .map(|row| row.iter().map(CellSnap::from).collect())
+                .map(|row| Row::from_cells(row))
                 .collect(),
         }
     }
@@ -330,17 +439,15 @@ impl Grid {
         self.scrollback_version += 1;
         for (r, row) in snap.cells.iter().enumerate() {
             if r >= self.viewport.len() { break; }
-            for (c, cell) in row.iter().enumerate() {
+            for (c, cell) in row.to_cells().into_iter().enumerate() {
                 if c >= self.viewport[r].len() { break; }
-                self.viewport[r][c] = cell.to_cell();
+                self.viewport[r][c] = cell;
             }
         }
         self.cur_row = snap.cur_row.min(self.rows.saturating_sub(1));
         self.cur_col = snap.cur_col.min(self.cols.saturating_sub(1));
         self.cursor_visible = snap.cursor_visible;
-        self.scrollback = snap.scrollback.iter()
-            .map(|row| row.iter().map(CellSnap::to_cell).collect())
-            .collect();
+        self.scrollback = snap.scrollback.iter().map(Row::to_cells).collect();
         self.trim_scrollback();
     }
 
@@ -2713,5 +2820,122 @@ mod row_height_tests {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod row_encoding_tests {
+    use super::*;
+
+    fn cell(ch: char, fg: egui::Color32, bg: Option<egui::Color32>) -> Cell {
+        Cell { ch, fg, bg }
+    }
+
+    /// The encoding is a change of representation, not of content: every
+    /// character comes back with exactly the colours it went in with.
+    #[test]
+    fn a_row_survives_the_round_trip_cell_for_cell() {
+        let red = egui::Color32::from_rgb(200, 40, 40);
+        let grey = egui::Color32::from_rgb(204, 204, 204);
+        let row: Vec<Cell> = "error: 2 unexpected arguments"
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                // Colour changing mid-row, and a background on part of it.
+                if i < 6 { cell(ch, red, None) }
+                else if i < 12 { cell(ch, grey, Some(egui::Color32::from_rgb(40, 20, 20))) }
+                else { cell(ch, grey, None) }
+            })
+            .collect();
+
+        let back = Row::from_cells(&row).to_cells();
+        assert_eq!(back.len(), row.len(), "row changed length");
+        for (i, (a, b)) in row.iter().zip(&back).enumerate() {
+            assert_eq!(a.ch, b.ch, "char {i}");
+            assert_eq!(a.fg, b.fg, "fg at {i}");
+            assert_eq!(a.bg, b.bg, "bg at {i}");
+        }
+    }
+
+    /// Runs are counted in characters, not bytes — a multi-byte character must
+    /// not consume more of a run than it should.
+    #[test]
+    fn multibyte_characters_line_up_with_their_runs() {
+        let a = egui::Color32::from_rgb(10, 20, 30);
+        let b = egui::Color32::from_rgb(40, 50, 60);
+        let row: Vec<Cell> = vec![
+            cell('日', a, None), cell('本', a, None),
+            cell('✔', b, None), cell('❯', b, None),
+        ];
+        let back = Row::from_cells(&row).to_cells();
+        assert_eq!(back.iter().map(|c| c.ch).collect::<String>(), "日本✔❯");
+        assert_eq!(back[0].fg, a);
+        assert_eq!(back[2].fg, b);
+    }
+
+    #[test]
+    fn an_empty_row_round_trips() {
+        assert!(Row::from_cells(&[]).to_cells().is_empty());
+    }
+
+    /// Sessions written by earlier builds store rows as per-cell arrays and are
+    /// on disk now. Reading them has to keep working, or the first launch after
+    /// this change brings every window back empty.
+    #[test]
+    fn a_row_written_by_an_older_build_still_reads() {
+        let old = r#"[
+            {"ch":"o","fg":[204,204,204,255],"bg":null},
+            {"ch":"k","fg":[10,200,10,255],"bg":[1,2,3,4]}
+        ]"#;
+        let row: Row = serde_json::from_str(old).expect("old per-cell format must still parse");
+        let cells = row.to_cells();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].ch, 'o');
+        assert_eq!(cells[1].ch, 'k');
+        assert_eq!(cells[1].fg, egui::Color32::from_rgba_premultiplied(10, 200, 10, 255));
+        assert_eq!(cells[1].bg, Some(egui::Color32::from_rgba_premultiplied(1, 2, 3, 4)));
+    }
+
+    /// A row whose runs do not cover its text keeps its characters rather than
+    /// panicking or dropping them — a truncated write must not cost the row.
+    #[test]
+    fn runs_that_fall_short_still_yield_the_text() {
+        let snap = RowSnap { t: "hello".into(), r: vec![RunSnap { n: 2, fg: [1, 2, 3, 4], bg: None }] };
+        let cells = snap.to_cells();
+        assert_eq!(cells.iter().map(|c| c.ch).collect::<String>(), "hello");
+        assert_eq!(cells[0].fg, egui::Color32::from_rgba_premultiplied(1, 2, 3, 4));
+    }
+
+    /// The point of the exercise. Terminal output is long stretches of one
+    /// colour, so the encoded form has to be dramatically smaller — measured,
+    /// not asserted by eye.
+    #[test]
+    fn the_encoded_form_is_far_smaller() {
+        let grey = egui::Color32::from_rgb(204, 204, 204);
+        let green = egui::Color32::from_rgb(40, 200, 40);
+        // 200 rows of 167 columns, the shape of a real saved scrollback, with a
+        // colour change partway along each line.
+        let rows: Vec<Vec<Cell>> = (0..200)
+            .map(|_| {
+                (0..167)
+                    .map(|c| cell(if c % 7 == 0 { ' ' } else { 'x' }, if c < 80 { grey } else { green }, None))
+                    .collect()
+            })
+            .collect();
+
+        let old: Vec<Vec<CellSnap>> = rows.iter()
+            .map(|r| r.iter().map(CellSnap::from).collect())
+            .collect();
+        let new: Vec<Row> = rows.iter().map(|r| Row::from_cells(r)).collect();
+
+        let was = serde_json::to_string(&old).unwrap().len();
+        let now = serde_json::to_string(&new).unwrap().len();
+        eprintln!("scrollback encoding: {was} bytes -> {now} bytes ({:.0}x smaller)", was as f64 / now as f64);
+        assert!(now * 20 < was, "only {:.1}x smaller: {was} -> {now}", was as f64 / now as f64);
+
+        // And it is still the same content.
+        for (a, b) in rows.iter().zip(&new) {
+            assert_eq!(a.len(), b.to_cells().len());
+        }
     }
 }

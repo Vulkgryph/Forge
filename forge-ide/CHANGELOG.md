@@ -4,16 +4,6 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-### Fixed
-
-- **The macOS download is notarized.** The `.dmg` on the releases page is signed with Vulkgryph LLC's Developer ID and notarized by Apple, with the ticket stapled to both the disk image and the app inside it — so it opens without the unidentified-developer warning, and offline too, since a stapled ticket needs no call to Apple. A bundle built locally is still unsigned or ad-hoc signed; the READMEs said the app was never notarized, which is no longer true of the release.
-
-  `scripts/sign_notarize_dmg.sh` is now safe to run in any order, rather than only immediately after `package_macos.sh`. It works on a copy of the bundle, because signing in place terminates any window running from it (`CODESIGNING, Invalid Page`); it discovers nested executables rather than naming them, so `forge-agent` and `forge-server` both carry the hardened runtime that notarization requires; it verifies notarization credentials before doing any work; and the `.dmg` is named after the manifest version.
-
-- **Resizing the terminal no longer duplicates or clips a line.** The number of rows the shell was told it had came from `Fonts::row_height`, which is derived from font metrics and does not have to agree with what layout produces: Menlo at 13pt reports 15.13 while every laid-out row is exactly 15.0. Dividing the panel height by the larger figure undercounts what fits, so the shell was given one row fewer than the panel was drawing — leaving a stale row at the bottom, or a galley slightly taller than its region with the last line cut off. Which of the two appeared depended on where the drag stopped, so raising or lowering the terminal produced a duplicated or a cut line.
-
-  The row height is now measured by laying a line out, the same way the column width already was, and from one place — the row count, the cursor and the text cannot hold different opinions about how tall a line is. Swept across 3,000 panel heights, the old formula disagreed with the measured one at 447 of them.
-
 ## [0.4.0] — 2026-09-07
 
 _Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
@@ -55,6 +45,14 @@ _Includes everything prepared for 0.3.2. That version was written up and its man
   Animated GIFs play at their own speed: every frame is composited to full size at decode time, and the frame shown is chosen by wall clock rather than by repaint count, with a repaint requested only while a file actually has more than one frame — so an open still costs nothing.
 
 ### Fixed
+
+- **The macOS download is notarized.** The `.dmg` on the releases page is signed with Vulkgryph LLC's Developer ID and notarized by Apple, with the ticket stapled to both the disk image and the app inside it — so it opens without the unidentified-developer warning, and offline too, since a stapled ticket needs no call to Apple. A bundle built locally is still unsigned or ad-hoc signed; the READMEs said the app was never notarized, which is no longer true of the release.
+
+  `scripts/sign_notarize_dmg.sh` is now safe to run in any order, rather than only immediately after `package_macos.sh`. It works on a copy of the bundle, because signing in place terminates any window running from it (`CODESIGNING, Invalid Page`); it discovers nested executables rather than naming them, so `forge-agent` and `forge-server` both carry the hardened runtime that notarization requires; it verifies notarization credentials before doing any work; and the `.dmg` is named after the manifest version.
+
+- **Resizing the terminal no longer duplicates or clips a line.** The number of rows the shell was told it had came from `Fonts::row_height`, which is derived from font metrics and does not have to agree with what layout produces: Menlo at 13pt reports 15.13 while every laid-out row is exactly 15.0. Dividing the panel height by the larger figure undercounts what fits, so the shell was given one row fewer than the panel was drawing — leaving a stale row at the bottom, or a galley slightly taller than its region with the last line cut off. Which of the two appeared depended on where the drag stopped, so raising or lowering the terminal produced a duplicated or a cut line.
+
+  The row height is now measured by laying a line out, the same way the column width already was, and from one place — the row count, the cursor and the text cannot hold different opinions about how tall a line is. Swept across 3,000 panel heights, the old formula disagreed with the measured one at 447 of them.
 
 - **Enter inserts a newline.** Writing the editor's text back to the buffer split it with `str::lines()`, which drops the trailing empty element, so a new empty line was discarded the moment it was made.
 

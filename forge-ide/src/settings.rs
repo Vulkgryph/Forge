@@ -97,6 +97,17 @@ pub struct Settings {
     /// How often, in seconds.
     #[serde(default = "default_auto_save_secs")]
     pub auto_save_secs: u64,
+    /// How many undo steps a buffer keeps.
+    ///
+    /// A step is one edit as a person would count it: anything that adds or
+    /// removes a line starts one immediately, and a burst of typing is folded
+    /// into a single step. Saving has nothing to do with it.
+    ///
+    /// Steps hold only the lines that changed, so this costs little for
+    /// ordinary editing — it was worth capping when a step was a copy of the
+    /// whole file.
+    #[serde(default = "default_undo_steps")]
+    pub undo_steps: usize,
 
     // Updates
     /// Check GitHub Releases for a newer Forge IDE version on startup. Off
@@ -142,11 +153,13 @@ pub struct Settings {
 /// Five minutes. Long enough that it is never in the way of typing, short
 /// enough that what a crash costs is a coffee break rather than an afternoon.
 fn default_auto_save_secs() -> u64 { 300 }
+fn default_undo_steps() -> usize { crate::buffer::DEFAULT_UNDO_STEPS }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size:          14.0,
+            undo_steps:         default_undo_steps(),
             tab_width:          4,
             insert_spaces:      true,
             word_wrap:           false,

@@ -7793,6 +7793,7 @@ impl IdeApp {
                      else          { egui::ScrollArea::both() };
         let scroll_key = buf.path.as_ref().map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("untitled-{idx}"));
+        let undo_steps = self.settings.undo_steps;
         scroll.id_salt(("split_editor_scroll", scroll_key))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -7805,7 +7806,7 @@ impl IdeApp {
                     .layouter(&mut layouter)
                     .show(ui);
                 if out.response.changed() {
-                    buf.set_text_from_editor(&text);
+                    buf.set_text_from_editor(&text, undo_steps);
                 }
             });
     }
@@ -10313,6 +10314,34 @@ impl IdeApp {
                 ui.horizontal(|ui| { ui.add_space(14.0); lbl(ui, "SESSION"); });
                 ui.add_space(4.0);
 
+                // Advanced: how far back undo reaches. Steps hold only the
+                // lines that changed, so this is cheap — it is here because
+                // "how many edits can I take back" is a real preference, not
+                // because the number needs managing.
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    lbl(ui, "Undo Steps");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        let before = s.undo_steps;
+                        ui.add(egui::DragValue::new(&mut s.undo_steps)
+                            .range(10..=5000).speed(1.0));
+                        if s.undo_steps != before { changed = true; }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.label(egui::RichText::new(
+                            "One step is one edit as you would count it: adding or removing a \
+                             line starts a step, and a burst of typing becomes a single step. \
+                             Saving does not affect it."
+                        ).size(10.5).color(egui::Color32::from_gray(130)));
+                    });
+                });
+                ui.add_space(4.0);
+
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     lbl(ui, "Auto-save Open Files");
@@ -12758,6 +12787,7 @@ impl IdeApp {
         // Everything else is left to the widget: a real tab needs no
         // substitution, and Shift+Tab is its de-indent, which has no
         // equivalent here.
+        let undo_steps = self.settings.undo_steps;
         let insertion = tab_insertion(ctrl, shift, self.settings.insert_spaces, self.settings.tab_width);
         if let Some(insertion) = insertion.filter(|_| editor_focused)
             && ui.input(|i| i.key_pressed(egui::Key::Tab))
@@ -13334,7 +13364,7 @@ impl IdeApp {
     }
 
                     if te_out.response.changed() {
-                        buf.set_text_from_editor(&text);
+                        buf.set_text_from_editor(&text, undo_steps);
                         // Any edit invalidates a completion list: it was
                         // requested for a prefix that no longer exists, and
                         // while it is non-empty it takes Enter for itself.

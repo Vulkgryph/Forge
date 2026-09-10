@@ -6,6 +6,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **Undo history stores the edit, not the file.** A step was a copy of the whole buffer, capped at a hundred of them — so editing an eighteen-thousand-line file held about 136 MB of undo history for that one buffer, and a window with two such files open accounted for most of its memory. A step is now the one region of lines that differs, with the matching lines around it not stored at all. Measured: two hundred steps on a 1.1 MB file cost **25 KB**, against 215 MB as whole copies.
+
+  The cost used to be invisible because undo did not work — `snapshot` was reachable only from the Tab handler, so the stack stayed empty. Making undo capture ordinary typing is what switched the cost on.
+
+  The depth is now a setting (**Undo Steps**, default 200) rather than a constant. One step is one edit as a person would count it: adding or removing a line starts a step, a burst of typing becomes a single step, and saving has nothing to do with it. A cap of zero still keeps one step, because an editor with no undo is not a thing to configure by accident.
+
 - **A saved session is a fraction of the size, with nothing dropped from it.** Each terminal row was stored with a colour beside every character — `{"ch":"E","fg":[204,204,204,255],"bg":null}`, about ninety bytes to say one letter — so two hundred rows of scrollback came to 1.8 MB and a config directory held twelve. Terminal output is long stretches of one colour, measured at sixty-two characters per style change, so a row is now stored as its text plus the runs of colour over it. Measured on real saved sessions: **12.3 MB to 0.5 MB**, twenty-three times smaller.
 
   Nothing is lost. Every character keeps its own colours; they are described once per run instead of once per character, and a row is reconstructed cell for cell — there is a test asserting exactly that, including for multi-byte characters, where a run has to count characters rather than bytes. Sessions written by earlier builds are still read, since they are on disk and the alternative is every window coming back empty on the first launch after the change.

@@ -27,12 +27,47 @@ Forge IDE is built for engineers who want to see and understand the tool they us
 - **Git** — status-colored file tree, staged/unstaged source control panel, inline diff gutter, unified diff view, commit/push/pull/fetch, inline blame, `gh`-backed "Publish to GitHub," and a `~/.ssh/config`-integrated remote picker
 - **SSH Remote** — a small Rust daemon (`forge-server`) uploads itself to the remote machine over SFTP, runs there, and speaks JSON-RPC back over the SSH channel. Remote file tree, remote terminal, and remote file editing all route through it — no VS Code Server–style background install step, and it works fully offline on the remote end (nothing is downloaded there).
 - **Debugging** — DAP client (breakpoints, step over/in/out, call stack, variables) against `lldb-dap`, `debugpy`, or any DAP-compliant adapter
-- **Terminal** — a real PTY with VT100/ANSI support, plus an Output panel for build/task/connection logs
+- **Terminal** — a real PTY with VT100/ANSI support, plus an Output panel for build/task/connection logs. Shells outlive the editor: they belong to a small pty daemon, so a terminal comes back with its processes still running after Forge IDE restarts — see [Shell history](#shell-history) for the one consequence of that.
 - **Task runner** — named tasks in `.forge/tasks.toml`, run from a picker, output streamed live
 - **Forge Agent** — an optional AI coding assistant panel with multi-tab conversations and persistent history
 - **Multi-window** — open more than one workspace or remote host at once
 - **Themes & settings** — font size, tab width, word wrap, and a theme picker (Dark+, Light+, Monokai, One Dark), all in `~/.config/forge-ide/settings.toml`
 - **Plugins** — a minimal C ABI for dynamically loaded `.so`/`.dylib`/`.dll` plugins, surfaced in the command palette
+
+## Shell history
+
+Terminals here are backed by a pty daemon that outlives the editor, so a shell
+keeps running across restarts and reloads and its processes survive with it.
+That is the point of the design, and it has one consequence worth knowing.
+
+`zsh` and `bash` both write their history file **when the shell exits**. A shell
+that never exits never writes one — so `↑` recalls everything typed in that
+terminal, while a *new* terminal starts with whatever the history file last
+held, which may be days old. Nothing is lost from the running session; it simply
+has not been written down.
+
+Terminal.app does not behave this way for an uninteresting reason: its shells
+die when you close the window.
+
+One line fixes it, in `~/.zshrc`:
+
+```sh
+setopt INC_APPEND_HISTORY    # write each command as it is entered
+```
+
+Or, if you keep several terminals open, `setopt SHARE_HISTORY` — it implies the
+above and also imports commands from other live sessions, so a command typed in
+one terminal is available in the next.
+
+For `bash`, the equivalent is:
+
+```sh
+PROMPT_COMMAND='history -a'
+```
+
+Forge IDE deliberately does not set these for you. They change how your shell
+behaves everywhere, and a tool that quietly edits your shell's semantics is not
+one worth trusting with the rest.
 
 ## Building
 

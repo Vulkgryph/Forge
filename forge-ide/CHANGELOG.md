@@ -4,6 +4,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Documentation
+
+- **Why a new terminal starts with old shell history.** Terminals are backed by a pty daemon that outlives the editor, so a shell keeps running across restarts — measured on a real machine, two of them had been alive for fifty-one and forty-eight days. Both `zsh` and `bash` write their history file when the shell *exits*, so a shell that never exits never writes one: `↑` recalls everything typed in that terminal, while a new terminal starts from a history file that may be days old. Nothing is lost, it is simply unwritten. The README now says so, with the one-line `setopt INC_APPEND_HISTORY` (or `SHARE_HISTORY`) that changes it — and why Forge IDE does not set it for you.
+
 ## [0.4.1] — 2026-09-13
 
 ### Fixed

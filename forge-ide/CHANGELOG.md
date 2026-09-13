@@ -4,6 +4,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-13
+
 ### Fixed
 
 - **Undo history stores the edit, not the file.** A step was a copy of the whole buffer, capped at a hundred of them — so editing an eighteen-thousand-line file held about 136 MB of undo history for that one buffer, and a window with two such files open accounted for most of its memory. A step is now the one region of lines that differs, with the matching lines around it not stored at all. Measured: two hundred steps on a 1.1 MB file cost **25 KB**, against 215 MB as whole copies.

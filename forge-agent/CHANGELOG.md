@@ -4,6 +4,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-13
+
+No changes in this component; released with `forge-ide`, which shares its version.
+
 ## [0.4.0] — 2026-09-07
 
 _Includes everything prepared for 0.3.2. That version was written up and its manifests committed, but it was never tagged and never released, so it existed only as a commit on `main` — nobody could install it. Its notes are here rather than under a heading for a version that never shipped._
@@ -207,7 +211,8 @@ Initial public release.
 - Five-way setup wizard: local LLM / Claude subscription / ChatGPT Codex subscription / direct API key / skip
 - Cross-platform browser launching for OAuth flows (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows)
 
-[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vulkgryph/Forge/compare/v0.2.1...v0.3.0

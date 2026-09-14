@@ -4,6 +4,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- **The agent composer grows with what you type.** The text area was a fixed 56 points inside a fixed 118-point panel, so a message longer than three lines scrolled inside those three lines — and the panel could not grow to show the rest, because its height was a constant. Both now follow the text, bounded at 40% of the panel's height so the transcript above never disappears and a very long message scrolls *inside* the text area rather than pushing the composer off the bottom. A trailing newline counts as a line, so pressing Enter at the end of a message keeps the caret in view.
+
+- **The send button says the agent is working, and stops it.** It sat inert and blue for the whole time a turn ran — the one control a person looks at to find out whether anything is happening. While a turn is in flight it is now red, carries a stop square instead of the send arrow, sweeps a ring so the motion says *working*, and clicking it interrupts the turn. Escape already did that, but only with the panel focused and only if you knew.
+
 ### Documentation
 
 - **Why a new terminal starts with old shell history.** Terminals are backed by a pty daemon that outlives the editor, so a shell keeps running across restarts — measured on a real machine, two of them had been alive for fifty-one and forty-eight days. Both `zsh` and `bash` write their history file when the shell *exits*, so a shell that never exits never writes one: `↑` recalls everything typed in that terminal, while a new terminal starts from a history file that may be days old. Nothing is lost, it is simply unwritten. The README now says so, with the one-line `setopt INC_APPEND_HISTORY` (or `SHARE_HISTORY`) that changes it — and why Forge IDE does not set it for you.

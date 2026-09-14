@@ -1459,6 +1459,38 @@ fn comp_kind_glyph(kind: u8) -> &'static str {
     }
 }
 
+/// The square a running turn shows in place of the send arrow.
+///
+/// A square, not a second arrow with a different tint: the button changes what
+/// it *does* while a turn is running, and a control whose action changes has to
+/// look different, or the only way to find out is to press it.
+fn paint_stop_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)), 1.5, color);
+}
+
+/// How tall the composer's text area should be for `text`, in points.
+///
+/// The box used to be a fixed 56 points inside a fixed 118-point panel, so a
+/// long message scrolled inside three visible lines with the rest out of reach
+/// — and the panel could not grow to show it because its height was a constant.
+///
+/// It now grows with the text and stops at `max`, which the caller derives from
+/// the panel's own height so the transcript above always keeps room. Past that
+/// the text area scrolls, which is the right behaviour for a message that is
+/// longer than the window.
+fn composer_text_height(text: &str, row_h: f32, max: f32) -> f32 {
+    // Wrapped lines are not counted: egui lays the text out, and asking it
+    // would mean laying it out twice. Newlines are what a person adds
+    // deliberately, and they are what makes a message tall enough to notice.
+    let lines = text.lines().count().max(1) + usize::from(text.ends_with('\n'));
+    let wanted = row_h * lines as f32;
+    // `max` wins over the resting size. In a very short panel the cap can fall
+    // below three rows, and `clamp` with min > max panics — so the floor is
+    // applied first and then bounded, which yields a small composer rather than
+    // one that overflows the panel it is in.
+    wanted.max(row_h * 3.0).min(max)
+}
+
 fn paint_send_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     // Up-arrow (modern chat-app style)
     let s = egui::Stroke::new(2.2_f32, color);
@@ -8928,7 +8960,16 @@ impl IdeApp {
                       else { 24.0 * tab.session.queued.len() as f32 + 4.0 };
         let show_activity = tab.session.is_active();
         let activity_h = if show_activity { 22.0 } else { 0.0 };
-        let input_h = 118.0 + queue_h + activity_h;
+        // The composer grows with what is being typed instead of scrolling
+        // inside three fixed lines. Bounded at 40% of the panel so the
+        // transcript above never disappears behind the box, and so a very long
+        // message scrolls *inside* the text area rather than pushing the whole
+        // composer off the bottom of an unscrollable panel — which is what a
+        // fixed 118-point panel did with a 56-point box inside it.
+        let row_h = ui.text_style_height(&egui::TextStyle::Body);
+        let panel_h = ui.available_height().max(240.0);
+        let text_h = composer_text_height(&tab.session.input, row_h, panel_h * 0.40);
+        let input_h = 62.0 + text_h + queue_h + activity_h;
         let mut revoke_idx: Option<usize> = None;
         let mut send_now_idx: Option<usize> = None;
         egui::TopBottomPanel::bottom("agent_input_panel")
@@ -9052,7 +9093,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(outer_pad);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(frame_outer, 96.0),
+                        egui::vec2(frame_outer, text_h + 40.0),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             egui::Frame::none()
@@ -9063,7 +9104,7 @@ impl IdeApp {
                                 .show(ui, |ui| {
                                     let inner_w = ui.available_width();
                                     let resp = ui.add_sized(
-                                        egui::vec2(inner_w, 56.0),
+                                        egui::vec2(inner_w, text_h),
                                         egui::TextEdit::multiline(&mut tab.session.input)
                                             .hint_text("Ask Forge…")
                                             .frame(false)
@@ -9111,17 +9152,56 @@ impl IdeApp {
                                         }
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        // One control, three states. While a turn
+                                        // is running it stops the turn — Escape
+                                        // already did that, but only if you knew,
+                                        // and only with the panel focused. A
+                                        // button that sits inert for the whole
+                                        // time the agent is working is also the
+                                        // one place a person looks to find out
+                                        // whether anything is happening.
+                                        let running = tab.session.is_active();
                                         let active = !tab.session.input.trim().is_empty();
                                         let (rect2, btn_resp) = ui.allocate_exact_size(egui::vec2(28.0,28.0), egui::Sense::click());
-                                        let bg = if active && btn_resp.hovered() { egui::Color32::from_rgb(20,145,235) }
+                                        let clickable = running || active;
+                                        let bg = if running && btn_resp.hovered() { egui::Color32::from_rgb(210, 90, 80) }
+                                                 else if running { egui::Color32::from_rgb(180, 70, 60) }
+                                                 else if active && btn_resp.hovered() { egui::Color32::from_rgb(20,145,235) }
                                                  else if active { egui::Color32::from_rgb(0,120,212) }
                                                  else { egui::Color32::from_gray(55) };
                                         ui.painter().circle_filled(rect2.center(), 14.0, bg);
-                                        paint_send_icon(ui.painter(), rect2.center(),
-                                            if active { egui::Color32::WHITE } else { egui::Color32::from_gray(120) });
-                                        if active && btn_resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                        if running {
+                                            // A ring that sweeps while the turn
+                                            // runs, so the button carries the fact
+                                            // that work is in progress and not
+                                            // only the means to stop it.
+                                            let t = ui.input(|i| i.time) as f32;
+                                            let sweep = std::f32::consts::TAU * 0.75;
+                                            let start = t * 2.2 % std::f32::consts::TAU;
+                                            let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgba_unmultiplied(255,255,255,190));
+                                            let steps = 24;
+                                            let pts: Vec<egui::Pos2> = (0..=steps).map(|i| {
+                                                let a = start + sweep * (i as f32 / steps as f32);
+                                                rect2.center() + 11.5 * egui::vec2(a.cos(), a.sin())
+                                            }).collect();
+                                            ui.painter().add(egui::Shape::line(pts, stroke));
+                                            paint_stop_icon(ui.painter(), rect2.center(), egui::Color32::WHITE);
+                                            // Keep the sweep moving: this panel
+                                            // is otherwise redrawn on demand.
+                                            ui.ctx().request_repaint();
+                                        } else {
+                                            paint_send_icon(ui.painter(), rect2.center(),
+                                                if active { egui::Color32::WHITE } else { egui::Color32::from_gray(120) });
+                                        }
+                                        if clickable && btn_resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                        if btn_resp.hovered() {
+                                            btn_resp.clone().on_hover_text(
+                                                if running { "Stop the agent" } else { "Send  (Enter)" });
+                                        }
                                         let send_key = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                                        if active && (btn_resp.clicked() || send_key) {
+                                        if running {
+                                            if btn_resp.clicked() { tab.session.cancel_run(); }
+                                        } else if active && (btn_resp.clicked() || send_key) {
                                             let mut text = std::mem::take(&mut tab.session.input);
                                             if text.ends_with('\n') { text.pop(); }
                                             tab.session.send_user(text);
@@ -18675,5 +18755,63 @@ mod subagent_visibility_tests {
             subagent_activity_phrase("some_new_tool", "x").as_deref(),
             Some("Running some new tool…")
         );
+    }
+}
+
+#[cfg(test)]
+mod composer_height_tests {
+    use super::composer_text_height;
+
+    const ROW: f32 = 16.0;
+    const MAX: f32 = 200.0;
+
+    /// An empty composer is still three rows tall — the size it has always
+    /// been, so opening the panel looks no different.
+    #[test]
+    fn an_empty_composer_keeps_its_resting_size() {
+        assert_eq!(composer_text_height("", ROW, MAX), ROW * 3.0);
+        assert_eq!(composer_text_height("one line", ROW, MAX), ROW * 3.0);
+        assert_eq!(composer_text_height("a\nb", ROW, MAX), ROW * 3.0);
+    }
+
+    /// Past three lines it grows, which is the whole point: a long message used
+    /// to scroll inside a fixed 56-point box with the rest out of reach.
+    #[test]
+    fn it_grows_with_the_message() {
+        assert_eq!(composer_text_height("a\nb\nc\nd", ROW, MAX), ROW * 4.0);
+        assert_eq!(composer_text_height("a\nb\nc\nd\ne\nf", ROW, MAX), ROW * 6.0);
+    }
+
+    /// And stops, so the transcript above is never pushed off the screen. Past
+    /// the cap the text area scrolls, which is correct for a message longer
+    /// than the window — what was wrong before was scrolling at three lines.
+    #[test]
+    fn it_stops_before_it_eats_the_panel() {
+        let huge = "x\n".repeat(500);
+        assert_eq!(composer_text_height(&huge, ROW, MAX), MAX);
+        // Even a cap below the resting size is honoured: a very short panel
+        // gets a small composer rather than one that overflows it.
+        assert_eq!(composer_text_height(&huge, ROW, ROW), ROW);
+    }
+
+    /// A trailing newline is a line the cursor is on, so it counts — otherwise
+    /// pressing Enter at the end of a message moves the caret somewhere the box
+    /// has not grown to show.
+    #[test]
+    fn a_trailing_newline_counts_as_a_line() {
+        let a = composer_text_height("a\nb\nc\nd", ROW, MAX);
+        let b = composer_text_height("a\nb\nc\nd\n", ROW, MAX);
+        assert!(b > a, "the caret's own line was not counted: {a} vs {b}");
+    }
+
+    /// Whatever the text, the height stays within bounds — this feeds a panel
+    /// height, and a negative or unbounded value would be a broken layout
+    /// rather than a wrong one.
+    #[test]
+    fn the_height_is_always_within_bounds() {
+        for text in ["", "\n", "\n\n\n\n\n", &"word ".repeat(400), &"x\n".repeat(99)] {
+            let h = composer_text_height(text, ROW, MAX);
+            assert!(h >= ROW.min(MAX) && h <= MAX, "{h} out of bounds for {:?}", &text[..text.len().min(12)]);
+        }
     }
 }

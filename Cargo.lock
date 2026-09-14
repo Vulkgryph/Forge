@@ -1732,6 +1732,7 @@ dependencies = [
  "clap",
  "diffy",
  "dirs 6.0.0",
+ "forge-search",
  "futures",
  "futures-util",
  "fxhash",

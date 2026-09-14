@@ -52,6 +52,14 @@ pub struct Limits {
     /// Largest page body to parse, in bytes. A page beyond this is skipped
     /// rather than truncated, since half a document indexes as a document.
     pub max_page_bytes: usize,
+    /// Seconds the crawl may run, or `None` for no limit.
+    ///
+    /// The page limit bounds the work but not the time: one slow host can hold
+    /// a twenty-page crawl for minutes, and a crawl driven by something with a
+    /// caller waiting on it — a tool call, a request — needs a bound on the
+    /// clock rather than on the count. Checked between pages, so it stops
+    /// promptly rather than mid-fetch.
+    pub max_seconds: Option<f64>,
 }
 
 impl Default for Limits {
@@ -62,6 +70,7 @@ impl Default for Limits {
             politeness: 1.0,
             stay_on_host: true,
             max_page_bytes: 2 * 1024 * 1024,
+            max_seconds: None,
         }
     }
 }
@@ -88,6 +97,10 @@ pub struct Report {
     /// Left in the queue when a limit was reached. Non-zero means the crawl
     /// stopped early and there is more to find.
     pub remaining: usize,
+    /// Whether the clock, rather than the page count, ended the crawl. The
+    /// caller's response differs: more pages is a setting, more time may not
+    /// be available.
+    pub timed_out: bool,
 }
 
 /// A clock a crawl can be tested against.
@@ -198,12 +211,22 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
     /// Crawl until a limit is reached, adding what is found to `index`.
     pub fn run(&mut self, index: &mut Index) -> Report {
         let mut report = Report::default();
+        let started = self.clock.now();
 
         while let Some((url, depth)) = self.queue.pop_front() {
             if report.fetched >= self.limits.max_pages {
                 // Put it back so `remaining` counts honestly.
                 self.queue.push_front((url, depth));
                 break;
+            }
+            // Between pages rather than mid-fetch, so the crawl stops promptly
+            // without abandoning a request already in flight.
+            if let Some(budget) = self.limits.max_seconds {
+                if self.clock.now() - started >= budget {
+                    self.queue.push_front((url, depth));
+                    report.timed_out = true;
+                    break;
+                }
             }
 
             if !self.robots_allow(&url) {
@@ -672,5 +695,69 @@ mod tests {
             "a depth-first crawl went down instead of across"
         );
         assert!(!index.contains_url("https://a.example/deep3"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::fetch::StaticFetcher;
+
+    /// A page limit bounds the work; it does not bound the time. One slow host
+    /// can hold a small crawl for minutes, which is why anything with a caller
+    /// waiting needs a limit on the clock too.
+    #[test]
+    fn the_clock_can_end_a_crawl_the_page_limit_would_not() {
+        // Twenty pages all linked from the seed, so the page limit is nowhere
+        // near reached.
+        let mut fetcher = StaticFetcher::new().with_page(
+            "https://a.example/",
+            &(0..20)
+                .map(|i| format!(r#"<a href="/p{i}">{i}</a>"#))
+                .collect::<String>(),
+        );
+        for i in 0..20 {
+            fetcher = fetcher.with_page(&format!("https://a.example/p{i}"), "<p>page</p>");
+        }
+
+        // A second of politeness per page, and four seconds to spend.
+        let limits = Limits {
+            max_pages: 500,
+            politeness: 1.0,
+            max_seconds: Some(4.0),
+            ..Default::default()
+        };
+        let clock = FakeClock::default();
+        let mut index = Index::new();
+        let report = {
+            let mut c = Crawler::new(&fetcher, &clock, limits);
+            c.seed("https://a.example/").unwrap();
+            c.run(&mut index)
+        };
+
+        assert!(report.timed_out, "the clock did not stop the crawl: {report:?}");
+        assert!(report.fetched < 21, "fetched everything despite the budget: {report:?}");
+        assert!(report.remaining > 0, "stopped but reported nothing left");
+        // And it did index what it managed to reach, rather than nothing.
+        assert!(index.len() > 0, "a timed-out crawl indexed nothing");
+    }
+
+    /// Without a budget the crawl runs to its page limit, so the default
+    /// behaviour is unchanged.
+    #[test]
+    fn no_budget_means_no_time_limit() {
+        let fetcher = StaticFetcher::new()
+            .with_page("https://a.example/", r#"<a href="/x">x</a>"#)
+            .with_page("https://a.example/x", "<p>x</p>");
+        let limits = Limits { politeness: 100.0, max_seconds: None, ..Default::default() };
+        let clock = FakeClock::default();
+        let mut index = Index::new();
+        let report = {
+            let mut c = Crawler::new(&fetcher, &clock, limits);
+            c.seed("https://a.example/").unwrap();
+            c.run(&mut index)
+        };
+        assert!(!report.timed_out);
+        assert_eq!(index.len(), 2, "a long politeness delay stopped the crawl");
     }
 }

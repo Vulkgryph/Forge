@@ -235,7 +235,12 @@ impl ToolExecutor {
             }
             "glob_files" => self.glob_files(args).await,
             "todo_write" => self.todo_write(args).await,
-            "web_search" => web::web_search(args).await,
+            // The engine in `forge-search`, not a scrape of someone else's
+            // results page. Indexed per workspace, so the pages an agent has
+            // read for this project stay with the project.
+            "web_search" => {
+                crate::tools::search::web_search(args, crate::tools::search::index_path(&self.project_root)).await
+            }
             "web_fetch" => web::web_fetch(args, summarizer).await,
             "project_overview" => self.project_overview().await,
             _ => {

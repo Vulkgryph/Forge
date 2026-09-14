@@ -321,7 +321,14 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
-        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+        // Bounded by bytes but cut on a character boundary. An entity name is
+        // short, so twelve bytes is a generous window — but `&` followed by a
+        // four-byte emoji puts a character across that boundary, and slicing
+        // there panics. Found by crawling a real page rather than by a test:
+        // the multibyte test used three-byte characters and never placed one
+        // within twelve bytes of an ampersand.
+        let window = floor_boundary(tail, tail.len().min(12));
+        let Some(semi) = tail[..window].find(';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -489,6 +496,32 @@ mod tests {
         let page = parse("<title>日本語</title><p>émoji — ✔ done</p>");
         assert_eq!(page.title, "日本語");
         assert!(page.text.contains("émoji — ✔ done"), "{:?}", page.text);
+    }
+
+    /// A `&` followed by a multi-byte character put a character across the
+    /// entity-scanning window and panicked. Found by crawling the
+    /// Rustonomicon, which has a 🔬 in its text — not by a test, because the
+    /// multibyte test above uses three-byte characters and never placed one
+    /// close enough to an ampersand.
+    #[test]
+    fn an_ampersand_before_a_wide_character_does_not_panic() {
+        for html in [
+            "<p>Tom & 🔬 Jerry</p>",
+            "<p>&🔬</p>",
+            "<p>a &amp; 🔬🔬🔬 b</p>",
+            "<p>&日本語のテキスト</p>",
+            "<p>x&</p>",
+            "<title>& 🔬</title>",
+        ] {
+            let page = parse(html);
+            // The contract is that it returns; the emoji must also survive.
+            if html.contains('🔬') {
+                assert!(
+                    page.text.contains('🔬') || page.title.contains('🔬'),
+                    "the character was lost from {html:?}"
+                );
+            }
+        }
     }
 
     #[test]

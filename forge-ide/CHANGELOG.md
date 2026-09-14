@@ -4,6 +4,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dropping a file into the terminal works with a full-screen program running.** The drop handler wrote the path as raw bytes, bypassing the paste path — so a program that had asked for bracketed paste (`CSI ?2004h`) saw a burst of keystrokes instead of a paste, and was entitled to treat it quite differently. A plain shell has bracketed paste off and was unaffected, which is why this looked like it worked everywhere except where it mattered: dragging a screenshot in to show it to a CLI tool is the case the feature exists for.
+
 ## [0.4.2] — 2026-09-14
 
 ### Added

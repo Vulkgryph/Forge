@@ -1834,9 +1834,17 @@ impl Terminal {
                 })
                 .collect();
             if !paths.is_empty() {
-                let bytes = paths.join(" ").into_bytes();
-                self.pending_input.push(bytes.clone());
-                self.write_bytes(&bytes);
+                // Through `paste`, not as raw bytes.
+                //
+                // A drop *is* a paste, and a program that asked for bracketed
+                // paste (`CSI ?2004h`) expects the text wrapped in
+                // `ESC[200~`/`ESC[201~`. Writing the path raw makes it arrive
+                // as a burst of keystrokes instead, which a full-screen input
+                // editor is entitled to treat quite differently — Claude Code,
+                // named in the comment above as the case this exists for, is
+                // one of them. A plain shell has bracketed paste off and was
+                // unaffected, which is why this looked like it worked.
+                self.paste(&paths.join(" "));
             }
         }
 
@@ -2937,5 +2945,44 @@ mod row_encoding_tests {
         for (a, b) in rows.iter().zip(&new) {
             assert_eq!(a.len(), b.to_cells().len());
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_paste_tests {
+    use super::paste_bytes;
+
+    /// A dropped path reaches a program that asked for bracketed paste wrapped
+    /// in the markers it asked for.
+    ///
+    /// The drop handler used to write the path as raw bytes, so a full-screen
+    /// input editor saw a burst of keystrokes rather than a paste. A plain
+    /// shell has bracketed paste off and was unaffected, which is exactly why
+    /// the fault showed up only with something like Claude Code running.
+    #[test]
+    fn a_dropped_path_is_bracketed_when_the_program_asked() {
+        let path = "'/Users/me/Pictures/screenshot 1.png'";
+        let out = paste_bytes(path, true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b[200~"), "no paste-start marker: {s:?}");
+        assert!(s.ends_with("\x1b[201~"), "no paste-end marker: {s:?}");
+        assert!(s.contains(path), "the path itself was altered: {s:?}");
+    }
+
+    /// And arrives bare for a program that did not — a shell must not see the
+    /// markers as text.
+    #[test]
+    fn a_dropped_path_is_bare_for_a_plain_shell() {
+        let out = paste_bytes("'/tmp/a.png'", false);
+        assert_eq!(String::from_utf8(out).unwrap(), "'/tmp/a.png'");
+    }
+
+    /// Several files dropped together are one paste, not several.
+    #[test]
+    fn multiple_paths_are_a_single_paste() {
+        let joined = "'/tmp/a.png' '/tmp/b.png'";
+        let s = String::from_utf8(paste_bytes(joined, true)).unwrap();
+        assert_eq!(s.matches("\x1b[200~").count(), 1, "more than one paste started");
+        assert_eq!(s.matches("\x1b[201~").count(), 1, "more than one paste ended");
     }
 }

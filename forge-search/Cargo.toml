@@ -1,0 +1,13 @@
+[package]
+name        = "forge-search"
+version     = "0.1.0"
+edition     = "2021"
+description = "A small search engine: fetch, extract, index, rank."
+license     = "Apache-2.0"
+publish     = false
+
+# No dependencies, and that is the point of the crate rather than an
+# incidental property of it. Everything here — HTML parsing, tokenising, the
+# on-disk index, ranking — is written out, so the engine can be lifted whole
+# into something that is not Forge and does not have cargo.
+[dependencies]

@@ -209,7 +209,9 @@ fn run(
         let limits = Limits {
             max_pages,
             max_depth: 3,
-            politeness: 0.5,
+            // The conventional one request per second. See Limits::politeness:
+            // this is a courtesy setting, not a performance one.
+            politeness: 1.0,
             stay_on_host: true,
             max_page_bytes: 2 * 1024 * 1024,
             // A tool call that never returns is worse than one that returns

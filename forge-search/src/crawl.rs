@@ -42,6 +42,14 @@ pub struct Limits {
     /// Seconds to wait between requests to one host, unless its `robots.txt`
     /// asks for longer — a site's own figure is honoured over this, never
     /// undercut by it.
+    ///
+    /// One second is the conventional figure and the default here. It is not a
+    /// performance setting: at this rate a crawl spends almost all of its wall
+    /// clock deliberately waiting, because fetching and indexing a page costs
+    /// about sixteen milliseconds. Lowering it makes a crawl faster and makes
+    /// Forge's user agent — which identifies itself honestly — more likely to
+    /// be blocked, and a blocked reputation attaches to Forge rather than to
+    /// an anonymous scraper.
     pub politeness: f64,
     /// Whether to leave the seeds' hosts.
     ///

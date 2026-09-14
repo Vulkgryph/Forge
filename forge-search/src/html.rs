@@ -64,10 +64,6 @@ pub fn parse(html: &str) -> Page {
     let mut page = Page::default();
     let bytes = html.as_bytes();
     let mut at = 0;
-    // Which skipped element we are inside, if any, and how deep. Counted
-    // rather than a flag: `<script>` inside `<svg>` must not end the skip when
-    // the inner one closes.
-    let mut skip_depth = 0usize;
     let mut in_title = false;
     let mut text = String::with_capacity(html.len() / 4);
 
@@ -78,8 +74,31 @@ pub fn parse(html: &str) -> Page {
                 // whitespace or a digit is prose — "3 < 4" — and scanning it as
                 // a tag swallows everything up to the next `>`, which is
                 // usually the end of the enclosing element.
+                // A comment is recognised here, from the `<`, because its
+                // terminator is `-->` and not the first `>`. Scanning it as an
+                // ordinary tag first and then looking for `-->` afterwards is
+                // wrong in the common case: for a well-formed `<!-- x -->`,
+                // `find_tag_end` already stops on the `>` of `-->`, so the
+                // position is past the comment and the extra scan runs on to
+                // the *next* comment, swallowing everything in between.
+                //
+                // Measured on a real Wikipedia article: a comment 21 kB in
+                // dropped the following 1,298,945 bytes — the whole body — and
+                // left 51 indexable terms of navigation chrome. The tests did
+                // not catch it because their comments contained a `>`, which
+                // stops `find_tag_end` early and makes the second scan correct.
+                if html[at..].starts_with("<!--") {
+                    at = match html[at + 4..].find("-->") {
+                        Some(i) => at + 4 + i + 3,
+                        // Unterminated: the rest of the document is comment,
+                        // which is also what a browser concludes.
+                        None => bytes.len(),
+                    };
+                    continue;
+                }
+
                 let Some(tag_end) = find_tag_end(bytes, at) else {
-                    push_text(&mut text, &html[at..], skip_depth > 0);
+                    push_text(&mut text, &html[at..]);
                     break;
                 };
                 let raw = &html[at + 1..tag_end];
@@ -89,9 +108,9 @@ pub fn parse(html: &str) -> Page {
                     // Comment, doctype, CDATA — none of it is text. A comment
                     // needs its own scan because `-->` is the terminator, not
                     // the `>` that `find_tag_end` stopped at.
-                    if rest.starts_with("--") {
-                        at = html[at..].find("-->").map_or(bytes.len(), |i| at + i + 3);
-                    }
+                    // Doctype and CDATA, which do end at `>`. Comments were
+                    // already handled above.
+                    let _ = rest;
                     continue;
                 }
 
@@ -102,10 +121,15 @@ pub fn parse(html: &str) -> Page {
                 }
 
                 if SKIPPED.contains(&name.as_str()) {
-                    if closing {
-                        skip_depth = skip_depth.saturating_sub(1);
-                    } else if !raw.ends_with('/') {
-                        skip_depth += 1;
+                    if !closing && !raw.ends_with('/') {
+                        // Jump past the closing tag rather than tokenising the
+                        // content. These elements hold raw text, not markup,
+                        // and real scripts contain `<` used as less-than and
+                        // quoted strings full of angle brackets. Counting depth
+                        // while still scanning tags inside them means a string
+                        // like `"</div>"` is read as markup, and one containing
+                        // `"<script>"` opens a nesting level that never closes.
+                        at = find_raw_text_end(bytes, at, &name).unwrap_or(bytes.len());
                     }
                     continue;
                 }
@@ -138,7 +162,7 @@ pub fn parse(html: &str) -> Page {
                     }
                 }
 
-                if BLOCK.contains(&name.as_str()) && skip_depth == 0 && !in_title {
+                if BLOCK.contains(&name.as_str()) && !in_title {
                     // A newline rather than a space, so a snippet taken from
                     // here does not read as one run-on sentence.
                     if !text.ends_with('\n') && !text.is_empty() {
@@ -163,7 +187,7 @@ pub fn parse(html: &str) -> Page {
                 if in_title {
                     page.title.push_str(chunk);
                 } else {
-                    push_text(&mut text, chunk, skip_depth > 0);
+                    push_text(&mut text, chunk);
                 }
                 at = end;
             }
@@ -173,6 +197,40 @@ pub fn parse(html: &str) -> Page {
     page.title = collapse(&decode_entities(&page.title));
     page.text = tidy_lines(&decode_entities(&text));
     page
+}
+
+/// Where a raw-text element's content ends, just past its closing tag.
+///
+/// Scans bytes in place rather than lowercasing the rest of the document: a
+/// page with hundreds of inline scripts would otherwise copy the tail once per
+/// script, which is quadratic in the page size.
+fn find_raw_text_end(bytes: &[u8], from: usize, name: &str) -> Option<usize> {
+    let name = name.as_bytes();
+    let mut at = from;
+    while at + 2 + name.len() <= bytes.len() {
+        if bytes[at] == b'<'
+            && bytes[at + 1] == b'/'
+            && bytes[at + 2..at + 2 + name.len()].eq_ignore_ascii_case(name)
+        {
+            // The name has to end here, or `</scriptfoo>` would close a
+            // `<script>`.
+            let after = at + 2 + name.len();
+            match bytes.get(after) {
+                Some(b'>') => return Some(after + 1),
+                // `</script >` closes it too, so scan on to the `>`.
+                Some(c) if c.is_ascii_whitespace() => {
+                    let mut j = after;
+                    while j < bytes.len() && bytes[j] != b'>' {
+                        j += 1;
+                    }
+                    return Some((j + 1).min(bytes.len()));
+                }
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Where the tag that starts at `open` ends.
@@ -239,8 +297,8 @@ fn attribute(raw: &str, want: &str) -> Option<String> {
     None
 }
 
-fn push_text(out: &mut String, chunk: &str, skipping: bool) {
-    if skipping || chunk.is_empty() {
+fn push_text(out: &mut String, chunk: &str) {
+    if chunk.is_empty() {
         return;
     }
     // Newlines in the source are just whitespace — HTML says so, and a page
@@ -374,6 +432,90 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A comment must end at its own `-->` and nothing more.
+    ///
+    /// The bug this pins down: `find_tag_end` stops on the `>` of `-->`, so by
+    /// the time a comment is recognised the position is already past it.
+    /// Scanning on for another `-->` then jumps to the *next* comment in the
+    /// document and drops everything between the two. Every earlier comment
+    /// test here contained a `>` inside the comment, which stops
+    /// `find_tag_end` early and makes that second scan look right.
+    #[test]
+    fn a_comment_does_not_swallow_what_follows_it() {
+        let page = parse("<p>before</p><!-- nav --><p>the body</p>");
+        assert!(page.text.contains("before"));
+        assert!(
+            page.text.contains("the body"),
+            "content after a comment was dropped: {:?}",
+            page.text
+        );
+    }
+
+    /// The same defect with two comments, which is the shape a real page has:
+    /// commented-out section markers around the content.
+    #[test]
+    fn content_between_two_comments_survives() {
+        let page = parse(
+            "<!-- header --><p>alpha</p><!-- content --><p>beta</p><!-- footer --><p>gamma</p>",
+        );
+        for word in ["alpha", "beta", "gamma"] {
+            assert!(page.text.contains(word), "{word} missing from {:?}", page.text);
+        }
+    }
+
+    /// Measured against the real article that exposed this: 1.34 MB of HTML
+    /// must not collapse to a few dozen terms. The shape is what matters —
+    /// a comment early on, then the entire body after it.
+    #[test]
+    fn a_comment_near_the_top_does_not_cost_the_whole_document() {
+        let body = "<p>sodium channel kinetics at thirty five degrees</p>".repeat(200);
+        let page = parse(&format!("<html><body><!-- skin --><div>{body}</div></body></html>"));
+        assert!(
+            page.text.matches("sodium").count() == 200,
+            "kept {} of 200 paragraphs",
+            page.text.matches("sodium").count()
+        );
+    }
+
+    /// An unterminated comment does run to the end of the document — that is
+    /// what a browser concludes, and the boundary deserves pinning so the fix
+    /// above is not mistaken for one that ignores `<!--` entirely.
+    #[test]
+    fn an_unterminated_comment_runs_to_the_end() {
+        let page = parse("<p>kept</p><!-- and the rest <p>lost</p>");
+        assert!(page.text.contains("kept"));
+        assert!(!page.text.contains("lost"));
+    }
+
+    /// A script's content is raw text, so markup inside a JavaScript string is
+    /// not markup. Depth counting got this wrong: the `"<script>"` in the
+    /// string opened a level that the real `</script>` only half-closed, and
+    /// everything after was discarded as still-inside-a-script.
+    #[test]
+    fn markup_inside_a_script_string_is_not_markup() {
+        let page = parse(r#"<p>one</p><script>var s = "<script>";</script><p>two</p>"#);
+        assert!(page.text.contains("one"));
+        assert!(page.text.contains("two"), "lost text after a script: {:?}", page.text);
+    }
+
+    /// Less-than as an operator inside a script must not be read as a tag
+    /// either, and the closing tag is matched case-insensitively with
+    /// whitespace allowed before the `>`.
+    #[test]
+    fn a_script_closes_case_insensitively() {
+        let page = parse("<p>one</p><SCRIPT>if (a < b) { x() }</SCRIPT >\n<p>two</p>");
+        assert!(page.text.contains("one") && page.text.contains("two"));
+        assert!(!page.text.contains("x()"));
+    }
+
+    /// `</scriptfoo>` is not a closing `</script>`.
+    #[test]
+    fn a_longer_name_does_not_close_a_script() {
+        let page = parse("<script>a</scriptfoo>b</script><p>after</p>");
+        assert!(page.text.contains("after"));
+        assert!(!page.text.contains('b'), "script content leaked: {:?}", page.text);
+    }
 
     #[test]
     fn a_plain_page_yields_its_parts() {

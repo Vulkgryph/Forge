@@ -1,29 +1,50 @@
-// Not a test — a demonstration that the four stages compose.
+// The whole engine: crawl a site, then search it with operators and snippets.
+// Against a fixed fetcher, so it needs no network and gives the same answer
+// every time.
 fn main() {
-    use forge_search::{html, index::Index, rank};
-    let pages = [
-        ("https://doc.rust-lang.org/nomicon/", r#"<title>The Rustonomicon</title>
-            <p>Writing unsafe Rust requires understanding the allocator and memory layout.</p>"#),
-        ("https://doc.rust-lang.org/alloc/", r#"<title>The alloc crate</title>
-            <p>In no_std builds the allocator must be provided. The allocator is a global.</p>"#),
-        ("https://example.com/blog/2019/04/17/gardening/", r#"<title>Tomatoes</title>
-            <p>Tomatoes need sunshine. Nothing here about memory at all.</p>"#),
-    ];
-    let mut ix = Index::new();
-    for (url, raw) in pages {
-        let page = html::parse(raw);
-        ix.add(url, &page.title, &page.description, &page.text);
-    }
-    println!("indexed {} pages, average length {:.1} terms\n", ix.len(), ix.average_length());
-    for query in ["no_std allocator", "allocator", "tomatoes", "quantum"] {
-        println!("query: {query:?}");
-        let hits = rank::search(&ix, query, 5);
-        if hits.is_empty() { println!("    (no results)\n"); continue; }
+    use forge_search::{crawl, fetch::{Fetched, StaticFetcher}, query};
+
+    let site = StaticFetcher::new()
+        .with_response("https://docs.example/robots.txt", Fetched {
+            status: 200, final_url: "https://docs.example/robots.txt".into(),
+            content_type: "text/plain".into(),
+            body: "User-agent: *\nDisallow: /private/\n".into(),
+        })
+        .with_page("https://docs.example/", r#"<title>Runtime docs</title>
+            <p>Reference for the runtime.</p>
+            <a href="/alloc">Allocation</a><a href="/no-std">no_std</a>
+            <a href="/gc">Collection</a><a href="/private/internal">Internal</a>"#)
+        .with_page("https://docs.example/alloc", r#"<title>Allocation</title>
+            <meta name="description" content="How allocation works">
+            <p>Navigation: home docs allocator index.</p>
+            <p>The global allocator is chosen at link time. In no_std builds an
+            allocator must be provided by the crate, or nothing can allocate.</p>"#)
+        .with_page("https://docs.example/no-std", r#"<title>Writing no_std code</title>
+            <p>In no_std builds there is no allocator unless you bring one.
+            Core is always available.</p>"#)
+        .with_page("https://docs.example/gc", r#"<title>Garbage collection</title>
+            <p>This runtime has no garbage collector. Memory is freed by the
+            allocator when a value is dropped.</p>"#)
+        .with_page("https://docs.example/private/internal", "<p>never fetched</p>");
+
+    let limits = crawl::Limits { politeness: 0.0, ..Default::default() };
+    let (index, report) = crawl::crawl(&site, &["https://docs.example/"], limits);
+    println!("crawl: fetched {}, indexed {}, robots refused {}\n",
+             report.fetched, report.indexed, report.disallowed);
+
+    for q in [
+        "no_std allocator",
+        "\"global allocator\"",
+        "allocator -garbage",
+        "internal",
+    ] {
+        println!("query  {q}");
+        let hits = query::search(&index, q, 3);
+        if hits.is_empty() { println!("       (nothing)\n"); continue; }
         for h in &hits {
-            let d = ix.document(h.doc).unwrap();
-            println!("    {:.3}  {}", h.score, d.title);
-            println!("           {}", d.url);
-            println!("           bm25 {:.2}  title {:.2}  phrase {:.2}", h.features.bm25, h.features.title, h.features.phrase);
+            println!("  {:.2}  {}", h.score, h.title);
+            println!("        {}", h.url);
+            println!("        {}", h.snippet);
         }
         println!();
     }

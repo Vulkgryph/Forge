@@ -2,18 +2,32 @@
 //!
 //! Built in stages, each usable on its own:
 //!
+//! - [`crawl`] — what to fetch next, and when to stop. Every hard part of a
+//!   crawler is a limit.
+//! - [`fetch`] — what the engine needs from the network, as a trait it does
+//!   not implement. TLS is not something this crate should own.
 //! - [`html`] — a page's title, readable text and links. No DOM: a search
 //!   engine needs the words and the hyperlinks, never the tree.
 //! - [`tokenize`] — text into terms. Decides what can be found at all.
 //! - [`index`] — the inverted index: which documents hold a term, and where.
+//! - [`query`] — the operators a person typed, and the passage of each
+//!   document worth showing them back.
 //! - [`rank`] — which matching document to show first.
+//! - [`robots`] — what a site has asked crawlers not to fetch.
+//! - [`url`] — parsing, link resolution, and reducing two spellings of one
+//!   address to the same string, without which a crawl multiplies.
 //!
 //! Deliberately free of dependencies, which is the crate's purpose rather
 //! than a side effect. The engine should be liftable whole into something
 //! that is not Forge — including somewhere without cargo — so every stage is
 //! written out.
 
+pub mod crawl;
+pub mod fetch;
 pub mod html;
 pub mod index;
+pub mod query;
 pub mod rank;
+pub mod robots;
 pub mod tokenize;
+pub mod url;

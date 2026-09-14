@@ -13201,9 +13201,14 @@ impl IdeApp {
                                 new_positions.push(pos);
                             }
                             text = chars.into_iter().collect();
-                            buf.lines = text.split('\n').map(String::from).collect();
-                            if buf.lines.is_empty() { buf.lines.push(String::new()); }
-                            buf.modified = true;
+                            // Through `set_text_from_editor`, not by assigning
+                            // `lines` — that is what records an undo step. This
+                            // path wrote the buffer directly, so a multi-cursor
+                            // edit was not undoable at all: Ctrl+Z skipped
+                            // straight past it to whatever came before. Same
+                            // mistake as the original undo bug, where the only
+                            // caller that took a snapshot was the Tab handler.
+                            buf.set_text_from_editor(&text, undo_steps);
                             self.gutter_dirty = true;
                             let pidx = cursors.iter().position(|&c| c == primary_ci_before).unwrap_or(0);
                             mc_new_primary = Some(new_positions[pidx]);

@@ -747,3 +747,65 @@ mod undo_storage_tests {
         assert_eq!(e.after, vec!["line 42 edited".to_string()]);
     }
 }
+
+#[cfg(test)]
+mod undo_coverage_tests {
+    use super::{Buffer, DEFAULT_UNDO_STEPS};
+
+    /// Every path that changes a buffer has to record an undo step.
+    ///
+    /// This has now been wrong twice, the same way each time: a path wrote
+    /// `lines` directly instead of going through `set_text_from_editor`, so the
+    /// edit happened and no step was recorded — and Ctrl+Z silently skipped
+    /// past it to whatever came before. First it was ordinary typing (only the
+    /// Tab handler took a snapshot); then it was multi-cursor editing.
+    ///
+    /// This asserts the property rather than the call site: an edit made
+    /// through the editor's write path is undoable, whatever produced the text.
+    #[test]
+    fn an_edit_through_the_editor_path_is_undoable() {
+        let mut b = Buffer::new();
+        b.set_text_from_editor("one\ntwo\nthree", DEFAULT_UNDO_STEPS);
+        let before = b.lines.clone();
+        b.last_edit_at = None;
+
+        // What a multi-cursor insert produces: the whole text, rebuilt.
+        b.set_text_from_editor("Xone\nXtwo\nXthree", DEFAULT_UNDO_STEPS);
+        assert_eq!(b.lines, vec!["Xone", "Xtwo", "Xthree"]);
+
+        b.undo();
+        assert_eq!(b.lines, before, "the edit was not undoable");
+        b.redo();
+        assert_eq!(b.lines, vec!["Xone", "Xtwo", "Xthree"], "redo did not restore it");
+    }
+
+    /// A paste over a selection replaces a region with a different number of
+    /// lines — the case where a region-based step is most likely to be cut
+    /// wrongly.
+    #[test]
+    fn a_paste_over_a_selection_round_trips() {
+        let mut b = Buffer::new();
+        b.set_text_from_editor("a\nb\nc\nd\ne", DEFAULT_UNDO_STEPS);
+        let before = b.lines.clone();
+        b.last_edit_at = None;
+
+        // Lines b..d replaced by two different ones.
+        b.set_text_from_editor("a\nX\nY\ne", DEFAULT_UNDO_STEPS);
+        let after = b.lines.clone();
+        assert_eq!(after, vec!["a", "X", "Y", "e"]);
+
+        b.undo();
+        assert_eq!(b.lines, before, "undo of a shrinking replacement");
+        b.redo();
+        assert_eq!(b.lines, after, "redo of a shrinking replacement");
+
+        // And the growing direction.
+        b.last_edit_at = None;
+        b.set_text_from_editor("a\nX\n1\n2\n3\nY\ne", DEFAULT_UNDO_STEPS);
+        let grown = b.lines.clone();
+        b.undo();
+        assert_eq!(b.lines, after, "undo of a growing replacement");
+        b.redo();
+        assert_eq!(b.lines, grown, "redo of a growing replacement");
+    }
+}

@@ -282,3 +282,142 @@ fn inflate_block(
         }
     }
 }
+
+/// Inflate a gzip stream (RFC 1952): a ten-byte header, optional extra fields,
+/// the DEFLATE data, and a CRC-32 and length which are both verified.
+///
+/// gzip is the same DEFLATE payload this module already decodes for PNG, with a
+/// different wrapper — so opening a `.gz` costs a header parse rather than a
+/// dependency.
+///
+/// The trailer is checked rather than skipped. A `.gz` that decompresses to
+/// something subtly wrong is worse than one that refuses to open, and the file
+/// carries the means to tell the difference.
+pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 18 {
+        return Err("gzip: stream too short".into());
+    }
+    if data[0] != 0x1F || data[1] != 0x8B {
+        return Err("gzip: not a gzip stream".into());
+    }
+    if data[2] != 8 {
+        return Err(format!("gzip: compression method {} is not deflate", data[2]));
+    }
+    let flags = data[3];
+    if flags & 0xE0 != 0 {
+        return Err("gzip: reserved flag bits are set".into());
+    }
+    let mut at = 10;
+
+    // FEXTRA: a two-byte length followed by that many bytes.
+    if flags & 0x04 != 0 {
+        if at + 2 > data.len() {
+            return Err("gzip: truncated extra field".into());
+        }
+        let n = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+        at += 2 + n;
+    }
+    // FNAME and FCOMMENT: NUL-terminated strings.
+    for flag in [0x08u8, 0x10] {
+        if flags & flag != 0 {
+            let end = data[at..].iter().position(|&b| b == 0)
+                .ok_or("gzip: unterminated header string")?;
+            at += end + 1;
+        }
+    }
+    // FHCRC: a two-byte header checksum.
+    if flags & 0x02 != 0 {
+        at += 2;
+    }
+    if at + 8 > data.len() {
+        return Err("gzip: truncated before the compressed data".into());
+    }
+
+    // The last eight bytes are the trailer, not payload.
+    let body = &data[at..data.len() - 8];
+    let out = inflate(body)?;
+
+    let want_crc = u32::from_le_bytes([
+        data[data.len() - 8], data[data.len() - 7],
+        data[data.len() - 6], data[data.len() - 5],
+    ]);
+    let want_len = u32::from_le_bytes([
+        data[data.len() - 4], data[data.len() - 3],
+        data[data.len() - 2], data[data.len() - 1],
+    ]);
+    if out.len() as u32 != want_len {
+        return Err(format!(
+            "gzip: length mismatch — decompressed {} bytes, trailer says {want_len}",
+            out.len()
+        ));
+    }
+    let got = crc32(&out);
+    if got != want_crc {
+        return Err(format!("gzip: checksum mismatch ({got:08x} against {want_crc:08x})"));
+    }
+    Ok(out)
+}
+
+/// CRC-32 as gzip and PNG both define it, computed without a table so there is
+/// nothing to keep in step.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::gzip_decompress;
+
+    /// Round-tripped against the system `gzip`, so this is checked against a
+    /// real encoder rather than against our own idea of the format.
+    fn gzipped(text: &str) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("gzip").arg("-c")
+            .stdin(Stdio::piped()).stdout(Stdio::piped())
+            .spawn().expect("gzip must be on PATH for this test");
+        c.stdin.as_mut().unwrap().write_all(text.as_bytes()).unwrap();
+        c.wait_with_output().unwrap().stdout
+    }
+
+    #[test]
+    fn a_real_gzip_stream_decompresses() {
+        let text = "fn main() {\n    println!(\"hello\");\n}\n";
+        let out = gzip_decompress(&gzipped(text)).expect("should decompress");
+        assert_eq!(String::from_utf8(out).unwrap(), text);
+    }
+
+    /// Something large enough to span multiple DEFLATE blocks.
+    #[test]
+    fn a_long_stream_decompresses() {
+        let text: String = (0..5_000).map(|i| format!("line {i} of the file\n")).collect();
+        let out = gzip_decompress(&gzipped(&text)).expect("should decompress");
+        assert_eq!(String::from_utf8(out).unwrap(), text);
+    }
+
+    /// Corruption is refused rather than returning plausible-looking bytes —
+    /// the trailer exists precisely so this can be told apart.
+    #[test]
+    fn a_corrupt_stream_is_refused() {
+        let mut bytes = gzipped("the quick brown fox jumps over the lazy dog\n");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        let err = gzip_decompress(&bytes);
+        assert!(err.is_err(), "corruption was accepted: {:?}", err.map(|v| v.len()));
+    }
+
+    #[test]
+    fn rubbish_is_refused_rather_than_fatal() {
+        assert!(gzip_decompress(b"").is_err());
+        assert!(gzip_decompress(b"not gzip at all, just text").is_err());
+        assert!(gzip_decompress(&[0x1F, 0x8B, 0x08]).is_err());
+    }
+}

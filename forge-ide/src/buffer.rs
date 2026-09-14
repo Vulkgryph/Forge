@@ -146,8 +146,31 @@ impl Buffer {
                 image_bytes: Some(bytes), image_view: None,
             });
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        // A `.gz` is decompressed rather than refused. Opening one used to
+        // fail on invalid UTF-8 and report only to the status bar, so from the
+        // outside the tab simply never appeared. The DEFLATE decoder this uses
+        // is the one already written for PNG — gzip is the same payload with a
+        // different header, so this costs a header parse and no dependency.
+        let text = if ext.eq_ignore_ascii_case("gz") {
+            let raw = std::fs::read(&path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            let out = crate::img::inflate::gzip_decompress(&raw)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            String::from_utf8(out).map_err(|_| {
+                format!("{}: decompresses to something that is not text", path.display())
+            })?
+        } else {
+            std::fs::read_to_string(&path).map_err(|e| {
+                // `read_to_string` says "stream did not contain valid UTF-8",
+                // which names the cause without saying what it means for the
+                // file you just tried to open.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    format!("{} is not a text file", path.display())
+                } else {
+                    format!("read {}: {e}", path.display())
+                }
+            })?
+        };
         let trailing_newline = text.ends_with('\n');
         let lines = if text.is_empty() {
             vec![String::new()]
@@ -807,5 +830,74 @@ mod undo_coverage_tests {
         assert_eq!(b.lines, after, "undo of a growing replacement");
         b.redo();
         assert_eq!(b.lines, grown, "redo of a growing replacement");
+    }
+}
+
+#[cfg(test)]
+mod gz_open_tests {
+    use super::Buffer;
+
+    /// Opening a `.gz` shows its contents.
+    ///
+    /// It used to fail on invalid UTF-8 and report only to the status bar, so
+    /// from the outside nothing happened at all.
+    #[test]
+    fn a_gzipped_text_file_opens() {
+        let dir = std::env::temp_dir().join(format!("forge-gz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fn main() {\n    println!(\"from a gz\");\n}\n";
+        let plain = dir.join("sample.rs");
+        std::fs::write(&plain, src).unwrap();
+
+        let out = std::process::Command::new("gzip")
+            .arg("-c").arg(&plain).output().expect("gzip on PATH");
+        let gz = dir.join("sample.rs.gz");
+        std::fs::write(&gz, out.stdout).unwrap();
+
+        let buf = match Buffer::from_file(gz) {
+            Ok(b) => b,
+            Err(e) => panic!("a .gz should open: {e}"),
+        };
+        assert_eq!(buf.lines[0], "fn main() {");
+        assert!(buf.lines.iter().any(|l| l.contains("from a gz")));
+        assert!(!buf.modified, "opening a file must not mark it modified");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A binary file that is not gzip says what is wrong in those terms,
+    /// rather than reporting a UTF-8 decoding fault.
+    #[test]
+    fn a_binary_file_says_it_is_not_text() {
+        let dir = std::env::temp_dir().join(format!("forge-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("thing.bin");
+        std::fs::write(&p, [0xFFu8, 0xFE, 0x00, 0x01, 0x02]).unwrap();
+
+        let err = match Buffer::from_file(p) {
+            Err(e) => e,
+            Ok(_) => panic!("a binary file was opened as text"),
+        };
+        assert!(err.contains("not a text file"), "unhelpful error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.gz` that is not actually gzip reports that, rather than appearing
+    /// to do nothing.
+    #[test]
+    fn a_fake_gz_reports_why() {
+        let dir = std::env::temp_dir().join(format!("forge-fakegz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("lying.gz");
+        std::fs::write(&p, b"this is plain text pretending to be gzip").unwrap();
+
+        let err = match Buffer::from_file(p) {
+            Err(e) => e,
+            Ok(_) => panic!("a file claiming to be gzip was accepted"),
+        };
+        assert!(err.contains("gzip"), "does not say what went wrong: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

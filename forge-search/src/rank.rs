@@ -113,7 +113,7 @@ pub struct Hit {
 /// The `+0.5`/`+1.0` form is BM25's, and it matters here: the textbook IDF goes
 /// *negative* for a term in more than half the corpus, which would let a
 /// document be penalised for containing a query word. This form stays positive.
-fn idf(index: &Index, term: &str) -> f64 {
+pub(crate) fn idf(index: &Index, term: &str) -> f64 {
     let n = index.len() as f64;
     let df = index.document_frequency(term) as f64;
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln()

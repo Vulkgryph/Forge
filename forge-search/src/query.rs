@@ -137,7 +137,7 @@ pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
         // rewards rather than requires.
         query.phrases.iter().all(|p| has_phrase(index, hit.doc, p))
     });
-    hits.truncate(limit);
+    let hits = spread_across_hosts(index, hits, limit);
 
     hits.into_iter()
         .filter_map(|hit| {
@@ -155,6 +155,185 @@ pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
         })
         .collect()
 }
+
+/// At most this many results from any one host, while other hosts have
+/// results to offer.
+///
+/// Two, not one: a forum thread and the site's own article on the same subject
+/// are worth seeing together, and a hard limit of one would hide the better of
+/// two passages from the source that knows most about the question.
+const MAX_PER_HOST: usize = 2;
+
+/// Reorder so the results span sources instead of one source's best pages.
+///
+/// A question with contested answers is the case this exists for. Ranking is
+/// per document, so a site with five good pages on a subject takes all five
+/// slots and the disagreement becomes invisible — the reader sees one position
+/// stated five times and no sign that anywhere else says otherwise. Spreading
+/// across hosts makes the spread of opinion visible in the result list itself,
+/// which for "what oil does this engine take" is most of the answer.
+///
+/// Nothing is dropped: a host's third and later passages are deferred to the
+/// end in score order and still fill the list when no other source has
+/// anything. So the output is no longer strictly sorted by score, which is the
+/// intended effect rather than a defect.
+fn spread_across_hosts(
+    index: &Index,
+    hits: Vec<crate::rank::Hit>,
+    limit: usize,
+) -> Vec<crate::rank::Hit> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut kept: Vec<crate::rank::Hit> = Vec::new();
+    let mut deferred: Vec<crate::rank::Hit> = Vec::new();
+    for hit in hits {
+        let host = host_of(index, hit.doc);
+        let count = seen.entry(host).or_insert(0);
+        if *count < MAX_PER_HOST {
+            *count += 1;
+            kept.push(hit);
+        } else {
+            deferred.push(hit);
+        }
+    }
+    kept.truncate(limit);
+    for hit in deferred {
+        if kept.len() >= limit {
+            break;
+        }
+        kept.push(hit);
+    }
+    kept
+}
+
+/// The host a document came from, or its url when that cannot be parsed.
+///
+/// The unit of independence. Two threads on one forum are one source agreeing
+/// with itself; the same claim on two hosts is two sources.
+fn host_of(index: &Index, doc: DocId) -> String {
+    index
+        .document(doc)
+        .map(|d| {
+            crate::url::Url::parse(&d.url)
+                .map(|u| u.host)
+                .unwrap_or_else(|_| d.url.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// One thing the matching passages say, and who says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mention {
+    /// The term, as indexed.
+    pub term: String,
+    /// The distinct hosts whose matching passage contains it, sorted. The
+    /// length of this is the number of independent sources.
+    pub sources: Vec<String>,
+    /// How many passages contained it, which can exceed the number of sources
+    /// when one site says it more than once.
+    pub passages: usize,
+}
+
+/// What the matching passages actually say, and how many independent sources
+/// say each thing.
+///
+/// Ranking answers "which document is most relevant". It does not answer "do
+/// the sources agree", and for a question whose answers are contested that is
+/// the question being asked. Search a tractor forum for what oil a 1948 engine
+/// takes and the honest answer is not the top-ranked passage — it is that
+/// three sources say one grade, two say another, and the reason they differ is
+/// that the recommendation changed. A single passage presented as the answer
+/// hides exactly that.
+///
+/// So this tallies the distinctive terms appearing near matches, grouped by
+/// host, and sorts by how many independent sources carry each. No model and no
+/// knowledge of any particular site: a term is distinctive if it is not a stop
+/// word, not part of the query, and not in most of the corpus, and sources are
+/// counted by host because two pages on one site are one site.
+///
+/// `consider` is how many ranked documents to read, which bounds the work.
+pub fn spread(index: &Index, input: &str, consider: usize) -> Vec<Mention> {
+    let query = Query::parse(input);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let asked: std::collections::HashSet<&str> =
+        query.required.iter().map(|t| t.as_str()).collect();
+
+    let hits = crate::rank::search(index, &query.required.join(" "), consider);
+    // term -> (hosts, passage count)
+    let mut tally: std::collections::HashMap<String, (std::collections::HashSet<String>, usize)> =
+        std::collections::HashMap::new();
+
+    for hit in &hits {
+        let Some(doc) = index.document(hit.doc) else { continue };
+        // The passage, not the whole document. A term three screens away from
+        // any match is not part of what this document says in answer.
+        let passage = snippet(&doc.text, &query.required, SPREAD_WINDOW)
+            .unwrap_or_else(|| first_words(&doc.text, SPREAD_WINDOW));
+        let host = host_of(index, hit.doc);
+
+        let mut counted = std::collections::HashSet::new();
+        for term in crate::tokenize::terms(&passage) {
+            if asked.contains(term.as_str()) || term.len() < 2 {
+                continue;
+            }
+            // Function words are a closed class, so a list is the honest tool
+            // for them. `tokenize::terms` deliberately keeps them — phrase
+            // matching needs "end of the line" to stay four words — so the
+            // filtering happens here.
+            if crate::tokenize::is_stop_word(&term) {
+                continue;
+            }
+            // Present in nearly every document, so it separates nothing: a
+            // site's navigation, or a word the whole corpus shares because of
+            // what it is about.
+            //
+            // The threshold is near-universal rather than a majority, and the
+            // first version of this got it wrong in a way worth recording: at
+            // "more than half the corpus" a term in three documents out of
+            // five was discarded — which is precisely the *majority answer* to
+            // a contested question. The thing being looked for looked like
+            // boilerplate by frequency alone. Corroboration is the signal
+            // here, so only something approaching unanimity is noise.
+            if index.document_frequency(&term) as usize * 10 >= index.len() * 9 {
+                continue;
+            }
+            // Once per passage, so one page repeating a word is not agreement.
+            if !counted.insert(term.clone()) {
+                continue;
+            }
+            let entry = tally.entry(term).or_insert_with(|| (std::collections::HashSet::new(), 0));
+            entry.0.insert(host.clone());
+            entry.1 += 1;
+        }
+    }
+
+    let mut out: Vec<Mention> = tally
+        .into_iter()
+        .map(|(term, (hosts, passages))| {
+            let mut sources: Vec<String> = hosts.into_iter().collect();
+            sources.sort();
+            Mention { term, sources, passages }
+        })
+        .collect();
+    // Most independently corroborated first. Ties broken by passage count and
+    // then by the term, so the order does not depend on hash iteration.
+    out.sort_by(|a, b| {
+        b.sources
+            .len()
+            .cmp(&a.sources.len())
+            .then(b.passages.cmp(&a.passages))
+            .then(a.term.cmp(&b.term))
+    });
+    out
+}
+
+/// How much of each document to read when tallying.
+///
+/// Wider than a displayed snippet: this is looking for what a passage says
+/// rather than cutting a quotation, and the sentence carrying the answer is
+/// often just after the one carrying the query's words.
+const SPREAD_WINDOW: usize = 600;
 
 /// Whether `terms` appear consecutively, in order, in `doc`.
 ///
@@ -418,6 +597,169 @@ mod tests {
         let hits = search(&ix, "index", 3);
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].snippet.is_empty(), "no summary at all");
+    }
+
+    /// Five sites answering one contested question, which is the shape that
+    /// motivated both `spread` and host diversification: a 1948 tractor engine
+    /// and what oil to put in it, where the forums genuinely disagree.
+    fn contested() -> Index {
+        let mut ix = Index::new();
+        let page = |ix: &mut Index, host: &str, path: &str, body: &str| {
+            ix.add(&format!("https://{host}/{path}"), "Oil thread", "", body);
+        };
+        page(&mut ix, "forum-a.test", "t/1",
+             "What engine oil for the tractor? I run straight 30 weight in mine, \
+              same as the manual says. Never had a problem in twenty years.");
+        page(&mut ix, "forum-b.test", "t/2",
+             "For engine oil I switched to 15w-40 diesel oil. It has more zddp \
+              than modern car oil, which matters for a flat tappet cam.");
+        page(&mut ix, "forum-c.test", "t/3",
+             "Engine oil question comes up a lot. 15w-40 is what I run year round \
+              and the old timers at the club say the same.");
+        page(&mut ix, "forum-d.test", "t/4",
+             "The manual calls for straight 30 non-detergent engine oil. \
+              Detergent oil in an engine with no filter is asking for trouble.");
+        page(&mut ix, "forum-e.test", "t/5",
+             "Any decent engine oil works. I use 15w-40 because the tractor \
+              shares it with the truck.");
+        ix
+    }
+
+    /// The point of the whole exercise: a contested question should come back
+    /// as a spread of positions with source counts, not as one passage stated
+    /// as though it settled the matter.
+    #[test]
+    fn a_contested_question_reports_who_says_what() {
+        let ix = contested();
+        let spread = spread(&ix, "engine oil", 20);
+        let of = |term: &str| spread.iter().find(|m| m.term == term);
+
+        let grade = of("15w-40").expect("15w-40 was never surfaced");
+        let straight = of("30").expect("straight 30 was never surfaced");
+        assert_eq!(grade.sources.len(), 3, "{:?}", grade);
+        assert_eq!(straight.sources.len(), 2, "{:?}", straight);
+        // The better-corroborated position sorts first, but both are present —
+        // the minority view is the interesting half of a disagreement.
+        assert!(
+            spread.iter().position(|m| m.term == "15w-40")
+                < spread.iter().position(|m| m.term == "30"),
+            "three sources should outrank two: {spread:?}",
+        );
+    }
+
+    /// Sources are counted by host, because two pages on one site are one site
+    /// agreeing with itself rather than corroboration.
+    #[test]
+    fn one_site_saying_a_thing_twice_is_one_source() {
+        let mut ix = Index::new();
+        ix.add("https://one.test/a", "", "", "engine oil should be 15w-40 always");
+        ix.add("https://one.test/b", "", "", "engine oil, use 15w-40, no question");
+        ix.add("https://two.test/a", "", "", "engine oil wants straight 30 weight");
+        let spread = spread(&ix, "engine oil", 20);
+        let grade = spread.iter().find(|m| m.term == "15w-40").expect("15w-40");
+        assert_eq!(grade.sources, vec!["one.test"], "{grade:?}");
+        assert_eq!(grade.passages, 2, "both passages should still be counted");
+    }
+
+    /// A term in most of the corpus distinguishes nothing, so it is not a
+    /// position anyone is taking. This is what keeps ordinary words and
+    /// navigation furniture out without a list of either.
+    #[test]
+    fn words_common_to_the_whole_corpus_are_not_positions() {
+        let ix = contested();
+        let spread = spread(&ix, "engine oil", 20);
+        for common in ["the", "i", "for"] {
+            assert!(
+                !spread.iter().any(|m| m.term == common),
+                "{common:?} was reported as a position: {spread:?}",
+            );
+        }
+    }
+
+    fn hosts_of(ix: &Index, hits: &[Result_]) -> Vec<String> {
+        let _ = ix;
+        hits.iter()
+            .map(|h| crate::url::Url::parse(&h.url).map(|u| u.host).unwrap_or_default())
+            .collect()
+    }
+
+    /// A site with plenty to say must not crowd out the sites that disagree
+    /// with it. Every host here has enough pages to fill the list on its own.
+    #[test]
+    fn no_host_exceeds_its_share_when_others_have_pages() {
+        let mut ix = Index::new();
+        for host in ["loud.test", "other.test", "third.test"] {
+            for i in 0..4 {
+                ix.add(
+                    &format!("https://{host}/{i}"),
+                    "Oil",
+                    "",
+                    "engine oil is straight 30 weight and that is final",
+                );
+            }
+        }
+        let hits = search(&ix, "engine oil", 6);
+        let hosts = hosts_of(&ix, &hits);
+        for host in ["loud.test", "other.test", "third.test"] {
+            let n = hosts.iter().filter(|h| *h == host).count();
+            assert!(n <= MAX_PER_HOST, "{host} took {n} of 6 slots: {hosts:?}");
+        }
+        assert_eq!(hosts.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+    }
+
+    /// The dissenting source is heard even when it is outnumbered five to one
+    /// and its page does not rank best.
+    ///
+    /// The cap is deliberately soft: here the loud site does end up with three
+    /// of four slots, because after the one dissenter there is nothing else to
+    /// put in the list and a slot left empty helps nobody. What matters is
+    /// that the minority view is not buried, which is the half of a
+    /// disagreement a reader cannot get anywhere else.
+    #[test]
+    fn the_dissenting_source_is_heard() {
+        let mut ix = Index::new();
+        // The loud site's pages are built to outrank the dissenter: they say
+        // the query's words repeatedly and say little else. Without this the
+        // test proves nothing — a short page mentioning the terms once already
+        // scores well on length normalisation, so the dissenter would reach
+        // the list on its own merits and the mechanism would go untested.
+        for i in 0..5 {
+            ix.add(
+                &format!("https://loud.test/{i}"),
+                "Engine oil",
+                "",
+                "engine oil engine oil engine oil straight 30 weight engine oil",
+            );
+        }
+        ix.add(
+            "https://quiet.test/1",
+            "A long thread",
+            "",
+            &format!(
+                "{} Somebody asked about engine oil and the answer here is 15w-40. {}",
+                "Unrelated chatter about implements and paint. ".repeat(20),
+                "More unrelated chatter follows for a while. ".repeat(20),
+            ),
+        );
+        let hits = search(&ix, "engine oil", 4);
+        let hosts = hosts_of(&ix, &hits);
+        assert!(
+            hosts.iter().any(|h| h == "quiet.test"),
+            "the dissenting source never made the list: {hosts:?}",
+        );
+        assert_eq!(hits.len(), 4, "a slot was left empty rather than backfilled");
+    }
+
+    /// And nothing is dropped: when no other source has anything, the deferred
+    /// pages still fill the list.
+    #[test]
+    fn deferring_is_not_dropping() {
+        let mut ix = Index::new();
+        for i in 0..5 {
+            ix.add(&format!("https://only.test/{i}"), "Oil", "", "engine oil straight 30 weight");
+        }
+        let hits = search(&ix, "engine oil", 4);
+        assert_eq!(hits.len(), 4, "results were lost rather than deferred");
     }
 
     fn corpus() -> Index {

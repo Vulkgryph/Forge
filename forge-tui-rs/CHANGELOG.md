@@ -4,6 +4,10 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-14
+
+No changes in this component; released with `forge-ide` and `forge-agent`, which share its version.
+
 ## [0.4.1] — 2026-09-13
 
 No changes in this component; released with `forge-ide`, which shares its version.

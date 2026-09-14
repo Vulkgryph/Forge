@@ -4,6 +4,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-14
+
 ### Fixed
 
 - **A background command's result is actually delivered.** `shell_exec` tells the model "the result will be delivered automatically when it finishes" — and it was not. Ten places in the agent receive from the action channel (the streaming select, each approval wait, the `shell_exec` loop), and every nested one ended in a catch-all that *consumed and discarded* whatever it did not recognise. A background command's completion arrives while the model is still working, which is the normal case rather than a race, so it was always swallowed: the turn ended, nothing followed, and a watcher or a long build reported nothing ever. Reproduced against a real agent, where a three-second background command produced one turn and silence.
@@ -219,7 +221,8 @@ Initial public release.
 - Five-way setup wizard: local LLM / Claude subscription / ChatGPT Codex subscription / direct API key / skip
 - Cross-platform browser launching for OAuth flows (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows)
 
-[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...v0.3.1

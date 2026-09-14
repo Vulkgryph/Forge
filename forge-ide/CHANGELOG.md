@@ -4,6 +4,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-14
+
 ### Fixed
 
 - **Multi-cursor edits are undoable.** That path wrote the buffer's lines directly instead of going through the editor's write path, so no undo step was recorded and Ctrl+Z skipped straight past the edit to whatever came before it. The same mistake as the original undo bug, where the only caller that took a snapshot was the Tab handler — so the test added for it asserts the property (an edit made through the editor path is undoable) rather than naming a call site, since that is the form the bug keeps taking.

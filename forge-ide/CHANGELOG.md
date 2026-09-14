@@ -6,6 +6,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [0.4.2] — 2026-09-14
 
+### Added
+
+- **Right-click an editor tab to copy its path.** **Copy Path**, **Copy Relative Path** (when the file is inside the workspace) and **Copy Containing Folder** — the tab bar had no context menu at all before. Dragging a tab into another application, which is what VS Code allows, is not possible here: beginning a system drag needs an `NSDraggingSession` started from a real `NSEvent`, and the windowing layer this is built on delivers dropped files but offers no way to originate one. So what the drag is *for* is offered directly, which is also VS Code's own menu entry.
+
 ### Fixed
 
 - **Multi-cursor edits are undoable.** That path wrote the buffer's lines directly instead of going through the editor's write path, so no undo step was recorded and Ctrl+Z skipped straight past the edit to whatever came before it. The same mistake as the original undo bug, where the only caller that took a snapshot was the Tab handler — so the test added for it asserts the property (an edit made through the editor path is undoable) rather than naming a call site, since that is the form the bug keeps taking.

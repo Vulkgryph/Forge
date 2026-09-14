@@ -2168,6 +2168,37 @@ fn draw_todo_list(ui: &mut egui::Ui, rows: &[(TodoStatus, String)]) {
     }
 }
 
+/// The path entries a tab's context menu offers, as (label, value) pairs.
+///
+/// Separated from the menu so the values can be checked without clicking
+/// anything: the menu itself is a few lines of egui, and what is worth being
+/// sure of is that "relative" is relative to the workspace and that an entry
+/// is absent rather than wrong when there is nothing to base it on.
+///
+/// An unsaved buffer has no path and gets no entries — a menu offering to copy
+/// nothing is worse than no menu.
+fn tab_path_menu_entries(
+    path: Option<&std::path::Path>,
+    workspace_root: Option<&std::path::Path>,
+) -> Vec<(&'static str, String)> {
+    let Some(path) = path else { return Vec::new() };
+    let mut out = vec![("Copy Path", path.to_string_lossy().into_owned())];
+    // Only when it is genuinely inside the workspace: `strip_prefix` failing
+    // means the file is open from somewhere else, and "relative" would either
+    // be a lie or a pile of `..`.
+    if let Some(rel) = workspace_root
+        .and_then(|r| path.strip_prefix(r).ok())
+        .map(|r| r.to_string_lossy().into_owned())
+        .filter(|r| !r.is_empty())
+    {
+        out.push(("Copy Relative Path", rel));
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        out.push(("Copy Containing Folder", dir.to_string_lossy().into_owned()));
+    }
+    out
+}
+
 /// Small X — "denied"/"error", font-independent (see `paint_checkmark_at`).
 fn paint_cross(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -7221,9 +7252,14 @@ impl IdeApp {
                         ui.add_space(4.0);
                         let count = self.buffers.len();
                         let mut close_idx: Option<usize> = None;
+                        let mut tab_copy: Option<String> = None;
                         for i in 0..count {
                             let title    = self.buffers[i].title();
                             let selected = i == self.active;
+                            let tab_entries = tab_path_menu_entries(
+                                self.buffers[i].path.as_deref(),
+                                self.workspace_root().as_deref(),
+                            );
                             let tab_bg   = if selected { egui::Color32::from_rgb(30, 30, 30) }
                                            else        { egui::Color32::from_rgb(24, 24, 24) };
                             egui::Frame::none()
@@ -7233,8 +7269,26 @@ impl IdeApp {
                                     ui.horizontal(|ui| {
                                         let color = if selected { egui::Color32::WHITE }
                                                     else        { egui::Color32::from_gray(140) };
-                                        if ui.label(egui::RichText::new(&title).size(13.0).color(color))
-                                            .clicked() { self.active = i; }
+                                        let title_resp = ui.add(
+                                            egui::Label::new(egui::RichText::new(&title).size(13.0).color(color))
+                                                .sense(egui::Sense::click()));
+                                        if title_resp.clicked() { self.active = i; }
+                                        // On the label, never the frame. Sensing
+                                        // clicks across the whole frame put a
+                                        // widget over the × as well, which
+                                        // stopped tabs closing — the menu worked
+                                        // and the close it covered did not.
+                                        if !tab_entries.is_empty() {
+                                            title_resp.context_menu(|ui| {
+                                                ui.set_min_width(200.0);
+                                                for (label, value) in &tab_entries {
+                                                    if ui.button(*label).clicked() {
+                                                        tab_copy = Some(value.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                        }
                                         let x = egui::RichText::new("×").size(13.0)
                                             .color(egui::Color32::from_gray(100));
                                         let xr = ui.add(egui::Label::new(x).sense(egui::Sense::click()));
@@ -7259,6 +7313,10 @@ impl IdeApp {
                                 self.active = self.buffers.len().saturating_sub(1);
             }
         }
+                        if let Some(text) = tab_copy {
+                            ui.output_mut(|o| o.copied_text = text.clone());
+                            self.status = format!("Copied {text}");
+                        }
                     });
                 });
         }
@@ -18818,5 +18876,67 @@ mod composer_height_tests {
             let h = composer_text_height(text, ROW, MAX);
             assert!(h >= ROW.min(MAX) && h <= MAX, "{h} out of bounds for {:?}", &text[..text.len().min(12)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_path_menu_tests {
+    use super::tab_path_menu_entries;
+    use std::path::Path;
+
+    /// A file inside the workspace offers all three, and the relative path is
+    /// relative to the workspace rather than to anything else.
+    #[test]
+    fn a_file_in_the_workspace_offers_all_three() {
+        let entries = tab_path_menu_entries(
+            Some(Path::new("/work/proj/src/lib.rs")),
+            Some(Path::new("/work/proj")),
+        );
+        let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, vec!["Copy Path", "Copy Relative Path", "Copy Containing Folder"]);
+        assert_eq!(entries[0].1, "/work/proj/src/lib.rs");
+        assert_eq!(entries[1].1, "src/lib.rs");
+        assert_eq!(entries[2].1, "/work/proj/src");
+    }
+
+    /// A file open from outside the workspace has no meaningful relative path,
+    /// so it is absent rather than a lie or a pile of `..`.
+    #[test]
+    fn a_file_outside_the_workspace_offers_no_relative_path() {
+        let entries = tab_path_menu_entries(
+            Some(Path::new("/elsewhere/notes.md")),
+            Some(Path::new("/work/proj")),
+        );
+        let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, vec!["Copy Path", "Copy Containing Folder"]);
+    }
+
+    /// And with no folder open at all.
+    #[test]
+    fn no_workspace_means_no_relative_path() {
+        let entries = tab_path_menu_entries(Some(Path::new("/tmp/scratch.rs")), None);
+        assert!(!entries.iter().any(|(l, _)| *l == "Copy Relative Path"));
+        assert_eq!(entries[0].1, "/tmp/scratch.rs");
+    }
+
+    /// An unsaved buffer has nothing to copy, so it gets no menu — one
+    /// offering to copy nothing is worse than none at all.
+    #[test]
+    fn an_unsaved_buffer_offers_nothing() {
+        assert!(tab_path_menu_entries(None, Some(Path::new("/work"))).is_empty());
+    }
+
+    /// The file *is* the workspace root — a degenerate case that would
+    /// otherwise offer an empty relative path.
+    #[test]
+    fn a_path_equal_to_the_root_offers_no_empty_string() {
+        let entries = tab_path_menu_entries(
+            Some(Path::new("/work/proj")),
+            Some(Path::new("/work/proj")),
+        );
+        assert!(
+            entries.iter().all(|(_, v)| !v.is_empty()),
+            "an entry would copy an empty string: {entries:?}"
+        );
     }
 }

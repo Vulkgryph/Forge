@@ -706,6 +706,76 @@ fn base_name(p: &str) -> String {
     p.rsplit('/').next().unwrap_or(p).to_string()
 }
 
+/// How much of one tool result the saved transcript keeps.
+///
+/// The transcript on disk is a *display* cache: it exists so reopening a
+/// conversation shows what happened. The agent's own record is separate and
+/// complete — `.forge/sessions/<id>/conversation.jsonl`, written verbatim with
+/// no truncation, which is what rewind reads and what the model was actually
+/// given.
+///
+/// So the display copy does not need every byte, and paying for them is
+/// expensive in a way that is easy to miss: the whole transcript is
+/// re-serialised and rewritten each time an item is added. One conversation
+/// here reached 11.4 MB on the strength of a single 7.4 MB tool result, and
+/// that rewrite happens on the event-loop thread.
+///
+/// 64 KB is far more than the panel shows — it renders a first line collapsed
+/// and a scrollable body expanded — while bounding the file to something that
+/// can be written without a person noticing.
+const SAVED_RESULT_CAP: usize = 64 * 1024;
+
+/// Shorten one saved tool result, keeping both ends and saying what went.
+///
+/// Head and tail because they answer different questions: a file or a diff
+/// identifies itself at the top, while a command's verdict — the error, the
+/// test count — is at the bottom. Cutting from one end reliably loses one of
+/// the two. The same reasoning as `clamp_tool_result` in the agent, and the
+/// note is worded so a reader knows the full output still exists.
+fn cap_saved_result(content: &str) -> String {
+    if content.len() <= SAVED_RESULT_CAP {
+        return content.to_string();
+    }
+    let notice = format!(
+        "\n\n[… {} bytes omitted from the saved transcript. The agent's own log \
+         for this session has the full output. …]\n\n",
+        content.len() - SAVED_RESULT_CAP
+    );
+    let keep = SAVED_RESULT_CAP.saturating_sub(notice.len());
+    let head_len = floor_boundary(content, keep * 2 / 5);
+    let tail_start = ceil_boundary(content, content.len() - (keep - head_len));
+    format!("{}{}{}", &content[..head_len], notice, &content[tail_start..])
+}
+
+/// `str::floor_char_boundary` is unstable, and slicing through a multi-byte
+/// character panics.
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    i
+}
+
+/// The transcript as it is written to disk, with oversized tool output
+/// shortened. Nothing else is touched.
+fn items_for_saving(items: &[ChatItem]) -> Vec<ChatItem> {
+    items.iter().map(|item| match item {
+        ChatItem::ToolResult { name, content, success, expanded } if content.len() > SAVED_RESULT_CAP =>
+            ChatItem::ToolResult {
+                name: name.clone(),
+                content: cap_saved_result(content),
+                success: *success,
+                expanded: *expanded,
+            },
+        other => other.clone(),
+    }).collect()
+}
+
 pub fn save_conversation(session: &AgentSession, id: &str, cwd: &std::path::Path) {
     let dir = conversations_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -719,11 +789,14 @@ pub fn save_conversation(session: &AgentSession, id: &str, cwd: &std::path::Path
     }).unwrap_or_else(|| "New conversation".into());
     let conv = SavedConversation {
         id: id.to_string(), title, model: session.model.clone(),
-        items: session.items.clone(),
+        items: items_for_saving(&session.items),
         forge_session_id: session.forge_session_id.clone(),
         workspace: cwd.to_string_lossy().into_owned(),
     };
-    if let Ok(json) = serde_json::to_string_pretty(&conv) {
+    // Compact, not pretty. This file is written whenever an item is added and
+    // read only by the panel; the indentation was costing roughly a third of
+    // its size for the benefit of nobody who reads it.
+    if let Ok(json) = serde_json::to_string(&conv) {
         let _ = std::fs::write(dir.join(format!("{id}.json")), json);
     }
 }
@@ -2113,5 +2186,70 @@ mod countdown_lifetime_tests {
         s.handle(shell_request("sleep 60"), policy());
         let second = s.activity_elapsed().unwrap();
         assert!(second < first, "the clock carried over: {second:?} vs {first:?}");
+    }
+}
+
+#[cfg(test)]
+mod saved_transcript_tests {
+    use super::*;
+
+    /// An ordinary result is stored byte for byte — the cap must not tax the
+    /// common case, which is nearly every result.
+    #[test]
+    fn a_normal_result_is_stored_whole() {
+        let body = "File: src/lib.rs (240 lines total)\n".to_string() + &"line\n".repeat(240);
+        assert!(body.len() < SAVED_RESULT_CAP);
+        assert_eq!(cap_saved_result(&body), body);
+    }
+
+    /// A huge result is bounded. One conversation here held a single 7.4 MB
+    /// result, and the whole transcript is rewritten each time an item lands.
+    #[test]
+    fn a_huge_result_is_bounded() {
+        let body = format!("FIRST LINE\n{}\nLAST LINE", "junk\n".repeat(500_000));
+        let out = cap_saved_result(&body);
+        assert!(out.len() <= SAVED_RESULT_CAP, "still {} bytes", out.len());
+        assert!(out.starts_with("FIRST LINE"), "head lost");
+        assert!(out.ends_with("LAST LINE"), "tail lost");
+        assert!(out.contains("omitted from the saved transcript"), "the cut is not declared");
+        assert!(out.contains("agent's own log"), "does not say where the full output is");
+    }
+
+    /// Only tool results are shortened. A person's own message and the agent's
+    /// prose are the transcript's point, and are never cut whatever their size.
+    #[test]
+    fn only_tool_results_are_shortened() {
+        let long = "x".repeat(SAVED_RESULT_CAP * 2);
+        let items = vec![
+            ChatItem::User(long.clone()),
+            ChatItem::Assistant { text: long.clone(), done: true },
+            ChatItem::ToolResult { name: "read_file".into(), content: long.clone(), success: true, expanded: false },
+        ];
+        let saved = items_for_saving(&items);
+        match &saved[0] { ChatItem::User(t) => assert_eq!(t.len(), long.len(), "a user message was cut"), _ => panic!() }
+        match &saved[1] { ChatItem::Assistant { text, .. } => assert_eq!(text.len(), long.len(), "an assistant message was cut"), _ => panic!() }
+        match &saved[2] { ChatItem::ToolResult { content, .. } => assert!(content.len() <= SAVED_RESULT_CAP), _ => panic!() }
+    }
+
+    /// Multi-byte text must not be sliced through a character — the cut points
+    /// are byte offsets into a UTF-8 string.
+    #[test]
+    fn the_cut_never_splits_a_character() {
+        let body = "日本語のテキスト".repeat(20_000);
+        assert!(body.len() > SAVED_RESULT_CAP);
+        let out = cap_saved_result(&body);
+        assert!(out.len() <= SAVED_RESULT_CAP);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "produced invalid UTF-8");
+    }
+
+    /// A result exactly at the boundary is left alone, and one just past it is
+    /// not — the off-by-one that would otherwise cut a result needlessly.
+    #[test]
+    fn the_boundary_is_exact() {
+        let at = "x".repeat(SAVED_RESULT_CAP);
+        assert_eq!(cap_saved_result(&at).len(), SAVED_RESULT_CAP);
+        let over = "x".repeat(SAVED_RESULT_CAP + 1);
+        assert!(cap_saved_result(&over).len() <= SAVED_RESULT_CAP);
+        assert!(cap_saved_result(&over).contains("omitted"));
     }
 }

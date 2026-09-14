@@ -4,6 +4,14 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **A background command's result is actually delivered.** `shell_exec` tells the model "the result will be delivered automatically when it finishes" — and it was not. Ten places in the agent receive from the action channel (the streaming select, each approval wait, the `shell_exec` loop), and every nested one ended in a catch-all that *consumed and discarded* whatever it did not recognise. A background command's completion arrives while the model is still working, which is the normal case rather than a race, so it was always swallowed: the turn ended, nothing followed, and a watcher or a long build reported nothing ever. Reproduced against a real agent, where a three-second background command produced one turn and silence.
+
+  Nested loops now park what they cannot handle, and the main loop — the only place with an arm for every action — drains that queue *before* awaiting the channel. Draining afterwards would leave a finished command waiting on whatever the user next happened to type. Verified the same way it was found: the agent now receives the output and acts on it.
+
+  The regression test is structural rather than behavioural, because the property is: it asserts no action consumer discards silently, which catches the next one added rather than only the case exercised. A first version of it matched a bare `_ => {}` and so passed against the exact code it was written to catch — the real line carried a trailing comment.
+
 ## [0.4.1] — 2026-09-13
 
 No changes in this component; released with `forge-ide`, which shares its version.

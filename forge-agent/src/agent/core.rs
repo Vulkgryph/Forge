@@ -586,6 +586,21 @@ pub struct Agent {
     last_shell_command: Option<String>,
     consecutive_shell_runs: usize,
     queued_user_messages: VecDeque<String>,
+    /// Actions that arrived while a nested loop owned the channel and could not
+    /// act on them there.
+    ///
+    /// Ten places in this file receive from `action_rx` — the streaming select,
+    /// each approval wait, the shell_exec loop — and every one of them ended in
+    /// `_ => {}`, so an action none of them handled was *consumed and dropped*.
+    /// `BgDone` is the case that mattered: a background command finishes while
+    /// the model is still working, which is the normal case rather than a race,
+    /// so its completion was swallowed and the result never delivered. The tool
+    /// had already told the model "the result will be delivered automatically
+    /// when it finishes", which made it a promise the agent could not keep.
+    ///
+    /// Anything parked here is drained by the main loop, which is the only
+    /// place that knows how to handle every action.
+    deferred_actions: VecDeque<UserAction>,
     rewind_checkpoints: Vec<RewindCheckpoint>,
     touched_worktree_roots: Vec<PathBuf>,
     pending_file_snapshots: Vec<FileSnapshot>,
@@ -667,6 +682,7 @@ impl Agent {
             last_shell_command: None,
             consecutive_shell_runs: 0,
             queued_user_messages: VecDeque::new(),
+            deferred_actions: VecDeque::new(),
             rewind_checkpoints: Vec::new(),
             touched_worktree_roots: Vec::new(),
             pending_file_snapshots: Vec::new(),
@@ -775,6 +791,7 @@ impl Agent {
             last_shell_command: None,
             consecutive_shell_runs: 0,
             queued_user_messages: VecDeque::new(),
+            deferred_actions: VecDeque::new(),
             rewind_checkpoints,
             touched_worktree_roots: Vec::new(),
             pending_file_snapshots: Vec::new(),
@@ -799,9 +816,17 @@ impl Agent {
             }));
 
         loop {
-            let action = match self.action_rx.recv().await {
+            // Anything a nested loop could not act on is handled here first,
+            // where every action has an arm. Taken before awaiting the channel,
+            // or a parked action would wait on the next thing the user happens
+            // to do — and for a finished background command that means its
+            // result arrives long after it was true, or never.
+            let action = match self.deferred_actions.pop_front() {
                 Some(a) => a,
-                None => break,
+                None => match self.action_rx.recv().await {
+                    Some(a) => a,
+                    None => break,
+                },
             };
 
             match action {
@@ -1251,7 +1276,11 @@ impl Agent {
                                 stream_cancelled = true;
                                 break;
                             }
-                            _ => {} // ignore other actions during streaming
+                            // Parked, not dropped: this arm used to discard
+                            // whatever it did not recognise, which lost a
+                            // background command's completion.
+                            Some(other) => self.deferred_actions.push_back(other),
+                            None => {}
                         }
                     }
 
@@ -2080,7 +2109,10 @@ impl Agent {
                             let _ = self.event_tx.send(AgentEvent::Cancelled);
                             return false;
                         }
-                        _ => {}
+                        // Parked for the main loop rather than dropped —
+                        // see `deferred_actions`.
+                        Some(other) => self.deferred_actions.push_back(other),
+                        None => {}
                     }
                 }
             }
@@ -5064,5 +5096,68 @@ mod repl_guard_tests {
     fn each_part_of_a_compound_command_is_checked() {
         assert!(refused("echo hi && python3"));
         assert!(!refused("echo hi && python3 -m unittest"));
+    }
+}
+
+#[cfg(test)]
+mod deferred_action_tests {
+
+    /// Every nested `action_rx` consumer must park what it cannot handle.
+    ///
+    /// This is asserted against the source rather than by driving an agent,
+    /// because the property is *structural*: ten places in this file receive
+    /// from the action channel, and the bug was that nine of them ended in
+    /// `_ => {}` and silently consumed anything they did not recognise. A
+    /// background command's completion was the casualty — it arrives while the
+    /// model is still working, so a nested loop always owned the channel.
+    ///
+    /// A behavioural test would only catch it for the one action that happens
+    /// to be exercised; this catches the next one added.
+    #[test]
+    fn no_action_consumer_silently_discards() {
+        let src = include_str!("core.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            // A trailing comment must not hide it. The original offender was
+            // `_ => {} // ignore other actions during streaming`, and a first
+            // version of this test matched only the bare form — so it passed
+            // against the very code it was written to catch.
+            let code = line.split("//").next().unwrap_or("").trim();
+            if code != "_ => {}" && code != "_ => {},"
+                && !code.starts_with("_ => {} ") {
+                continue;
+            }
+            // Only arms belonging to a match on an action receive.
+            let window = lines[i.saturating_sub(30)..i].join("\n");
+            if window.contains("action_rx.recv()") && window.contains("UserAction::") {
+                offenders.push(i + 1);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an action consumer discards unrecognised actions at line(s) {offenders:?} — \
+             park them in `deferred_actions` instead, or a background command's \
+             completion is lost again"
+        );
+    }
+
+    /// The main loop takes parked actions before awaiting the channel.
+    ///
+    /// Draining afterwards would leave a finished background command waiting on
+    /// whatever the user next happens to do — so the result arrives long after
+    /// it was true, or not at all in a session where nothing else is typed.
+    #[test]
+    fn parked_actions_are_drained_before_waiting() {
+        let src = include_str!("core.rs");
+        let at = src.find("pub async fn run(&mut self)").expect("the main loop");
+        let body = &src[at..at + 2500];
+        let pop = body.find("deferred_actions.pop_front()").expect("no drain in the main loop");
+        let recv = body.find("action_rx.recv()").expect("no channel receive in the main loop");
+        assert!(
+            pop < recv,
+            "the main loop awaits the channel before draining parked actions, so a \
+             finished background command waits for unrelated user input"
+        );
     }
 }

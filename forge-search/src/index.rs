@@ -55,11 +55,33 @@ pub struct Posting {
 
 /// How much of a document's text is kept for snippets.
 ///
-/// The text dominates the index's size, and a snippet is drawn from the first
-/// match — which on a page long enough to exceed this is almost always early.
-/// Ranking is unaffected: term counts come from the whole document before this
-/// is applied.
-const TEXT_KEPT: usize = 8 * 1024;
+/// The text dominates the index's size, so it is capped — but only the
+/// snippet is affected. Ranking is unaffected: term counts and positions come
+/// from the whole document before this is applied.
+///
+/// That asymmetry is a trap, and it bit. A term deep in a page has a posting
+/// and no stored text, so the document ranks as a hit and then has no
+/// snippet to show for it — and the fallback shows the head of the page,
+/// which on a site with a sidebar is the navigation menu. The earlier value
+/// of 8 KB was justified on the grounds that a first match "is almost always
+/// early", which was only true while a parser bug was cutting pages down to a
+/// few hundred bytes.
+///
+/// Measured on a thirty-page crawl of Wikipedia neuroscience articles (median
+/// page 25 KB of text, largest 121 KB), over seven queries and every hit they
+/// returned:
+///
+/// ```text
+///    8 KB   83% of hits had a reachable snippet     242 KB stored
+///   16 KB   91%                                     448 KB
+///   32 KB  100%                                     728 KB
+///   64 KB  100%                                     991 KB
+/// ```
+///
+/// The furthest first match was at byte 22,407, so 32 KB covers the observed
+/// worst case with room to spare, and 64 KB buys nothing for a third more
+/// space.
+const TEXT_KEPT: usize = 32 * 1024;
 
 /// An in-memory inverted index.
 #[derive(Clone, Debug, Default)]
@@ -237,6 +259,49 @@ impl Index {
                 break;
             }
         }
+        live.sort_unstable();
+        live
+    }
+
+    /// Every document containing at least `least` of the given terms, paired
+    /// with how many it contains.
+    ///
+    /// The widening companion to [`candidates`](Self::candidates), for when a
+    /// strict reading of the query finds nothing. Measured need: a crawl of
+    /// neuroscience pages answered nothing for `Q10 temperature coefficient
+    /// neuron`, because the page defining the Q10 coefficient does not happen
+    /// to contain the word "neuron" — three of four terms, and no result. A
+    /// question asked in more words than the corpus uses is the normal case,
+    /// not a malformed query.
+    ///
+    /// The count comes back with each document because ranking needs it:
+    /// `Features::coverage` demotes a partial match in proportion to how much
+    /// of the query it missed, so a document with everything still outranks
+    /// one with half. Without that, widening would just be noise.
+    ///
+    /// Costs a pass over the postings of every term rather than stopping at
+    /// the rarest, which is the price of not requiring all of them.
+    pub fn candidates_at_least(&self, terms: &[String], least: usize) -> Vec<(DocId, usize)> {
+        if terms.is_empty() || least == 0 {
+            return Vec::new();
+        }
+        let mut counts: std::collections::HashMap<DocId, usize> =
+            std::collections::HashMap::new();
+        // Distinct terms only, or a query repeating a word would count it
+        // twice and clear the threshold on its own.
+        let mut seen = std::collections::HashSet::new();
+        for term in terms {
+            if !seen.insert(term.as_str()) {
+                continue;
+            }
+            for posting in self.postings(term) {
+                *counts.entry(posting.doc).or_insert(0) += 1;
+            }
+        }
+        let mut live: Vec<(DocId, usize)> = counts
+            .into_iter()
+            .filter(|&(doc, n)| n >= least && self.document(doc).is_some())
+            .collect();
         live.sort_unstable();
         live
     }
@@ -608,16 +673,16 @@ mod tests {
         let doc = ix.document(id).unwrap();
         assert!(doc.text.len() <= TEXT_KEPT, "text is {} bytes", doc.text.len());
         assert!(std::str::from_utf8(doc.text.as_bytes()).is_ok());
-        // Ranking still sees the whole document's length, not the kept part.
-        // Compared against the kept text rather than a constant: the point is
-        // that truncating for snippets did not shorten the document as far as
-        // ranking is concerned.
-        let terms_in_kept = crate::tokenize::terms(&doc.text).len();
-        assert!(
-            doc.term_count as usize > terms_in_kept * 4,
-            "term count {} looks like it came from the {} bytes kept for snippets \
-             ({terms_in_kept} terms), not from the whole document",
-            doc.term_count,
+        assert!(doc.text.len() < long.len(), "the text was not capped at all");
+        // Ranking still sees the whole document, not the kept part. Stated as
+        // an equality against the full text rather than as a ratio against the
+        // kept text: a ratio has to be recalibrated whenever `TEXT_KEPT`
+        // changes, and an assertion that needs tuning to keep passing is not
+        // asserting much.
+        assert_eq!(
+            doc.term_count as usize,
+            crate::tokenize::terms(&long).len(),
+            "term count came from the {} bytes kept for snippets, not the whole document",
             doc.text.len(),
         );
     }

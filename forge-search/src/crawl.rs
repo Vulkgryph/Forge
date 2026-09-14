@@ -168,6 +168,23 @@ impl Clock for FakeClock {
     }
 }
 
+/// How many queue entries are looked at when choosing the next page.
+///
+/// Bounded so the choice costs the same whether the frontier holds a hundred
+/// URLs or a hundred thousand — a real crawl of six seed pages left 7,409
+/// queued, and scanning all of them on every pop would make the crawler
+/// quadratic in its own frontier.
+const FRONTIER_WINDOW: usize = 512;
+
+/// How many pages must have been seen before link frequency means anything.
+///
+/// With one page crawled, every link on it was linked by 100% of pages.
+const TEMPLATE_EVIDENCE: usize = 4;
+
+/// The share of crawled pages that must link a URL for it to look like part of
+/// the site's template rather than its content.
+const TEMPLATE_SHARE: f64 = 0.8;
+
 /// A crawl in progress.
 pub struct Crawler<'a, F: Fetcher, C: Clock> {
     fetcher: &'a F,
@@ -181,6 +198,16 @@ pub struct Crawler<'a, F: Fetcher, C: Clock> {
     /// When each host may next be contacted.
     next_allowed: HashMap<String, f64>,
     hosts: HashSet<String>,
+    /// How many crawled pages linked each URL, counted once per page.
+    ///
+    /// This is how the site's furniture gives itself away. A template is, by
+    /// definition, what every page has in common: the sidebar, the footer, the
+    /// "About" and "Contact" links. Content links are on a few pages; nav
+    /// links are on all of them.
+    link_sources: HashMap<String, usize>,
+    /// How many crawled pages have contributed link evidence — the denominator
+    /// for the above.
+    pages_linked: usize,
 }
 
 impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
@@ -194,6 +221,8 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             robots: HashMap::new(),
             next_allowed: HashMap::new(),
             hosts: HashSet::new(),
+            link_sources: HashMap::new(),
+            pages_linked: 0,
         }
     }
 
@@ -221,7 +250,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         let mut report = Report::default();
         let started = self.clock.now();
 
-        while let Some((url, depth)) = self.queue.pop_front() {
+        while let Some((url, depth)) = self.next_page() {
             if report.fetched >= self.limits.max_pages {
                 // Put it back so `remaining` counts honestly.
                 self.queue.push_front((url, depth));
@@ -276,19 +305,74 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             // So a redirect target is not fetched again on its own account.
             self.seen.insert(actual.as_string());
 
-            if depth < self.limits.max_depth {
-                for link in &page.links {
-                    let Ok(target) = actual.join(link) else { continue };
-                    if self.limits.stay_on_host && !self.hosts.contains(&target.host) {
-                        continue;
-                    }
+            // Link evidence is recorded whatever the depth: a page at the
+            // depth limit still shows which links every page carries, and
+            // that is what tells the template apart from the content.
+            let mut on_this_page = HashSet::new();
+            for link in &page.links {
+                let Ok(target) = actual.join(link) else { continue };
+                if self.limits.stay_on_host && !self.hosts.contains(&target.host) {
+                    continue;
+                }
+                let key = target.as_string();
+                // Once per page. A sidebar link repeated in the footer is one
+                // page's worth of evidence, not two.
+                if !on_this_page.insert(key.clone()) {
+                    continue;
+                }
+                *self.link_sources.entry(key).or_insert(0) += 1;
+                if depth < self.limits.max_depth {
                     self.enqueue(target, depth + 1);
                 }
+            }
+            if !on_this_page.is_empty() {
+                self.pages_linked += 1;
             }
         }
 
         report.remaining = self.queue.len();
         report
+    }
+
+    /// The next page to fetch: the first candidate near the front of the
+    /// frontier that does not look like part of the site's template.
+    ///
+    /// Breadth-first order is kept as the base, and this only reorders within
+    /// a bounded window of it. The reason is measured: crawling thirty pages
+    /// from six neuroscience articles on Wikipedia spent ten of them on
+    /// `Main_Page`, `Help:Contents`, `Wikipedia:About`, `Portal:Current_events`
+    /// and the file-upload wizard. A third of the budget went to the sidebar,
+    /// because navigation links come before body links in the document and
+    /// breadth-first takes them in the order it finds them.
+    ///
+    /// Nothing is excluded — a deferred URL stays in the queue and is taken
+    /// once the better candidates run out. That matters because the signal has
+    /// a known false positive: on a tightly topical seed set, a genuinely
+    /// central page can be linked from every seed and look like furniture.
+    /// Deferring such a page costs its position; dropping it would cost the
+    /// page, so this defers.
+    fn next_page(&mut self) -> Option<(Url, usize)> {
+        let window = self.queue.len().min(FRONTIER_WINDOW);
+        let mut pick = 0;
+        for i in 0..window {
+            if !self.looks_like_template(&self.queue[i].0.as_string()) {
+                pick = i;
+                break;
+            }
+        }
+        // If everything in the window looks like template, the front of the
+        // queue is taken anyway rather than stalling.
+        self.queue.remove(pick)
+    }
+
+    /// Whether a URL is linked by a large enough share of the pages crawled so
+    /// far to be the site's own furniture.
+    fn looks_like_template(&self, url: &str) -> bool {
+        if self.pages_linked < TEMPLATE_EVIDENCE {
+            return false;
+        }
+        let sources = self.link_sources.get(url).copied().unwrap_or(0);
+        sources as f64 / self.pages_linked as f64 >= TEMPLATE_SHARE
     }
 
     /// Whether `robots.txt` permits this URL, fetching the file once per host.
@@ -353,6 +437,107 @@ pub fn crawl<F: Fetcher>(fetcher: &F, seeds: &[&str], limits: Limits) -> (Index,
 mod tests {
     use super::*;
     use crate::fetch::{Fetched, StaticFetcher};
+
+    /// A site with a sidebar, which is the shape that exposed the frontier
+    /// problem: every article carries the same navigation links, and they come
+    /// before the body links in the document.
+    fn site_with_a_sidebar() -> StaticFetcher {
+        let mut f = StaticFetcher::new();
+        for i in 1..=6 {
+            f = f.with_page(
+                &format!("https://a.example/article{i}"),
+                &format!(
+                    r#"<title>Article {i}</title>
+                       <nav><a href="/about">About</a><a href="/help">Help</a>
+                            <a href="/upload">Upload</a></nav>
+                       <p>The subject of article {i}.</p>
+                       <a href="/content{i}">Related {i}</a>"#
+                ),
+            );
+        }
+        for name in ["about", "help", "upload"] {
+            f = f.with_page(
+                &format!("https://a.example/{name}"),
+                &format!("<title>{name}</title><p>Site furniture, not content.</p>"),
+            );
+        }
+        for i in 1..=6 {
+            f = f.with_page(
+                &format!("https://a.example/content{i}"),
+                &format!("<title>Content {i}</title><p>More about subject {i}.</p>"),
+            );
+        }
+        f
+    }
+
+    /// The page budget should go to content, not to the sidebar.
+    ///
+    /// Measured against the real thing first: thirty pages crawled from six
+    /// Wikipedia articles spent ten on `Main_Page`, `Help:Contents`,
+    /// `Wikipedia:About`, `Portal:Current_events` and the upload wizard. Here
+    /// the same shape in miniature — three nav links on all six articles, one
+    /// content link on each. Breadth-first takes the nav links first because
+    /// they come first in the document; there are exactly three pages of
+    /// budget left after the seeds, and plain FIFO spends all three on them.
+    #[test]
+    fn the_site_template_does_not_eat_the_page_budget() {
+        let fetcher = site_with_a_sidebar();
+        let clock = FakeClock::default();
+        let limits = Limits {
+            max_pages: 9,
+            max_depth: 3,
+            politeness: 0.0,
+            ..Limits::default()
+        };
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, limits);
+        for i in 1..=6 {
+            crawler.seed(&format!("https://a.example/article{i}")).unwrap();
+        }
+        crawler.run(&mut index);
+
+        let urls: Vec<String> = index.urls().map(str::to_string).collect();
+        let furniture: Vec<&String> = urls
+            .iter()
+            .filter(|u| ["/about", "/help", "/upload"].iter().any(|f| u.ends_with(f)))
+            .collect();
+        assert!(
+            furniture.is_empty(),
+            "budget went to the template: {furniture:?}"
+        );
+        let content = urls.iter().filter(|u| u.contains("/content")).count();
+        assert_eq!(content, 3, "expected the three spare pages to be content: {urls:?}");
+    }
+
+    /// Deferring is not excluding. Given the budget to reach them, the
+    /// template pages are still crawled — the false positive this heuristic
+    /// can have on a tightly topical seed set costs a position, not a page.
+    #[test]
+    fn deferred_pages_are_still_reached_eventually() {
+        let fetcher = site_with_a_sidebar();
+        let clock = FakeClock::default();
+        let limits = Limits {
+            max_pages: 100,
+            max_depth: 3,
+            politeness: 0.0,
+            ..Limits::default()
+        };
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, limits);
+        for i in 1..=6 {
+            crawler.seed(&format!("https://a.example/article{i}")).unwrap();
+        }
+        let report = crawler.run(&mut index);
+        assert_eq!(report.remaining, 0, "crawl did not finish");
+        let urls: Vec<String> = index.urls().map(str::to_string).collect();
+        for name in ["/about", "/help", "/upload"] {
+            assert!(
+                urls.iter().any(|u| u.ends_with(name)),
+                "{name} was dropped rather than deferred"
+            );
+        }
+        assert_eq!(urls.len(), 15, "{urls:?}");
+    }
 
     /// A small site: front page linking to two pages, one of which links on.
     fn site() -> StaticFetcher {

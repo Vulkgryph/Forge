@@ -322,17 +322,103 @@ fn word_end(s: &str, mut at: usize) -> usize {
 
 /// The opening of a document, for when nothing matched in its text.
 fn first_words(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.trim().to_string();
+    // Start at the first line that reads like prose rather than like a menu.
+    //
+    // Block elements are already on their own lines, so a navigation item is a
+    // line of two or three words and a paragraph is a long one. Taking the
+    // first long line steps over the sidebar and the table of contents without
+    // knowing anything about the site — which matters because this fallback is
+    // what a reader sees when the match itself is out of reach, and "Jump to
+    // content Main menu move to sidebar hide Navigation" tells them nothing.
+    const PROSE: usize = 120;
+    let mut at = 0;
+    for line in text.split('\n') {
+        if line.trim().len() >= PROSE {
+            break;
+        }
+        at += line.len() + 1;
     }
-    let end = word_end(text, max_bytes);
-    format!("{}…", text[..end].trim())
+    // No prose found — a page that really is a list of links. Its head is then
+    // the most honest thing to show.
+    let body = if at >= text.len() { text.trim() } else { text[at..].trim() };
+    if body.len() <= max_bytes {
+        return body.to_string();
+    }
+    let end = word_end(body, max_bytes);
+    format!("{}…", body[..end].trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::Index;
+
+    /// A match past the old 8 KB snippet cap must still be reachable.
+    ///
+    /// The cap applied to the stored text but not to the postings, so a term
+    /// deep in a page ranked as a hit and then had no snippet to show — and
+    /// the fallback showed the head of the page instead. On real articles
+    /// (median 25 KB of text) that lost 17% of snippets outright.
+    #[test]
+    fn a_match_deep_in_a_page_still_gets_a_snippet() {
+        let mut ix = Index::new();
+        // Past 8 KB, inside 32 KB.
+        let filler = "Filler about unrelated matters. ".repeat(400);
+        ix.add(
+            "https://x.example/long",
+            "A long page",
+            "",
+            &format!("{filler}The recordings were made at thirty five degrees."),
+        );
+        let hits = search(&ix, "recordings degrees", 3);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("thirty five degrees"),
+            "snippet never reached the match: {:?}",
+            hits[0].snippet
+        );
+    }
+
+    /// When there is genuinely no snippet to draw, the summary must not be the
+    /// sidebar.
+    ///
+    /// The query term is in the title only, which is how this happens in
+    /// practice: the document is a hit on a term its body never uses, so the
+    /// fallback runs. Showing "Jump to content / Main menu / move to sidebar /
+    /// Navigation" tells a reader nothing about the page.
+    #[test]
+    fn the_fallback_skips_the_navigation_menu() {
+        let mut ix = Index::new();
+        ix.add(
+            "https://x.example/p",
+            "Hodgkin Huxley neuron model",
+            "",
+            "Jump to content\nMain menu\nmove to sidebar\nNavigation\nMain page\n\
+             Contents\nCurrent events\nRandom article\nAbout\nContact us\n\
+             The model describes how a cell membrane generates an action potential, \
+             and the rate constants it uses were fitted to measurements made on the \
+             squid giant axon at a stated temperature.",
+        );
+        let hits = search(&ix, "neuron", 3);
+        assert_eq!(hits.len(), 1, "the title term should still make it a hit");
+        assert!(
+            hits[0].snippet.starts_with("The model describes"),
+            "the sidebar was shown as the summary: {:?}",
+            hits[0].snippet
+        );
+    }
+
+    /// A page that really is only a list of links has no prose to find, and
+    /// its head is then the most honest thing to show rather than nothing.
+    #[test]
+    fn a_page_of_only_links_still_gets_a_summary() {
+        let mut ix = Index::new();
+        ix.add("https://x.example/toc", "Index of things", "",
+               "Alpha\nBeta\nGamma\nDelta");
+        let hits = search(&ix, "index", 3);
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].snippet.is_empty(), "no summary at all");
+    }
 
     fn corpus() -> Index {
         let mut ix = Index::new();

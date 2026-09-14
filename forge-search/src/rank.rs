@@ -128,7 +128,23 @@ pub fn search(index: &Index, query: &str, limit: usize) -> Vec<Hit> {
     if terms.is_empty() {
         return Vec::new();
     }
-    let candidates = index.candidates(&terms);
+    let mut candidates = index.candidates(&terms);
+    if candidates.len() < limit && terms.len() > 1 {
+        // A strict reading came up short, so accept documents missing some of
+        // the query. `coverage` multiplies the score by the fraction found, so
+        // these sort below anything that matched in full — widening changes
+        // what is reachable, not what wins.
+        //
+        // The floor is a majority of the terms rather than one of them: the
+        // point is a near miss, not every page sharing the query's commonest
+        // word. A two-word query does end up as a union, which is the right
+        // reading when nothing contains both.
+        let least = (terms.len() + 1) / 2;
+        let widened = index.candidates_at_least(&terms, least);
+        if widened.len() > candidates.len() {
+            candidates = widened.into_iter().map(|(doc, _)| doc).collect();
+        }
+    }
     let mut hits: Vec<Hit> = candidates
         .into_iter()
         .filter_map(|doc| {
@@ -405,12 +421,78 @@ mod tests {
         assert!(hits.iter().all(|h| h.features.phrase == 0.0));
     }
 
+    /// Coverage is the fraction of the query a document contains. It used to
+    /// be 1.0 for everything, because only documents with every term were ever
+    /// candidates; now that a near miss can reach ranking, it carries real
+    /// information and is what keeps widening honest.
     #[test]
-    fn coverage_reports_how_much_of_the_query_was_found() {
+    fn coverage_is_the_fraction_of_the_query_found() {
         let ix = corpus();
+        // "Allocators" has the allocator but never says no_std.
         let hits = search(&ix, "no_std allocator", 10);
+        let full = hits.iter().find(|h| url_of(&ix, h).ends_with("/no-std")).unwrap();
+        assert_eq!(full.features.coverage, 1.0);
+        let partial = hits.iter().find(|h| url_of(&ix, h).ends_with("/alloc"));
+        if let Some(p) = partial {
+            assert_eq!(p.features.coverage, 0.5);
+        }
+    }
+
+    /// The case this was built for, in miniature.
+    ///
+    /// A real crawl answered nothing for `Q10 temperature coefficient neuron`
+    /// even with the defining page indexed, because that page does not contain
+    /// the word "neuron" — three terms of four, and no result at all. Asking a
+    /// question in more words than the corpus uses is normal, so a strict
+    /// reading that finds nothing must widen rather than give up.
+    #[test]
+    fn a_near_miss_is_found_when_nothing_matches_in_full() {
+        let mut ix = Index::new();
+        ix.add(
+            "https://bio.example/q10",
+            "Q10 temperature coefficient",
+            "",
+            "The q10 coefficient describes how a rate changes with temperature \
+             across a ten degree interval.",
+        );
+        ix.add("https://bio.example/unrelated", "Gardening", "", "Soil and compost and seeds.");
+        let hits = search(&ix, "q10 temperature coefficient neuron", 5);
+        assert_eq!(hits.len(), 1, "a three-of-four match should be reachable");
+        assert_eq!(url_of(&ix, &hits[0]), "https://bio.example/q10");
+        assert_eq!(hits[0].features.coverage, 0.75);
+    }
+
+    /// Widening must not change which document wins: a document with the whole
+    /// query outranks one missing part of it, because `coverage` multiplies.
+    #[test]
+    fn a_full_match_outranks_a_near_miss() {
+        let mut ix = Index::new();
+        ix.add("https://a.example/both", "Both", "", "alpha and beta together here.");
+        // Says alpha many times, so its term frequency alone would win.
+        ix.add(
+            "https://a.example/one",
+            "Only alpha",
+            "",
+            &"alpha ".repeat(60),
+        );
+        let hits = search(&ix, "alpha beta", 5);
+        assert_eq!(url_of(&ix, &hits[0]), "https://a.example/both",
+                   "a partial match with more term frequency must not win");
+    }
+
+    /// And widening only happens when the strict reading came up short, so a
+    /// query that is well answered is not diluted with near misses.
+    #[test]
+    fn a_sufficient_strict_result_is_not_widened() {
+        let mut ix = Index::new();
+        for i in 0..4 {
+            ix.add(&format!("https://a.example/{i}"), "Both", "", "alpha beta present.");
+        }
+        ix.add("https://a.example/partial", "Half", "", "alpha only.");
+        let hits = search(&ix, "alpha beta", 4);
+        assert_eq!(hits.len(), 4);
         assert!(hits.iter().all(|h| h.features.coverage == 1.0),
-                "intersection should mean full coverage");
+                "near misses leaked into a result set that was already full");
     }
 
     #[test]

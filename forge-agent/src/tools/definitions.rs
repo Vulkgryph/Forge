@@ -206,9 +206,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 description: "Search pages Forge has crawled and indexed itself. Returns titles, URLs and \
                     snippets. This is a real index, not a scrape of someone else's results page, so it is \
                     reliable — but it only knows what it has crawled. A query the index cannot answer \
-                    triggers a crawl first, which takes up to 25 seconds; every later query is \
+                    triggers a crawl first, which takes a couple of minutes; every later query is \
                     milliseconds. If the results are off-topic, the index simply has not read the right \
-                    pages: pass `sites` with the URLs to crawl rather than rephrasing the query. For \
+                    pages: pass `sites` with the URLs to crawl rather than rephrasing the query, and \
+                    raise `max_pages` rather than repeating the same call — a second crawl restarts \
+                    from the seeds instead of continuing. For \
                     biomedical or life-sciences literature use search_papers instead, which reaches \
                     journal articles this cannot.".to_string(),
                 parameters: json!({
@@ -231,9 +233,10 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "max_pages": {
                             "type": "integer",
-                            "description": "Pages to crawl if a crawl is needed (default 40, max 500). \
-                                Higher covers more and takes longer; the 25-second budget may stop it early, \
-                                in which case asking again continues from where it stopped."
+                            "description": "Pages to crawl if a crawl is needed (default 120, max 500). \
+                                Measured: below about 100 pages a forum crawl returns board index pages \
+                                rather than the discussions that answer anything, so prefer raising this \
+                                to rephrasing. The time budget scales with it, roughly a second a page."
                         }
                     },
                     "required": ["query"]

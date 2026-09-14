@@ -127,12 +127,49 @@ impl Fetcher for HttpFetcher {
     }
 }
 
-/// How long a crawl may take before it is cut short, whatever its page limit.
+/// Pages to crawl when the caller does not say.
 ///
-/// A tool call that never returns is worse than one that returns little. The
-/// page limit bounds the work but not the time — one slow host can hold a
-/// twenty-page crawl for minutes — so the wall clock is bounded as well.
-const DEFAULT_BUDGET_SECS: u64 = 25;
+/// A hundred and twenty, which is high enough to be worth defending. Below
+/// roughly a hundred pages a crawl of a forum returns board *indexes* rather
+/// than discussions — the listing names the subject in forty thread titles and
+/// answers nothing, and there is no ranking trick that rescues it because the
+/// answers were never fetched. Measured on two tractor forums asked what
+/// engine oil an old tractor takes:
+///
+/// ```text
+///    25 pages   4 of the top 5 results were board listings
+///   130 pages   0 of 5 — every result a thread, with answers in it
+/// ```
+///
+/// The ranking features were the same in both runs. The corpus was the
+/// difference, and no amount of scoring fixes a page that was never read.
+const DEFAULT_MAX_PAGES: usize = 120;
+
+/// How long a crawl may take before it is cut short.
+///
+/// A tool call that never returns is worse than one that returns little, so
+/// the wall clock is bounded and not only the page count — one slow host can
+/// otherwise hold a twenty-page crawl for minutes.
+///
+/// It scales with the pages asked for, which the previous fixed 25 seconds did
+/// not, and that made every other setting a lie: at one request per second a
+/// 25-second budget stops at about 25 pages, so the `max_pages` default of 40
+/// was unreachable and its documented ceiling of 500 was fiction. The tool
+/// could not leave the regime that returns listings no matter what it was
+/// asked for.
+///
+/// The ceiling is what keeps it honest in the other direction: 500 pages at a
+/// second each is over eight minutes, and a tool call that long should stop
+/// and say it stopped rather than hold the turn.
+fn crawl_budget_secs(max_pages: usize, politeness: f64) -> f64 {
+    const OVERHEAD: f64 = 15.0;
+    const CEILING: f64 = 300.0;
+    (max_pages as f64 * politeness * 1.2 + OVERHEAD).min(CEILING)
+}
+
+/// Seconds between requests to one host. A courtesy setting, not a
+/// performance one — see `Limits::politeness`.
+const POLITENESS: f64 = 1.0;
 
 /// What one search did, for the model and for anyone measuring.
 #[derive(Debug, Default)]
@@ -145,8 +182,12 @@ pub struct Timing {
     pub search_ms: u128,
     pub index_size: usize,
     pub results: usize,
-    /// The crawl ran out of time rather than pages, which the model should
-    /// know: asking again continues from where it stopped.
+    /// The crawl ran out of time rather than pages.
+    ///
+    /// Worth telling the model, but not as "ask again and it continues" — the
+    /// frontier is not persisted, so a second crawl starts from the seeds and
+    /// refetches. What it should do instead is raise `max_pages`, or narrow
+    /// `sites`.
     pub timed_out: bool,
 }
 
@@ -177,7 +218,7 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
     let max_pages = args
         .get("max_pages")
         .and_then(|v| v.as_u64())
-        .unwrap_or(40)
+        .unwrap_or(DEFAULT_MAX_PAGES as u64)
         .clamp(1, 500) as usize;
 
     let handle = tokio::runtime::Handle::current();
@@ -217,15 +258,10 @@ fn run(
         let limits = Limits {
             max_pages,
             max_depth: 3,
-            // The conventional one request per second. See Limits::politeness:
-            // this is a courtesy setting, not a performance one.
-            politeness: 1.0,
+            politeness: POLITENESS,
             stay_on_host: true,
             max_page_bytes: 2 * 1024 * 1024,
-            // A tool call that never returns is worse than one that returns
-            // little, and the page limit bounds the work without bounding the
-            // clock.
-            max_seconds: Some(DEFAULT_BUDGET_SECS as f64),
+            max_seconds: Some(crawl_budget_secs(max_pages, POLITENESS)),
         };
 
         let crawl_start = std::time::Instant::now();
@@ -280,7 +316,8 @@ fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String 
             out.push_str(&format!(
                 "Crawled {} pages ({} indexed, {} refused by robots.txt) in {}ms and found \
                  nothing matching. The index now holds {} pages; try different terms, or pass \
-                 `sites` to crawl somewhere else.\n",
+                 `sites` to crawl somewhere else. Crawling again repeats the same pages rather \
+                 than continuing, so raise `max_pages` instead of retrying as-is.\n",
                 timing.fetched, timing.indexed, timing.disallowed, timing.crawl_ms,
                 timing.index_size,
             ));
@@ -309,7 +346,12 @@ fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String 
              Later searches use the index and do not crawl.]\n",
             timing.fetched,
             timing.crawl_ms,
-            if timing.timed_out { " (stopped on the time budget, more remains)" } else { "" },
+            if timing.timed_out {
+                " (stopped on the time budget; a further crawl restarts from the seeds, so \
+                 raise max_pages rather than repeating this call)"
+            } else {
+                ""
+            },
             timing.index_size,
             timing.search_ms,
         ));
@@ -330,6 +372,40 @@ pub fn index_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The budget has to permit the pages that were asked for. A fixed
+    /// 25 seconds at one request per second stopped every crawl at about 25
+    /// pages, which made the `max_pages` default of 40 unreachable and its
+    /// ceiling of 500 fiction — and 25 pages is exactly the regime that
+    /// returns board listings instead of answers.
+    #[test]
+    fn the_time_budget_allows_the_pages_requested() {
+        for pages in [25usize, 40, 120] {
+            let budget = crawl_budget_secs(pages, POLITENESS);
+            assert!(
+                budget > pages as f64 * POLITENESS,
+                "{pages} pages at {POLITENESS}s each cannot finish in {budget}s",
+            );
+        }
+    }
+
+    /// And it is still bounded, because a tool call that holds the turn for
+    /// ten minutes is its own failure.
+    #[test]
+    fn the_time_budget_is_capped() {
+        assert!(crawl_budget_secs(500, POLITENESS) <= 300.0);
+        assert!(crawl_budget_secs(100_000, POLITENESS) <= 300.0);
+    }
+
+    /// The default is above the measured threshold where a forum crawl starts
+    /// returning discussions rather than indexes of discussions.
+    #[test]
+    fn the_default_page_count_clears_the_measured_threshold() {
+        assert!(
+            DEFAULT_MAX_PAGES >= 100,
+            "{DEFAULT_MAX_PAGES} pages returns board listings, measured",
+        );
+    }
 
     #[test]
     fn the_index_path_is_inside_the_workspace() {

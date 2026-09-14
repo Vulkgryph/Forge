@@ -41,6 +41,28 @@ pub struct Document {
     /// Whether the document is still live. A removed document keeps its id and
     /// its postings; see [`Index::remove`].
     pub live: bool,
+    /// What share of the text, as a percentage, sits in lines long enough to
+    /// be prose.
+    ///
+    /// The difference between a page with something on it and a page that is a
+    /// list of links to pages with something on them. A forum's board index
+    /// mentions the subject in forty thread titles and answers nothing; the
+    /// thread answers it. Ranked the same, the index wins on title matches and
+    /// the answer never surfaces.
+    ///
+    /// Measured on real pages, and the margin is wide enough to use: board
+    /// listings came out at 4% and 9%, discussion threads at 27% and 42%, a
+    /// Wikipedia article at 72%.
+    ///
+    /// Computed over the whole text before it is capped for snippets, which
+    /// matters — the kept head of a long page is the navigation, so measuring
+    /// the stored text would underestimate exactly the long articles that are
+    /// worth most.
+    ///
+    /// A line rather than a sentence because block elements already end lines,
+    /// and the same threshold the snippet fallback uses to step over a
+    /// navigation menu.
+    pub prose_share: u8,
     /// Who the content belongs to and on what terms — a licence, a required
     /// credit, or empty when the source said nothing.
     ///
@@ -211,6 +233,7 @@ impl Index {
             text: truncate_on_boundary(text, TEXT_KEPT),
             term_count,
             live: true,
+            prose_share: prose_share(text),
             attribution: attribution.to_string(),
         });
         self.by_url.insert(url.to_string(), id);
@@ -358,6 +381,27 @@ impl Index {
     }
 }
 
+/// The share of `text`, as a percentage, in lines long enough to be prose.
+///
+/// See [`Document::prose_share`] for why this is worth knowing and what the
+/// measured values look like.
+fn prose_share(text: &str) -> u8 {
+    const PROSE_LINE: usize = 120;
+    let mut total = 0usize;
+    let mut prose = 0usize;
+    for line in text.lines() {
+        let n = line.trim().len();
+        total += n;
+        if n >= PROSE_LINE {
+            prose += n;
+        }
+    }
+    if total == 0 {
+        return 0;
+    }
+    ((prose * 100) / total).min(100) as u8
+}
+
 /// Cut `s` to at most `max` bytes without splitting a character.
 fn truncate_on_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -383,7 +427,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 impl Index {
     /// Write the index to `path`.
@@ -406,6 +450,7 @@ impl Index {
             put_str(&mut out, &doc.description);
             put_str(&mut out, &doc.text);
             put_str(&mut out, &doc.attribution);
+            put_u32(&mut out, doc.prose_share as u32);
         }
         std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
     }
@@ -437,7 +482,13 @@ impl Index {
             let description = take_str(&bytes, &mut at)?;
             let text = take_str(&bytes, &mut at)?;
             let attribution = take_str(&bytes, &mut at)?;
-            index.add_attributed(&url, &title, &description, &text, &attribution);
+            let share = take_u32(&bytes, &mut at)?;
+            let id = index.add_attributed(&url, &title, &description, &text, &attribution);
+            // Recomputing would measure the capped text, which is a different
+            // number — see `Document::prose_share`. The stored one is kept.
+            if let Some(doc) = index.docs.get_mut(id as usize) {
+                doc.prose_share = share.min(100) as u8;
+            }
         }
         Ok(index)
     }
@@ -700,6 +751,30 @@ mod tests {
 
     /// The text kept for snippets is capped, and cutting it must not split a
     /// character.
+    /// Prose share is stored rather than recomputed on load, because the two
+    /// are different numbers: it is measured over the whole text, and only the
+    /// capped head survives a save. Recomputing would measure the navigation.
+    #[test]
+    fn prose_share_survives_a_round_trip_and_is_not_recomputed() {
+        let mut ix = Index::new();
+        let body = "A sentence long enough to count as prose, repeated so the text \
+                    exceeds the snippet cap and the head is not representative. "
+            .repeat(900);
+        let id = ix.add("https://a.test/long", "Long", "", &body);
+        let before = ix.document(id).unwrap().prose_share;
+        assert!(before > 50, "fixture is not prose-shaped: {before}");
+        assert!(ix.document(id).unwrap().text.len() < body.len(), "fixture was not capped");
+
+        let dir = std::env::temp_dir().join(format!("forge-search-prose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.bin");
+        ix.save(&path).expect("save");
+        let back = Index::load(&path).expect("load");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.document(0).unwrap().prose_share, before, "prose share changed across a save");
+    }
+
     /// An attribution that does not survive a save is no attribution at all:
     /// the obligation attaches to the text, and the text persists.
     #[test]

@@ -75,6 +75,9 @@ pub struct Features {
     /// missing a term is a worse answer than one containing all of them even
     /// when its score is higher, which pure BM25 does not guarantee.
     pub coverage: f64,
+    /// How much of the document is prose rather than a list of links, from 0.0
+    /// to 1.0. See [`Document::prose_share`](crate::index::Document::prose_share).
+    pub prose: f64,
 }
 
 impl Features {
@@ -92,11 +95,17 @@ impl Features {
         // query must not outrank a complete match by accumulating frequency on
         // the terms it does have, and addition allows exactly that.
         //
-        // With today's intersecting candidate set this is always 1.0, so it
-        // changes nothing — it is here because the moment partial matches are
-        // allowed it becomes the difference between useful and useless, and
-        // discovering that later means rediscovering why.
-        base * self.coverage
+        // Once it was always 1.0, because the candidate set was an
+        // intersection and every candidate held every term. Widening to near
+        // misses is what gave it work to do.
+        //
+        // Prose share multiplies too, and for a related reason: a page that is
+        // a list of links to answers accumulates title and term matches
+        // without containing an answer, and adding a penalty lets a long
+        // enough list out-accumulate a short real one. The floor keeps it a
+        // demotion rather than an exclusion — a specification table is mostly
+        // not prose and is still sometimes the right result.
+        base * self.coverage * (PROSE_FLOOR + (1.0 - PROSE_FLOOR) * self.prose)
     }
 }
 
@@ -118,6 +127,28 @@ pub(crate) fn idf(index: &Index, term: &str) -> f64 {
     let df = index.document_frequency(term) as f64;
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
 }
+
+/// The most a document can be demoted for being a list rather than a page.
+///
+/// At 0.3 a board index keeps a third of its score and a thread keeps about
+/// six tenths of its own — enough to reorder them without deciding that a page
+/// of links is never what anyone wanted.
+const PROSE_FLOOR: f64 = 0.3;
+
+/// Below this many terms, a document is not judged on its shape at all.
+///
+/// The measure asks whether a page's text is dominated by short fragments
+/// *despite having plenty of text*, which is what a list of links looks like.
+/// A short page is not a list, it is short — and the first version of this
+/// missed the distinction and broke length normalisation with it: a concise
+/// answer of a few words has no line long enough to count as prose, so it
+/// scored zero and was demoted to the floor, while a document padded with a
+/// single nine-kilobyte line of filler scored a perfect hundred. The existing
+/// test for padding caught it, which is the only reason it is not still here.
+///
+/// Roughly a kilobyte of text. Below it the feature is neutral, and BM25's
+/// length normalisation is left to do the job it already does.
+const MIN_TERMS_TO_JUDGE_SHAPE: u32 = 150;
 
 /// Score and sort the documents matching `query`.
 ///
@@ -200,6 +231,11 @@ pub fn features(index: &Index, doc: DocId, terms: &[String]) -> Option<Features>
     }
 
     f.coverage = present as f64 / terms.len() as f64;
+    f.prose = if document.term_count < MIN_TERMS_TO_JUDGE_SHAPE {
+        1.0
+    } else {
+        document.prose_share as f64 / 100.0
+    };
     f.phrase = phrase_score(index, doc, terms);
     f.url_depth = url_depth_score(&document.url);
     Some(f)
@@ -324,6 +360,55 @@ mod tests {
             "ranked {:?} first",
             url_of(&ix, &hits[0])
         );
+    }
+
+    /// A board index must not outrank the thread that answers the question.
+    ///
+    /// This is the shape measured on a real forum: the listing carries the
+    /// subject in forty thread titles and answers nothing, while the thread
+    /// carries the answer in two sentences. Ranked on terms alone the listing
+    /// wins — it says the words far more often — and the answer never
+    /// surfaces. Real values were 4% and 9% prose for listings against 27% and
+    /// 42% for threads.
+    #[test]
+    fn a_page_of_links_does_not_outrank_a_page_with_an_answer() {
+        let mut ix = Index::new();
+        // A listing: many short lines, the subject named in every one of them.
+        let listing: String = (0..60)
+            .map(|i| format!("Engine oil thread {i}\nReplies {i} Views 12K\n"))
+            .collect();
+        ix.add("https://forum.test/board", "Engine oil - Board index", "", &listing);
+        // A thread: prose, the subject named twice.
+        let thread = format!(
+            "{}\n{}\n",
+            "Somebody asked what engine oil to run in the old tractor and the \
+             answer that came back was straight thirty weight, because that is \
+             what the manual in the glovebox calls for and nobody has managed \
+             to argue otherwise in seventy years of trying.",
+            "The longer discussion about detergent and non-detergent went on for \
+             pages after that, and the short version is that an engine with no \
+             filter is happier without the detergent holding grit in suspension \
+             where the bearings can find it again later on.",
+        );
+        ix.add("https://forum.test/thread", "What oil - thread", "", &thread);
+
+        let hits = search(&ix, "engine oil", 5);
+        assert_eq!(
+            url_of(&ix, &hits[0]),
+            "https://forum.test/thread",
+            "the board index won: {:?}",
+            hits.iter().map(|h| (url_of(&ix, h), h.score, h.features.prose)).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A short page is short, not a list, and must not be demoted for having
+    /// no line long enough to look like prose.
+    #[test]
+    fn a_short_page_is_not_judged_on_its_shape() {
+        let mut ix = Index::new();
+        ix.add("https://a.test/x", "", "", "The oil is straight 30 weight.");
+        let hits = search(&ix, "oil", 5);
+        assert_eq!(hits[0].features.prose, 1.0, "a short page was penalised for being short");
     }
 
     /// Length normalisation, stated as a property: padding a document with

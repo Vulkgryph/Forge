@@ -30,7 +30,7 @@ use forge_search::query;
 /// the answer it gets. It matters more here, because a crawler that lies about
 /// who it is cannot meaningfully claim to be obeying `robots.txt` — the file
 /// addresses crawlers by name.
-const USER_AGENT: &str = concat!("forge-search/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("forge-search/", env!("CARGO_PKG_VERSION"));
 
 /// Where a crawl starts when the query names no site of its own.
 ///
@@ -50,12 +50,29 @@ const DEFAULT_SEEDS: &[&str] = &[
 /// The trait is synchronous and `reqwest` here is not, so each fetch blocks on
 /// the runtime handle. That is only sound off a runtime worker thread, which
 /// is why every crawl runs inside `spawn_blocking` — see [`search`].
-struct HttpFetcher {
+pub(crate) struct HttpFetcher {
     client: reqwest::Client,
     handle: tokio::runtime::Handle,
     /// Largest body to read, so one enormous page cannot exhaust memory
     /// before the crawler's own limit has a chance to reject it.
     max_bytes: usize,
+}
+
+impl HttpFetcher {
+    /// One configured the way every caller wants it: identified, bounded in
+    /// time, and following a sane number of redirects.
+    pub(crate) fn new(handle: tokio::runtime::Handle, max_bytes: usize) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .timeout(std::time::Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .unwrap_or_default(),
+            handle,
+            max_bytes,
+        }
+    }
 }
 
 impl Fetcher for HttpFetcher {
@@ -196,16 +213,7 @@ fn run(
     timing.search_ms = search_start.elapsed().as_millis();
 
     if hits.is_empty() {
-        let fetcher = HttpFetcher {
-            client: reqwest::Client::builder()
-                .user_agent(USER_AGENT)
-                .timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .unwrap_or_default(),
-            handle,
-            max_bytes: 2 * 1024 * 1024,
-        };
+        let fetcher = HttpFetcher::new(handle, 2 * 1024 * 1024);
         let limits = Limits {
             max_pages,
             max_depth: 3,

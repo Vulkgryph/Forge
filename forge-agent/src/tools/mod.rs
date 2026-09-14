@@ -2,6 +2,7 @@
 pub mod custom;
 mod definitions;
 mod executor;
+pub mod papers;
 pub mod patch;
 pub mod search;
 pub mod scratchpad;

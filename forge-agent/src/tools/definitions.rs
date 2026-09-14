@@ -203,21 +203,76 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_search".to_string(),
-                description: "Search the web using DuckDuckGo. Returns titles, URLs, and snippets for each result. \
-                    UNRELIABLE: DuckDuckGo challenges automated queries and refuses most of them, so this \
-                    frequently returns an error saying the search was blocked. That is not a transient \
-                    failure and retrying the same query will not help — say so and carry on without it, or \
-                    use web_fetch on a URL you already know. Do not spend turns retrying.".to_string(),
+                description: "Search pages Forge has crawled and indexed itself. Returns titles, URLs and \
+                    snippets. This is a real index, not a scrape of someone else's results page, so it is \
+                    reliable — but it only knows what it has crawled. A query the index cannot answer \
+                    triggers a crawl first, which takes up to 25 seconds; every later query is \
+                    milliseconds. If the results are off-topic, the index simply has not read the right \
+                    pages: pass `sites` with the URLs to crawl rather than rephrasing the query. For \
+                    biomedical or life-sciences literature use search_papers instead, which reaches \
+                    journal articles this cannot.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The search query"
+                            "description": "The search query. Supports quoted phrases and -excluded terms."
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum number of results to return (default 10, max 20)"
+                            "description": "Maximum number of results to return (default 5, max 20)"
+                        },
+                        "sites": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "URLs to crawl when the index cannot answer the query. Use this \
+                                to point the crawler at the right documentation instead of hoping the \
+                                default seeds cover it. Crawling stays on the hosts given here."
+                        },
+                        "max_pages": {
+                            "type": "integer",
+                            "description": "Pages to crawl if a crawl is needed (default 40, max 500). \
+                                Higher covers more and takes longer; the 25-second budget may stop it early, \
+                                in which case asking again continues from where it stopped."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "search_papers".to_string(),
+                description: "Search the biomedical and life-sciences literature through Europe PMC, and \
+                    search the full text of the articles it returns. Use this for a measured value, a \
+                    method, or a result that would be stated in a paper — recording temperatures, \
+                    concentrations, cell types, assay conditions — none of which are on the pages \
+                    web_search can crawl, because PubMed Central forbids crawling. \
+                    Only open-access articles have their text indexed; anything else comes back as a \
+                    citation and a link, and the result says so. Every result reports the licence its \
+                    text is held under: quote it with that attribution, and note that cc by-nc excludes \
+                    commercial use. \
+                    The query goes to Europe PMC as written, so its syntax works: quoted phrases, AND/OR, \
+                    and field prefixes such as AUTH:, JOURNAL:, METHODS:. First call on a topic fetches \
+                    articles at one per second; later ones are instant.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The query, in Europe PMC syntax. Prefer a few specific terms \
+                                over a sentence — e.g. '\"pyramidal neuron\" AND \"patch clamp\" AND temperature'."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of passages to return (default 5, max 20)"
+                        },
+                        "max_articles": {
+                            "type": "integer",
+                            "description": "How many articles to fetch if the local index cannot answer \
+                                (default 6, max 25). Each one is a request at one per second, so raising \
+                                this makes the first call slower and the coverage wider."
                         }
                     },
                     "required": ["query"]
@@ -509,7 +564,78 @@ pub fn get_toggleable_tool_names() -> Vec<&'static str> {
         "todo_write",
         "web_search",
         "web_fetch",
+        "search_papers",
         "shell_exec",
         "delegate_task",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool that can be toggled but has no definition is wired only halfway:
+    /// turning it on does nothing, and the two halves live in different files.
+    ///
+    /// `delegate_task` is the one exception, and a real one rather than an
+    /// oversight — its definition is built from whichever subagents are
+    /// available, so it cannot be a constant. It is named here so the
+    /// exception is a decision rather than a hole in the check.
+    #[test]
+    fn every_toggleable_tool_is_actually_defined() {
+        const BUILT_PER_SESSION: &[&str] = &["delegate_task"];
+        let defined: Vec<String> = get_tool_definitions()
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        for name in get_toggleable_tool_names() {
+            if BUILT_PER_SESSION.contains(&name) {
+                continue;
+            }
+            assert!(
+                defined.iter().any(|d| d == name),
+                "{name} can be toggled but has no definition, so turning it on does nothing",
+            );
+        }
+        // And the exception really is built, rather than missing everywhere.
+        assert_eq!(delegate_task_definition(&[]).function.name, "delegate_task");
+    }
+
+    #[test]
+    fn the_literature_tool_is_offered() {
+        let defs = get_tool_definitions();
+        let papers = defs
+            .iter()
+            .find(|t| t.function.name == "search_papers")
+            .expect("search_papers is not in the tool list");
+        // The licence obligation has to reach the model, since it is what
+        // decides whether a passage may be quoted or used commercially.
+        let described = &papers.function.description;
+        assert!(described.contains("licence"), "the description does not mention licensing: {described}");
+        assert!(
+            described.contains("open-access") || described.contains("open access"),
+            "the description does not say what is and is not kept: {described}",
+        );
+        let props = &papers.function.parameters["properties"];
+        assert!(props.get("query").is_some());
+        assert!(props.get("max_articles").is_some());
+        assert!(get_toggleable_tool_names().contains(&"search_papers"));
+    }
+
+    /// The old description told the model the tool was unreliable and not to
+    /// retry, which was true of a DuckDuckGo scrape and is not true of an
+    /// index Forge crawls itself. Left in place it steers the model away from
+    /// a tool that works.
+    #[test]
+    fn web_search_no_longer_describes_itself_as_a_scrape() {
+        let defs = get_tool_definitions();
+        let web = defs.iter().find(|t| t.function.name == "web_search").expect("web_search");
+        let described = &web.function.description;
+        assert!(!described.contains("DuckDuckGo"), "{described}");
+        assert!(!described.contains("UNRELIABLE"), "{described}");
+        // And it documents the arguments that decide what gets crawled.
+        let props = &web.function.parameters["properties"];
+        assert!(props.get("sites").is_some(), "`sites` is undocumented, so the model cannot aim the crawl");
+        assert!(props.get("max_pages").is_some());
+    }
 }

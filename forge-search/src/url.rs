@@ -224,6 +224,34 @@ fn normalise_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unreserved_characters_are_left_alone() {
+        assert_eq!(encode_query("abcXYZ019-._~"), "abcXYZ019-._~");
+    }
+
+    #[test]
+    fn a_space_becomes_percent_twenty_not_a_plus() {
+        // `+` means space only in form encoding, so a literal `+` in a search
+        // term would come back as a space.
+        assert_eq!(encode_query("pyramidal neuron"), "pyramidal%20neuron");
+        assert_eq!(encode_query("a+b"), "a%2Bb");
+    }
+
+    /// The characters that delimit a query string must not survive inside a
+    /// value, or one parameter becomes two.
+    #[test]
+    fn delimiters_are_encoded() {
+        assert_eq!(encode_query("a&b=c"), "a%26b%3Dc");
+        assert_eq!(encode_query("\"quoted phrase\""), "%22quoted%20phrase%22");
+    }
+
+    #[test]
+    fn non_ascii_is_encoded_per_utf8_byte() {
+        // Two bytes for a degree sign, three for a CJK character.
+        assert_eq!(encode_query("°"), "%C2%B0");
+        assert_eq!(encode_query("日"), "%E6%97%A5");
+    }
+
     fn p(s: &str) -> Url {
         Url::parse(s).unwrap_or_else(|e| panic!("{s:?}: {e}"))
     }
@@ -378,4 +406,28 @@ mod tests {
             assert_eq!(resolved, reparsed, "{link:?} did not round trip");
         }
     }
+}
+
+/// Percent-encode a string for use as the value of a query parameter.
+///
+/// Everything outside RFC 3986's unreserved set is encoded, byte by byte over
+/// the UTF-8 form. That is more than strictly required — `/` and `:` are legal
+/// in a query — but a value is opaque to the server's parser only if the
+/// characters that delimit parameters cannot appear in it, and a literal `&`
+/// or `=` in a search phrase would otherwise split one parameter into two.
+///
+/// Space becomes `%20` rather than `+`. `+` means space only in
+/// `application/x-www-form-urlencoded`, and a query string is not required to
+/// be that; a literal `+` in a query term would then arrive as a space.
+pub fn encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }

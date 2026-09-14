@@ -214,15 +214,23 @@ pub struct AgentConfig {
     pub scratchpad: ScratchpadConfig,
     /// Tool names to exclude from every agent turn. Internal tools are never affected.
     ///
-    /// `web_search` is in here by default. It works by scraping DuckDuckGo's HTML,
-    /// which is not a search API and does not reliably answer — a tool that
-    /// usually returns nothing is worse than one that is absent, because the
-    /// model spends a turn on it and then reasons about the emptiness. Off until
-    /// there is a real search behind it. Turn it on from the tools menu in either
-    /// client if you want it as it stands; that choice is written here and kept.
+    /// Empty by default. `web_search` used to be in here, because it scraped
+    /// DuckDuckGo's HTML and usually came back empty, and a tool that usually
+    /// returns nothing is worse than one that is absent — the model spends a
+    /// turn on it and then reasons about the emptiness. The note said "off
+    /// until there is a real search behind it"; there is one now, an index
+    /// Forge crawls itself, so the condition is met and the default is off the
+    /// list.
     ///
-    /// `web_fetch` stays on: it retrieves a URL it has been given and summarises
-    /// it, which does not depend on search working.
+    /// That only reaches installs that have never written a config. The app
+    /// serialises this field, so anyone who has run Forge before has
+    /// `disabled_tools = ["web_search"]` on disk already, and it is not
+    /// distinguishable from somebody who chose it — so it is kept. The tools
+    /// menu in either client turns it back on.
+    ///
+    /// `web_fetch` and `search_papers` are on for the same reason: both
+    /// retrieve something they have been asked for rather than depending on a
+    /// search working.
     #[serde(default = "default_disabled_tools")]
     pub disabled_tools: Vec<String>,
     #[serde(default)]
@@ -273,7 +281,7 @@ fn default_compact_at_percent() -> u8 {
 
 /// Tools off unless asked for. See `AgentConfig::disabled_tools`.
 fn default_disabled_tools() -> Vec<String> {
-    vec!["web_search".to_string()]
+    Vec::new()
 }
 
 fn default_thinking_mode() -> bool {
@@ -532,14 +540,17 @@ mod default_tools_tests {
 
     /// `web_search` is off unless asked for.
     ///
-    /// It scrapes DuckDuckGo's HTML rather than using a search API, and usually
-    /// comes back empty. A tool that usually returns nothing is worse than one
-    /// that is absent: the model spends a turn on it and then reasons about the
-    /// emptiness as if it meant something.
+    /// `web_search` was disabled by default for as long as it scraped
+    /// DuckDuckGo and usually came back empty. It is now an index Forge crawls
+    /// itself, which answers, so the reason is gone and so is the default.
     #[test]
-    fn web_search_is_off_by_default() {
+    fn web_search_is_on_now_that_it_is_a_real_index() {
         let cfg = AppConfig::default();
-        assert!(cfg.agent.disabled_tools.iter().any(|t| t == "web_search"));
+        assert!(
+            !cfg.agent.disabled_tools.iter().any(|t| t == "web_search"),
+            "disabled by default: {:?}",
+            cfg.agent.disabled_tools,
+        );
     }
 
     /// `web_fetch` stays on. It retrieves a URL it has been handed and summarises
@@ -572,11 +583,26 @@ mod default_tools_tests {
         toml::from_str(&out).expect("parse")
     }
 
-    /// A config that does not mention the setting gets the new default, so the
-    /// change reaches everybody who has never touched it.
+    /// A config that does not mention the setting gets the current default.
+    ///
+    /// Worth being precise about what this does and does not reach: the app
+    /// serialises `disabled_tools`, so a file written by any previous version
+    /// names `web_search` explicitly and keeps it. Only a config from before
+    /// the field existed — or a fresh install — takes the default. Changing a
+    /// default is not a migration, and treating it as one would be the wrong
+    /// claim to make here.
     #[test]
     fn a_config_without_the_setting_gets_the_default() {
-        assert_eq!(config_with(None).agent.disabled_tools, vec!["web_search".to_string()]);
+        assert!(config_with(None).agent.disabled_tools.is_empty());
+    }
+
+    /// And the case above, stated as the limitation it is: an existing file
+    /// that disables web search still disables it.
+    #[test]
+    fn an_existing_file_keeps_web_search_disabled() {
+        let old = config_with(Some("disabled_tools = [\"web_search\"]"));
+        assert_eq!(old.agent.disabled_tools, vec!["web_search".to_string()],
+                   "a choice already on disk must not be quietly reversed");
     }
 
     /// And a config that *does* mention it is obeyed, including an empty list —

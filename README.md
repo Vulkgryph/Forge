@@ -204,30 +204,52 @@ Forge deliberately does **not** implement it: xAI's consumer terms prohibit
 programmatic access and reverse engineering, and route developer use to their
 Enterprise terms with an API key. Grok works here through an API key.
 
-## Web search does not really work
+## Search is ours now
 
-`web_search` scrapes DuckDuckGo, and DuckDuckGo challenges automated queries.
-In practice most searches come back refused. There is a fallback through a
-public mirror, and that is blocked by network reputation for entire ISP ranges
-— including, on the machine this was written on, the whole of AS7018.
+`web_search` used to scrape DuckDuckGo's HTML, which challenges automated
+queries and refused most of them. A tool that usually returns nothing is worse
+than one that is absent: the model spends a turn on it and then reasons about
+the emptiness as if it meant something. So it was off by default, with a note
+saying "off until there is a real search behind it".
 
-So treat it as absent. The tool exists, reports honestly when it is refused,
-and tells the agent not to retry, because retrying does not help. Everything
-else — reading files, running commands, git, the editor, remote work — does not
-depend on it, and coding tasks rarely need it.
+There is one now, in `forge-search` — a crawler, an inverted index, BM25
+ranking and snippets, with no dependencies. It answers from pages Forge has
+actually read. The cost is that it only knows what it has crawled, so a query
+the index cannot answer crawls first, which takes up to 25 seconds once and
+milliseconds afterwards. Pass `sites` to aim the crawl somewhere specific
+rather than rephrasing the query.
 
-So it is **off by default**, and the tools menu in either client turns it on if
-you want it as it stands — that choice is written to the config and kept. A tool
-that usually returns nothing is worse than one that is absent: the model spends a
-turn on it and then reasons about the emptiness as if it meant something.
+It is **on by default** now. Anyone who ran an earlier version has
+`disabled_tools = ["web_search"]` written to their config already, and that is
+indistinguishable from having chosen it, so it is left alone — the tools menu
+in either client turns it back on.
 
-`web_fetch` is unaffected and stays on. It retrieves a URL it has been given and
-summarises it, which does not depend on search working, and a pasted link is how
-anyone actually asks for a page to be read.
+Crawling has limits that are not bugs. `robots.txt` is obeyed, including
+`Crawl-delay`, and requests to one host are spaced a second apart by default.
+Sites that refuse crawlers are refused, and PubMed Central refuses everyone:
+its `robots.txt` is `User-agent: *` and `Disallow: /`.
 
-Making search work properly needs a real search API behind a key you supply;
-nothing of the sort is in the tree today, and this README makes no claim about
-when or whether it will be.
+## Literature, through the front door
+
+Which is why there is a second tool. `search_papers` asks Europe PMC's REST
+API — the channel published for programmatic access — rather than crawling a
+website that has asked not to be crawled. It searches, fetches the full text of
+articles whose licence permits keeping it, and indexes that; anything else
+comes back as a citation and a link, and says so.
+
+Only open-access articles have their text kept. That is more conservative than
+it has to be, and deliberately so: it is one sentence to state and one
+condition to audit. Every result reports the licence its text is held under,
+because a passage quoted without its terms is a passage quoted blind — `cc by`
+wants attribution, `cc by-nc` excludes commercial use, and the index carries
+that with the document so it survives being saved and searched a month later.
+
+This is what the crawler could not do. Asked for pyramidal neuron patch-clamp
+recordings at a stated temperature, it answers out of a Methods section:
+
+> We performed electrophysiological recordings at room temperature
+> (20°C-25°C), but the recording chamber might be heated to
+> near-physiological temperatures using a bath-controller
 
 `web_fetch` is unaffected: give it a URL and it fetches that page.
 

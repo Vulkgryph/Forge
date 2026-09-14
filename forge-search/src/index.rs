@@ -41,6 +41,16 @@ pub struct Document {
     /// Whether the document is still live. A removed document keeps its id and
     /// its postings; see [`Index::remove`].
     pub live: bool,
+    /// Who the content belongs to and on what terms — a licence, a required
+    /// credit, or empty when the source said nothing.
+    ///
+    /// Stored with the document rather than alongside the fetch, because the
+    /// obligation outlives the request. An index saved to disk and searched a
+    /// month later must still be able to say that a passage came from a CC
+    /// BY-NC article, since that answer is what decides whether the passage
+    /// may be shown, quoted, or used commercially. Metadata kept only in a
+    /// crawl report is metadata lost on the first save.
+    pub attribution: String,
 }
 
 /// One occurrence list: the positions of a term within one document.
@@ -150,6 +160,22 @@ impl Index {
     ///
     /// Re-crawling is the normal case, so this is an upsert. Returns the id.
     pub fn add(&mut self, url: &str, title: &str, description: &str, text: &str) -> DocId {
+        self.add_attributed(url, title, description, text, "")
+    }
+
+    /// Add a document that carries terms of use.
+    ///
+    /// The same as [`add`](Self::add) but recording an attribution string —
+    /// for content from a source that states a licence, which a crawled web
+    /// page generally does not and a journal article always does.
+    pub fn add_attributed(
+        &mut self,
+        url: &str,
+        title: &str,
+        description: &str,
+        text: &str,
+        attribution: &str,
+    ) -> DocId {
         if let Some(&existing) = self.by_url.get(url) {
             self.remove(existing);
         }
@@ -185,6 +211,7 @@ impl Index {
             text: truncate_on_boundary(text, TEXT_KEPT),
             term_count,
             live: true,
+            attribution: attribution.to_string(),
         });
         self.by_url.insert(url.to_string(), id);
         self.live_docs += 1;
@@ -223,7 +250,13 @@ impl Index {
         }
         let mut rebuilt = Index::new();
         for doc in self.docs.iter().filter(|d| d.live) {
-            rebuilt.add(&doc.url, &doc.title, &doc.description, &doc.text);
+            rebuilt.add_attributed(
+                &doc.url,
+                &doc.title,
+                &doc.description,
+                &doc.text,
+                &doc.attribution,
+            );
         }
         *self = rebuilt;
         dead
@@ -350,7 +383,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 impl Index {
     /// Write the index to `path`.
@@ -372,6 +405,7 @@ impl Index {
             put_str(&mut out, &doc.title);
             put_str(&mut out, &doc.description);
             put_str(&mut out, &doc.text);
+            put_str(&mut out, &doc.attribution);
         }
         std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
     }
@@ -402,7 +436,8 @@ impl Index {
             let title = take_str(&bytes, &mut at)?;
             let description = take_str(&bytes, &mut at)?;
             let text = take_str(&bytes, &mut at)?;
-            index.add(&url, &title, &description, &text);
+            let attribution = take_str(&bytes, &mut at)?;
+            index.add_attributed(&url, &title, &description, &text, &attribution);
         }
         Ok(index)
     }
@@ -665,6 +700,36 @@ mod tests {
 
     /// The text kept for snippets is capped, and cutting it must not split a
     /// character.
+    /// An attribution that does not survive a save is no attribution at all:
+    /// the obligation attaches to the text, and the text persists.
+    #[test]
+    fn attribution_survives_a_round_trip() {
+        let mut ix = Index::new();
+        ix.add_attributed(
+            "https://europepmc.org/article/MED/1",
+            "A paper",
+            "",
+            "Recordings were made at thirty two degrees.",
+            "cc by-nc — Europe PMC, PMC1234567",
+        );
+        ix.add("https://example.com/page", "A page", "", "No stated terms.");
+        let dir = std::env::temp_dir().join(format!("forge-search-attr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.bin");
+        ix.save(&path).expect("save");
+        let back = Index::load(&path).expect("load");
+        std::fs::remove_dir_all(&dir).ok();
+        let of = |ix: &Index, url: &str| -> String {
+            (0..ix.len() as DocId)
+                .filter_map(|d| ix.document(d))
+                .find(|d| d.url == url)
+                .map(|d| d.attribution.clone())
+                .expect("document missing after a round trip")
+        };
+        assert_eq!(of(&back, "https://europepmc.org/article/MED/1"), "cc by-nc — Europe PMC, PMC1234567");
+        assert_eq!(of(&back, "https://example.com/page"), "", "a source with no stated terms should stay empty");
+    }
+
     #[test]
     fn stored_text_is_capped_without_splitting_a_character() {
         let mut ix = Index::new();

@@ -186,7 +186,8 @@ Current built-in tools:
 | `write_file` | Write | Create or overwrite a file |
 | `edit_file` | Write | Replace an exact string |
 | `shell_exec` | Execute | Run shell commands through a PTY/streaming path |
-| `web_search` | Execute | DuckDuckGo web search via curl |
+| `web_search` | Execute | Search pages Forge crawled and indexed itself (`forge-search`) |
+| `search_papers` | Execute | Europe PMC literature search; indexes open-access full text with its licence |
 | `web_fetch` | Execute | Web page extraction with LLM summarization |
 | `ask_question` | Read | Ask structured user questions |
 | `delegate_task` | Execute | Spawn parallel subagents |

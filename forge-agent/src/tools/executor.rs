@@ -135,7 +135,7 @@ impl ToolExecutor {
             "enter_plan_mode" => ToolKind::Execute,
             "apply_patch" => ToolKind::Write, // <-- FIX: Added apply_patch
             "write_file" | "edit_file" => ToolKind::Write,
-            "web_search" | "web_fetch" => ToolKind::Execute,
+            "web_search" | "web_fetch" | "search_papers" => ToolKind::Execute,
             "shell_exec" | "delegate_task" => ToolKind::Execute,
             _ => ToolKind::Unknown,
         }
@@ -238,6 +238,13 @@ impl ToolExecutor {
             // The engine in `forge-search`, not a scrape of someone else's
             // results page. Indexed per workspace, so the pages an agent has
             // read for this project stay with the project.
+            "search_papers" => {
+                crate::tools::papers::search_papers(
+                    args,
+                    crate::tools::papers::index_path(&self.project_root),
+                )
+                .await
+            }
             "web_search" => {
                 crate::tools::search::web_search(args, crate::tools::search::index_path(&self.project_root)).await
             }

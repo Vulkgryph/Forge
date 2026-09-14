@@ -4,6 +4,22 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **`search_papers` — the biomedical literature, through the channel published for it.** PubMed Central's `robots.txt` is `User-agent: *` / `Disallow: /`, so the primary literature cannot be crawled. That is why the engine answered nothing for a question about a measured value at a stated temperature: those numbers are in Methods sections, and no amount of crawling encyclopaedias reaches one.
+
+  The new tool asks Europe PMC's REST API, which is the documented programmatic channel and on a different host from the website. It searches, fetches the full text of articles whose licence permits keeping it, indexes that, and answers from it. Anything not open access comes back as a citation and a link, and the result says so rather than leaving the model to assume there was nothing.
+
+  Only open-access articles have their text kept — more conservative than necessary, on purpose, because it is one sentence to state and one condition to audit. Every result reports the licence its text is held under: `cc by` wants attribution, `cc by-nc` excludes commercial use, and the index now carries that with the document so it survives a save.
+
+  Measured live: 2,636 matching articles, 9 examined, 3 indexed, 1 refused on licence, in 3.4 seconds. It then answers out of a Methods section — "We performed electrophysiological recordings at room temperature (20°C–25°C), but the recording chamber might be heated to near-physiological temperatures using a bath-controller" — which is what none of this could do before.
+
+### Changed
+
+- **`web_search` is on by default, and no longer describes itself as broken.** Its schema still told the model it scraped DuckDuckGo and was "UNRELIABLE", with instructions not to retry. All true of the scrape; none of it true of the index Forge now crawls itself, and left in place it steered the model away from a tool that works. The description now says what the tool is, and documents `sites` and `max_pages` — which existed and were undocumented, so the model could not aim a crawl.
+
+  The config default that disabled it is gone too; its own note said "off until there is a real search behind it", and there is. This reaches fresh installs only: the app serialises `disabled_tools`, so anyone who has run Forge before has `["web_search"]` on disk, which is indistinguishable from having chosen it and is therefore left alone. The tools menu turns it back on.
+
 ## [0.4.2] — 2026-09-14
 
 ### Fixed

@@ -4459,6 +4459,8 @@ pub struct IdeApp {
     crawling: Option<crate::websearch::Crawling>,
     /// The site the search page will crawl, as typed.
     crawl_seed: String,
+    /// A single word being probed as a hostname, when it found nothing here.
+    guessing: Option<crate::websearch::Guessing>,
     /// Where the shared web view should be this frame, and what it should
     /// show. `None` means hide it.
     ///
@@ -4959,6 +4961,7 @@ impl IdeApp {
             browser_commands: Vec::new(),
             crawling: None,
             crawl_seed: String::new(),
+            guessing: None,
             active:          0,
             terminal_tabs:   vec![TerminalTab::new(&cwd)],
             terminal_active: 0,
@@ -6273,6 +6276,7 @@ impl IdeApp {
         self.drain_browser_events();
         // And any crawl the search page started.
         self.poll_crawl();
+        self.poll_guess(ctx);
 
         // Keep the window's title current. Sent only when it changes: a
         // viewport command every frame would be a platform round-trip 60 times
@@ -15021,6 +15025,58 @@ impl IdeApp {
                                 );
                             }
                             None => {
+                                // A word that looks like a site's name gets
+                                // offered before the page asks for one — the
+                                // answer to "microsoft" is microsoft.com, and
+                                // making somebody type it out would be silly.
+                                if let Some(guess) = &self.guessing {
+                                    if !guess.found.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{:?} looks like a site:",
+                                                guess.word,
+                                            ))
+                                            .size(12.0)
+                                            .color(self.palette.default_fg_c()),
+                                        );
+                                        for url in &guess.found {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .button(format!("Open {url}"))
+                                                    .clicked()
+                                                {
+                                                    commands.push(BrowserCommand::Go(
+                                                        url.clone(),
+                                                    ));
+                                                }
+                                                if ui
+                                                    .button("Read it")
+                                                    .on_hover_text(
+                                                        "Crawls it into the index, so this \
+                                                         search and later ones answer from it.",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    commands.push(BrowserCommand::Crawl {
+                                                        query: tab.searched.clone(),
+                                                        seed: url.clone(),
+                                                    });
+                                                }
+                                            });
+                                        }
+                                        ui.add_space(10.0);
+                                    } else if !guess.done {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "checking whether {:?} is a site…",
+                                                guess.word,
+                                            ))
+                                            .size(11.0)
+                                            .color(self.palette.comment_c()),
+                                        );
+                                        ui.add_space(6.0);
+                                    }
+                                }
                                 ui.label(
                                     egui::RichText::new(
                                         "Forge reads where you point it — it has no index of \
@@ -15108,9 +15164,21 @@ impl IdeApp {
                 }
             })
             .collect();
+        let empty = tab.results.is_empty();
         tab.searched = query.to_string();
         tab.index_pages = pages;
         tab.mode = crate::buffer::BrowserMode::Home;
+
+        // A single word that found nothing here might simply be a site's name.
+        // "microsoft" is answered by microsoft.com, which needs no index of
+        // the web — only the domain name system. A phrase is not a hostname,
+        // so it is not guessed at: probing a mangled "ford 8n engine oil"
+        // would send requests to whatever happens to be registered there.
+        let worth_guessing = empty
+            && !query.trim().is_empty()
+            && !query.trim().contains(char::is_whitespace)
+            && !query.contains('.');
+        self.guessing = worth_guessing.then(|| crate::websearch::guess(query.trim()));
     }
 
     /// Act on a toolbar press.
@@ -15155,6 +15223,18 @@ impl IdeApp {
             return;
         }
         self.browser_commands.push(command);
+    }
+
+    /// Look in on a hostname guess.
+    ///
+    /// Only to keep drawing while it runs; the results are read straight off
+    /// the struct when the page is drawn.
+    fn poll_guess(&mut self, ctx: &egui::Context) {
+        let Some(guess) = self.guessing.as_mut() else { return };
+        if !guess.poll() {
+            // Two requests with a six-second timeout, so worth repainting for.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Look in on a running crawl, and search again when it finishes.

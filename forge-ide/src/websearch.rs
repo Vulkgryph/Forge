@@ -285,3 +285,138 @@ mod tests {
         assert!(!USER_AGENT.to_lowercase().contains("mozilla"), "a crawler must not pretend");
     }
 }
+
+// ── Guessing a site from a word ──────────────────────────────────────────────
+
+/// Domain endings tried when a single word finds nothing.
+///
+/// Two, in this order, because the point is to answer "microsoft" with
+/// microsoft.com rather than to enumerate the domain name system. More endings
+/// means more requests to sites nobody asked about.
+const ENDINGS: [&str; 2] = ["com", "org"];
+
+/// Sites a word might name, being probed.
+pub struct Guessing {
+    pub word: String,
+    /// Addresses that answered, in the order the endings are tried.
+    pub found: Vec<String>,
+    pub done: bool,
+    rx: Receiver<Option<String>>,
+}
+
+impl Guessing {
+    /// Collect whatever has answered. True when every ending has reported.
+    pub fn poll(&mut self) -> bool {
+        while let Ok(result) = self.rx.try_recv() {
+            match result {
+                Some(url) => self.found.push(url),
+                // A sentinel for "that was the last one", so the caller can
+                // stop saying "looking" without counting replies itself.
+                None => self.done = true,
+            }
+        }
+        self.done
+    }
+}
+
+/// Probe `word` as a hostname.
+///
+/// This is how a browser answered a single word before the address bar became
+/// a search box: microsoft.com exists, and the domain name system will say so
+/// without anybody holding an index of the web. It costs two requests and
+/// needs no upstream service, which is why it is here and a search engine is
+/// not.
+///
+/// What it deliberately does not do is guess at phrases. "ford 8n engine oil"
+/// is not a hostname and no amount of trying will make it one — that case
+/// wants a site named, which the page asks for.
+pub fn guess(word: &str) -> Guessing {
+    let (tx, rx) = mpsc::channel();
+    let word_owned = word.to_string();
+    std::thread::Builder::new()
+        .name("forge-guess".into())
+        .spawn(move || {
+            for ending in ENDINGS {
+                let url = format!("https://{word_owned}.{ending}");
+                if answers(&url) {
+                    let _ = tx.send(Some(url));
+                }
+            }
+            let _ = tx.send(None);
+            crate::wake::wake();
+        })
+        .ok();
+
+    Guessing {
+        word: word.to_string(),
+        found: Vec::new(),
+        done: false,
+        rx,
+    }
+}
+
+/// Whether there is a working site at `url`.
+///
+/// A success or a redirect counts; anything else does not. That matters more
+/// than it sounds: `rust.com` answers 500 and `rust.org` does not resolve at
+/// all, so a word can have a registered domain with nothing behind it, and
+/// offering that as the answer would be worse than offering nothing.
+///
+/// `HEAD`, so a probe of a site nobody asked about costs headers rather than a
+/// page. A server that refuses `HEAD` is treated as not answering, which is
+/// the conservative way round.
+fn answers(url: &str) -> bool {
+    match ureq::head(url)
+        .set("User-Agent", USER_AGENT)
+        .timeout(std::time::Duration::from_secs(6))
+        .call()
+    {
+        Ok(response) => (200..400).contains(&response.status()),
+        // A status error carries a response; 500 and 404 are answers that mean
+        // "not a site worth offering".
+        Err(ureq::Error::Status(code, _)) => (200..400).contains(&code),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod guess_tests {
+    use super::*;
+
+    /// Two endings, in an order — `.com` before `.org`, since the case this
+    /// exists for is a company name.
+    #[test]
+    fn com_is_tried_before_org() {
+        assert_eq!(ENDINGS, ["com", "org"]);
+    }
+
+    /// A phrase is not a hostname, and the caller must not ask.
+    ///
+    /// Asserted here rather than left to the caller because the failure is
+    /// silent and rude: probing "ford 8n engine oil" would send requests to
+    /// whatever happens to be registered at a mangled version of it.
+    #[test]
+    fn only_a_single_word_is_worth_guessing() {
+        let worth = |q: &str| {
+            let q = q.trim();
+            !q.is_empty() && !q.contains(char::is_whitespace) && !q.contains('.')
+        };
+        assert!(worth("microsoft"));
+        assert!(worth("kubernetes"));
+        assert!(!worth("ford 8n engine oil"));
+        assert!(!worth("example.com"), "an address is not a guess");
+        assert!(!worth(""));
+    }
+
+    /// Only a working site counts. Measured: `rust.com` answers 500 and
+    /// `rust.org` does not resolve, so a registered domain with nothing behind
+    /// it must not be offered as the answer.
+    #[test]
+    fn only_success_or_redirect_counts_as_a_site() {
+        let counts = |code: u16| (200..400).contains(&code);
+        assert!(counts(200));
+        assert!(counts(301));
+        assert!(!counts(404));
+        assert!(!counts(500));
+    }
+}

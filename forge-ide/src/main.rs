@@ -5,6 +5,9 @@ mod dap;
 #[cfg(target_os = "macos")]
 mod dock_install;
 mod dock_menu;
+mod websearch;
+#[cfg(target_os = "macos")]
+mod webview;
 #[cfg(feature = "vulkan-renderer")]
 mod egui_pass;
 mod filetree;
@@ -429,6 +432,26 @@ struct IdeWindow {
     #[cfg(not(feature = "vulkan-renderer"))]
     egui:   gfx_wgpu::WgpuPass,
     app:    IdeApp,
+    /// The window's shared web view, created the first time a browser tab
+    /// wants one.
+    ///
+    /// One per window rather than one per tab: each is a content process, and
+    /// a tab that is not showing is a tab whose page nobody is looking at.
+    /// Lazily created so a session that never opens one pays nothing.
+    #[cfg(target_os = "macos")]
+    webview: Option<webview::WebView>,
+    /// What the web view was last told to load, so it is not reloaded every
+    /// frame — `loadRequest:` on the page already showing would throw away
+    /// whatever the person had done on it.
+    #[cfg(target_os = "macos")]
+    webview_url: Option<String>,
+    /// The last page the browser finished loading.
+    ///
+    /// Kept rather than consumed, because "send this to the agent" is a button
+    /// pressed some time after the page loaded — the delivery happens on
+    /// navigation and the decision to share happens when the person decides.
+    #[cfg(target_os = "macos")]
+    last_page: Option<webview::LoadedPage>,
     /// Closed by the user but not yet removed from the vec.
     closing: bool,
     /// Earliest time anything asked to be repainted again, captured via
@@ -441,7 +464,127 @@ struct IdeWindow {
     next_repaint: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
+/// AppKit's y, from egui's.
+///
+/// egui measures points down from the top of the window; AppKit measures them
+/// up from the bottom, and a view's frame origin is its *bottom* left corner.
+/// So the distance from the bottom of the window to the bottom of the
+/// rectangle is the window's height less the rectangle's lower edge.
+///
+/// Its own function because getting it wrong does not look like a small
+/// offset — it puts the browser off the bottom of the window, or above the
+/// top, where it is indistinguishable from not having been created at all.
+#[cfg(target_os = "macos")]
+fn appkit_y(window_height_points: f64, rect_bottom_from_top: f64) -> f64 {
+    window_height_points - rect_bottom_from_top
+}
+
 impl IdeWindow {
+    /// Position, show or hide the window's web view for this frame.
+    ///
+    /// The app records where a browser tab wants the view and the window puts
+    /// it there, because the native view belongs to the window. Called after
+    /// every frame, and the `None` case matters as much as the `Some` one: a
+    /// frame that drew no browser tab hides the view, or it stays floating
+    /// over whatever the person switched to.
+    #[cfg(target_os = "macos")]
+    fn place_webview(&mut self) {
+        // Commands first, and unconditionally.
+        //
+        // They were drained after the placement guard, which meant a frame
+        // showing Forge's own results page — no placement, so an early return
+        // — never applied them. Clicking a result did nothing and the queue
+        // grew. Toolbar presses are not contingent on a browser being visible:
+        // the one that navigates is precisely the one that makes it visible.
+        let commands = self.app.take_browser_commands();
+        for command in &commands {
+            match command {
+                // Both resolved in the app, which knows what was typed and
+                // owns the crawl.
+                crate::app::BrowserCommand::Go(_) => {}
+                crate::app::BrowserCommand::Crawl { .. } => {}
+                crate::app::BrowserCommand::Back => {
+                    if let Some(view) = &self.webview {
+                        view.go_back();
+                    }
+                }
+                crate::app::BrowserCommand::Forward => {
+                    if let Some(view) = &self.webview {
+                        view.go_forward();
+                    }
+                }
+                crate::app::BrowserCommand::Reload => {
+                    if let Some(view) = &self.webview {
+                        view.reload();
+                    }
+                }
+                crate::app::BrowserCommand::Share => {
+                    if let Some(page) = self.last_page.clone() {
+                        self.app.share_browser_page(&page.url, &page.html);
+                    }
+                }
+            }
+        }
+
+        let Some(place) = self.app.take_browser_placement() else {
+            if let Some(view) = &self.webview {
+                view.set_visible(false);
+            }
+            return;
+        };
+
+        if self.webview.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let Ok(handle) = self.window.window_handle() else { return };
+            let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return };
+            let Some(mtm) = objc2_foundation::MainThreadMarker::new() else { return };
+            // Safe to fail: without a browser the handoff simply declines, the
+            // same way a terminal does.
+            self.webview =
+                unsafe { webview::WebView::attach(appkit.ns_view.as_ptr(), mtm) };
+        }
+        let Some(view) = &self.webview else { return };
+
+        // Pages the browser finished loading. Kept, not consumed: sharing is a
+        // button pressed later.
+        if let Some(page) = webview::take_pages().pop() {
+            self.last_page = Some(page);
+        }
+
+        // Tell the tab where the browser actually got to — following a link or
+        // clearing a bot check moves it without the tab having asked.
+        let editing = self.egui.ctx.memory(|m| m.focused().is_some());
+        if let Some(at) = view.url() {
+            self.app.browser_moved(&at, view.can_go_back(), view.can_go_forward(), editing);
+        }
+
+        // egui measures in points from the top-left; AppKit from the
+        // bottom-left. The window's height in points is what converts them,
+        // and getting this wrong puts the browser off-screen rather than
+        // slightly askew — so it is worth stating: `y` is the distance from
+        // the bottom of the window to the *bottom* of the rectangle.
+        let scale = self.window.scale_factor();
+        let height_points = self.window.inner_size().height as f64 / scale;
+        let y = appkit_y(height_points, place.rect.max.y as f64);
+
+        view.place(
+            place.rect.min.x as f64,
+            y,
+            place.rect.width() as f64,
+            place.rect.height() as f64,
+        );
+        view.set_visible(true);
+
+        // Only when it changes. `loadRequest:` on the page already showing
+        // would discard whatever the person had done on it — including a bot
+        // check they had just cleared.
+        if self.webview_url.as_deref() != Some(place.url.as_str()) {
+            if view.load(&place.url) {
+                self.webview_url = Some(place.url);
+            }
+        }
+    }
+
     /// `shared` holds the process-wide Vulkan instance/device and egui
     /// pipeline once the first window has created them — every window after
     /// the first reuses them instead of paying MoltenVK's instance/device
@@ -547,9 +690,17 @@ impl IdeWindow {
         }
 
         #[cfg(feature = "vulkan-renderer")]
-        return Some(IdeWindow { id, window, gfx, egui, app, closing: false, next_repaint });
+        return Some(IdeWindow { id, window, gfx, egui, app,
+            #[cfg(target_os = "macos")] webview: None,
+            #[cfg(target_os = "macos")] webview_url: None,
+            #[cfg(target_os = "macos")] last_page: None,
+            closing: false, next_repaint });
         #[cfg(not(feature = "vulkan-renderer"))]
-        return Some(IdeWindow { id, window, egui, app, closing: false, next_repaint });
+        return Some(IdeWindow { id, window, egui, app,
+            #[cfg(target_os = "macos")] webview: None,
+            #[cfg(target_os = "macos")] webview_url: None,
+            #[cfg(target_os = "macos")] last_page: None,
+            closing: false, next_repaint });
     }
 
     /// Renders one frame and returns the earliest time (if any) this frame's
@@ -584,6 +735,13 @@ impl IdeWindow {
                 self.gfx.end_frame(cmd, img_idx);
             }
         }
+        // Put the native web view where this frame's browser tab asked for it.
+        //
+        // After the frame rather than during: the app computes the rectangle
+        // and the window owns the view. Same iteration, so there is no lag.
+        #[cfg(target_os = "macos")]
+        self.place_webview();
+
 
         #[cfg(not(feature = "vulkan-renderer"))]
         {
@@ -595,6 +753,14 @@ impl IdeWindow {
             let window = Arc::clone(&self.window);
             self.egui.present(&window, full_output, ppp);
         }
+
+        // Put the native web view where this frame's browser tab asked for it.
+        //
+        // After the frame rather than during: the app computes the rectangle
+        // and the window owns the view. Same iteration, so there is no lag.
+        #[cfg(target_os = "macos")]
+        self.place_webview();
+
 
         self.next_repaint.lock().unwrap().take()
     }
@@ -1285,6 +1451,32 @@ fn main() {
 
 #[cfg(test)]
 mod startup_tests {
+    /// The coordinate flip, with numbers.
+    ///
+    /// A browser tab occupying the lower two thirds of an 800-point window —
+    /// tab strip and toolbar above it — sits 0 points from the bottom and is
+    /// 600 tall. Getting the flip backwards would put it 200 from the bottom
+    /// and hang it off the top.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_browser_sits_where_egui_put_it() {
+        // egui rect: top edge 200, bottom edge 800, in an 800-point window.
+        assert_eq!(super::appkit_y(800.0, 800.0), 0.0);
+        // A panel not reaching the bottom: top 100, bottom 500.
+        assert_eq!(super::appkit_y(800.0, 500.0), 300.0);
+        // Filling the window.
+        assert_eq!(super::appkit_y(600.0, 600.0), 0.0);
+    }
+
+    /// A rectangle taller than the window yields a negative origin rather
+    /// than a panic, which AppKit clips — the honest outcome for a layout that
+    /// does not fit.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_oversized_rectangle_does_not_panic() {
+        assert_eq!(super::appkit_y(400.0, 900.0), -500.0);
+    }
+
     use super::*;
     use std::path::PathBuf;
 

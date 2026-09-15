@@ -51,6 +51,7 @@ enum OutgoingMsg {
     ToggleAutoMode,
     UpdateEndpointReasoning { endpoint_name: String, reasoning: serde_json::Value },
     AnswerQuestion { answer: String },
+    BrowserResult { request_id: String, final_url: String, html: String },
     ApprovePlan,
     RejectPlan { feedback: String },
     ClearAndApprovePlan,
@@ -190,6 +191,18 @@ pub enum AgentMsg {
         #[serde(default)] question: String,
         #[serde(default)] tool_id: String,
         #[serde(default)] items: Vec<QuestionItem>,
+    },
+    /// A page a bot check refused, which a person could open in the browser
+    /// tab. Not waited on — see the agent's `BrowserRequest`.
+    BrowserRequest {
+        #[serde(default)] request_id: String,
+        #[serde(default)] url: String,
+        #[serde(default)] refused_by: String,
+    },
+    /// That request no longer matters; the turn ended.
+    BrowserRequestWithdrawn {
+        #[serde(default)] request_id: String,
+        #[serde(default)] reason: String,
     },
     ProcessInputNeeded {
         #[serde(default)] prompt: String,
@@ -894,7 +907,22 @@ fn find_subagent_items_mut<'a>(items: &'a mut [ChatItem], id: &str) -> Option<&'
     }
 }
 
+/// Something the agent said about a page a bot check refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserEvent {
+    /// Open this, if you would.
+    Asked { request_id: String, url: String, refused_by: String },
+    /// Never mind — the turn ended, or the agent managed without it.
+    Withdrawn { request_id: String },
+}
+
 pub struct AgentSession {
+    /// Pages the agent asked a person to open, and requests it has withdrawn.
+    ///
+    /// The session cannot open a tab — it has no handle on the editor — so it
+    /// records and the app drains. Withdrawals ride the same queue so they
+    /// cannot overtake the request they cancel.
+    pub browser_events: Vec<BrowserEvent>,
     child:        Option<Child>,
     /// Where messages to the agent go. Boxed rather than a `ChildStdin`: the
     /// agent is a local subprocess when the workspace is local and an SSH exec
@@ -1114,6 +1142,7 @@ impl AgentSession {
                 usage:     UsageSnapshot::default(),
                 auto_mode:   false,
                 request_input_focus: false,
+            browser_events: Vec::new(),
             }
     }
 
@@ -1164,6 +1193,7 @@ impl AgentSession {
                 tool_pulses: 0,
                 auto_mode:   false,
                 request_input_focus: false,
+            browser_events: Vec::new(),
         }
     }
 
@@ -1261,6 +1291,7 @@ impl AgentSession {
                 tool_pulses: 0,
                 auto_mode:   false,
                 request_input_focus: false,
+                browser_events: Vec::new(),
             },
             Err(e) => Self {
                 child: None, stdin: None, rx,
@@ -1290,6 +1321,7 @@ impl AgentSession {
                 usage:     UsageSnapshot::default(),
                 auto_mode:   false,
                 request_input_focus: false,
+                browser_events: Vec::new(),
             },
         };
         if mode == crate::settings::AgentPermissionMode::AutoApprove {
@@ -1556,6 +1588,20 @@ impl AgentSession {
                     *s = summary;
                 }
             }
+            AgentMsg::BrowserRequest { request_id, url, refused_by } => {
+                self.items.push(ChatItem::Assistant {
+                    text: format!(
+                        "[{url} was refused by a bot check ({refused_by}). It is open in a \
+                         browser tab — clear the check, then press “Send to agent” to hand \
+                         it over.]"
+                    ),
+                    done: true,
+                });
+                self.browser_events.push(BrowserEvent::Asked { request_id, url, refused_by });
+            }
+            AgentMsg::BrowserRequestWithdrawn { request_id, .. } => {
+                self.browser_events.push(BrowserEvent::Withdrawn { request_id });
+            }
             AgentMsg::QuestionRequest { question, tool_id, items } => {
                 let n = items.len();
                 self.items.push(ChatItem::Question {
@@ -1658,6 +1704,24 @@ impl AgentSession {
             }
             AgentMsg::Other => {}
         }
+    }
+
+    /// Hand a page the person opened in the browser to the agent.
+    ///
+    /// `request_id` is the handoff the agent asked for, or empty when a person
+    /// opened the browser on their own account and decided to share what they
+    /// found. The agent indexes it either way; the id is only how it knows
+    /// whether anything was waiting.
+    ///
+    /// Always from a button. A person browsing is not publishing every page
+    /// they visit to the agent, and that control is the reason the panel
+    /// exists.
+    pub fn send_browser_page(&mut self, request_id: &str, final_url: &str, html: &str) {
+        let _ = self.write(&OutgoingMsg::BrowserResult {
+            request_id: request_id.to_string(),
+            final_url: final_url.to_string(),
+            html: html.to_string(),
+        });
     }
 
     pub fn send_user(&mut self, content: String) {

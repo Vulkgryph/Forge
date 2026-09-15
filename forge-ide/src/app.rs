@@ -413,6 +413,8 @@ enum Cmd {
     ToggleTerminal, ToggleFileTree,
     QuickOpen,
     ReloadWindow, RestartWindow, RestartAll, Consolidate,
+    /// Open a browser tab. See `IdeApp::open_browser_tab`.
+    OpenBrowser,
     /// Index into PluginHost::commands.
     Plugin(usize),
 }
@@ -432,6 +434,10 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Restart This Window", "",           Cmd::RestartWindow),
     ("Restart All Windows", "",           Cmd::RestartAll),
     ("Collect All Windows Into One Process", "", Cmd::Consolidate),
+    // The agent opens one of these by itself when a bot check refuses it a
+    // page. This is how a person opens one on their own account — to look
+    // something up, and hand the page over if it turns out to matter.
+    ("New Browser Tab",  "",             Cmd::OpenBrowser),
 ];
 
 struct CmdPalette {
@@ -4443,6 +4449,25 @@ impl FindBar {
 pub struct IdeApp {
     file_tree:       FileTree,
     buffers:         Vec<Buffer>,
+    /// What the person asked the browser to do this frame, drained by the
+    /// event loop.
+    browser_commands: Vec<BrowserCommand>,
+    /// A crawl started from the search page, if one is running.
+    ///
+    /// One at a time per window: they are a page a second and two at once
+    /// would halve the courtesy owed to whichever host got both.
+    crawling: Option<crate::websearch::Crawling>,
+    /// The site the search page will crawl, as typed.
+    crawl_seed: String,
+    /// Where the shared web view should be this frame, and what it should
+    /// show. `None` means hide it.
+    ///
+    /// The app computes this and the event loop applies it, because the native
+    /// view belongs to the window and the window is not here. Cleared at the
+    /// start of every frame, so a frame that draws no browser tab hides the
+    /// view rather than leaving it floating over the editor — which is what
+    /// makes a stale value dangerous rather than merely wrong.
+    browser_placement: Option<BrowserPlacement>,
     active:          usize,
     terminal_tabs:   Vec<TerminalTab>,
     terminal_active: usize,
@@ -4771,6 +4796,117 @@ struct RemotePicker {
     typed:   String,
 }
 
+/// Something the person asked the browser to do.
+///
+/// Queued rather than done, for the same reason the placement is: the toolbar
+/// is drawn by the app and the browser belongs to the window. The event loop
+/// drains these after the frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserCommand {
+    /// Go to an address, or search for words.
+    ///
+    /// The distinction is made here rather than in the loop because it is a
+    /// question about what somebody typed, not about the browser.
+    Go(String),
+    Back,
+    Forward,
+    Reload,
+    /// Crawl a site with Forge's engine and answer the query from it.
+    ///
+    /// Carries the seed because the engine cannot find sites by content — see
+    /// `crate::websearch`. The person supplies the where; the engine does the
+    /// reading.
+    Crawl { query: String, seed: String },
+    /// Hand the page currently shown to the agent.
+    ///
+    /// Always explicit. A person navigating their own browser is not
+    /// automatically publishing every page they visit to the agent, and the
+    /// whole reason this panel exists is that they are in control of it.
+    Share,
+}
+
+/// Where a browser tab opened by hand starts: Forge's own search.
+///
+/// Empty rather than a URL, which is what puts the tab in
+/// `BrowserMode::Home` — the results page Forge draws itself, over the index
+/// it has been building. Opening onto another search engine would mean
+/// ignoring the one corpus this project has privileged access to.
+const BROWSER_START: &str = "";
+
+/// Where a typed search goes.
+///
+/// A person typing words into a browser is a person using a search engine,
+/// which raises none of the questions that crawling one does — the request is
+/// a browser's, made by a human, which is the intended use of the thing.
+///
+/// Substituted with the query percent-encoded.
+const SEARCH_TEMPLATE: &str = "https://duckduckgo.com/?q=";
+
+/// Whether what somebody typed is an address or something to search for.
+///
+/// Deliberately generous about addresses: `example.com` is one, and demanding
+/// a scheme would be pedantry aimed at the only people who would notice. A
+/// single word with a dot in it and no spaces is an address; anything with a
+/// space is a search.
+pub fn looks_like_address(typed: &str) -> bool {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return false;
+    }
+    if typed.starts_with("http://") || typed.starts_with("https://") {
+        return true;
+    }
+    if typed.contains(char::is_whitespace) {
+        return false;
+    }
+    // A dot with something either side of it, which "localhost:8080" does not
+    // have — but nor is it a search, so it is allowed through on the colon.
+    let host = typed.split('/').next().unwrap_or(typed);
+    let dotted = host
+        .split_once('.')
+        .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty());
+    dotted || host.contains(':')
+}
+
+/// The URL to load for something somebody typed.
+pub fn address_for(typed: &str) -> String {
+    let typed = typed.trim();
+    if !looks_like_address(typed) {
+        return format!("{SEARCH_TEMPLATE}{}", forge_search_encode(typed));
+    }
+    if typed.starts_with("http://") || typed.starts_with("https://") {
+        return typed.to_string();
+    }
+    format!("https://{typed}")
+}
+
+/// Percent-encode a query.
+///
+/// Written out rather than pulled in: `forge-search` has this, but the IDE
+/// does not depend on it and adding the dependency for one function would be
+/// the wrong trade.
+fn forge_search_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Where the shared web view goes this frame, and what it shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserPlacement {
+    /// In egui points, origin top-left — the event loop converts to AppKit's
+    /// bottom-left origin, which it can do because it has the window height.
+    pub rect: egui::Rect,
+    pub url: String,
+}
+
 impl IdeApp {
     /// The workspace folder, or `None` for a window with no folder open.
     ///
@@ -4822,6 +4958,10 @@ impl IdeApp {
             window_id,
             file_tree:       tree,
             buffers:         vec![],   // no untitled tab on startup
+            browser_placement: None,
+            browser_commands: Vec::new(),
+            crawling: None,
+            crawl_seed: String::new(),
             active:          0,
             terminal_tabs:   vec![TerminalTab::new(&cwd)],
             terminal_active: 0,
@@ -6129,6 +6269,12 @@ impl IdeApp {
             ctx.request_repaint();
             return;
         }
+
+        // Pages the agent has asked a person to open, before anything is laid
+        // out — so the tab exists this frame rather than next.
+        self.drain_browser_events();
+        // And any crawl the search page started.
+        self.poll_crawl();
 
         // Keep the window's title current. Sent only when it changes: a
         // viewport command every frame would be a platform round-trip 60 times
@@ -12232,6 +12378,7 @@ impl IdeApp {
             Cmd::OpenFolder    => self.open_folder_dialog(),
             Cmd::NewWindow     => { self.pending_new_window = Some(NewWindowSpec::default()); }
             Cmd::ToggleTerminal  => self.show_term  = !self.show_term,
+            Cmd::OpenBrowser     => self.open_browser_tab(BROWSER_START, None),
             Cmd::ToggleFileTree  => self.show_tree  = !self.show_tree,
             Cmd::QuickOpen       => self.open_quick_open(),
             Cmd::ReloadWindow    => self.reload_window(),
@@ -12611,6 +12758,13 @@ impl IdeApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_tree, "File Tree");
                     ui.checkbox(&mut self.show_term, "Terminal");
+                    ui.separator();
+                    // A browser tab is not a toggle like the two above — it is
+                    // a tab, and there can be several — so it is an action.
+                    if ui.button("New Browser Tab").clicked() {
+                        self.open_browser_tab(BROWSER_START, None);
+                        ui.close_menu();
+                    }
                 });
                 // Window, rather than more of File.
                 //
@@ -12826,6 +12980,12 @@ impl IdeApp {
         // ── Image tabs render as a preview; skip all editing machinery. ──────
         if self.buffers.get(self.active).map_or(false, |b| b.image_bytes.is_some()) {
             self.draw_image_view(ui);
+            return;
+        }
+
+        // ── Browser tabs hand their area to a real web view. ─────────────────
+        if self.buffers.get(self.active).map_or(false, |b| b.browser.is_some()) {
+            self.draw_browser_view(ui);
             return;
         }
 
@@ -14587,6 +14747,564 @@ impl IdeApp {
     }
 
     /// Render a read-only preview for an image tab, scaled to fit the pane.
+    /// A browser tab: reserve the area and let the native web view fill it.
+    ///
+    /// Nothing is painted into the rectangle. egui draws with the GPU and the
+    /// web view is an `NSView` on top of the window, so the two cannot
+    /// composite — whatever egui put here would be hidden anyway, and painting
+    /// a background would only show through while a page loads.
+    ///
+    /// The rectangle is recorded rather than used, because positioning the
+    /// native view needs the window. See `browser_placement`.
+    fn draw_browser_view(&mut self, ui: &mut egui::Ui) {
+        let Some(tab) = self.buffers.get(self.active).and_then(|b| b.browser.clone()) else {
+            return;
+        };
+
+        // The toolbar is egui, above the page. It has to be, since the web
+        // view is an opaque native rectangle — nothing can be drawn over it.
+        let mut bar = tab.bar.clone();
+        let mut commands: Vec<BrowserCommand> = Vec::new();
+        let toolbar_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
+        let full = ui.available_rect_before_wrap();
+        let toolbar_rect = egui::Rect::from_min_size(
+            full.min,
+            egui::vec2(full.width(), toolbar_height),
+        );
+
+        let mut toolbar = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(toolbar_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        toolbar
+            .painter()
+            .rect_filled(toolbar_rect, 0.0, self.palette.editor_bg_c());
+        toolbar.horizontal(|ui| {
+            if ui
+                .add_enabled(tab.can_back, egui::Button::new("←"))
+                .on_hover_text("Back")
+                .clicked()
+            {
+                commands.push(BrowserCommand::Back);
+            }
+            if ui
+                .add_enabled(tab.can_forward, egui::Button::new("→"))
+                .on_hover_text("Forward")
+                .clicked()
+            {
+                commands.push(BrowserCommand::Forward);
+            }
+            if ui.button("⟳").on_hover_text("Reload").clicked() {
+                commands.push(BrowserCommand::Reload);
+            }
+
+            // The share button before the address bar takes the remaining
+            // width, or it gets pushed off the edge on a narrow window.
+            let share = ui
+                .button("Send to agent")
+                .on_hover_text(
+                    "Hand this page to the agent. It is added to the search index, \
+                     so the agent can query it — nothing is sent until you click.",
+                );
+            if share.clicked() {
+                commands.push(BrowserCommand::Share);
+            }
+
+            let field = egui::TextEdit::singleline(&mut bar)
+                .hint_text("address, or words to search for")
+                .desired_width(ui.available_width());
+            if ui.add(field).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                commands.push(BrowserCommand::Go(bar.clone()));
+            }
+        });
+
+        // The page fills what is left — or Forge's own results do.
+        let page_rect = egui::Rect::from_min_max(
+            egui::pos2(full.min.x, toolbar_rect.max.y),
+            full.max,
+        );
+        match tab.mode {
+            crate::buffer::BrowserMode::Page => {
+                self.browser_placement = Some(BrowserPlacement {
+                    rect: page_rect,
+                    url: tab.url.clone(),
+                });
+            }
+            crate::buffer::BrowserMode::Home => {
+                // No placement, so the native view is hidden this frame and
+                // the results are drawn here instead. Forge's own page costs
+                // no browser at all.
+                self.draw_forge_results(ui, page_rect, &tab, &mut commands);
+            }
+        }
+        // Claimed so egui puts nothing else here and so scroll and click do
+        // not fall through to the editor underneath.
+        ui.allocate_rect(full, egui::Sense::hover());
+
+        if let Some(t) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) {
+            t.bar = bar;
+        }
+        // Applied after the borrow, since `Go` rewrites the tab's url.
+        for command in commands {
+            self.browser_command(command);
+        }
+    }
+
+    /// Forge's own results page, drawn by the editor.
+    ///
+    /// Not a web page and not in the browser — egui paints it, over the index
+    /// this project has been building. That is the point: the corpus Forge has
+    /// privileged access to is the one it crawled, and a browser that opened
+    /// onto somebody else's search engine would be ignoring it.
+    ///
+    /// It says how many pages the index holds, because that is the honest
+    /// measure of what a search here can possibly find, and because "no
+    /// results" means something very different at four pages than at six
+    /// hundred.
+    fn draw_forge_results(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        tab: &crate::buffer::BrowserTab,
+        commands: &mut Vec<BrowserCommand>,
+    ) {
+        let mut page = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        page.painter().rect_filled(rect, 0.0, self.palette.editor_bg_c());
+
+        egui::ScrollArea::vertical().show(&mut page, |ui| {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    if tab.searched.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Forge search")
+                                .size(20.0)
+                                .color(self.palette.default_fg_c()),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Searches the {} page(s) this project has crawled — not the web. \
+                                 Type words above to search them, or an address to go there.",
+                                tab.index_pages,
+                            ))
+                            .size(12.0)
+                            .color(self.palette.comment_c()),
+                        );
+                        return;
+                    }
+
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} result(s) for {:?}, from {} indexed page(s)",
+                            tab.results.len(),
+                            tab.searched,
+                            tab.index_pages,
+                        ))
+                        .size(12.0)
+                        .color(self.palette.comment_c()),
+                    );
+                    ui.add_space(8.0);
+
+                    if tab.results.is_empty() {
+                        // The distinction that matters: an empty index has not
+                        // failed to answer, it has nothing to answer from.
+                        let message = if tab.index_pages == 0 {
+                            "Nothing has been indexed for this project yet. The agent fills \
+                             this in when it searches — or press the button below to look on \
+                             the web."
+                        } else {
+                            "Nothing indexed matches that. The index only holds what has been \
+                             crawled, so this is as likely to mean the pages were never read \
+                             as that the words were wrong."
+                        };
+                        ui.label(
+                            egui::RichText::new(message)
+                                .size(12.0)
+                                .color(self.palette.comment_c()),
+                        );
+                        ui.add_space(10.0);
+                    }
+
+                    for hit in &tab.results {
+                        let title = if hit.title.is_empty() { &hit.url } else { &hit.title };
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(title).size(14.0).color(
+                                        self.palette.func_c(),
+                                    ),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(&hit.url)
+                            .clicked()
+                        {
+                            commands.push(BrowserCommand::Go(hit.url.clone()));
+                        }
+                        ui.label(
+                            egui::RichText::new(&hit.url)
+                                .size(11.0)
+                                .color(self.palette.string_c()),
+                        );
+                        if !hit.snippet.is_empty() {
+                            ui.label(
+                                egui::RichText::new(hit.snippet.replace('\n', " "))
+                                    .size(12.0)
+                                    .color(self.palette.default_fg_c()),
+                            );
+                        }
+                        // The licence, where the source stated one. Shown
+                        // because a passage quoted without its terms is a
+                        // passage quoted blind — the same reason the agent's
+                        // results carry it.
+                        if !hit.attribution.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&hit.attribution)
+                                    .size(10.0)
+                                    .color(self.palette.comment_c()),
+                            );
+                        }
+                        ui.add_space(12.0);
+                    }
+
+                    if !tab.crawl_note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&tab.crawl_note)
+                                .size(11.0)
+                                .color(self.palette.comment_c()),
+                        );
+                        ui.add_space(8.0);
+                    }
+
+                    // Reading a site with Forge's own engine.
+                    //
+                    // The seed is asked for because the engine cannot find
+                    // sites by their content — it reads where it is pointed.
+                    // That is what it is, and saying so here is better than an
+                    // empty results page implying the web was searched and
+                    // came back with nothing.
+                    if !tab.searched.is_empty() {
+                        ui.separator();
+                        ui.add_space(6.0);
+                        match &self.crawling {
+                            Some(crawl) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Reading {} — {} page(s) so far",
+                                        crawl.seed, crawl.pages,
+                                    ))
+                                    .size(12.0)
+                                    .color(self.palette.default_fg_c()),
+                                );
+                                if !crawl.last_url.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(&crawl.last_url)
+                                            .size(10.0)
+                                            .color(self.palette.comment_c()),
+                                    );
+                                }
+                                // A crawl is a page a second, so the window
+                                // has to keep drawing for the count to move.
+                                ui.ctx().request_repaint_after(
+                                    std::time::Duration::from_millis(250),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Forge reads where you point it — it has no index of \
+                                         the web to search. Name a site and it will read it \
+                                         and answer from that.",
+                                    )
+                                    .size(11.0)
+                                    .color(self.palette.comment_c()),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let field = egui::TextEdit::singleline(&mut self.crawl_seed)
+                                        .hint_text("site to read, e.g. doc.rust-lang.org")
+                                        .desired_width(260.0);
+                                    let typed = ui.add(field);
+                                    let entered = typed.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let pressed = ui
+                                        .button("Read this site")
+                                        .on_hover_text(
+                                            "Crawls the site with Forge's own engine, obeying \
+                                             robots.txt, about a page a second.",
+                                        )
+                                        .clicked();
+                                    if (entered || pressed) && !self.crawl_seed.trim().is_empty() {
+                                        commands.push(BrowserCommand::Crawl {
+                                            query: tab.searched.clone(),
+                                            seed: self.crawl_seed.trim().to_string(),
+                                        });
+                                    }
+                                });
+                                ui.add_space(8.0);
+                                // And the way out, still deliberate.
+                                let label =
+                                    format!("Search the web for {:?} instead", tab.searched);
+                                if ui.button(label).clicked() {
+                                    commands.push(BrowserCommand::Go(format!(
+                                        "{SEARCH_TEMPLATE}{}",
+                                        forge_search_encode(&tab.searched),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
+        });
+    }
+
+    /// Search Forge's own index, and show the results on Forge's own page.
+    ///
+    /// The index is the agent's: `.forge/search-index.bin`, holding whatever
+    /// has been crawled for this project and whatever articles were fetched
+    /// under a licence that allowed keeping them. So this searches what Forge
+    /// has actually read, which is a small corpus and a relevant one.
+    ///
+    /// Loaded per search rather than held open. It is a few tens of
+    /// milliseconds against a keystroke the person just made, it picks up
+    /// anything the agent has crawled since, and holding it would mean caring
+    /// about invalidation for no gain.
+    fn search_forge_index(&mut self, query: &str) {
+        let path = self.cwd.join(".forge").join("search-index.bin");
+        let index = forge_search::index::Index::load(&path).unwrap_or_else(|_| {
+            // No index yet is the ordinary case in a project where the agent
+            // has not searched anything. An empty one answers nothing, which
+            // the page then says plainly.
+            forge_search::index::Index::new()
+        });
+        let hits = forge_search::query::search(&index, query, 20);
+        let pages = index.len();
+
+        let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) else {
+            return;
+        };
+        tab.results = hits
+            .into_iter()
+            .map(|hit| {
+                let attribution = (0..index.len() as u32)
+                    .filter_map(|d| index.document(d))
+                    .find(|d| d.url == hit.url)
+                    .map(|d| d.attribution.clone())
+                    .unwrap_or_default();
+                crate::buffer::ForgeHit {
+                    title: hit.title,
+                    url: hit.url,
+                    snippet: hit.snippet,
+                    attribution,
+                }
+            })
+            .collect();
+        tab.searched = query.to_string();
+        tab.index_pages = pages;
+        tab.mode = crate::buffer::BrowserMode::Home;
+    }
+
+    /// Act on a toolbar press.
+    ///
+    /// `Go` is resolved here — an address is loaded and anything else is
+    /// searched for — because it is a question about what somebody typed
+    /// rather than about the browser. Everything else is passed through for
+    /// the event loop, which is where the browser is.
+    fn browser_command(&mut self, command: BrowserCommand) {
+        if let BrowserCommand::Go(typed) = &command {
+            // Words go to Forge's index, not out to the web. An address goes
+            // where it says. The one-click escape to a web search engine is on
+            // the results page, so leaving is deliberate rather than default.
+            if !looks_like_address(typed) {
+                let query = typed.clone();
+                self.search_forge_index(&query);
+                return;
+            }
+            let url = address_for(typed);
+            if let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) {
+                tab.url = url.clone();
+                tab.bar = url;
+                tab.mode = crate::buffer::BrowserMode::Page;
+                // A new page has not been handed over, whatever the last one's
+                // state was.
+                tab.handed_over = false;
+            }
+            return;
+        }
+        if let BrowserCommand::Crawl { query, seed } = &command {
+            // Not while one is already running: a page a second is a courtesy
+            // owed per host, and two crawls at once halve it for whichever
+            // host got both.
+            if self.crawling.is_none() {
+                let path = self.cwd.join(".forge").join("search-index.bin");
+                self.crawling = Some(crate::websearch::start(
+                    query,
+                    &address_for(seed),
+                    path,
+                ));
+            }
+            return;
+        }
+        self.browser_commands.push(command);
+    }
+
+    /// Look in on a running crawl, and search again when it finishes.
+    ///
+    /// Called each frame. Cheap when nothing is running, which is the usual
+    /// case.
+    fn poll_crawl(&mut self) {
+        let Some(crawl) = self.crawling.as_mut() else { return };
+        if !crawl.poll() {
+            return;
+        }
+        // Finished: search the index it just widened, and keep the message so
+        // the page can say what the crawl actually managed.
+        let query = crawl.query.clone();
+        let note = crawl.finished.clone().unwrap_or_default();
+        self.crawling = None;
+        self.search_forge_index(&query);
+        if let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) {
+            tab.crawl_note = note;
+        }
+    }
+
+    /// Hand a page to the agent, and say so in the tab.
+    ///
+    /// Returns the request the agent was waiting for, if any, so the caller
+    /// knows whether this satisfied a handoff or was somebody sharing
+    /// something they found.
+    pub fn share_browser_page(&mut self, at: &str, html: &str) -> bool {
+        // The tab the person is looking at, not the first one — a window can
+        // have several conversations and the page belongs to the one they are
+        // working in.
+        let index = self.agent_active;
+        if index >= self.agent_tabs.len() {
+            return false;
+        }
+        let request_id = self
+            .buffers
+            .get(self.active)
+            .and_then(|b| b.browser.as_ref())
+            .and_then(|t| t.request_id.clone())
+            .unwrap_or_default();
+
+        self.agent_tabs[index]
+            .session
+            .send_browser_page(&request_id, at, html);
+
+        if let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) {
+            tab.handed_over = true;
+            // Satisfied, so a later share is a fresh unsolicited one rather
+            // than answering a request twice.
+            tab.request_id = None;
+        }
+        true
+    }
+
+    /// Open tabs for pages the agent asked about, and close the ones it
+    /// withdrew.
+    ///
+    /// Drained each frame from every conversation, because the session records
+    /// and cannot open a tab itself.
+    ///
+    /// A withdrawn request does not close the tab. The agent no longer needs
+    /// the page, but a person may be halfway through clearing a bot check on
+    /// it and having the tab vanish underneath them would be its own small
+    /// betrayal — the request is simply no longer marked as outstanding, so
+    /// sharing becomes an ordinary share rather than an answer.
+    fn drain_browser_events(&mut self) {
+        let mut events = Vec::new();
+        for tab in &mut self.agent_tabs {
+            events.append(&mut tab.session.browser_events);
+        }
+        for event in events {
+            match event {
+                crate::agent_panel::BrowserEvent::Asked { request_id, url, .. } => {
+                    self.open_browser_tab(&url, Some(request_id));
+                }
+                crate::agent_panel::BrowserEvent::Withdrawn { request_id } => {
+                    for buf in &mut self.buffers {
+                        if let Some(tab) = buf.browser.as_mut() {
+                            if tab.request_id.as_deref() == Some(request_id.as_str()) {
+                                tab.request_id = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take this frame's browser commands, for the event loop to apply.
+    pub fn take_browser_commands(&mut self) -> Vec<BrowserCommand> {
+        std::mem::take(&mut self.browser_commands)
+    }
+
+    /// Tell the active browser tab where the browser actually is.
+    ///
+    /// Called by the event loop, because only it can ask. Kept out of the bar
+    /// while somebody is typing in it, which is the difference between a bar
+    /// that tracks the page and one that fights the person.
+    pub fn browser_moved(&mut self, at: &str, can_back: bool, can_forward: bool, editing: bool) {
+        let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) else {
+            return;
+        };
+        // Only while a page is actually showing. The web view keeps the last
+        // URL it loaded even while hidden, so on Forge's own results page this
+        // would put a stale address in the bar — over the query the person is
+        // looking at results for.
+        if tab.mode != crate::buffer::BrowserMode::Page {
+            return;
+        }
+        tab.can_back = can_back;
+        tab.can_forward = can_forward;
+        if tab.at != at {
+            tab.at = at.to_string();
+            if !editing {
+                tab.bar = at.to_string();
+            }
+        }
+    }
+
+    /// Take this frame's browser placement, for the event loop to apply.
+    pub fn take_browser_placement(&mut self) -> Option<BrowserPlacement> {
+        self.browser_placement.take()
+    }
+
+    /// Open a web page in a tab, or focus the tab already showing it.
+    ///
+    /// `request_id` marks a page the agent asked for after a bot check refused
+    /// it; `None` is a person opening the browser themselves.
+    pub fn open_browser_tab(&mut self, url: &str, request_id: Option<String>) {
+        if let Some(i) = self
+            .buffers
+            .iter()
+            .position(|b| b.browser.as_ref().is_some_and(|t| t.url == url))
+        {
+            self.active = i;
+            // A second request for the same page updates what it is waiting
+            // for rather than opening another tab.
+            if let Some(tab) = self.buffers[i].browser.as_mut() {
+                if request_id.is_some() {
+                    tab.request_id = request_id;
+                    tab.handed_over = false;
+                }
+            }
+            return;
+        }
+        self.buffers.push(Buffer::browser_tab(url, request_id));
+        self.active = self.buffers.len() - 1;
+    }
+
     fn draw_image_view(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, self.palette.editor_bg_c());
@@ -17901,6 +18619,48 @@ mod reload_cost_probe {
 mod command_palette_tests {
     use super::COMMANDS;
 
+    /// A browser tab opened by hand starts on Forge's own search, not on
+    /// somebody else's.
+    ///
+    /// The start page is empty precisely so the tab is in `Home` mode. A URL
+    /// here — which is what it used to be — would open the browser onto
+    /// another search engine and quietly ignore the one index this project
+    /// has privileged access to.
+    #[test]
+    fn a_new_browser_tab_starts_on_forge_search() {
+        assert!(
+            super::BROWSER_START.is_empty(),
+            "a new tab opens on {:?} rather than Forge's own search",
+            super::BROWSER_START,
+        );
+        let tab = crate::buffer::Buffer::browser_tab(super::BROWSER_START, None);
+        let browser = tab.browser.expect("a browser tab");
+        assert_eq!(browser.mode, crate::buffer::BrowserMode::Home);
+        assert!(browser.bar.is_empty(), "the address bar should start empty");
+    }
+
+    /// And a tab opened onto a page shows the page.
+    #[test]
+    fn a_tab_opened_onto_a_page_shows_it() {
+        let tab = crate::buffer::Buffer::browser_tab("https://example.test/x", None);
+        let browser = tab.browser.expect("a browser tab");
+        assert_eq!(browser.mode, crate::buffer::BrowserMode::Page);
+        assert_eq!(browser.bar, "https://example.test/x");
+    }
+
+    /// The browser is reachable by typing its name, not only from a menu.
+    ///
+    /// It is also on the View menu, but a command that exists only there is
+    /// one that has to be found by hunting — and this one is new enough that
+    /// nobody knows where it lives.
+    #[test]
+    fn the_browser_is_in_the_palette() {
+        assert!(
+            COMMANDS.iter().any(|(t, _, _)| *t == "New Browser Tab"),
+            "the browser cannot be opened by typing its name",
+        );
+    }
+
     /// Everything on the Window menu is typeable too. A command reachable only by
     /// hunting through menus is one that has to be remembered by position.
     #[test]
@@ -18322,6 +19082,52 @@ mod auto_save_tests {
     /// an image are read-only views, and a remote buffer's path belongs to
     /// another machine — writing it here would create or overwrite a local file
     /// of that name.
+    /// An address goes to the address; words go to a search.
+    ///
+    /// The generosity is deliberate — `example.com` is an address, and
+    /// demanding a scheme would only inconvenience the people who notice.
+    #[test]
+    fn typed_addresses_are_told_from_typed_searches() {
+        for address in [
+            "https://example.com",
+            "http://example.com/page",
+            "example.com",
+            "docs.rs/serde",
+            "localhost:8080",
+            "127.0.0.1:3000/x",
+        ] {
+            assert!(super::looks_like_address(address), "{address:?} is an address");
+        }
+        for search in [
+            "ford 8n engine oil",
+            "what oil",
+            "rust no_std allocator",
+            "",
+            "   ",
+        ] {
+            assert!(!super::looks_like_address(search), "{search:?} is a search");
+        }
+    }
+
+    /// A bare host gets a scheme; a search gets encoded into the query.
+    #[test]
+    fn an_address_is_completed_and_a_search_is_encoded() {
+        assert_eq!(super::address_for("example.com"), "https://example.com");
+        assert_eq!(super::address_for("https://example.com"), "https://example.com");
+        assert_eq!(super::address_for("  example.com  "), "https://example.com");
+
+        let searched = super::address_for("ford 8n oil");
+        assert!(searched.starts_with("https://duckduckgo.com/?q="), "{searched}");
+        assert!(searched.ends_with("ford%208n%20oil"), "{searched}");
+    }
+
+    /// The characters that would break a query string cannot survive in one.
+    #[test]
+    fn a_search_cannot_break_out_of_the_query() {
+        let searched = super::address_for("a&b=c #d");
+        assert!(searched.contains("a%26b%3Dc%20%23d"), "{searched}");
+    }
+
     fn savable(modified: bool, has_path: bool, is_diff: bool, is_image: bool, remote: bool) -> bool {
         !remote && modified && has_path && !is_diff && !is_image
     }

@@ -91,6 +91,81 @@ pub struct Buffer {
     /// upload needs an `egui::Context`, which load time doesn't have. Holds one
     /// texture, reused: an animation composites into it frame by frame.
     pub image_view: Option<crate::app::ImageView>,
+    /// When `Some`, this tab shows a web page rather than a file (`lines` is
+    /// unused, same as `diff` and `image_bytes`).
+    ///
+    /// The browser itself is not here. One native web view is shared by the
+    /// window — they are expensive, and several would each hold a content
+    /// process — so this records only which page the tab wants and what the
+    /// agent is waiting for. See `crate::webview`.
+    pub browser: Option<BrowserTab>,
+}
+
+/// What a browser tab is currently showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserMode {
+    /// Forge's own results, from Forge's own index, drawn by the editor.
+    ///
+    /// The default, and the reason is not pride: the index is right here and
+    /// it holds what this project has actually been reading. A browser that
+    /// opened onto somebody else's search engine would be ignoring the one
+    /// corpus it has privileged access to.
+    #[default]
+    Home,
+    /// A web page, in the native view.
+    Page,
+}
+
+/// One result from Forge's index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForgeHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    /// The licence the text is held under, when the source stated one — an
+    /// article from Europe PMC does, a crawled page does not.
+    pub attribution: String,
+}
+
+/// A tab showing a web page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BrowserTab {
+    /// Where the tab should be pointed. Compared against where the browser
+    /// actually is, so navigating inside the page does not fight the tab.
+    pub url: String,
+    /// The agent's handoff request this tab was opened for, if any.
+    ///
+    /// Present when the agent asked for a page a bot check refused; absent
+    /// when a person opened the browser themselves. It is what a delivered
+    /// page is reported against, and it is cleared once the page is handed
+    /// over so the same page is not sent twice.
+    pub request_id: Option<String>,
+    /// Whether the page has been handed to the agent yet.
+    pub handed_over: bool,
+    /// What is typed in the address bar, which is not the same as where the
+    /// browser is: it diverges while someone is typing, and is put back in
+    /// step when they navigate or the page changes under them.
+    pub bar: String,
+    /// Where the browser reported itself to be, last time it said.
+    ///
+    /// Shown in the bar when nobody is editing it, and it is not `url`
+    /// because following a link or clearing a bot check moves the browser
+    /// without the tab having asked it to.
+    pub at: String,
+    pub can_back: bool,
+    pub can_forward: bool,
+    pub mode: BrowserMode,
+    /// Results from Forge's index for `searched`.
+    pub results: Vec<ForgeHit>,
+    /// What `results` are for, so the page can say so and a repeat of the same
+    /// query does not reload the index.
+    pub searched: String,
+    /// How many pages the index holds, shown because it is the honest measure
+    /// of what a search here can possibly find.
+    pub index_pages: usize,
+    /// What the last crawl managed, if one has run — how many pages it read,
+    /// and how many a bot check refused.
+    pub crawl_note: String,
 }
 
 fn is_image_ext(ext: &str) -> bool {
@@ -131,7 +206,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self { path: None, lines: vec![String::new()], cursor: (0, 0), modified: false, diff: None,
                undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
-               image_bytes: None, image_view: None }
+               image_bytes: None, image_view: None, browser: None }
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, String> {
@@ -143,7 +218,7 @@ impl Buffer {
             return Ok(Self {
                 path: Some(path), lines: vec![String::new()], cursor: (0, 0), modified: false,
                 diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
-                image_bytes: Some(bytes), image_view: None,
+                image_bytes: Some(bytes), image_view: None, browser: None,
             });
         }
         // A `.gz` is decompressed rather than refused. Opening one used to
@@ -179,7 +254,7 @@ impl Buffer {
         };
         Ok(Self { path: Some(path), lines, cursor: (0, 0), modified: false, diff: None,
                   undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline, last_edit_at: None,
-                  image_bytes: None, image_view: None })
+                  image_bytes: None, image_view: None, browser: None })
     }
 
     /// A read-only diff tab for `path`, holding precomputed diff rows.
@@ -187,7 +262,53 @@ impl Buffer {
         Self { path: Some(path), lines: vec![String::new()], cursor: (0, 0),
                modified: false, diff: Some(rows), undo_stack: Vec::new(),
                redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
-               image_bytes: None, image_view: None }
+               image_bytes: None, image_view: None, browser: None }
+    }
+
+    /// A tab showing a web page.
+    ///
+    /// No path, because it is not a file — which also keeps it out of
+    /// everything keyed on one: saving, reloading, the file watcher, and the
+    /// session restore that reopens paths.
+    pub fn browser_tab(url: &str, request_id: Option<String>) -> Self {
+        Self {
+            path: None,
+            lines: vec![String::new()],
+            cursor: (0, 0),
+            modified: false,
+            diff: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            trailing_newline: true,
+            last_edit_at: None,
+            image_bytes: None,
+            image_view: None,
+            browser: Some(BrowserTab {
+                url: url.to_string(),
+                request_id,
+                handed_over: false,
+                bar: if url.is_empty() { String::new() } else { url.to_string() },
+                at: url.to_string(),
+                can_back: false,
+                can_forward: false,
+                // A tab opened onto a page shows it; one opened with no page
+                // shows Forge's own search.
+                mode: if url.is_empty() { BrowserMode::Home } else { BrowserMode::Page },
+                results: Vec::new(),
+                searched: String::new(),
+                index_pages: 0,
+                crawl_note: String::new(),
+            }),
+        }
+    }
+
+    /// Whether this tab shows something other than editable text.
+    ///
+    /// The three read-only kinds keep growing and every caller that asks
+    /// "can I edit this" had been listing them by hand — which is how a new
+    /// kind gets missed.
+    pub fn is_read_only_view(&self) -> bool {
+        self.diff.is_some() || self.image_bytes.is_some() || self.browser.is_some()
     }
 
     /// Full buffer text, plus the trailing newline the file had on disk when
@@ -199,7 +320,7 @@ impl Buffer {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
-        if self.diff.is_some() || self.image_bytes.is_some() { return Ok(()); } // read-only
+        if self.is_read_only_view() { return Ok(()); }
         let path = self.path.as_ref().ok_or("no path")?;
         std::fs::write(path, self.text_for_disk()).map_err(|e| format!("write: {e}"))?;
         self.modified = false;

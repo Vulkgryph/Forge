@@ -26,6 +26,10 @@ vulkan-renderer = ["dep:ash", "dep:ash-window", "dep:shaderc"]
 
 [dependencies]
 forge-proto       = { path = "forge-proto" }
+# The search engine, for the browser tab's own results page. A workspace
+# crate, not a third-party one — and it is the whole point of having written
+# it that Forge's browser searches Forge's index rather than somebody else's.
+forge-search      = { path = "../forge-search" }
 egui-wgpu         = { version = "0.29", default-features = false }
 wgpu              = "22"
 pollster          = "0.3"
@@ -61,11 +65,15 @@ features = ["relax-sign-encoding"]
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
 version = "0.2.2"
-features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder"]
+# NSView is for src/webview.rs, which parents a WKWebView onto the window's
+# content view. No new crate for WebKit itself — the class is looked up at
+# runtime and the framework linked directly, which keeps the objc2 in the
+# graph singular and adds nothing to the dependency count.
+features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSView", "NSWindow"]
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
 version = "0.2.2"
-features = ["NSString", "NSThread"]
+features = ["NSString", "NSThread", "NSURL", "NSURLRequest", "NSGeometry", "NSDictionary", "NSValue"]
 
 [build-dependencies]
 shaderc = { version = "0.10", optional = true }

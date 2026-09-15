@@ -143,14 +143,17 @@ pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
     hits.into_iter()
         .filter_map(|hit| {
             let doc = index.document(hit.doc)?;
+            // Read now, for this one document, because a snippet is the only
+            // thing that needs the text — see `Index::text`.
+            let text = index.text(hit.doc);
             Some(Result_ {
                 url: doc.url.clone(),
                 title: doc.title.clone(),
-                snippet: snippet(&doc.text, &query.required, 240)
+                snippet: snippet(&text, &query.required, 240)
                     .or_else(|| {
                         (!doc.description.is_empty()).then(|| doc.description.clone())
                     })
-                    .unwrap_or_else(|| first_words(&doc.text, 240)),
+                    .unwrap_or_else(|| first_words(&text, 240)),
                 score: hit.score,
             })
         })
@@ -304,11 +307,11 @@ pub fn spread(index: &Index, input: &str, consider: usize) -> Vec<Mention> {
         std::collections::HashMap::new();
 
     for hit in &hits {
-        let Some(doc) = index.document(hit.doc) else { continue };
         // The passage, not the whole document. A term three screens away from
         // any match is not part of what this document says in answer.
-        let passage = snippet(&doc.text, &query.required, SPREAD_WINDOW)
-            .unwrap_or_else(|| first_words(&doc.text, SPREAD_WINDOW));
+        let text = index.text(hit.doc);
+        let passage = snippet(&text, &query.required, SPREAD_WINDOW)
+            .unwrap_or_else(|| first_words(&text, SPREAD_WINDOW));
         let host = host_of(index, hit.doc);
 
         let mut counted = std::collections::HashSet::new();

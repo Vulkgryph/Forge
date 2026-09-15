@@ -469,9 +469,10 @@ mod tests {
         let doc = index.document(0).unwrap();
         assert_eq!(doc.url, "https://europepmc.org/article/PMC/PMC9");
         assert_eq!(doc.attribution, "cc by — Europe PMC PMC9 doi:10.1000/x");
-        assert!(doc.text.contains("Slices were held at 32 degrees"), "{:?}", doc.text);
-        assert!(doc.text.contains("We measured the rate"), "the abstract should be searchable");
-        assert!(!doc.text.contains("Gardening"), "the reference list was indexed");
+        let text = index.text(0);
+        assert!(text.contains("Slices were held at 32 degrees"), "{text:?}");
+        assert!(text.contains("We measured the rate"), "the abstract should be searchable");
+        assert!(!text.contains("Gardening"), "the reference list was indexed");
         // And it is findable by something only the Methods section says.
         let hits = crate::query::search(&index, "slices acsf", 3);
         assert_eq!(hits.len(), 1, "the body text did not make it into the postings");

@@ -514,6 +514,63 @@ mod tests {
 
     /// A single term has no proximity to express, so it is not rewarded for
     /// one.
+    /// The per-block bounds are the largest term frequency in each block.
+    ///
+    /// Stored for a query strategy that can skip blocks — see
+    /// `Index::compute_block_bounds`. Tested on its own because the strategy
+    /// is not written yet and a bound that is too low would make a future
+    /// skip silently wrong, which is worse than slow.
+    #[test]
+    fn block_bounds_really_are_the_maximum_in_each_block() {
+        let mut ix = Index::new();
+        // Three blocks' worth, with a frequency that varies per document so
+        // the maxima differ between blocks.
+        for d in 0..300 {
+            let repeats = 1 + (d % 11);
+            ix.add(
+                &format!("https://a.test/{d}"),
+                "",
+                "",
+                &format!("{}tail", "shared ".repeat(repeats)),
+            );
+        }
+        ix.compute_block_bounds();
+        let bounds = ix.block_max_tf("shared");
+        assert_eq!(bounds.len(), 3, "300 postings should be three blocks of 128");
+
+        // Checked against the postings themselves rather than against the
+        // formula that produced them.
+        let postings = ix.postings("shared");
+        for (b, block) in postings.chunks(128).enumerate() {
+            let actual = block.iter().map(|p| p.positions.len() as u32).max().unwrap();
+            assert_eq!(bounds[b], actual, "block {b}");
+        }
+    }
+
+    /// And they survive a save, since a loaded index is the one that most
+    /// wants to skip — it has not just built the postings itself.
+    #[test]
+    fn block_bounds_survive_a_round_trip() {
+        let mut ix = Index::new();
+        for d in 0..200 {
+            ix.add(&format!("https://a.test/{d}"), "", "", &format!("{}x", "w ".repeat(1 + d % 7)));
+        }
+        let dir = std::env::temp_dir().join(format!("forge-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("i.bin");
+        ix.save(&path).unwrap();
+        let back = Index::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let bounds = back.block_max_tf("w");
+        assert!(!bounds.is_empty(), "bounds were not written or not read back");
+        let postings = back.posting_list("w");
+        for (b, block) in postings.chunks(128).enumerate() {
+            let actual = block.iter().map(|p| p.positions.len() as u32).max().unwrap();
+            assert_eq!(bounds[b], actual, "block {b} after a round trip");
+        }
+    }
+
     #[test]
     fn a_single_term_query_has_no_phrase_score() {
         let ix = corpus();

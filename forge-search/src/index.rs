@@ -32,9 +32,21 @@ pub struct Document {
     /// The page's own description, used for a snippet when the query matches
     /// nothing quotable in the body.
     pub description: String,
-    /// The readable text, kept so a snippet can be cut around the match. This
-    /// is the bulk of the index's size and the reason it is capped.
-    pub text: String,
+    /// The readable text, when it is in memory.
+    ///
+    /// `Some` for a document just added, or one whose text has been read back.
+    /// `None` for a document that came from a file and has not been asked for
+    /// — which is the ordinary case, and the point.
+    ///
+    /// Not loaded with the index because almost nothing needs it. A query
+    /// needs postings; text is needed only to cut a snippet around a match, so
+    /// for ten results out of fifty thousand documents. Loading all of it to
+    /// answer anything was a third of a 223 MB file read on every query.
+    ///
+    /// Read through [`Index::text`], which knows where to find it.
+    text: Option<String>,
+    /// Where the text is in the index file, when it is not in memory.
+    text_at: Option<(u64, u32)>,
     /// How many terms the document has, which ranking needs in order to stop
     /// preferring long documents simply for containing more words.
     pub term_count: u32,
@@ -85,6 +97,15 @@ pub struct Posting {
     pub positions: Vec<u32>,
 }
 
+/// Postings per block, for the per-block score bounds that let a query skip
+/// work.
+///
+/// A hundred and twenty-eight, which is what Lucene fixes its packed block at
+/// and for the reason it gives: a smaller block means less variance in the
+/// width of the integers in it, hence a smaller index, while a larger one
+/// means more efficient bulk reads. The same number is its skip interval.
+pub(crate) const BLOCK: usize = 128;
+
 /// How much of a document's text is kept for snippets.
 ///
 /// The text dominates the index's size, so it is capped — but only the
@@ -129,6 +150,35 @@ pub struct Index {
     /// Summed term counts over live documents, for the average length ranking
     /// needs.
     total_terms: u64,
+    /// Per term, the largest term frequency in each block of postings.
+    ///
+    /// What makes a query able to skip. For each block it gives an upper bound
+    /// on what any document in that block could score for that term, so a
+    /// block that cannot beat the current tenth-best result is never read —
+    /// which is the difference between answering a broad query and scoring
+    /// every document in the corpus to return ten of them.
+    ///
+    /// Computed when the index is saved rather than as documents are added.
+    /// Postings for a term grow by appends, so recomputing per document would
+    /// be quadratic in the length of a common term's list; computing once over
+    /// the finished index is linear. Empty means "not computed", and search
+    /// falls back to scoring everything — correct, just slower.
+    block_max_tf: HashMap<String, Vec<u32>>,
+    /// The file this index was loaded from, for reading document text on
+    /// demand. `None` for one built in memory, whose text is all in memory
+    /// anyway.
+    source: Option<std::path::PathBuf>,
+}
+
+impl Document {
+    /// How long the text is, whether or not it is in memory.
+    pub fn text_len(&self) -> usize {
+        match (&self.text, self.text_at) {
+            (Some(t), _) => t.len(),
+            (None, Some((_, len))) => len as usize,
+            (None, None) => 0,
+        }
+    }
 }
 
 impl Index {
@@ -162,6 +212,12 @@ impl Index {
     }
 
     /// The documents containing `term`, or an empty slice.
+    /// The whole posting list for a term, for a caller walking it in blocks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn posting_list(&self, term: &str) -> &[Posting] {
+        self.postings(term)
+    }
+
     pub fn postings(&self, term: &str) -> &[Posting] {
         // Canonicalised here rather than at every call site. This is the one
         // place every read goes through — `document_frequency`, `positions`,
@@ -244,13 +300,17 @@ impl Index {
             url: url.to_string(),
             title: title.to_string(),
             description: description.to_string(),
-            text: truncate_on_boundary(text, TEXT_KEPT),
+            text: Some(truncate_on_boundary(text, TEXT_KEPT)),
+            text_at: None,
             term_count,
             live: true,
             prose_share: prose_share(text),
             attribution: attribution.to_string(),
         });
         self.by_url.insert(url.to_string(), id);
+        // Stale: this document's postings moved the block boundaries for
+        // every term it contains. Recomputed on save.
+        self.block_max_tf.clear();
         self.live_docs += 1;
         self.total_terms += term_count as u64;
         id
@@ -449,6 +509,75 @@ impl Index {
         live
     }
 
+    /// Upper bounds per block of `term`'s postings, or empty when not
+    /// computed.
+    ///
+    /// Not yet read by a query — the strategy that skips blocks is not
+    /// written. Kept because the bounds are the part that has to be in the
+    /// file format, and computing them later would mean rewriting every index
+    /// again.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn block_max_tf(&self, term: &str) -> &[u32] {
+        let term = crate::tokenize::canonical(term);
+        self.block_max_tf
+            .get(term.as_ref())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Compute the per-block bounds, so later searches can skip.
+    ///
+    /// Linear in the total number of postings. Called by `save`, and callable
+    /// directly by anything that builds an index in memory and wants to query
+    /// it quickly without a round trip through a file.
+    pub fn compute_block_bounds(&mut self) {
+        self.block_max_tf.clear();
+        for (term, postings) in &self.postings {
+            let bounds: Vec<u32> = postings
+                .chunks(BLOCK)
+                .map(|block| {
+                    block
+                        .iter()
+                        .map(|p| p.positions.len() as u32)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .collect();
+            self.block_max_tf.insert(term.clone(), bounds);
+        }
+    }
+
+    /// A document's text by reference, for a caller that has the document.
+    fn text_of(&self, doc: &Document) -> String {
+        if let Some(text) = &doc.text {
+            return text.clone();
+        }
+        let (Some((offset, len)), Some(path)) = (doc.text_at, self.source.as_ref()) else {
+            return String::new();
+        };
+        read_at(path, offset, len).unwrap_or_default()
+    }
+
+    /// A document's text, read from the file if it is not in memory.
+    ///
+    /// Empty when the document is gone, or when the read fails — a snippet is
+    /// worth having and not worth failing a search for, and the caller has
+    /// already got the result it was going to show.
+    ///
+    /// Not cached. The callers are the snippet for each of a handful of
+    /// results, each asking once; a cache would be bookkeeping for a hit rate
+    /// of zero.
+    pub fn text(&self, doc: DocId) -> String {
+        let Some(document) = self.document(doc) else { return String::new() };
+        if let Some(text) = &document.text {
+            return text.clone();
+        }
+        let (Some((offset, len)), Some(path)) = (document.text_at, self.source.as_ref()) else {
+            return String::new();
+        };
+        read_at(path, offset, len).unwrap_or_default()
+    }
+
     /// The positions of `term` in `doc`, or an empty slice.
     pub fn positions(&self, term: &str, doc: DocId) -> &[u32] {
         self.postings(term)
@@ -489,6 +618,56 @@ fn prose_share(text: &str) -> u8 {
     ((prose * 100) / total).min(100) as u8
 }
 
+/// The index file up to where document text begins.
+///
+/// The header carries the blob's absolute position, so this reads the first
+/// few numbers to find it and then reads only what precedes it. For a
+/// 20,000-page index that is 148 MB of postings and metadata instead of 223 MB
+/// — the text is read later, per document, and only for documents something
+/// actually wants.
+fn read_prefix(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+    let end = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    // magic (8) + version (4) + document count (4) + text base (8)
+    let mut header = [0u8; 24];
+    let base = match file.read_exact(&mut header) {
+        Ok(()) => u64::from_le_bytes(header[16..24].try_into().map_err(|_| "bad header")?),
+        // Too short to hold a header at all. Read the whole thing and let the
+        // parser say what is wrong with it — a truncated or wrong-version file
+        // deserves the specific complaint the parser makes, not a generic one
+        // from here.
+        Err(_) => 0,
+    };
+
+    // Zero means an older file, or one too short to say; take all of it.
+    let take = if base == 0 || base > end { end } else { base };
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek {}: {e}", path.display()))?;
+    let mut bytes = vec![0u8; take as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Read `len` bytes at `offset` from `path`, as text.
+///
+/// One seek and one read rather than mapping the file: the reads are a few
+/// kilobytes, a handful per query, and a mapping would have to be kept and
+/// invalidated when the index is rewritten.
+fn read_at(path: &Path, offset: u64, len: u32) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buffer = vec![0u8; len as usize];
+    file.read_exact(&mut buffer).ok()?;
+    String::from_utf8(buffer).ok()
+}
+
 /// Cut `s` to at most `max` bytes without splitting a character.
 fn truncate_on_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -514,7 +693,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 4;
+const VERSION: u32 = 6;
 
 impl Index {
     /// Write the index to `path`.
@@ -523,6 +702,20 @@ impl Index {
     /// compacted — a long-running crawler's index does not accumulate the
     /// pages it has replaced.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        // Computed here so the file carries them and a loaded index can skip
+        // from its first query. `&self` rather than `&mut`, so this is done on
+        // a copy of the bounds rather than mutating during a save.
+        let mut bounds: HashMap<&String, Vec<u32>> = HashMap::new();
+        for (term, postings) in &self.postings {
+            bounds.insert(
+                term,
+                postings
+                    .chunks(BLOCK)
+                    .map(|b| b.iter().map(|p| p.positions.len() as u32).max().unwrap_or(0))
+                    .collect(),
+            );
+        }
+
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
@@ -538,15 +731,31 @@ impl Index {
             }
         }
 
-        put_u32(&mut out, live.len() as u32);
+        // Document text goes to a blob at the end of the file, and each
+        // record carries where to find it. A loaded index then holds the
+        // metadata a query needs and reads text only for what it ranks.
+        let mut text_blob: Vec<u8> = Vec::new();
+        let mut text_spans: Vec<(u64, u32)> = Vec::with_capacity(live.len());
         for doc in &live {
+            let text = self.text_of(doc);
+            text_spans.push((text_blob.len() as u64, text.len() as u32));
+            text_blob.extend_from_slice(text.as_bytes());
+        }
+
+        put_u32(&mut out, live.len() as u32);
+        // Patched once the blob's position is known, which is only after
+        // everything before it has been written.
+        let base_at = out.len();
+        put_u64(&mut out, 0);
+        for (doc, (offset, len)) in live.iter().zip(&text_spans) {
             put_str(&mut out, &doc.url);
             put_str(&mut out, &doc.title);
             put_str(&mut out, &doc.description);
-            put_str(&mut out, &doc.text);
             put_str(&mut out, &doc.attribution);
             put_u32(&mut out, doc.prose_share as u32);
             put_u32(&mut out, doc.term_count);
+            put_u64(&mut out, *offset);
+            put_u32(&mut out, *len);
         }
 
         // The postings, written out rather than rebuilt from the text on load.
@@ -568,6 +777,13 @@ impl Index {
         put_u32(&mut out, terms.len() as u32);
         for term in terms {
             put_str(&mut out, term);
+            // The block bounds for this term, before its postings — a reader
+            // that wants to skip needs them before deciding what to read.
+            let term_bounds = bounds.get(term).map(|v| v.as_slice()).unwrap_or(&[]);
+            put_u32(&mut out, term_bounds.len() as u32);
+            for bound in term_bounds {
+                put_u32(&mut out, *bound);
+            }
             let live_postings: Vec<&Posting> = self.postings[term]
                 .iter()
                 .filter(|p| renumbered.contains_key(&p.doc))
@@ -581,6 +797,12 @@ impl Index {
                 }
             }
         }
+        // The blob last, and its absolute position back-patched into the
+        // header so a reader can turn a record's relative offset into a seek.
+        let base = out.len() as u64;
+        out[base_at..base_at + 8].copy_from_slice(&base.to_le_bytes());
+        out.extend_from_slice(&text_blob);
+
         std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
     }
 
@@ -591,8 +813,14 @@ impl Index {
     /// inconsistent: there is no way for the postings on disk to disagree with
     /// the documents, because there are no postings on disk.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        // Only the part before the text blob.
+        //
+        // Moving text out of the deserialising was not enough on its own:
+        // `fs::read` still pulled the whole file in, so the third of it that
+        // is document text was read and then ignored. The blob's position is
+        // in the header, so the header is read first and then exactly the
+        // prefix that matters.
+        let bytes = read_prefix(path)?;
         if bytes.len() < 12 || &bytes[..8] != MAGIC {
             return Err("not a forge-search index".into());
         }
@@ -604,7 +832,9 @@ impl Index {
             ));
         }
         let count = take_u32(&bytes, &mut at)?;
+        let text_base = take_u64(&bytes, &mut at)?;
         let mut index = Index::new();
+        index.source = Some(path.to_path_buf());
         // Documents are restored, not re-added: re-adding would re-tokenise
         // the capped text and rebuild postings from it, which is the bug this
         // format exists to fix. Everything the ranker needs is read back.
@@ -612,16 +842,20 @@ impl Index {
             let url = take_str(&bytes, &mut at)?;
             let title = take_str(&bytes, &mut at)?;
             let description = take_str(&bytes, &mut at)?;
-            let text = take_str(&bytes, &mut at)?;
             let attribution = take_str(&bytes, &mut at)?;
             let share = take_u32(&bytes, &mut at)?;
             let term_count = take_u32(&bytes, &mut at)?;
+            let text_offset = take_u64(&bytes, &mut at)?;
+            let text_len = take_u32(&bytes, &mut at)?;
             let id = index.docs.len() as DocId;
             index.docs.push(Document {
                 url: url.clone(),
                 title,
                 description,
-                text,
+                // Left on disk. This is the whole point of the format: the
+                // text is a third of the file and almost nothing reads it.
+                text: None,
+                text_at: Some((text_base + text_offset, text_len)),
                 term_count,
                 live: true,
                 prose_share: share.min(100) as u8,
@@ -635,6 +869,11 @@ impl Index {
         let term_count = take_u32(&bytes, &mut at)?;
         for _ in 0..term_count {
             let term = take_str(&bytes, &mut at)?;
+            let bound_count = take_u32(&bytes, &mut at)?;
+            let mut term_bounds = Vec::with_capacity(bound_count as usize);
+            for _ in 0..bound_count {
+                term_bounds.push(take_u32(&bytes, &mut at)?);
+            }
             let postings = take_u32(&bytes, &mut at)?;
             let mut list = Vec::with_capacity(postings as usize);
             for _ in 0..postings {
@@ -649,6 +888,7 @@ impl Index {
                 }
                 list.push(Posting { doc, positions });
             }
+            index.block_max_tf.insert(term.clone(), term_bounds);
             index.postings.insert(term, list);
         }
         Ok(index)
@@ -657,6 +897,19 @@ impl Index {
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
+    if *at + 8 > bytes.len() {
+        return Err("index file ends mid-number".into());
+    }
+    let v = u64::from_le_bytes(bytes[*at..*at + 8].try_into().map_err(|_| "bad u64")?);
+    *at += 8;
+    Ok(v)
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -832,7 +1085,7 @@ mod tests {
         let doc = back.document(id).unwrap();
         assert_eq!(doc.url, "https://c.example/unrelated");
         assert_eq!(doc.title, "Gardening");
-        assert!(doc.text.contains("Tomatoes"));
+        assert!(ix.text(id).contains("Tomatoes"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -973,7 +1226,7 @@ mod tests {
         let filler = "Filler about unrelated matters. ".repeat(1600);
         ix.add("https://a.test/long", "Long", "", &format!("{filler}thirtytwo degrees celsius"));
         let before = ix.document(0).unwrap().term_count;
-        assert!(ix.document(0).unwrap().text.len() < TEXT_KEPT + 1, "fixture not capped");
+        assert!(ix.document(0).unwrap().text_len() < TEXT_KEPT + 1, "fixture not capped");
         assert_eq!(ix.document_frequency("celsius"), 1);
 
         let dir = std::env::temp_dir().join(format!("forge-deep-{}", std::process::id()));
@@ -1019,7 +1272,7 @@ mod tests {
         let id = ix.add("https://a.test/long", "Long", "", &body);
         let before = ix.document(id).unwrap().prose_share;
         assert!(before > 50, "fixture is not prose-shaped: {before}");
-        assert!(ix.document(id).unwrap().text.len() < body.len(), "fixture was not capped");
+        assert!(ix.document(id).unwrap().text_len() < body.len(), "fixture was not capped");
 
         let dir = std::env::temp_dir().join(format!("forge-search-prose-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1067,9 +1320,9 @@ mod tests {
         let long = "日本語のテキスト ".repeat(4000);
         let id = ix.add("https://x.example", "", "", &long);
         let doc = ix.document(id).unwrap();
-        assert!(doc.text.len() <= TEXT_KEPT, "text is {} bytes", doc.text.len());
-        assert!(std::str::from_utf8(doc.text.as_bytes()).is_ok());
-        assert!(doc.text.len() < long.len(), "the text was not capped at all");
+        assert!(doc.text_len() <= TEXT_KEPT, "text is {} bytes", doc.text_len());
+        assert!(std::str::from_utf8(ix.text(id).as_bytes()).is_ok());
+        assert!(doc.text_len() < long.len(), "the text was not capped at all");
         // Ranking still sees the whole document, not the kept part. Stated as
         // an equality against the full text rather than as a ratio against the
         // kept text: a ratio has to be recalibrated whenever `TEXT_KEPT`
@@ -1079,7 +1332,7 @@ mod tests {
             doc.term_count as usize,
             crate::tokenize::terms(&long).len(),
             "term count came from the {} bytes kept for snippets, not the whole document",
-            doc.text.len(),
+            doc.text_len(),
         );
     }
 }

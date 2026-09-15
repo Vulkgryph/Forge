@@ -275,20 +275,28 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
 
 /// Most pages kept in the on-disk index.
 ///
-/// The index is a cache of crawled pages that lives next to the project, so an
-/// unbounded one leaks into somebody's working directory.
+/// Raised from 600, which was set to save seven megabytes and was the wrong
+/// thing to be saving. What a person reads in a lifetime is small: at 250
+/// words a minute, two hours a day for fifty years is 548 million words, about
+/// 3.3 GB of text. Ten web pages a day for fifty years is 182,500 pages — 2.9
+/// GB at the sixteen kilobytes an indexed page costs here.
 ///
-/// Measured rather than estimated, and the estimate was wrong: an index file
-/// is about 1.8 times the text it stores, because it now persists its postings
-/// instead of rebuilding them. At roughly twelve kilobytes of text per page
-/// that puts this cap near thirteen megabytes, not the seven originally
-/// claimed here.
+/// So storage was never the constraint, and 600 pages is about two months of
+/// reading. The thing of value in this file is precisely that it does not
+/// forget a page somebody already read, and the old cap threw that away to
+/// save less disk than a single photograph.
 ///
-/// Still the right trade. A dropped page costs about a second to fetch again
-/// if it is wanted, and keeping every page ever read to avoid that is the
-/// wrong way round — but the figure belongs in the comment honestly, since it
-/// is the number anyone changing this cap will reason from.
-const MAX_INDEXED_PAGES: usize = 600;
+/// Fifty thousand, which is thirteen years at ten pages a day and about eight
+/// hundred megabytes at the limit. Not a lifetime, and deliberately: this
+/// index is per project, so a lifetime of reading spread over many projects
+/// wants one shared index instead — a separate decision, and not one to make
+/// by quietly growing a per-project file.
+///
+/// What is now the constraint is query time, not size. A broad single-term
+/// query against 50,000 pages takes about six seconds today, because it scores
+/// every document to return ten. That is the next thing to fix, and it is the
+/// reason this is fifty thousand rather than five hundred thousand.
+const MAX_INDEXED_PAGES: usize = 50_000;
 
 /// How many passages to return.
 ///

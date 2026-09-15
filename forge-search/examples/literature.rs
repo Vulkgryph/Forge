@@ -139,18 +139,21 @@ fn main() {
     // Anything that looks like a temperature in the text that was kept.
     println!("\n── temperatures stated in the text ──");
     let mut shown = 0;
-    for doc in (0..index.len() as u32).filter_map(|d| index.document(d)) {
-        for (at, _) in doc.text.char_indices().filter(|(_, c)| *c == '°') {
-            let from = doc.text[..at]
+    for d in 0..index.len() as u32 {
+        // Read for this one document, which is what the on-demand layout is
+        // for — the text is not loaded with the index.
+        let text = index.text(d);
+        for (at, _) in text.char_indices().filter(|(_, c)| *c == '°') {
+            let from = text[..at]
                 .char_indices()
                 .rev()
                 .nth(110)
                 .map_or(0, |(i, _)| i);
-            let to = doc.text[at..]
+            let to = text[at..]
                 .char_indices()
                 .nth(12)
-                .map_or(doc.text.len(), |(i, _)| at + i);
-            println!("  …{}…", doc.text[from..to].replace('\n', " ").trim());
+                .map_or(text.len(), |(i, _)| at + i);
+            println!("  …{}…", text[from..to].replace('\n', " ").trim());
             shown += 1;
             if shown >= 8 {
                 break;

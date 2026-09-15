@@ -344,8 +344,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn index_with(pages: &[(&str, &str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("forge-fetch-sug-{}", std::process::id()));
+    /// Named per test, not per process: tests run in parallel threads of one
+    /// process, so a path keyed on the pid alone has two tests deleting each
+    /// other's fixture. Which is exactly what happened.
+    fn index_with(name: &str, pages: &[(&str, &str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forge-fetch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = forge_search::index::Index::new();
@@ -364,7 +367,7 @@ mod tests {
     /// returned. So a failed call should say what would have worked.
     #[test]
     fn a_failed_guess_is_answered_with_real_urls_from_that_host() {
-        let path = index_with(&[
+        let path = index_with("guess", &[
             ("https://myfordtractors.com/tune.shtml", "Tune Up and Maintenance",
              "motor oil straight 30 weight for temperatures above ninety degrees"),
             ("https://myfordtractors.com/backhoe.shtml", "Backhoe Project", "front end loader axle"),
@@ -388,7 +391,7 @@ mod tests {
     /// and the useful advice is different — crawl it first.
     #[test]
     fn an_unread_host_is_told_to_search_first() {
-        let path = index_with(&[("https://other.test/p", "P", "text")]);
+        let path = index_with("unread", &[("https://other.test/p", "P", "text")]);
         let out = suggest_real_urls(&path, "https://unread.test/guessed.html", "anything");
         assert!(out.contains("has not read unread.test"), "{out}");
         assert!(out.contains("web_search"), "{out}");

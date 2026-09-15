@@ -901,6 +901,53 @@ fn json_to_user_action(
 
 // ── Headless event loop ───────────────────────────────────────────────
 
+/// Everything sent before the first user turn, in the order it goes out.
+///
+/// Extracted from `run_headless` so it can be asserted on. The write path
+/// there is `tokio::io::stdout()` directly, which a test cannot capture, so
+/// the *ordering and content* of the opening sequence had no coverage — and
+/// the startup notices are the part where that matters. A notice that is
+/// built correctly and never written reaches nobody, and the version of this
+/// code that shipped first put it on stderr, where exactly that happened.
+fn opening_messages(init: HeadlessInit) -> Vec<OutgoingMessage> {
+    let mut out = Vec::new();
+    out.push(OutgoingMessage::Init {
+        project_root: init.project_root,
+        model_name: init.model_name,
+        model_id: init.model_id,
+        max_context_tokens: init.max_context_tokens,
+        log_path: init.log_path,
+        dangerously_allow_all: init.dangerously_allow_all,
+        agent_definitions: init.agent_definitions,
+        endpoints: init.endpoints,
+        session_id: init.session_id,
+        available_tools: init.available_tools,
+        context_strategy: init.context_strategy,
+        chatgpt_logged_in: init.chatgpt_logged_in,
+        offline_mode: init.offline_mode,
+        agent_version: env!("CARGO_PKG_VERSION"),
+    });
+
+    // After `init`, because a client needs to know what session this is before
+    // it has messages to put in it — and before the replay, so a notice about
+    // this startup is not buried under a resumed conversation.
+    for notice in init.startup_notices {
+        out.push(OutgoingMessage::AssistantMessage { content: notice });
+    }
+
+    if let Some(meta) = init.resume_meta {
+        out.push(OutgoingMessage::SessionLoaded {
+            session_id: meta.id,
+            title: meta.title,
+            message_count: meta.message_count,
+            compaction_count: meta.compaction_count,
+            entries: init.replay_entries,
+            rewind_checkpoints: init.rewind_checkpoints,
+        });
+    }
+    out
+}
+
 pub async fn run_headless(
     mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     action_tx: mpsc::UnboundedSender<UserAction>,
@@ -911,39 +958,8 @@ pub async fn run_headless(
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
 
-    // Send init message
-    let init_msg = OutgoingMessage::Init {
-        project_root: init_info.project_root,
-        model_name: init_info.model_name,
-        model_id: init_info.model_id,
-        max_context_tokens: init_info.max_context_tokens,
-        log_path: init_info.log_path,
-        dangerously_allow_all: init_info.dangerously_allow_all,
-        agent_definitions: init_info.agent_definitions,
-        endpoints: init_info.endpoints,
-        session_id: init_info.session_id,
-        available_tools: init_info.available_tools,
-        context_strategy: init_info.context_strategy,
-        chatgpt_logged_in: init_info.chatgpt_logged_in,
-        offline_mode: init_info.offline_mode,
-        agent_version: env!("CARGO_PKG_VERSION"),
-    };
-    let json = serde_json::to_string(&init_msg)?;
-    stdout.write_all(json.as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
-
-    // If resuming, send session_loaded with replay entries
-    if let Some(ref meta) = init_info.resume_meta {
-        let loaded_msg = OutgoingMessage::SessionLoaded {
-            session_id: meta.id.clone(),
-            title: meta.title.clone(),
-            message_count: meta.message_count,
-            compaction_count: meta.compaction_count,
-            entries: init_info.replay_entries,
-            rewind_checkpoints: init_info.rewind_checkpoints,
-        };
-        let json = serde_json::to_string(&loaded_msg)?;
+    for msg in opening_messages(init_info) {
+        let json = serde_json::to_string(&msg)?;
         stdout.write_all(json.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
@@ -1105,6 +1121,22 @@ pub struct HeadlessInit {
     pub context_strategy: String,
     pub chatgpt_logged_in: bool,
     pub offline_mode: bool,
+    /// Things the user should be told before their first turn, as the
+    /// conversation's own messages rather than as log lines.
+    ///
+    /// Startup decisions Forge made on the user's behalf belong in front of
+    /// them. The one this exists for is substituting a model: the endpoint
+    /// list is discovered and the configured default is a stored name, so a
+    /// default can go stale and Forge picks something else to stay usable —
+    /// and the one thing worse than picking is picking quietly, because every
+    /// answer afterwards came from a model the user did not choose and has no
+    /// way to notice.
+    ///
+    /// `stderr` is not enough. A client speaking this protocol has no reason
+    /// to be showing the agent's stderr, so a note there reaches nobody. This
+    /// goes out as an assistant message, which both clients already render
+    /// inline — the same channel the git-repository notice uses.
+    pub startup_notices: Vec<String>,
 }
 
 impl HeadlessInit {
@@ -1223,5 +1255,111 @@ mod replay_fit_tests {
     #[test]
     fn an_empty_transcript_stays_empty() {
         assert!(fit_replay_entries(Vec::new(), REPLAY_BUDGET_BYTES).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod opening_tests {
+    use super::*;
+
+    fn init(notices: Vec<String>) -> HeadlessInit {
+        HeadlessInit {
+            project_root: "/tmp/p".into(),
+            model_name: "GPT-6-Astra".into(),
+            model_id: "gpt-6-astra".into(),
+            max_context_tokens: 1000,
+            log_path: "/tmp/p/.forge/log".into(),
+            dangerously_allow_all: false,
+            agent_definitions: Vec::new(),
+            endpoints: Vec::new(),
+            session_id: Some("s1".into()),
+            resume_meta: None,
+            replay_entries: Vec::new(),
+            rewind_checkpoints: Vec::new(),
+            available_tools: Vec::new(),
+            context_strategy: "compaction".into(),
+            chatgpt_logged_in: false,
+            offline_mode: false,
+            startup_notices: notices,
+        }
+    }
+
+    fn kinds(msgs: &[OutgoingMessage]) -> Vec<String> {
+        msgs.iter()
+            .map(|m| {
+                serde_json::to_value(m)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// A startup notice has to actually be sent. This is the gap that let the
+    /// first version of the feature put the notice on stderr, where no client
+    /// speaking this protocol would ever show it — the note was built
+    /// correctly and reached nobody.
+    #[test]
+    fn a_startup_notice_is_sent_to_the_client() {
+        let msgs = opening_messages(init(vec!["[using GPT-6-Astra instead]".into()]));
+        let notice = msgs
+            .iter()
+            .find_map(|m| match m {
+                OutgoingMessage::AssistantMessage { content } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the notice was never sent");
+        assert_eq!(notice, "[using GPT-6-Astra instead]");
+    }
+
+    /// As an assistant message, which is the channel both clients render
+    /// inline — the same one the git-repository notice uses. Anything else is
+    /// a field a client has to be taught about.
+    #[test]
+    fn it_is_sent_as_an_assistant_message_after_init() {
+        let msgs = opening_messages(init(vec!["[note]".into()]));
+        assert_eq!(kinds(&msgs), vec!["init", "assistant_message"]);
+    }
+
+    /// Ahead of the replay, so a notice about *this* startup is not buried
+    /// under a resumed conversation.
+    #[test]
+    fn a_notice_comes_before_a_resumed_session() {
+        let mut i = init(vec!["[note]".into()]);
+        i.resume_meta = Some(SessionMeta {
+            id: "s1".into(),
+            title: "resumed".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            message_count: 4,
+            compaction_count: 0,
+            model: "GPT-6-Astra".into(),
+            rolling_window_plan: None,
+        });
+        let msgs = opening_messages(i);
+        assert_eq!(kinds(&msgs), vec!["init", "assistant_message", "session_loaded"]);
+    }
+
+    /// And nothing extra is sent when there is nothing to say. Announcing the
+    /// ordinary case is how a warning stops being read.
+    #[test]
+    fn no_notice_means_no_extra_message() {
+        let msgs = opening_messages(init(Vec::new()));
+        assert_eq!(kinds(&msgs), vec!["init"]);
+    }
+
+    /// Several notices keep their order, since the first is the one that
+    /// explains the others.
+    #[test]
+    fn notices_keep_their_order() {
+        let msgs = opening_messages(init(vec!["[first]".into(), "[second]".into()]));
+        let said: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OutgoingMessage::AssistantMessage { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, vec!["[first]", "[second]"]);
     }
 }

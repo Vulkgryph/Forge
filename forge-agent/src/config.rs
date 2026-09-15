@@ -506,6 +506,276 @@ impl AppConfig {
     pub fn default_endpoint(&self) -> Option<&ModelEndpoint> {
         self.get_endpoint(&self.models.default)
     }
+
+    /// The endpoint to actually use, and a note when it is not the one named.
+    ///
+    /// `default` is a name written to this file, and the endpoint list is
+    /// discovered — the ChatGPT Codex pass adds newly available models and
+    /// prunes ones that have gone, persisting both. A stored name against a
+    /// list that changes underneath it will dangle sooner or later, so that is
+    /// a case to handle rather than an accident to report.
+    ///
+    /// Observed: a config naming `GPT-6-Astra` as its default against a list
+    /// of thirty-seven endpoints containing `gpt-6-astra-wm` and no exact
+    /// match. Forge refused to start at all, having written that state itself.
+    ///
+    /// The ladder is deliberately short. An exact match, then the same name in
+    /// a different case — which is the same endpoint, spelled differently.
+    /// Then any endpoint at all, with a loud note, because a working model the
+    /// user did not pick is better than an agent that will not launch and it
+    /// is one line to correct.
+    ///
+    /// It does *not* guess by prefix. `gpt-6-astra` is a prefix of
+    /// `gpt-6-astra-wm` and might well be the intended model, but it might
+    /// equally be a different tier at a different price, and silently billing
+    /// somebody for a model they did not choose is worse than telling them to
+    /// choose.
+    ///
+    /// Nothing is written back. The file is the user's, and a config that
+    /// silently repairs itself hides the thing they need to fix.
+    pub fn resolve_default(&self) -> Option<(&ModelEndpoint, Option<String>)> {
+        let wanted = &self.models.default;
+        if let Some(exact) = self.get_endpoint(wanted) {
+            return Some((exact, None));
+        }
+        if let Some(cased) = self
+            .models
+            .endpoints
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(wanted))
+        {
+            return Some((
+                cased,
+                Some(format!(
+                    "config names the default endpoint '{wanted}'; using '{}', which differs \
+                     only in case",
+                    cased.name,
+                )),
+            ));
+        }
+        let picked = pick_newest(&self.models.endpoints)?;
+        let named = if wanted.is_empty() {
+            "no default endpoint is set".to_string()
+        } else {
+            format!("the default endpoint '{wanted}' is not in the config")
+        };
+        Some((
+            picked,
+            Some(format!(
+                "{named}; using '{}' — the highest version number available. \
+                 Change it with /model, or set `default` in ~/.config/forge/config.toml.",
+                picked.name,
+            )),
+        ))
+    }
+}
+
+/// The endpoint with the highest version number in its name, ties broken
+/// alphabetically.
+///
+/// Installation does not have to choose a default and a stale one does not have
+/// to stop anything: there is always a defensible pick, and the user changes it
+/// with `/model` whenever they like.
+///
+/// Numbers are compared component by component rather than by taking the
+/// largest in the name, which matters because a name can carry a number that is
+/// not a version: `Claude Opus 4.6 (200k)` reads as 4, then 6, then 200 — a
+/// context size, and taking the maximum would rank it above every GPT-6. First
+/// component first makes `gpt-6-pro` beat `gpt-5-6-mini`, which is the ordering
+/// anyone would expect.
+///
+/// A name with no digits sorts last, since there is nothing to claim it is new.
+///
+/// Ties go to the alphabetically lower name, compared without case so `Grok`
+/// and `grok` order the same way. That is not a claim about which is better —
+/// it is a claim that the choice must be the same on every run, because a
+/// default that moves around is worse than one that is merely arbitrary.
+fn pick_newest(endpoints: &[ModelEndpoint]) -> Option<&ModelEndpoint> {
+    let mut ranked: Vec<&ModelEndpoint> = endpoints.iter().collect();
+    ranked.sort_by(|a, b| {
+        version_of(&b.name)
+            .cmp(&version_of(&a.name))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    ranked.first().copied()
+}
+
+/// The runs of digits in a name, in order — `gpt-5-6-mini` is `[5, 6]`.
+fn version_of(name: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut digits = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            out.push(digits.parse().unwrap_or(0));
+            digits.clear();
+        }
+    }
+    if !digits.is_empty() {
+        out.push(digits.parse().unwrap_or(0));
+    }
+    out
+}
+
+#[cfg(test)]
+mod default_endpoint_tests {
+    use super::*;
+
+    fn endpoints(names: &[&str]) -> Vec<ModelEndpoint> {
+        names
+            .iter()
+            .map(|n| ModelEndpoint {
+                name: (*n).to_string(),
+                base_url: "http://localhost:1/v1".to_string(),
+                model_id: "auto".to_string(),
+                api_key: None,
+                max_context_tokens: 8192,
+                max_output_tokens: 1024,
+                request_timeout_secs: 60,
+                endpoint_type: EndpointType::default(),
+                reasoning: EndpointReasoningConfig::default(),
+                xai_priority_tier: false,
+            })
+            .collect()
+    }
+
+    fn config(default: &str, names: &[&str]) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.models.default = default.to_string();
+        cfg.models.endpoints = endpoints(names);
+        cfg
+    }
+
+    #[test]
+    fn an_exact_name_is_used_without_comment() {
+        let cfg = config("gpt-6-pro", &["gpt-5-5", "gpt-6-pro"]);
+        let (ep, note) = cfg.resolve_default().unwrap();
+        assert_eq!(ep.name, "gpt-6-pro");
+        assert!(note.is_none());
+    }
+
+    /// The same endpoint spelled in a different case is the same endpoint.
+    #[test]
+    fn a_case_difference_still_resolves() {
+        let cfg = config("GPT-6-Pro", &["gpt-6-pro"]);
+        let (ep, note) = cfg.resolve_default().unwrap();
+        assert_eq!(ep.name, "gpt-6-pro");
+        assert!(note.unwrap().contains("differs only in case"));
+    }
+
+    /// The case that stopped Forge starting: a default naming an endpoint that
+    /// discovery has since pruned, against a list of thirty-seven others.
+    #[test]
+    fn a_dangling_default_falls_back_to_the_highest_version() {
+        let cfg = config(
+            "GPT-6-Astra",
+            &["gpt-5-5", "gpt-5-6-mini", "gpt-6-astra-wm", "o3-pro", "research"],
+        );
+        let (ep, note) = cfg.resolve_default().unwrap();
+        assert_eq!(ep.name, "gpt-6-astra-wm");
+        let note = note.unwrap();
+        assert!(note.contains("not in the config"), "{note}");
+        assert!(note.contains("/model"), "it should say how to change it: {note}");
+    }
+
+    /// Installation does not have to pick one.
+    #[test]
+    fn no_default_at_all_is_not_an_error() {
+        let cfg = config("", &["gpt-5-5", "gpt-6-pro"]);
+        let (ep, note) = cfg.resolve_default().unwrap();
+        assert_eq!(ep.name, "gpt-6-pro");
+        assert!(note.unwrap().contains("no default endpoint is set"));
+    }
+
+    /// Version numbers compare component by component. Taking the largest
+    /// number in the name would rank a context size above a version: the
+    /// `(200k)` in `Claude Opus 4.6 (200k)` is not a version 200.
+    #[test]
+    fn a_context_size_is_not_mistaken_for_a_version() {
+        let cfg = config("", &["Claude Opus 4.6 (200k)", "gpt-6-pro"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "gpt-6-pro");
+    }
+
+    #[test]
+    fn the_first_component_decides_before_the_second() {
+        let cfg = config("", &["gpt-5-6-mini", "gpt-6-pro"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "gpt-6-pro");
+    }
+
+    /// The same thing in the naming that actually occurs, where the version is
+    /// written with a dot: a 6 must beat a 5.6, not lose to it for having
+    /// fewer digits.
+    #[test]
+    fn a_major_version_beats_a_higher_minor_of_a_lower_major() {
+        let cfg = config(
+            "",
+            &[
+                "GPT-5.5",
+                "GPT-5.6-Luna",
+                "GPT-5.6-Sol",
+                "GPT-5.6-Terra",
+                "GPT-6-Astra",
+                "Grok 4.20 Reasoning",
+                "Claude Opus 4.6 (200k)",
+                "GPT-Reserve",
+            ],
+        );
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "GPT-6-Astra");
+    }
+
+    /// And a release number is not a decimal: 4.20 is the twentieth release
+    /// after 4, so it is newer than 4.6 rather than older.
+    #[test]
+    fn a_release_number_is_not_a_decimal() {
+        let cfg = config("", &["Grok 4.6", "Grok 4.20 Reasoning"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "Grok 4.20 Reasoning");
+    }
+
+    /// A wrinkle worth pinning rather than pretending away. Component-wise
+    /// comparison stops a context size outranking a major version — the `200`
+    /// in `Claude Opus 4.6 (200k)` cannot beat a 5 or a 6 — but between two
+    /// endpoints whose versions are otherwise identical it still decides, so
+    /// the 200k variant sorts above the plain one. That is a defensible
+    /// outcome (more context) reached for an undignified reason, and it is
+    /// here so a later change notices it.
+    #[test]
+    fn a_trailing_number_still_breaks_a_tie_between_equal_versions() {
+        let cfg = config("", &["Claude Sonnet 4.6", "Claude Sonnet 4.6 (200k)"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "Claude Sonnet 4.6 (200k)");
+        // But it cannot climb past a genuinely higher version.
+        let beaten = config("", &["Claude Sonnet 4.6 (200k)", "GPT-6-Astra"]);
+        assert_eq!(beaten.resolve_default().unwrap().0.name, "GPT-6-Astra");
+    }
+
+    /// Ties go alphabetically, without case, so the pick is the same on every
+    /// run — a default that moves around is worse than an arbitrary one.
+    #[test]
+    fn a_tie_is_broken_by_the_lower_name() {
+        let cfg = config("", &["zeta-6", "Alpha-6", "middle-6"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "Alpha-6");
+        // And the same answer whatever order they arrive in.
+        let other = config("", &["middle-6", "zeta-6", "Alpha-6"]);
+        assert_eq!(other.resolve_default().unwrap().0.name, "Alpha-6");
+    }
+
+    /// A name with no digits has nothing to claim it is new, so it sorts last
+    /// — but is still picked when it is all there is.
+    #[test]
+    fn a_name_without_digits_sorts_last_but_is_still_usable() {
+        let cfg = config("", &["research", "gpt-5-5"]);
+        assert_eq!(cfg.resolve_default().unwrap().0.name, "gpt-5-5");
+        let only = config("", &["research"]);
+        assert_eq!(only.resolve_default().unwrap().0.name, "research");
+    }
+
+    /// Nothing configured is the one case no fallback can rescue.
+    #[test]
+    fn no_endpoints_at_all_resolves_to_nothing() {
+        let cfg = config("anything", &[]);
+        assert!(cfg.resolve_default().is_none());
+    }
 }
 
 #[cfg(test)]

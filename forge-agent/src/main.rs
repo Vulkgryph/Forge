@@ -100,14 +100,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // needs `&mut app_config.models.endpoints` (to persist newly discovered
     // and pruned models), which can't coexist with a borrow of one of its
     // own elements held across that point.
-    let endpoint = match app_config.default_endpoint() {
-        Some(ep) => ep.clone(),
+    let mut fell_back_to = None;
+    // Startup decisions worth putting in front of the user. See
+    // `HeadlessInit::startup_notices`.
+    let mut startup_notices: Vec<String> = Vec::new();
+    let endpoint = match app_config.resolve_default() {
+        Some((ep, note)) => {
+            // A note means the endpoint is not the one named — see
+            // `AppConfig::resolve_default`. Loud, on stderr, and the run
+            // continues: a working model the user did not pick beats an agent
+            // that will not launch over one line of config.
+            if let Some(note) = note {
+                eprintln!("forge-agent: {note}");
+                startup_notices.push(format!("[{note}]"));
+                // Kept so the named endpoint can be tried again once
+                // discovery has run — see below.
+                fell_back_to = Some(ep.name.clone());
+            }
+            ep.clone()
+        }
         None => {
+            // No endpoints at all, which no amount of falling back can fix.
             let err = serde_json::json!({
                 "type": "error",
                 "message": format!(
-                    "No endpoint '{}' found in config. Edit ~/.config/forge/config.toml \
-                     or re-run ./install.sh to reconfigure.",
+                    "No model endpoints are configured (the default is '{}'). Edit \
+                     ~/.config/forge/config.toml or re-run ./install.sh to reconfigure.",
                     app_config.models.default
                 )
             });
@@ -346,6 +364,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // they don't have to be rediscovered (and re-pruned) fresh every launch.
     app_config.models.endpoints = all_endpoints.clone();
     let _ = app_config.save();
+
+    // The named default is resolved before this point, and the list it names
+    // is populated after it — so a Codex model can be unavailable at
+    // resolution and present moments later. That ordering is why this failed
+    // intermittently: whether the default resolved depended on whether the
+    // *previous* run happened to leave it in the file.
+    //
+    // Observed within one session: a config listing 37 endpoints with
+    // `GPT-6-Astra` as its default and no such endpoint in the file, so Forge
+    // refused to start — then the next run's discovery rewrote the file with
+    // 21 endpoints including `GPT-6-Astra`, and it worked again.
+    //
+    // Resolution is not moved after discovery, because the offline-mode guard
+    // above needs to know whether the active endpoint is Codex before deciding
+    // whether to fetch the catalog at all. Asking again is enough, and only
+    // when the first answer was a fallback.
+    let endpoint = match fell_back_to {
+        Some(_) => match app_config.resolve_default() {
+            Some((named, None)) => {
+                eprintln!(
+                    "forge-agent: '{}' is available after model discovery; using it after all",
+                    named.name,
+                );
+                // The substitution notice is withdrawn, and nothing replaces
+                // it. No model was actually substituted — resolution happened
+                // to run a moment before discovery — so there is nothing the
+                // user needs to know, and announcing the ordinary case is how
+                // a warning stops being read. The stderr line stays for
+                // anyone debugging the ordering.
+                startup_notices.clear();
+                named.clone()
+            }
+            _ => endpoint,
+        },
+        None => endpoint,
+    };
 
     // Channels
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -587,6 +641,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let init = headless::HeadlessInit {
+        startup_notices,
         project_root: workspace_root.clone(),
         model_name: endpoint.name.clone(),
         model_id: model_id.clone(),

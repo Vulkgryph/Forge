@@ -99,6 +99,17 @@ impl Fetcher for HttpFetcher {
 
             let status = response.status().as_u16();
             let final_url = response.url().to_string();
+            // Names lowercased, values skipped when they are not UTF-8. The
+            // one that matters is `cf-mitigated`, which says a bot-management
+            // challenge was served rather than the page — see
+            // `Fetched::challenge`.
+            let headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+                })
+                .collect();
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -121,6 +132,7 @@ impl Fetcher for HttpFetcher {
                         status,
                         final_url,
                         content_type,
+                        headers,
                         // Deliberately oversized, so the crawler's own
                         // `max_page_bytes` rejects it and counts it. Reporting
                         // a short body would have it indexed as a short page.
@@ -130,7 +142,7 @@ impl Fetcher for HttpFetcher {
             }
 
             let body = response.text().await.unwrap_or_default();
-            Ok(Fetched { status, final_url, content_type, body })
+            Ok(Fetched { status, final_url, content_type, headers, body })
         })
     }
 
@@ -194,6 +206,14 @@ pub struct Timing {
     pub search_ms: u128,
     pub index_size: usize,
     pub results: usize,
+    /// Pages refused by a bot-management challenge, and the hosts that did it.
+    ///
+    /// Reported separately from everything else because the response is
+    /// different: no rewording or re-crawling reaches a page behind a
+    /// challenge, and the model should stop trying rather than spend the turn
+    /// on it.
+    pub challenged: usize,
+    pub challenged_hosts: Vec<String>,
     /// Pages dropped from the index to keep it bounded. Reported rather than
     /// silent: an agent that queried a page last week and cannot find it now
     /// should be able to tell eviction from the page having changed.
@@ -344,6 +364,8 @@ fn run(
         timing.fetched = report.fetched;
         timing.indexed = report.indexed;
         timing.disallowed = report.disallowed;
+        timing.challenged = report.challenged;
+        timing.challenged_hosts = report.challenged_hosts.clone();
         timing.timed_out = report.timed_out;
 
         // Bounded before saving, so the file next to the project cannot grow
@@ -434,6 +456,7 @@ fn render(
                 timing.fetched, timing.indexed, timing.disallowed, timing.crawl_ms,
                 timing.index_size,
             ));
+            render_challenges(&mut out, timing);
         } else {
             out.push_str(&format!(
                 "The index holds {} page(s) and none matched, and no crawl was attempted \
@@ -455,6 +478,7 @@ fn render(
         }
         out.push('\n');
     }
+    render_challenges(&mut out, timing);
     render_spread(&mut out, spread);
 
     if timing.crawled {
@@ -484,6 +508,33 @@ fn render(
         ));
     }
     out
+}
+
+/// Sites that refused the crawler rather than answering it.
+///
+/// Said plainly and separately, because the useful response is different from
+/// every other failure. A page that 404s might be at another address and a
+/// query that matches nothing might match different words, so trying again is
+/// reasonable in both cases. A page behind a bot-management challenge is at
+/// the right address and no wording reaches it — the server is willing to
+/// serve it to a browser and not to us. An agent not told the difference
+/// spends the turn rephrasing.
+fn render_challenges(out: &mut String, timing: &Timing) {
+    if timing.challenged == 0 {
+        return;
+    }
+    out.push_str(&format!(
+        "{} page(s) were refused by a bot check rather than served",
+        timing.challenged,
+    ));
+    if !timing.challenged_hosts.is_empty() {
+        out.push_str(&format!(" ({})", timing.challenged_hosts.join(", ")));
+    }
+    out.push_str(
+        ". Those pages need a browser, so rewording the query or crawling again will not \
+         reach them — say so and use what else you have, or ask the user to open the page. \
+         Other sites in this search were unaffected.\n\n",
+    );
 }
 
 /// What several sources say, when several of them say something.

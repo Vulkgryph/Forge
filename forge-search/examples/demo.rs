@@ -8,8 +8,7 @@ fn main() {
         .with_response("https://docs.example/robots.txt", Fetched {
             status: 200, final_url: "https://docs.example/robots.txt".into(),
             content_type: "text/plain".into(),
-            body: "User-agent: *\nDisallow: /private/\n".into(),
-        })
+            body: "User-agent: *\nDisallow: /private/\n".into(), headers: Vec::new() })
         .with_page("https://docs.example/", r#"<title>Runtime docs</title>
             <p>Reference for the runtime.</p>
             <a href="/alloc">Allocation</a><a href="/no-std">no_std</a>

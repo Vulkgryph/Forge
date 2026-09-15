@@ -19,8 +19,7 @@ impl Fetcher for Curl {
             status: f.first().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
             final_url: f.get(1).unwrap_or(&url).to_string(),
             content_type: f.get(2).unwrap_or(&"").split(';').next().unwrap_or("").trim().to_lowercase(),
-            body: body.to_string(),
-        })
+            body: body.to_string(), headers: Vec::new() })
     }
     fn user_agent(&self) -> &str { &self.agent }
 }

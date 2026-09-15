@@ -34,6 +34,18 @@ pub struct Fetched {
     /// `Content-Type`, lowercased, without parameters — `text/html`, not
     /// `text/html; charset=utf-8`.
     pub content_type: String,
+    /// Response headers, names lowercased.
+    ///
+    /// Carried because some things a crawler needs to know are only in the
+    /// headers and cannot be inferred from the body. The one this was added
+    /// for is `cf-mitigated`, which says outright that a bot-management
+    /// challenge was served instead of the page — a fact worth having as a
+    /// stated header rather than guessed from HTML.
+    ///
+    /// A list rather than a map: responses have few headers, lookup is by a
+    /// handful of known names, and a `Vec` keeps `Fetched` cheap to build for
+    /// the fetchers that have nothing to put here.
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
@@ -52,6 +64,89 @@ impl Fetched {
     /// so the crawler can forget it rather than retrying forever.
     pub fn is_permanently_gone(&self) -> bool {
         matches!(self.status, 400..=499 if self.status != 408 && self.status != 429)
+    }
+
+    /// The first header with this name, lowercased comparison.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether a bot-management interstitial was served instead of the page,
+    /// and which system served it.
+    ///
+    /// This is a distinct outcome from the page being missing, and conflating
+    /// the two tells a caller the wrong thing: a 404 means the URL is wrong,
+    /// while a challenge means the URL is fine and the *access* is wrong. The
+    /// responses are different — correct the address, or open it in a browser.
+    ///
+    /// Worse, some of these arrive with status 200 and get indexed as content.
+    /// A crawl of a challenged site then holds a page whose text is "Just a
+    /// moment... Enable JavaScript and cookies to continue", which will match
+    /// queries and answer nothing.
+    ///
+    /// Detection is by vendor, not by site, and in order of how much the
+    /// server is actually telling us:
+    ///
+    /// 1. `cf-mitigated`, which Cloudflare sets to say a challenge was served.
+    ///    A stated fact, not an inference.
+    /// 2. Headers particular to other bot-management systems.
+    /// 3. A body signature, for the ones that announce themselves only in
+    ///    HTML.
+    ///
+    /// The last of those is bounded by size, and that bound matters: plenty of
+    /// ordinary pages carry "please enable JavaScript" in a `<noscript>`, so
+    /// the phrase alone would misread them. A challenge page is nearly empty —
+    /// the one measured was 5.5 kB — while a real page carrying such a notice
+    /// is almost never under sixteen.
+    pub fn challenge(&self) -> Option<&'static str> {
+        // Cloudflare says so outright.
+        if self.header("cf-mitigated").is_some() {
+            return Some("Cloudflare");
+        }
+        if self.header("x-datadome").is_some() {
+            return Some("DataDome");
+        }
+        if self.header("x-iinfo").is_some() {
+            return Some("Imperva");
+        }
+        if self
+            .header("server")
+            .is_some_and(|v| v.eq_ignore_ascii_case("AkamaiGHost"))
+            && !self.is_ok()
+        {
+            return Some("Akamai");
+        }
+
+        if !self.is_html() {
+            return None;
+        }
+        let body = self.body.to_lowercase();
+        // Signatures that name the system that produced them.
+        for (marker, vendor) in [
+            ("cf-browser-verification", "Cloudflare"),
+            ("__cf_chl", "Cloudflare"),
+            ("/cdn-cgi/challenge-platform", "Cloudflare"),
+            ("px-captcha", "PerimeterX"),
+            ("_px_captcha", "PerimeterX"),
+            ("datadome", "DataDome"),
+        ] {
+            if body.contains(marker) {
+                return Some(vendor);
+            }
+        }
+
+        // And the generic interstitial, size-bounded as above.
+        const INTERSTITIAL_MAX: usize = 16 * 1024;
+        if self.body.len() < INTERSTITIAL_MAX
+            && (body.contains("just a moment")
+                || (body.contains("enable javascript") && body.contains("cookie")))
+        {
+            return Some("an unidentified bot check");
+        }
+        None
     }
 }
 
@@ -103,7 +198,8 @@ impl StaticFetcher {
                 final_url: url.to_string(),
                 content_type: "text/html".into(),
                 body: body.to_string(),
-            },
+                    headers: Vec::new(),
+                },
         );
         self
     }
@@ -124,7 +220,8 @@ impl StaticFetcher {
                 final_url: to.to_string(),
                 content_type: "text/html".into(),
                 body: body.to_string(),
-            },
+                    headers: Vec::new(),
+                },
         );
         self
     }
@@ -161,7 +258,8 @@ impl Fetcher for StaticFetcher {
                 final_url: url.to_string(),
                 content_type: "text/plain".into(),
                 body: String::new(),
-            }),
+                    headers: Vec::new(),
+                }),
         }
     }
 }
@@ -169,6 +267,118 @@ impl Fetcher for StaticFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response(status: u16, headers: &[(&str, &str)], body: &str) -> Fetched {
+        Fetched {
+            status,
+            final_url: "https://a.example/".into(),
+            content_type: "text/html".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_string(),
+        }
+    }
+
+    /// The real response, as measured: a 403 with `cf-mitigated: challenge`
+    /// and 5.5 kB of interstitial where the page should be.
+    #[test]
+    fn a_cloudflare_challenge_is_recognised() {
+        let got = response(
+            403,
+            &[("cf-mitigated", "challenge"), ("server", "cloudflare")],
+            "<html><head><title>Just a moment...</title></head><body>\
+             Enable JavaScript and cookies to continue</body></html>",
+        );
+        assert_eq!(got.challenge(), Some("Cloudflare"));
+    }
+
+    /// The header alone is enough, because it is the server stating the fact
+    /// rather than us inferring it from HTML that may change.
+    #[test]
+    fn the_header_alone_identifies_a_challenge() {
+        let got = response(403, &[("cf-mitigated", "challenge")], "");
+        assert_eq!(got.challenge(), Some("Cloudflare"));
+    }
+
+    /// The dangerous case: a challenge served with status 200. Nothing about
+    /// the status says anything is wrong, so without this it is indexed as
+    /// content and answers later queries with "Just a moment".
+    #[test]
+    fn a_challenge_served_as_200_is_still_a_challenge() {
+        let got = response(
+            200,
+            &[],
+            "<html><body><h1>Just a moment...</h1>\
+             <p>Enable JavaScript and cookies to continue</p></body></html>",
+        );
+        assert!(got.is_ok(), "the fixture should look successful");
+        assert_eq!(got.challenge(), Some("an unidentified bot check"));
+    }
+
+    /// Other systems, by their own headers.
+    #[test]
+    fn other_bot_managers_are_recognised_too() {
+        assert_eq!(response(403, &[("x-datadome", "protected")], "").challenge(), Some("DataDome"));
+        assert_eq!(response(403, &[("x-iinfo", "1-2-3")], "").challenge(), Some("Imperva"));
+        assert_eq!(
+            response(403, &[("server", "AkamaiGHost")], "").challenge(),
+            Some("Akamai"),
+        );
+        // Akamai serves plenty of ordinary pages; a 200 from it is not a
+        // challenge.
+        assert_eq!(response(200, &[("server", "AkamaiGHost")], "<p>fine</p>").challenge(), None);
+    }
+
+    /// The signature check must not fire on an ordinary page.
+    ///
+    /// This is the false positive that matters: a great many real pages carry
+    /// "please enable JavaScript" in a `<noscript>`, and reading those as
+    /// challenges would silently drop them from every crawl. The size bound is
+    /// what separates them — a challenge page is nearly empty, a real page
+    /// carrying the notice is not.
+    #[test]
+    fn a_real_page_mentioning_javascript_is_not_a_challenge() {
+        let real = format!(
+            "<html><body><noscript>Please enable JavaScript and cookies.</noscript>{}</body></html>",
+            "<p>Actual article content that goes on for a while. </p>".repeat(400),
+        );
+        assert!(real.len() > 16 * 1024, "fixture is not big enough to be a real page");
+        assert_eq!(response(200, &[], &real).challenge(), None);
+    }
+
+    /// A short page that simply says nothing about JavaScript is fine too.
+    #[test]
+    fn an_ordinary_short_page_is_not_a_challenge() {
+        assert_eq!(response(200, &[], "<p>A brief but genuine page.</p>").challenge(), None);
+    }
+
+    /// Non-HTML cannot be an interstitial, and JSON that happens to contain
+    /// the words must not be read as one.
+    #[test]
+    fn non_html_is_never_a_challenge_by_signature() {
+        let mut json = response(200, &[], "{\"error\":\"just a moment, enable javascript cookie\"}");
+        json.content_type = "application/json".into();
+        assert_eq!(json.challenge(), None);
+    }
+
+    /// A 404 is a missing page, not a refused one — the distinction the whole
+    /// method exists to preserve.
+    #[test]
+    fn a_plain_404_is_not_a_challenge() {
+        let got = response(404, &[("server", "nginx")], "<h1>Not Found</h1>");
+        assert_eq!(got.challenge(), None);
+        assert!(got.is_permanently_gone());
+    }
+
+    #[test]
+    fn headers_are_read_case_insensitively() {
+        let got = response(200, &[("Content-Language", "en")], "");
+        assert_eq!(got.header("content-language"), Some("en"));
+        assert_eq!(got.header("CONTENT-LANGUAGE"), Some("en"));
+        assert_eq!(got.header("absent"), None);
+    }
 
     #[test]
     fn a_static_fetcher_serves_what_it_was_given() {
@@ -219,7 +429,8 @@ mod tests {
             final_url: "https://a.example/".into(),
             content_type: String::new(),
             body: String::new(),
-        };
+                headers: Vec::new(),
+            };
         assert!(gone(404).is_permanently_gone());
         assert!(gone(410).is_permanently_gone());
         assert!(gone(403).is_permanently_gone());
@@ -241,7 +452,8 @@ mod tests {
             final_url: "https://a.example/".into(),
             content_type: String::new(),
             body: "<p>x</p>".into(),
-        };
+                headers: Vec::new(),
+            };
         assert!(f.is_html());
     }
 
@@ -253,7 +465,8 @@ mod tests {
                 final_url: "https://a.example/x".into(),
                 content_type: ct.into(),
                 body: String::new(),
-            };
+                    headers: Vec::new(),
+                };
             assert!(!f.is_html(), "{ct} was treated as html");
         }
     }

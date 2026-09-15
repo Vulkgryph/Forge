@@ -98,6 +98,17 @@ pub struct Report {
     pub not_html: usize,
     /// Fetched and gone — 404 and the like.
     pub missing: usize,
+    /// Refused by a bot-management challenge rather than served.
+    ///
+    /// Counted apart from `missing` because the two mean opposite things about
+    /// what to do next: a missing page means the address is wrong, while a
+    /// challenge means the address is right and the access is not. Told the
+    /// first when it is really the second, a caller corrects the URL forever
+    /// and never opens a browser.
+    pub challenged: usize,
+    /// Hosts that served a challenge, deduplicated, so a caller can say which
+    /// site needs a browser rather than only how many pages did.
+    pub challenged_hosts: Vec<String>,
     /// No response at all.
     pub unreachable: usize,
     /// Too large to parse.
@@ -281,6 +292,20 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             };
             report.fetched += 1;
 
+            // Before the status check, because a challenge can arrive as a
+            // 200 and would otherwise be indexed as content — a page whose
+            // text is "Just a moment... Enable JavaScript and cookies to
+            // continue", matching later queries and answering nothing.
+            if let Some(vendor) = fetched.challenge() {
+                report.challenged += 1;
+                let host = url.host.clone();
+                if !report.challenged_hosts.contains(&host) {
+                    report.challenged_hosts.push(host);
+                }
+                let _ = vendor;
+                continue;
+            }
+
             if !fetched.is_ok() {
                 report.missing += 1;
                 continue;
@@ -437,6 +462,57 @@ pub fn crawl<F: Fetcher>(fetcher: &F, seeds: &[&str], limits: Limits) -> (Index,
 mod tests {
     use super::*;
     use crate::fetch::{Fetched, StaticFetcher};
+
+    /// A challenged page is refused, not missing, and never indexed.
+    ///
+    /// The 200 case is the one that matters. Nothing about the status says
+    /// anything is wrong, so before this the interstitial was indexed as a
+    /// page — a document whose entire text is "Just a moment... Enable
+    /// JavaScript and cookies to continue", which then matches queries and
+    /// answers nothing.
+    #[test]
+    fn a_challenge_is_neither_indexed_nor_counted_as_missing() {
+        let challenge = Fetched {
+            status: 200,
+            final_url: "https://walled.example/".into(),
+            content_type: "text/html".into(),
+            headers: vec![("cf-mitigated".into(), "challenge".into())],
+            body: "<html><title>Just a moment...</title><body>\
+                   Enable JavaScript and cookies to continue</body></html>"
+                .into(),
+        };
+        let fetcher = StaticFetcher::new().with_response("https://walled.example/", challenge);
+        let clock = FakeClock::default();
+        let limits = Limits { max_pages: 4, politeness: 0.0, ..Limits::default() };
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, limits);
+        crawler.seed("https://walled.example/").unwrap();
+        let report = crawler.run(&mut index);
+
+        assert_eq!(report.challenged, 1, "{report:?}");
+        assert_eq!(report.missing, 0, "a refusal is not a missing page: {report:?}");
+        assert_eq!(report.indexed, 0, "the interstitial was indexed as content");
+        assert_eq!(index.len(), 0);
+        // And the host is named, so a caller can say which site needs a
+        // browser rather than only that something did.
+        assert_eq!(report.challenged_hosts, vec!["walled.example".to_string()]);
+    }
+
+    /// A genuinely missing page is still missing — the distinction has to hold
+    /// in both directions or it is not a distinction.
+    #[test]
+    fn a_missing_page_is_not_reported_as_challenged() {
+        let fetcher = StaticFetcher::new();
+        let clock = FakeClock::default();
+        let limits = Limits { max_pages: 4, politeness: 0.0, ..Limits::default() };
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, limits);
+        crawler.seed("https://nowhere.example/gone").unwrap();
+        let report = crawler.run(&mut index);
+        assert_eq!(report.missing, 1, "{report:?}");
+        assert_eq!(report.challenged, 0, "{report:?}");
+        assert!(report.challenged_hosts.is_empty());
+    }
 
     /// A site with a sidebar, which is the shape that exposed the frontier
     /// problem: every article carries the same navigation links, and they come
@@ -662,7 +738,8 @@ mod tests {
                 final_url: "https://a.example/robots.txt".into(),
                 content_type: "text/plain".into(),
                 body: "User-agent: *\nDisallow: /two\n".into(),
-            },
+                    headers: Vec::new(),
+                },
         );
         let (index, report, _) = run(&fetcher, Limits::default());
         assert!(!index.contains_url("https://a.example/two"), "fetched a disallowed page");
@@ -708,7 +785,8 @@ mod tests {
                 final_url: "https://a.example/robots.txt".into(),
                 content_type: "text/plain".into(),
                 body: String::new(),
-            },
+                    headers: Vec::new(),
+                },
         );
         let (index, report, _) = run(&fetcher, Limits::default());
         assert_eq!(index.len(), 0, "crawled a site whose rules could not be read");
@@ -749,7 +827,8 @@ mod tests {
                 final_url: "https://a.example/robots.txt".into(),
                 content_type: "text/plain".into(),
                 body: "User-agent: *\nCrawl-delay: 5\n".into(),
-            },
+                    headers: Vec::new(),
+                },
         );
         let limits = Limits { politeness: 0.5, ..Default::default() };
         let (_, _, clock) = run(&fetcher, limits);
@@ -786,7 +865,8 @@ mod tests {
                     final_url: "https://a.example/doc.pdf".into(),
                     content_type: "application/pdf".into(),
                     body: "%PDF-1.4".into(),
-                },
+                        headers: Vec::new(),
+                    },
             )
             .with_page("https://a.example/ok", "<p>fine</p>");
         let (index, report, _) = run(&fetcher, Limits::default());

@@ -430,7 +430,8 @@ mod tests {
                     final_url: search_url("firing rate", 3),
                     content_type: "application/xml".into(),
                     body: response("MED", false, "", "PMC9"),
-                },
+                        headers: Vec::new(),
+                    },
             )
             .with_page(&full_text_url("PMC9"), full_text());
         let clock = FakeClock::default();
@@ -455,7 +456,8 @@ mod tests {
                     final_url: search_url("firing rate", 3),
                     content_type: "application/xml".into(),
                     body: response("MED", true, "cc by", "PMC9"),
-                },
+                        headers: Vec::new(),
+                    },
             )
             .with_page(&full_text_url("PMC9"), full_text());
         let clock = FakeClock::default();
@@ -517,7 +519,8 @@ mod tests {
                     final_url: search_url("q", 3),
                     content_type: "application/xml".into(),
                     body: response("MED", true, "cc by", "PMC9"),
-                },
+                        headers: Vec::new(),
+                    },
             )
             .with_page(&full_text_url("PMC9"), full_text());
         let clock = FakeClock::default();

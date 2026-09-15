@@ -31,6 +31,33 @@ fn build_http_client() -> reqwest::Client {
 /// arbitrarily.
 const MAX_LENGTH: usize = 40_000;
 
+/// What to say when a page was refused by a bot check rather than served.
+///
+/// Its own function because both paths need it — a refusal arrives as a 4xx
+/// with telling headers, and also as a perfectly ordinary 200 with an
+/// interstitial in the body.
+///
+/// The wording matters more than usual. Every other failure here invites
+/// another attempt: a 404 might be the wrong address, an empty result might be
+/// the wrong words. This one does not, and an agent that treats it as one
+/// spends the turn rephrasing a request that cannot succeed. So it says the
+/// address is right, that retrying will not help, and what the alternative is.
+fn refused(url: &str, vendor: &str, status: Option<u16>) -> String {
+    let how = match status {
+        Some(code) => format!("status {code}"),
+        // A 200 carrying an interstitial, which is the case nothing else
+        // would have caught.
+        None => "status 200, with the bot check in place of the page".to_string(),
+    };
+    format!(
+        "Error: {url} was refused by a bot check ({vendor}) rather than served — {how}.\n\
+         The address is fine; the access is not. No rewording and no retry reaches a page \
+         behind a challenge — the server will serve it to a browser and not to this tool. \
+         Use what you have from elsewhere and say that this source was unavailable, or ask \
+         the user to open the page themselves."
+    )
+}
+
 /// What the index actually holds on the host that was just guessed at.
 ///
 /// Ranked against the caller's own `prompt`, since that says what it wanted
@@ -114,7 +141,36 @@ pub async fn web_fetch(
         .await
         .context("Failed to fetch URL")?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    // The response headers, so the same challenge detection the crawler uses
+    // applies here. Collected before the body is consumed.
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
+    let content_type = headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        // A refusal before a failure: the headers alone identify most
+        // challenges, and it is a different thing from the page being gone.
+        let probe = forge_search::fetch::Fetched {
+            status: status.as_u16(),
+            final_url: url.to_string(),
+            content_type: content_type.clone(),
+            headers: headers.clone(),
+            body: String::new(),
+        };
+        if let Some(vendor) = probe.challenge() {
+            return Ok(refused(url, vendor, Some(status.as_u16())));
+        }
+
         let mut out = format!("Error: Request failed with status {}", response.status());
         // A failed fetch is nearly always a guessed path, and the index
         // usually knows the real ones.
@@ -137,6 +193,22 @@ pub async fn web_fetch(
         .text()
         .await
         .context("Failed to read response body")?;
+
+    // The dangerous case: a challenge served with status 200. Nothing about
+    // the status says anything is wrong, so without this the interstitial is
+    // summarised as though it were the page — and the answer comes back as
+    // "the page asks you to enable JavaScript", which reads like a fact about
+    // the site rather than a refusal.
+    let served = forge_search::fetch::Fetched {
+        status: status.as_u16(),
+        final_url: final_url.clone(),
+        content_type,
+        headers,
+        body: html.clone(),
+    };
+    if let Some(vendor) = served.challenge() {
+        return Ok(refused(url, vendor, None));
+    }
 
     // Parse HTML and extract text in a block so `document` (non-Send) is dropped
     // before any subsequent .await points.
@@ -358,6 +430,47 @@ mod tests {
         let path = dir.join("search-index.bin");
         ix.save(&path).unwrap();
         path
+    }
+
+    /// The wording of a refusal, on both paths it can arrive by.
+    ///
+    /// Checked as text because that text is the whole point: it has to tell an
+    /// agent that retrying is futile, which is the opposite of what every
+    /// other failure here says.
+    #[test]
+    fn a_refusal_says_not_to_retry_and_why() {
+        let out = refused("https://walled.test/p", "Cloudflare", Some(403));
+        assert!(out.contains("refused by a bot check (Cloudflare)"), "{out}");
+        assert!(out.contains("status 403"), "{out}");
+        assert!(out.contains("address is fine"), "{out}");
+        assert!(out.contains("no retry"), "{out}");
+        assert!(out.contains("ask") && out.contains("user"), "{out}");
+    }
+
+    /// The 200 case has to read differently, because "status 200" on its own
+    /// would look like success.
+    #[test]
+    fn a_refusal_served_as_200_says_so() {
+        let out = refused("https://walled.test/p", "Cloudflare", None);
+        assert!(out.contains("status 200"), "{out}");
+        assert!(out.contains("in place of the page"), "{out}");
+    }
+
+    /// Ignored for the same reason as the other network tests. It is here
+    /// because the detection was written against one real response and this
+    /// is how to check it still matches: yesterdaystractors.com serves a
+    /// Cloudflare interstitial with `cf-mitigated: challenge` on a 403.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn live_a_walled_site_is_reported_as_refused_not_missing() {
+        let args = json!({
+            "url": "https://www.yesterdaystractors.com/",
+            "prompt": "anything at all",
+        });
+        let out = web_fetch(&args, None, None).await.expect("call");
+        println!("{out}");
+        assert!(out.contains("refused by a bot check"), "{out}");
+        assert!(!out.contains("Request failed with status"), "a refusal was reported as a plain failure: {out}");
     }
 
     /// A guessed path is the usual reason a fetch fails, and the index

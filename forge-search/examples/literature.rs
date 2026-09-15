@@ -54,8 +54,7 @@ impl Fetcher for Curl {
                 .unwrap_or("")
                 .trim()
                 .to_lowercase(),
-            body: text[..cut].to_string(),
-        })
+            body: text[..cut].to_string(), headers: Vec::new() })
     }
 
     fn user_agent(&self) -> &str {

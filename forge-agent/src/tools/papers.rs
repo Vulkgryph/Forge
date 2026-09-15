@@ -90,7 +90,7 @@ fn run(
     let mut hits = query::search(&index, query_text, max_results);
     let local_ms = started.elapsed().as_millis();
     if !hits.is_empty() {
-        return Ok(render_hits(query_text, &hits, &index, Fetched::no(index.len(), local_ms)));
+        return Ok(render_hits(query_text, &hits, &index, Outcome::no(index.len(), local_ms)));
     }
 
     let fetcher = HttpFetcher::new(handle, 8 * 1024 * 1024);
@@ -113,7 +113,7 @@ fn run(
     hits = query::search(&index, query_text, max_results);
     let search_ms = local_ms + again.elapsed().as_millis();
 
-    let fetched = Fetched {
+    let fetched = Outcome {
         ran: true,
         hit_count: report.hit_count,
         examined: report.examined,
@@ -138,7 +138,11 @@ fn run(
 }
 
 /// What the tool did, beyond the results themselves.
-struct Fetched {
+///
+/// Named `Outcome` rather than `Fetched` because `forge_search::fetch::Fetched`
+/// is a different thing — one HTTP response — and having both in scope under
+/// one name is how a mechanical edit across the crate mangled this file.
+struct Outcome {
     ran: bool,
     hit_count: usize,
     examined: usize,
@@ -151,7 +155,7 @@ struct Fetched {
     cited: Vec<(String, String)>,
 }
 
-impl Fetched {
+impl Outcome {
     fn no(index_size: usize, search_ms: u128) -> Self {
         Self {
             ran: false,
@@ -168,7 +172,7 @@ impl Fetched {
     }
 }
 
-fn render_hits(query_text: &str, hits: &[query::Result_], index: &Index, f: Fetched) -> String {
+fn render_hits(query_text: &str, hits: &[query::Result_], index: &Index, f: Outcome) -> String {
     let mut out = String::new();
 
     if hits.is_empty() {
@@ -244,7 +248,7 @@ fn render_hits(query_text: &str, hits: &[query::Result_], index: &Index, f: Fetc
 ///
 /// Reported rather than dropped: an agent that is not told coverage was
 /// limited will read what it got as everything there is.
-fn render_citations(out: &mut String, f: &Fetched) {
+fn render_citations(out: &mut String, f: &Outcome) {
     if f.cited.is_empty() {
         return;
     }
@@ -305,7 +309,7 @@ mod tests {
         );
         let hits = query::search(&index, "slices acsf", 3);
         assert_eq!(hits.len(), 1);
-        let out = render_hits("slices acsf", &hits, &index, Fetched::no(1, 1));
+        let out = render_hits("slices acsf", &hits, &index, Outcome::no(1, 1));
         assert!(out.contains("terms: cc by-nc — Europe PMC PMC1"), "{out}");
     }
 
@@ -313,7 +317,7 @@ mod tests {
     /// told nothing about it will assume there was nothing.
     #[test]
     fn articles_that_could_not_be_kept_are_still_cited() {
-        let mut f = Fetched::no(0, 0);
+        let mut f = Outcome::no(0, 0);
         f.ran = true;
         f.citation_only = 2;
         f.cited = vec![(
@@ -330,14 +334,14 @@ mod tests {
     /// they are not reported with the same words.
     #[test]
     fn an_api_failure_reads_differently_from_an_empty_result() {
-        let mut down = Fetched::no(0, 0);
+        let mut down = Outcome::no(0, 0);
         down.ran = true;
         down.unreachable = 1;
         let out = render_hits("x", &[], &Index::new(), down);
         assert!(out.contains("did not respond"), "{out}");
         assert!(out.contains("worth one retry"), "{out}");
 
-        let mut empty = Fetched::no(0, 0);
+        let mut empty = Outcome::no(0, 0);
         empty.ran = true;
         let out = render_hits("x", &[], &Index::new(), empty);
         assert!(out.contains("no articles matching at all"), "{out}");
@@ -348,7 +352,7 @@ mod tests {
     /// the model knows to widen rather than conclude the literature is silent.
     #[test]
     fn matches_that_were_not_reached_are_distinguished_from_none() {
-        let mut some = Fetched::no(0, 0);
+        let mut some = Outcome::no(0, 0);
         some.ran = true;
         some.hit_count = 2636;
         some.examined = 18;

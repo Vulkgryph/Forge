@@ -123,6 +123,19 @@ pub enum AgentEvent {
         tool_id: String,
         items: Vec<QuestionItem>,
     },
+    /// A page was refused by a bot check and a person could open it.
+    ///
+    /// Not waited on — see the proto's `BrowserRequest`.
+    BrowserRequest {
+        request_id: String,
+        url: String,
+        refused_by: String,
+    },
+    /// That request no longer matters; drop any prompt for it.
+    BrowserRequestWithdrawn {
+        request_id: String,
+        reason: String,
+    },
     PlanModeEntered {
         plan_path: String,
     },
@@ -330,6 +343,17 @@ pub enum UserAction {
     ApprovePlan,
     RejectPlan(String), // revision feedback text
     AnswerQuestion(String),
+    /// A person opened a refused page; this is what was there.
+    BrowserResult {
+        request_id: String,
+        final_url: String,
+        html: String,
+    },
+    /// Nobody will open it.
+    BrowserDeclined {
+        request_id: String,
+        reason: String,
+    },
     ClearAndApprovePlan,
     ClearSession,
     Rewind(Option<String>),
@@ -601,6 +625,14 @@ pub struct Agent {
     /// Anything parked here is drained by the main loop, which is the only
     /// place that knows how to handle every action.
     deferred_actions: VecDeque<UserAction>,
+    /// Browser handoff requests raised during this turn: id → url.
+    ///
+    /// Turn-scoped on purpose. A refused page is offered to whoever is
+    /// watching, the agent carries on with what else it has, and anything
+    /// still outstanding when the turn ends is withdrawn — because the page
+    /// may have stopped mattering, and a prompt that outlives its purpose is
+    /// one people learn to dismiss.
+    pending_browser: std::collections::HashMap<String, String>,
     rewind_checkpoints: Vec<RewindCheckpoint>,
     touched_worktree_roots: Vec<PathBuf>,
     pending_file_snapshots: Vec<FileSnapshot>,
@@ -683,6 +715,7 @@ impl Agent {
             consecutive_shell_runs: 0,
             queued_user_messages: VecDeque::new(),
             deferred_actions: VecDeque::new(),
+            pending_browser: std::collections::HashMap::new(),
             rewind_checkpoints: Vec::new(),
             touched_worktree_roots: Vec::new(),
             pending_file_snapshots: Vec::new(),
@@ -792,6 +825,7 @@ impl Agent {
             consecutive_shell_runs: 0,
             queued_user_messages: VecDeque::new(),
             deferred_actions: VecDeque::new(),
+            pending_browser: std::collections::HashMap::new(),
             rewind_checkpoints,
             touched_worktree_roots: Vec::new(),
             pending_file_snapshots: Vec::new(),
@@ -1081,6 +1115,15 @@ impl Agent {
                         self.client = client;
                     }
                 }
+                // ── Browser handoff ───────────────────────────────────
+                UserAction::BrowserResult { request_id, final_url, html } => {
+                    self.absorb_browser_result(&request_id, &final_url, &html);
+                }
+                UserAction::BrowserDeclined { request_id, reason } => {
+                    self.pending_browser.remove(&request_id);
+                    let _ = reason;
+                }
+
                 UserAction::Compact => {
                     let _ = self.log.log_run_state(RunState::Running);
                     self.do_compaction_with(true).await?;
@@ -1509,7 +1552,8 @@ impl Agent {
                 if tool_calls.is_empty() {
                     let _ = self.log.log_message(&choice.message);
                     self.history.push(choice.message.clone());
-                    let _ = self.event_tx.send(AgentEvent::Done);
+                    self.withdraw_refused_pages("the turn ended");
+                let _ = self.event_tx.send(AgentEvent::Done);
                     return Ok(());
                 }
 
@@ -1557,7 +1601,8 @@ impl Agent {
                                 tc.function.name, consecutive_count
                             ),
                         ));
-                        let _ = self.event_tx.send(AgentEvent::Done);
+                        self.withdraw_refused_pages("the turn ended");
+                let _ = self.event_tx.send(AgentEvent::Done);
                         return Ok(());
                     }
 
@@ -2064,6 +2109,12 @@ impl Agent {
                     continue; // Loop back to call the model again
                 }
 
+                // Any page a bot check refused during that round is offered to
+                // whoever is watching. After the tools, not during: the agent
+                // has already been told and has already carried on, so this is
+                // an offer rather than a question.
+                self.offer_refused_pages();
+
                 if toolless_intent_retries < MAX_TOOLLESS_INTENT_RETRIES
                     && looks_like_tool_intent_without_action(choice.message.content.as_deref())
                 {
@@ -2080,6 +2131,7 @@ impl Agent {
                     continue;
                 }
 
+                self.withdraw_refused_pages("the turn ended");
                 let _ = self.event_tx.send(AgentEvent::Done);
                 return Ok(());
             }
@@ -3893,6 +3945,71 @@ impl Agent {
 
     // --- Ask question helper ---
 
+    /// Offer any pages a bot check refused to whoever is watching.
+    ///
+    /// Called after every tool call, because that is when a refusal has just
+    /// been recorded — see `tools::refused`. Nothing here waits: the agent has
+    /// already been told the page was refused and has already moved on, and
+    /// the request sits with the client until somebody services it or the turn
+    /// ends.
+    fn offer_refused_pages(&mut self) {
+        for refusal in crate::tools::refused::drain() {
+            // Ids are derived from the URL rather than random, so the same
+            // page refused twice in a turn is one request.
+            let request_id = format!("browser-{:x}", hash_of(&refusal.url));
+            if self.pending_browser.contains_key(&request_id) {
+                continue;
+            }
+            self.pending_browser
+                .insert(request_id.clone(), refusal.url.clone());
+            let _ = self.event_tx.send(AgentEvent::BrowserRequest {
+                request_id,
+                url: refusal.url,
+                refused_by: refusal.refused_by,
+            });
+        }
+    }
+
+    /// Withdraw every outstanding handoff request.
+    ///
+    /// The turn is over, so the question that needed the page has either been
+    /// answered without it or abandoned. Either way nobody should still be
+    /// asked to open it.
+    fn withdraw_refused_pages(&mut self, reason: &str) {
+        for (request_id, _) in std::mem::take(&mut self.pending_browser) {
+            let _ = self.event_tx.send(AgentEvent::BrowserRequestWithdrawn {
+                request_id,
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    /// A person opened a refused page. Put it where the agent can find it.
+    ///
+    /// Indexed rather than pasted into the conversation. The page belongs in
+    /// the corpus `web_search` already queries, so the agent reaches it the
+    /// same way it reaches everything else and a hundred kilobytes of HTML
+    /// does not land in the context window. The note that follows is one line.
+    ///
+    /// The HTML came from a real browser that really made the request. Nothing
+    /// was replayed and no credential was moved — see `tools::refused`.
+    fn absorb_browser_result(&mut self, request_id: &str, final_url: &str, html: &str) {
+        self.pending_browser.remove(request_id);
+        let page = forge_search::html::parse(html);
+        let index_path = crate::tools::search::index_path(self.executor.project_root());
+        let mut index = forge_search::index::Index::load(&index_path)
+            .unwrap_or_else(|_| forge_search::index::Index::new());
+        index.add(final_url, &page.title, &page.description, &page.text);
+        let _ = crate::workdir::ensure_parent_of(&index_path);
+        let _ = index.save(&index_path);
+
+        let terms = forge_search::tokenize::terms(&page.text).len();
+        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+            "[{final_url} was opened in a browser and added to the search index \
+             ({terms} terms). Query it with web_search.]"
+        )));
+    }
+
     async fn handle_ask_question(&mut self, tc: &ToolCall) -> Result<String> {
         let args: serde_json::Value =
             serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
@@ -5186,4 +5303,18 @@ mod deferred_action_tests {
              finished background command waits for unrelated user input"
         );
     }
+}
+
+/// A stable hash, so a request id is a function of the URL it is for.
+///
+/// Written out rather than taken from the standard library's hasher, whose
+/// output is explicitly not guaranteed to be stable between runs — and an id
+/// that changes between runs would let the same page be offered twice.
+fn hash_of(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
 }

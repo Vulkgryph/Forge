@@ -4,6 +4,7 @@ mod definitions;
 mod executor;
 pub mod papers;
 pub mod patch;
+pub mod refused;
 pub mod search;
 pub mod scratchpad;
 pub mod web;

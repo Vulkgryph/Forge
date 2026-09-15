@@ -109,6 +109,17 @@ pub struct Report {
     /// Hosts that served a challenge, deduplicated, so a caller can say which
     /// site needs a browser rather than only how many pages did.
     pub challenged_hosts: Vec<String>,
+    /// One refused URL per challenged host.
+    ///
+    /// A host is what you name in a message; a URL is what a browser can
+    /// actually be pointed at. One per host rather than all of them because a
+    /// wholly walled site refuses every page in the crawl and nobody is going
+    /// to open them one at a time — the first names the problem.
+    pub challenged_urls: Vec<String>,
+    /// The system that did the refusing, as last seen. One name is enough: a
+    /// crawl is nearly always walled by one thing, and the alternative is a
+    /// list nobody reads.
+    pub challenged_by: String,
     /// No response at all.
     pub unreachable: usize,
     /// Too large to parse.
@@ -301,8 +312,9 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 let host = url.host.clone();
                 if !report.challenged_hosts.contains(&host) {
                     report.challenged_hosts.push(host);
+                    report.challenged_urls.push(url.as_string());
+                    report.challenged_by = vendor.to_string();
                 }
-                let _ = vendor;
                 continue;
             }
 

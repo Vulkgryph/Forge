@@ -200,6 +200,35 @@ pub enum AgentMessage {
         items: Vec<QuestionItem>,
     },
 
+    // ── Browser handoff ───────────────────────────────────────────────────
+    /// A page was refused by a bot check, and a person could open it.
+    ///
+    /// Not a question the agent waits on. It carries on with whatever else it
+    /// has and the request sits with the client until somebody services it,
+    /// because the page may not turn out to matter — and a prompt that
+    /// outlives the need for it is a prompt people learn to dismiss.
+    ///
+    /// Servicing it is optional, and a host with no browser (a terminal, a
+    /// headless run) is expected to ignore it. That is why this is a
+    /// capability rather than a requirement: the agent asks, and a host that
+    /// can, answers.
+    BrowserRequest {
+        request_id: String,
+        url: String,
+        /// Which bot-management system refused it, for a client that wants to
+        /// say why.
+        refused_by: String,
+    },
+    /// The request no longer matters — drop any prompt for it.
+    ///
+    /// Sent when the turn that raised it ends. The agent either answered the
+    /// question from elsewhere or gave up on it, and either way nobody should
+    /// still be being asked to open a page for a task that is over.
+    BrowserRequestWithdrawn {
+        request_id: String,
+        reason: String,
+    },
+
     // ── Plan mode ─────────────────────────────────────────────────────────
     PlanModeEntered {
         plan_path: String,
@@ -271,6 +300,8 @@ impl AgentMessage {
             Self::SubagentStatus { .. } => "subagent_status",
             Self::SubagentFinished { .. } => "subagent_finished",
             Self::QuestionRequest { .. } => "question_request",
+            Self::BrowserRequest { .. } => "browser_request",
+            Self::BrowserRequestWithdrawn { .. } => "browser_request_withdrawn",
             Self::PlanModeEntered { .. } => "plan_mode_entered",
             Self::PlanModeExited { .. } => "plan_mode_exited",
             Self::PlanReady { .. } => "plan_ready",
@@ -605,6 +636,27 @@ pub enum ClientMessage {
     // ── Replies to agent requests ─────────────────────────────────────────
     AnswerQuestion {
         answer: String,
+    },
+    /// A person opened the page and this is what was there.
+    ///
+    /// `html` is the document as the browser had it after any bot check was
+    /// cleared — so it comes from a real browser engine with a real
+    /// fingerprint, not from replaying a cookie through an HTTP client that
+    /// would then be claiming to be something it is not.
+    ///
+    /// `final_url` is where the browser ended up, which is not always where
+    /// it was sent: clearing a challenge usually involves a redirect, and the
+    /// person may have navigated on.
+    BrowserResult {
+        request_id: String,
+        final_url: String,
+        html: String,
+    },
+    /// Nobody is going to open it. The agent should stop counting on it.
+    BrowserDeclined {
+        request_id: String,
+        #[serde(default)]
+        reason: String,
     },
     ProcessInput {
         content: String,

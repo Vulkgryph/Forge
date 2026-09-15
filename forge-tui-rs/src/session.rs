@@ -770,6 +770,25 @@ impl Session {
                 self.pending = Some(Pending::Question { question, tool_id, items });
             }
 
+            // ── Browser handoff ───────────────────────────────────────────
+            // This client has no browser, and that is the expected case
+            // rather than a gap: the handoff is a capability a host may have,
+            // and a terminal does not. It says so and carries on. Nothing is
+            // waiting on an answer, so declining is a matter of telling the
+            // person what happened, not of unblocking the agent.
+            AgentMessage::BrowserRequest { url, refused_by, .. } => {
+                self.entries.push(Entry::new(
+                    EntryKind::System,
+                    format!(
+                        "{url} was refused by a bot check ({refused_by}).                          Opening it needs a browser, which this client does not have —                          open it yourself, or use the IDE."
+                    ),
+                ));
+            }
+            // Withdrawn because the turn ended: the agent either managed
+            // without the page or gave up on it. Nothing to undo here, since
+            // nothing was pending in a terminal.
+            AgentMessage::BrowserRequestWithdrawn { .. } => {}
+
             // ── Plan mode ─────────────────────────────────────────────────
             AgentMessage::PlanModeEntered { plan_path } => {
                 self.plan_mode = true;

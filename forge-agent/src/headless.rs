@@ -45,6 +45,15 @@ enum OutgoingMessage {
     ReasoningToken {
         content: String,
     },
+    BrowserRequest {
+        request_id: String,
+        url: String,
+        refused_by: String,
+    },
+    BrowserRequestWithdrawn {
+        request_id: String,
+        reason: String,
+    },
     AssistantMessage {
         content: String,
     },
@@ -394,6 +403,19 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
         AgentEvent::ReasoningToken(content) => OutgoingMessage::ReasoningToken {
             content: content.clone(),
         },
+        AgentEvent::BrowserRequest { request_id, url, refused_by } => {
+            OutgoingMessage::BrowserRequest {
+                request_id: request_id.clone(),
+                url: url.clone(),
+                refused_by: refused_by.clone(),
+            }
+        }
+        AgentEvent::BrowserRequestWithdrawn { request_id, reason } => {
+            OutgoingMessage::BrowserRequestWithdrawn {
+                request_id: request_id.clone(),
+                reason: reason.clone(),
+            }
+        }
         AgentEvent::AssistantMessage(content) => OutgoingMessage::AssistantMessage {
             content: content.clone(),
         },
@@ -576,6 +598,17 @@ enum IncomingMessage {
         #[serde(default)]
         reason: String,
     },
+    BrowserResult {
+        request_id: String,
+        #[serde(default)]
+        final_url: String,
+        html: String,
+    },
+    BrowserDeclined {
+        request_id: String,
+        #[serde(default)]
+        reason: String,
+    },
     ToggleAutoMode,
     SwitchModel {
         name: String,
@@ -711,6 +744,12 @@ fn json_to_user_action(
         IncomingMessage::ApproveAction { tool_id } => Some(UserAction::ApproveAction(tool_id)),
         IncomingMessage::DenyAction { tool_id, reason } => {
             Some(UserAction::DenyAction { tool_id, reason })
+        }
+        IncomingMessage::BrowserResult { request_id, final_url, html } => {
+            Some(UserAction::BrowserResult { request_id, final_url, html })
+        }
+        IncomingMessage::BrowserDeclined { request_id, reason } => {
+            Some(UserAction::BrowserDeclined { request_id, reason })
         }
         IncomingMessage::ToggleAutoMode => Some(UserAction::ToggleAutoMode),
         IncomingMessage::SwitchModel {

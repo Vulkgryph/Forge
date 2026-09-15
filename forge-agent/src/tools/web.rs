@@ -43,6 +43,9 @@ const MAX_LENGTH: usize = 40_000;
 /// spends the turn rephrasing a request that cannot succeed. So it says the
 /// address is right, that retrying will not help, and what the alternative is.
 fn refused(url: &str, vendor: &str, status: Option<u16>) -> String {
+    // Queued for a person who might open it. Not a retry and not a bypass —
+    // see `tools::refused`.
+    super::refused::record(url, vendor);
     let how = match status {
         Some(code) => format!("status {code}"),
         // A 200 carrying an interstitial, which is the case nothing else

@@ -2944,7 +2944,12 @@ impl Agent {
                         let _ = self.log.log_run_state(RunState::WaitingUser);
                         return Ok(result);
                     }
-                    _ => continue,
+                    // Parked rather than dropped: this loop owns the action
+                    // channel while the user is being asked something, so a
+                    // background command finishing here would be lost. See
+                    // `deferred_actions`.
+                    Some(other) => self.deferred_actions.push_back(other),
+                    None => continue,
                 }
             }
         } else {
@@ -3979,7 +3984,12 @@ impl Agent {
                 Some(UserAction::Quit) => {
                     return Ok("Session ended by user".to_string());
                 }
-                _ => continue,
+                // Parked rather than dropped: this loop owns the action
+                // channel while the user is being asked something, so a
+                // background command finishing here would be lost. See
+                // `deferred_actions`.
+                Some(other) => self.deferred_actions.push_back(other),
+                None => continue,
             }
         };
 
@@ -4062,7 +4072,12 @@ impl Agent {
                     Some(UserAction::Quit) => {
                         return "Session ended by user".to_string();
                     }
-                    _ => continue,
+                    // Parked rather than dropped: this loop owns the action
+                    // channel while the user is being asked something, so a
+                    // background command finishing here would be lost. See
+                    // `deferred_actions`.
+                    Some(other) => self.deferred_actions.push_back(other),
+                    None => continue,
                 }
             }
         } else {
@@ -5126,8 +5141,17 @@ mod deferred_action_tests {
             // version of this test matched only the bare form — so it passed
             // against the very code it was written to catch.
             let code = line.split("//").next().unwrap_or("").trim();
-            if code != "_ => {}" && code != "_ => {},"
-                && !code.starts_with("_ => {} ") {
+            // `continue` discards just as thoroughly as `{}` does, and the
+            // first version of this test matched only the block form — so it
+            // passed over a wait loop in `handle_ask_question` that dropped
+            // every action it did not recognise. A background command
+            // completing while the user was being asked a question was lost.
+            let discards = matches!(
+                code,
+                "_ => {}" | "_ => {}," | "_ => continue" | "_ => continue,"
+                    | "_ => { continue }" | "_ => { continue; }"
+            ) || code.starts_with("_ => {} ");
+            if !discards {
                 continue;
             }
             // Only arms belonging to a match on an action receive.

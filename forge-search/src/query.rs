@@ -137,6 +137,7 @@ pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
         // rewards rather than requires.
         query.phrases.iter().all(|p| has_phrase(index, hit.doc, p))
     });
+    let hits = one_per_page(index, hits);
     let hits = spread_across_hosts(index, hits, limit);
 
     hits.into_iter()
@@ -163,6 +164,44 @@ pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
 /// are worth seeing together, and a hard limit of one would hide the better of
 /// two passages from the source that knows most about the question.
 const MAX_PER_HOST: usize = 2;
+
+/// Keep one result per page, collapsing query-string variants of it.
+///
+/// A query string very often selects a view of one document rather than a
+/// different document: `?pivots=azure-cli`, `?tab=bicep`, `?lang=en`,
+/// `?print=1`. Those are the same page to a reader, and each extra copy costs
+/// a result slot that a genuinely different page could have had.
+///
+/// Measured: a search of Microsoft's Container Apps documentation returned
+/// `scale-app?pivots=azure-cli`, `scale-app?&pivots=azure-resource-manager`
+/// and `scale-app?&pivots=container-apps-bicep` as results one, two and
+/// three — three of five slots on one document, while the billing and jobs
+/// pages that answered the rest of the question sat below the cut.
+///
+/// The best-scoring variant wins, so nothing is lost but the duplicates. This
+/// runs before the per-host cap: collapsing first is what lets that cap spend
+/// its two slots on two different pages.
+///
+/// It is deliberately not applied at indexing time. A query string sometimes
+/// *is* the document — `?id=`, `?page=2`, a search result — and merging those
+/// in the index would lose pages. Here the cost of being wrong is one result
+/// shown instead of two near-identical ones, which is the safer direction.
+fn one_per_page(index: &Index, hits: Vec<crate::rank::Hit>) -> Vec<crate::rank::Hit> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            let key = index
+                .document(hit.doc)
+                .map(|d| match crate::url::Url::parse(&d.url) {
+                    // Host and path, without the query.
+                    Ok(u) => format!("{}{}", u.host, u.path),
+                    Err(_) => d.url.clone(),
+                })
+                .unwrap_or_default();
+            seen.insert(key)
+        })
+        .collect()
+}
 
 /// Reorder so the results span sources instead of one source's best pages.
 ///
@@ -681,6 +720,39 @@ mod tests {
         hits.iter()
             .map(|h| crate::url::Url::parse(&h.url).map(|u| u.host).unwrap_or_default())
             .collect()
+    }
+
+    /// Query-string variants of one page are one page.
+    ///
+    /// Measured on Microsoft's Container Apps documentation, where
+    /// `scale-app?pivots=azure-cli`, `scale-app?&pivots=azure-resource-manager`
+    /// and `scale-app?&pivots=container-apps-bicep` took results one, two and
+    /// three — three of five slots on a single document.
+    #[test]
+    fn one_page_does_not_appear_three_times_under_different_query_strings() {
+        let mut ix = Index::new();
+        let body = "Scaling settings: minReplicas and maxReplicas control the replica count.";
+        for pivot in ["azure-cli", "azure-resource-manager", "container-apps-bicep"] {
+            ix.add(
+                &format!("https://learn.test/azure/scale-app?pivots={pivot}"),
+                "Scaling in Azure Container Apps",
+                "",
+                body,
+            );
+        }
+        ix.add("https://learn.test/azure/billing", "Billing", "", "Scaling to zero incurs no charges for replicas.");
+        ix.add("https://learn.test/azure/jobs", "Jobs", "", "Jobs do not support the replica scaling rules above.");
+
+        let hits = search(&ix, "scaling replicas", 5);
+        let paths: Vec<String> = hits
+            .iter()
+            .map(|h| h.url.split('?').next().unwrap_or("").to_string())
+            .collect();
+        let scale_app = paths.iter().filter(|p| p.ends_with("/scale-app")).count();
+        assert_eq!(scale_app, 1, "the same page appeared {scale_app} times: {paths:?}");
+        // And the slots it was taking go to different pages.
+        assert!(paths.iter().any(|p| p.ends_with("/billing")), "{paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("/jobs")), "{paths:?}");
     }
 
     /// A site with plenty to say must not crowd out the sites that disagree

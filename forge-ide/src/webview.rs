@@ -253,6 +253,12 @@ impl WebView {
     }
 
     /// Whether the browser is still loading, for a caller that wants to say so.
+    ///
+    /// Unused so far: the toolbar shows no loading state, because a page that
+    /// takes long enough to notice is usually a bot check and that gets said
+    /// in plainer words. Kept because it is one message send and the panel
+    /// will want it the moment anything shows progress.
+    #[allow(dead_code)]
     pub fn is_loading(&self) -> bool {
         unsafe { msg_send![&self.view, isLoading] }
     }
@@ -284,6 +290,10 @@ impl WebView {
 
     /// The page's title, for a tab that wants to name itself something better
     /// than its URL.
+    ///
+    /// Unused so far — browser tabs are still labelled by address. Kept for
+    /// when they are not.
+    #[allow(dead_code)]
     pub fn title(&self) -> Option<String> {
         unsafe {
             let title: *mut AnyObject = msg_send![&self.view, title];

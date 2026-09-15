@@ -202,7 +202,14 @@ pub enum AgentMsg {
     /// That request no longer matters; the turn ended.
     BrowserRequestWithdrawn {
         #[serde(default)] request_id: String,
-        #[serde(default)] reason: String,
+        /// Why it was withdrawn. Part of the wire format and deliberately
+        /// parsed even though this client does not show it: dropping the
+        /// field would make the struct disagree with the agent's, and the
+        /// next client that wants to explain the withdrawal would have to add
+        /// it back on both sides.
+        #[serde(default)]
+        #[allow(dead_code)]
+        reason: String,
     },
     ProcessInputNeeded {
         #[serde(default)] prompt: String,

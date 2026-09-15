@@ -4525,6 +4525,17 @@ pub struct IdeApp {
     /// because it is a `stat`, and only while the window is drawing anyway — an
     /// untouched window learning about it a few seconds late costs nothing.
     build_is_stale: bool,
+    /// The installed build a person said "later" to, by its timestamp.
+    ///
+    /// Dismissing the banner used to set `update_banner_dismissed`, which the
+    /// *release* notice also uses — so clicking × on "Forge IDE 0.4.2 is
+    /// available" silenced the new-build prompt for the rest of that window's
+    /// life, including for every build after it. A window left open for a
+    /// fortnight would never mention a new binary again.
+    ///
+    /// Dismissal now applies to the build it was shown for. Install another
+    /// and the banner comes back, which is what "later" means.
+    build_banner_dismissed: Option<std::time::SystemTime>,
     build_checked:  Option<std::time::Instant>,
     update_banner_dismissed: bool,
     /// AI-provider setup wizard — `Some` while open, regardless of which
@@ -5117,6 +5128,7 @@ impl IdeApp {
             update_check_rx: None,
             update_available: None,
             build_is_stale: false,
+            build_banner_dismissed: None,
             build_checked:  None,
             update_banner_dismissed: false,
             onboarding: None,
@@ -7817,7 +7829,12 @@ impl IdeApp {
         // A newer build actually *installed* outranks news of a newer release:
         // one is something to read about, the other is something this window is
         // not running yet.
-        if self.build_is_stale && !self.update_banner_dismissed {
+        let dismissed_this_build = match (self.build_banner_dismissed, exe_mtime()) {
+            (Some(said_later_to), Some(on_disk)) => said_later_to == on_disk,
+            // Nothing dismissed, or the timestamp cannot be read: show it.
+            _ => false,
+        };
+        if self.build_is_stale && !dismissed_this_build {
             let mut action: Option<BuildUpdateAction> = None;
             let running = build_stamp().to_string();
             egui::TopBottomPanel::top("build_stale_banner").show(ctx, |ui| {
@@ -7848,7 +7865,8 @@ impl IdeApp {
             match action {
                 Some(BuildUpdateAction::ThisWindow) => self.restart_window(),
                 Some(BuildUpdateAction::Everything) => self.restart_every_window(),
-                Some(BuildUpdateAction::Later) => self.update_banner_dismissed = true,
+                // For this build, not for good.
+                Some(BuildUpdateAction::Later) => self.build_banner_dismissed = exe_mtime(),
                 None => {}
             }
             return;
@@ -18508,6 +18526,58 @@ mod stale_build_tests {
         );
         // Nothing has been installed over it, so no banner and no menu note.
         assert!(!app.build_is_stale);
+    }
+
+    /// Saying "later" to a new build must not silence the next one.
+    ///
+    /// It used to set the same flag the release notice uses, so one dismissal
+    /// — of either banner — stopped this window ever mentioning a new binary
+    /// again. A window left open for a fortnight, which is ordinary here,
+    /// would go the whole time without a prompt while builds were installed
+    /// under it.
+    #[test]
+    fn dismissing_one_build_does_not_silence_the_next() {
+        use std::time::{Duration, SystemTime};
+        let first = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let second = first + Duration::from_secs(60);
+
+        // The comparison the banner makes: dismissed *this* build, or not?
+        let suppressed = |said_later_to: Option<SystemTime>, on_disk: Option<SystemTime>| {
+            match (said_later_to, on_disk) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+
+        // Dismissed the build that is installed: stay quiet.
+        assert!(suppressed(Some(first), Some(first)));
+        // A newer one arrives: speak up again.
+        assert!(!suppressed(Some(first), Some(second)));
+        // Never dismissed anything: speak up.
+        assert!(!suppressed(None, Some(first)));
+        // Cannot read the timestamp: speak up rather than stay silent by
+        // accident.
+        assert!(!suppressed(Some(first), None));
+    }
+
+    /// And the release notice keeps its own dismissal, so the two cannot
+    /// silence each other again.
+    #[test]
+    fn the_release_notice_and_the_build_notice_dismiss_separately() {
+        let src = include_str!("app.rs");
+        let banner = src
+            .split("fn draw_update_banner")
+            .nth(1)
+            .expect("the banner");
+        let build_half = banner.split("let Some(update) = &self.update_available").next().unwrap();
+        assert!(
+            !build_half.contains("self.update_banner_dismissed = true"),
+            "the build banner sets the release banner's dismissal again",
+        );
+        assert!(
+            build_half.contains("build_banner_dismissed"),
+            "the build banner is not using its own dismissal",
+        );
     }
 
     /// The direction that matters, which cannot be arranged by replacing the

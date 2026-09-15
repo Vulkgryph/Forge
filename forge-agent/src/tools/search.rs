@@ -212,11 +212,6 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
         .as_str()
         .context("Missing 'query' argument")?
         .to_string();
-    let max_results = args
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5)
-        .clamp(1, 20) as usize;
 
     // Seeds from the query when it names a site, so "search docs.rs for
     // tokio" reaches somewhere the default list does not. A query that names
@@ -240,18 +235,13 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
         DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect()
     };
 
-    let max_pages = args
-        .get("max_pages")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_MAX_PAGES as u64)
-        .clamp(1, 500) as usize;
 
     let handle = tokio::runtime::Handle::current();
     // The whole crawl-and-search runs off the runtime's worker threads,
     // because the fetcher blocks and blocking a worker starves everything
     // else the agent is doing.
     let result = tokio::task::spawn_blocking(move || {
-        run(&query_text, &seeds, asked_for_sites, max_results, max_pages, index_path, handle)
+        run(&query_text, &seeds, asked_for_sites, index_path, handle)
     })
     .await
     .map_err(|e| anyhow::anyhow!("search task failed: {e}"))?;
@@ -259,15 +249,25 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
     result
 }
 
+/// How many passages to return.
+///
+/// Not a parameter, deliberately. Every setting a tool exposes is a decision
+/// the model has to make correctly, and this is one it has no basis for — a
+/// real headless run chose page budgets of 120, 150 and 200 on consecutive
+/// calls with no reason to prefer any of them, and 200 pages is over three
+/// minutes of crawling. The tools this is modelled on take a query and
+/// nothing else for the same reason.
+const MAX_RESULTS: usize = 5;
+
 fn run(
     query_text: &str,
     seeds: &[String],
     asked_for_sites: bool,
-    max_results: usize,
-    max_pages: usize,
     index_path: std::path::PathBuf,
     handle: tokio::runtime::Handle,
 ) -> Result<String> {
+    let max_results = MAX_RESULTS;
+    let max_pages = DEFAULT_MAX_PAGES;
     let mut timing = Timing::default();
 
     // An index that cannot be read is replaced rather than fatal. It is a
@@ -340,7 +340,11 @@ fn run(
 
     timing.index_size = index.len();
     timing.results = hits.len();
-    Ok(render(query_text, &hits, &timing))
+    // Where the sources agree or differ, in the same call. The agent should
+    // not have to know a second tool exists, or make a second round trip, to
+    // find out that a question is contested.
+    let spread = forge_search::query::spread(&index, query_text, 25);
+    Ok(render(query_text, &hits, &spread, &timing))
 }
 
 /// Whether to fetch anything, given what the index could already do.
@@ -386,7 +390,12 @@ fn hosts_already_read(index: &Index, seeds: &[String]) -> bool {
 /// crawled forty pages to answer a question is a search whose next call will
 /// be instant, and an agent that knows that will not avoid the tool for being
 /// slow.
-fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String {
+fn render(
+    query_text: &str,
+    hits: &[query::Result_],
+    spread: &[forge_search::query::Mention],
+    timing: &Timing,
+) -> String {
     let mut out = String::new();
     if hits.is_empty() {
         out.push_str(&format!("No results for {query_text:?}.\n"));
@@ -420,6 +429,8 @@ fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String 
         }
         out.push('\n');
     }
+    render_spread(&mut out, spread);
+
     if timing.crawled {
         out.push_str(&format!(
             "[crawled {} pages in {}ms{}; index now {} pages; search {}ms. \
@@ -442,6 +453,34 @@ fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String 
         ));
     }
     out
+}
+
+/// What several sources say, when several of them say something.
+///
+/// Ranking answers which passage is most relevant. It does not answer whether
+/// the sources agree, and for a contested question that is the thing being
+/// asked — what oil an old engine takes has more than one answer, and the
+/// useful reply is the spread and not whichever passage scored highest.
+///
+/// Written only when at least two sources concur on something. A list of terms
+/// each mentioned once is the ranking again in a worse format, and padding the
+/// result with it costs context for nothing.
+fn render_spread(out: &mut String, spread: &[forge_search::query::Mention]) {
+    let corroborated: Vec<&forge_search::query::Mention> =
+        spread.iter().filter(|m| m.sources.len() > 1).take(8).collect();
+    if corroborated.is_empty() {
+        return;
+    }
+    out.push_str("Mentioned by more than one source:\n");
+    for m in corroborated {
+        out.push_str(&format!(
+            "   {} — {} sources ({})\n",
+            m.term,
+            m.sources.len(),
+            m.sources.join(", "),
+        ));
+    }
+    out.push('\n');
 }
 
 /// Where the index lives for a workspace.
@@ -591,14 +630,14 @@ mod tests {
             snippet: "something".into(),
             score: 1.0,
         }];
-        let crawled = render("q", &hits, &Timing {
+        let crawled = render("q", &hits, &[], &Timing {
             crawled: true, fetched: 40, crawl_ms: 9000, index_size: 40, search_ms: 2,
             ..Default::default()
         });
         assert!(crawled.contains("crawled 40 pages"));
         assert!(crawled.contains("Later searches use the index"));
 
-        let cached = render("q", &hits, &Timing {
+        let cached = render("q", &hits, &[], &Timing {
             crawled: false, index_size: 40, search_ms: 2, ..Default::default()
         });
         assert!(cached.contains("no crawl"), "{cached}");
@@ -610,7 +649,7 @@ mod tests {
     /// DuckDuckGo implementation wasted turns.
     #[test]
     fn an_empty_result_explains_itself() {
-        let empty = render("q", &[], &Timing {
+        let empty = render("q", &[], &[], &Timing {
             crawled: true, fetched: 12, indexed: 10, disallowed: 2, crawl_ms: 3000,
             index_size: 10, ..Default::default()
         });
@@ -626,7 +665,7 @@ mod tests {
             query::Result_ { url: "https://x.example/1".into(), title: "First".into(), snippet: "one".into(), score: 2.0 },
             query::Result_ { url: "https://x.example/2".into(), title: String::new(), snippet: "two".into(), score: 1.0 },
         ];
-        let out = render("q", &hits, &Timing::default());
+        let out = render("q", &hits, &[], &Timing::default());
         assert!(out.contains("1. First"));
         assert!(out.contains("https://x.example/1"));
         // A page with no title is listed by its URL rather than blank.

@@ -30,6 +30,12 @@ use forge_search::query;
 
 use super::search::HttpFetcher;
 
+/// How many passages to return.
+///
+/// Not a parameter. See the note on `search::MAX_RESULTS`: a knob the model
+/// cannot reason about is a knob it sets arbitrarily.
+const MAX_RESULTS: usize = 5;
+
 /// How many articles to fetch when the local index cannot answer.
 ///
 /// Each one is a request, and at one request per second a larger default would
@@ -51,21 +57,13 @@ pub async fn search_papers(args: &serde_json::Value, index_path: std::path::Path
         .as_str()
         .context("Missing 'query' argument")?
         .to_string();
-    let max_results = args
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5)
-        .clamp(1, 20) as usize;
-    let max_articles = args
-        .get("max_articles")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_ARTICLES as u64)
-        .clamp(1, 25) as usize;
 
     let handle = tokio::runtime::Handle::current();
     // The fetcher blocks on the runtime handle, which is only sound off a
     // worker thread — the same reason `web_search` does this.
-    tokio::task::spawn_blocking(move || run(&query_text, max_results, max_articles, index_path, handle))
+    tokio::task::spawn_blocking(move || {
+        run(&query_text, MAX_RESULTS, DEFAULT_ARTICLES, index_path, handle)
+    })
         .await
         .map_err(|e| anyhow::anyhow!("literature search task failed: {e}"))?
 }
@@ -181,7 +179,7 @@ fn render_hits(query_text: &str, hits: &[query::Result_], index: &Index, f: Fetc
                 out.push_str(&format!(
                     "Europe PMC reports {} matching article(s); {} were examined and {} had \
                      full text that may be kept. The text that was kept does not answer this \
-                     query — try different terms, or raise `max_articles`.\n",
+                     query — try different or broader terms.\n",
                     f.hit_count, f.examined, f.indexed,
                 ));
             }
@@ -348,7 +346,7 @@ mod tests {
         some.indexed = 6;
         let out = render_hits("x", &[], &Index::new(), some);
         assert!(out.contains("2636 matching article(s)"), "{out}");
-        assert!(out.contains("raise `max_articles`"), "{out}");
+        assert!(out.contains("different or broader terms"), "{out}");
     }
 
     /// The whole path, against the live API.

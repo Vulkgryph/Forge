@@ -203,45 +203,33 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_search".to_string(),
-                description: "Search pages Forge has crawled and indexed itself. Returns titles, URLs and \
-                    snippets. This is a real index, not a scrape of someone else's results page, so it is \
-                    reliable — but it only knows what it has crawled. A query the index cannot answer \
-                    triggers a crawl first, which takes a couple of minutes; every later query is \
-                    milliseconds. IMPORTANT: it only knows what it has been pointed at, so you must \
-                    pass `sites` — with no `sites` it searches the existing index and fetches nothing. \
-                    Name the sites worth reading for the question; guessing is fine, since a wrong \
-                    site costs one call. If the results are off-topic the index has not read the right \
-                    pages: change `sites` rather than rephrasing the query, and \
-                    raise `max_pages` rather than repeating the same call — a second crawl restarts \
-                    from the seeds instead of continuing. For \
-                    biomedical or life-sciences literature use search_papers instead, which reaches \
-                    journal articles this cannot.".to_string(),
+                description: "Search the web. Give it a query and, if you know where to look, the \
+                    sites worth reading; it crawls them, indexes what it finds, and returns the \
+                    passages that answer the query along with where the sources agree or differ. \
+                    This is Forge's own index, not a scrape of anyone else's results page, so it \
+                    answers reliably — but it only knows what it has read. \
+                    Naming sites in `sites` is how it learns something new: a first call on a new \
+                    site takes a couple of minutes, every later query against it is instant. \
+                    Guessing a site is fine; a wrong one costs one call. \
+                    Without `sites` it searches only what has already been read and fetches \
+                    nothing. \
+                    After a site has been read, query it again here rather than guessing page URLs \
+                    for web_fetch — the index already holds the pages. \
+                    For biomedical or life-sciences literature use search_papers instead.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The search query. Supports quoted phrases and -excluded terms."
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default 5, max 20)"
+                            "description": "What to look for. Supports quoted phrases and -excluded terms."
                         },
                         "sites": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "URLs to crawl. Effectively required: without it nothing is \
-                                fetched and only the existing index is searched. Name the sites that would \
-                                actually carry the answer — official docs, a project's own site, the forum \
-                                where the subject is discussed. Crawling stays on the hosts given here, and \
-                                a host already read is answered from the index instead of refetched."
-                        },
-                        "max_pages": {
-                            "type": "integer",
-                            "description": "Pages to crawl if a crawl is needed (default 120, max 500). \
-                                Measured: below about 100 pages a forum crawl returns board index pages \
-                                rather than the discussions that answer anything, so prefer raising this \
-                                to rephrasing. The time budget scales with it, roughly a second a page."
+                            "description": "Sites to read, as URLs — the homepage or a relevant section is \
+                                enough, it crawls from there. Name the places that would actually carry the \
+                                answer: official documentation, a project's own site, the forum where the \
+                                subject is discussed. Omit only when the answer should already be in the index."
                         }
                     },
                     "required": ["query"]
@@ -252,18 +240,18 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "search_papers".to_string(),
-                description: "Search the biomedical and life-sciences literature through Europe PMC, and \
-                    search the full text of the articles it returns. Use this for a measured value, a \
+                description: "Search the biomedical and life-sciences literature through Europe PMC \
+                    and search the full text of what it returns. Use this for a measured value, a \
                     method, or a result that would be stated in a paper — recording temperatures, \
-                    concentrations, cell types, assay conditions — none of which are on the pages \
+                    concentrations, cell types, assay conditions — none of which are on pages \
                     web_search can crawl, because PubMed Central forbids crawling. \
                     Only open-access articles have their text indexed; anything else comes back as a \
                     citation and a link, and the result says so. Every result reports the licence its \
-                    text is held under: quote it with that attribution, and note that cc by-nc excludes \
-                    commercial use. \
-                    The query goes to Europe PMC as written, so its syntax works: quoted phrases, AND/OR, \
-                    and field prefixes such as AUTH:, JOURNAL:, METHODS:. First call on a topic fetches \
-                    articles at one per second; later ones are instant.".to_string(),
+                    text is held under: quote it with that attribution, and note that cc by-nc \
+                    excludes commercial use. \
+                    The query goes to Europe PMC as written, so its syntax works: quoted phrases, \
+                    AND/OR, and field prefixes such as AUTH:, JOURNAL:, METHODS:. A first call on a \
+                    topic fetches articles and takes a few seconds; later ones are instant.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -271,16 +259,6 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                             "type": "string",
                             "description": "The query, in Europe PMC syntax. Prefer a few specific terms \
                                 over a sentence — e.g. '\"pyramidal neuron\" AND \"patch clamp\" AND temperature'."
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum number of passages to return (default 5, max 20)"
-                        },
-                        "max_articles": {
-                            "type": "integer",
-                            "description": "How many articles to fetch if the local index cannot answer \
-                                (default 6, max 25). Each one is a request at one per second, so raising \
-                                this makes the first call slower and the coverage wider."
                         }
                     },
                     "required": ["query"]
@@ -624,9 +602,16 @@ mod tests {
             described.contains("open-access") || described.contains("open access"),
             "the description does not say what is and is not kept: {described}",
         );
+        // One argument. Every setting a tool exposes is a decision the model
+        // has to make correctly, and a count of articles to fetch is one it
+        // has no basis for.
         let props = &papers.function.parameters["properties"];
         assert!(props.get("query").is_some());
-        assert!(props.get("max_articles").is_some());
+        assert_eq!(
+            props.as_object().map(|o| o.len()),
+            Some(1),
+            "search_papers grew arguments: {props:?}",
+        );
         assert!(get_toggleable_tool_names().contains(&"search_papers"));
     }
 
@@ -641,9 +626,39 @@ mod tests {
         let described = &web.function.description;
         assert!(!described.contains("DuckDuckGo"), "{described}");
         assert!(!described.contains("UNRELIABLE"), "{described}");
-        // And it documents the arguments that decide what gets crawled.
-        let props = &web.function.parameters["properties"];
-        assert!(props.get("sites").is_some(), "`sites` is undocumented, so the model cannot aim the crawl");
-        assert!(props.get("max_pages").is_some());
+    }
+
+    /// The search tools take what the model can reason about and nothing else.
+    ///
+    /// A query, and where to look. Not a page budget, not a result count, not
+    /// a crawl depth — a real headless run picked page budgets of 120, 150 and
+    /// 200 on consecutive calls with no reason to prefer any of them, and 200
+    /// pages is over three minutes of crawling it did not need. The tools this
+    /// is modelled on take a query and optional domain filters; everything
+    /// else is the implementation's business.
+    ///
+    /// Stated as a test because the pressure is always toward one more knob.
+    #[test]
+    fn the_search_tools_expose_no_knobs_the_model_cannot_reason_about() {
+        let defs = get_tool_definitions();
+        let web = defs.iter().find(|t| t.function.name == "web_search").expect("web_search");
+        let props = web.function.parameters["properties"].as_object().expect("properties");
+        assert!(props.contains_key("query"));
+        assert!(
+            props.contains_key("sites"),
+            "the model has to be able to say where to look",
+        );
+        for knob in ["max_pages", "max_results", "max_depth", "politeness", "timeout"] {
+            assert!(
+                !props.contains_key(knob),
+                "web_search exposes {knob}, which the model has no basis to choose",
+            );
+        }
+        assert_eq!(props.len(), 2, "web_search grew arguments: {:?}", props.keys().collect::<Vec<_>>());
+        assert_eq!(
+            web.function.parameters["required"].as_array().map(|a| a.len()),
+            Some(1),
+            "only the query should be required",
+        );
     }
 }

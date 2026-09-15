@@ -23,18 +23,84 @@ fn build_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// How much of a page to hand the summariser.
+///
+/// Not a parameter. It was one, and a real headless run set it to 24,000,
+/// 55,000 and 180,000 on consecutive calls with no reason to prefer any of
+/// them — a number the caller cannot reason about is a number it fills in
+/// arbitrarily.
+const MAX_LENGTH: usize = 40_000;
+
+/// What the index actually holds on the host that was just guessed at.
+///
+/// Ranked against the caller's own `prompt`, since that says what it wanted
+/// rather than what it typed. Three at most: this is a correction to a failed
+/// call, not a directory listing, and a wall of URLs is its own kind of
+/// unhelpful.
+fn suggest_real_urls(index_path: &std::path::Path, asked: &str, prompt: &str) -> String {
+    let Ok(wanted) = forge_search::url::Url::parse(asked) else {
+        return String::new();
+    };
+    let Ok(index) = forge_search::index::Index::load(index_path) else {
+        return String::new();
+    };
+
+    let same_host = |u: &str| {
+        forge_search::url::Url::parse(u)
+            .map(|p| p.host == wanted.host)
+            .unwrap_or(false)
+    };
+    let held = index.urls().filter(|u| same_host(u)).count();
+    if held == 0 {
+        return format!(
+            "The index has not read {} at all, so there is nothing to check this path \
+             against. Call web_search with sites=[\"{}://{}\"] first — it will crawl the \
+             site and return real URLs, which is more reliable than guessing a path.",
+            wanted.host, wanted.scheme, wanted.host,
+        );
+    }
+
+    // Best pages on that host for what the caller said it wanted.
+    let mut found: Vec<String> = forge_search::rank::search(&index, prompt, 60)
+        .into_iter()
+        .filter_map(|hit| index.document(hit.doc).map(|d| d.url.clone()))
+        .filter(|u| same_host(u) && u != asked)
+        .collect();
+    found.truncate(3);
+
+    if found.is_empty() {
+        return format!(
+            "The index holds {held} page(s) from {} but none matching that description. \
+             Query them with web_search rather than guessing another path.",
+            wanted.host,
+        );
+    }
+
+    let mut out = format!(
+        "The index holds {held} page(s) from {}. These are real URLs on it, closest to \
+         what you asked for:\n",
+        wanted.host,
+    );
+    for u in &found {
+        out.push_str(&format!("   {u}\n"));
+    }
+    out.push_str(
+        "Fetch one of those, or query the site with web_search. Do not guess another path — \
+         a guessed path is the usual reason this call fails.",
+    );
+    out
+}
+
 pub async fn web_fetch(
     args: &serde_json::Value,
     summarizer: Option<(&ApiClient, &str)>,
+    index_path: Option<&std::path::Path>,
 ) -> Result<String> {
     let url = args["url"].as_str().context("Missing 'url' argument")?;
     let prompt = args["prompt"]
         .as_str()
         .context("Missing 'prompt' argument")?;
-    let max_length = args
-        .get("max_length")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20000) as usize;
+    let max_length = MAX_LENGTH;
 
     let client = build_http_client();
 
@@ -49,10 +115,21 @@ pub async fn web_fetch(
         .context("Failed to fetch URL")?;
 
     if !response.status().is_success() {
-        return Ok(format!(
-            "Error: Request failed with status {}",
-            response.status()
-        ));
+        let mut out = format!("Error: Request failed with status {}", response.status());
+        // A failed fetch is nearly always a guessed path, and the index
+        // usually knows the real ones.
+        //
+        // Measured over five headless runs on one question: 21 of 35
+        // `web_fetch` calls returned 404, every one of them a URL the model
+        // invented, while every fetch that produced something useful used a
+        // URL `web_search` had returned. Two of the guesses even had a space
+        // in them. So the most useful thing a failed call can say is what
+        // would have worked.
+        if let Some(path) = index_path {
+            out.push('\n');
+            out.push_str(&suggest_real_urls(path, url, prompt));
+        }
+        return Ok(out);
     }
 
     let final_url = response.url().to_string();
@@ -266,6 +343,69 @@ fn collapse_whitespace(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn index_with(pages: &[(&str, &str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forge-fetch-sug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = forge_search::index::Index::new();
+        for (url, title, body) in pages {
+            ix.add(url, title, "", body);
+        }
+        let path = dir.join("search-index.bin");
+        ix.save(&path).unwrap();
+        path
+    }
+
+    /// A guessed path is the usual reason a fetch fails, and the index
+    /// usually holds the real ones. Measured over five headless runs on one
+    /// question: 21 of 35 `web_fetch` calls returned 404, every one a URL the
+    /// model invented, while every useful fetch used a URL `web_search` had
+    /// returned. So a failed call should say what would have worked.
+    #[test]
+    fn a_failed_guess_is_answered_with_real_urls_from_that_host() {
+        let path = index_with(&[
+            ("https://myfordtractors.com/tune.shtml", "Tune Up and Maintenance",
+             "motor oil straight 30 weight for temperatures above ninety degrees"),
+            ("https://myfordtractors.com/backhoe.shtml", "Backhoe Project", "front end loader axle"),
+            ("https://elsewhere.test/oil", "Oil", "motor oil weight temperature"),
+        ]);
+        let out = suggest_real_urls(
+            &path,
+            "https://myfordtractors.com/lubrication.shtml", // never existed
+            "engine oil weight and temperature recommendations",
+        );
+        assert!(out.contains("tune.shtml"), "the real page was not suggested: {out}");
+        assert!(
+            !out.contains("elsewhere.test"),
+            "a different host was suggested: {out}",
+        );
+        assert!(out.contains("Do not guess"), "{out}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// When the host has never been read there is nothing to check against,
+    /// and the useful advice is different — crawl it first.
+    #[test]
+    fn an_unread_host_is_told_to_search_first() {
+        let path = index_with(&[("https://other.test/p", "P", "text")]);
+        let out = suggest_real_urls(&path, "https://unread.test/guessed.html", "anything");
+        assert!(out.contains("has not read unread.test"), "{out}");
+        assert!(out.contains("web_search"), "{out}");
+        assert!(out.contains("sites="), "it should say how: {out}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// No index, or an unreadable one, must not turn a 404 into an error.
+    #[test]
+    fn a_missing_index_costs_nothing() {
+        let out = suggest_real_urls(
+            std::path::Path::new("/nonexistent/forge/index.bin"),
+            "https://a.test/x",
+            "anything",
+        );
+        assert!(out.is_empty(), "{out}");
+    }
     /// Ignored for the same reason as the search above. This one passes today,
     /// which is exactly why it should not be a gate: it depends on a page on
     /// someone else's server keeping its wording, and it fails on a train.
@@ -273,7 +413,7 @@ mod tests {
     #[ignore = "hits the live web; depends on rust-lang.org's content"]
     async fn test_web_fetch_live() {
         let args = json!({"url": "https://www.rust-lang.org/", "prompt": "What is Rust?", "max_length": 2000});
-        let result = web_fetch(&args, None).await.unwrap();
+        let result = web_fetch(&args, None, None).await.unwrap();
         println!("FETCH RESULT:\n{}", result);
         assert!(
             result.contains("web_content"),

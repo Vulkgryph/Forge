@@ -230,7 +230,22 @@ pub fn features(index: &Index, doc: DocId, terms: &[String]) -> Option<Features>
         }
     }
 
-    f.coverage = present as f64 / terms.len() as f64;
+    // Terms the corpus contains at all. A term in no document cannot separate
+    // one document from another, so counting it in the denominator measures
+    // the query's vocabulary rather than the document's relevance — a search
+    // for "10W30" against a corpus that only ever writes "10W-30" penalised
+    // every page equally for a word none of them use.
+    //
+    // It does not reorder anything on its own, since the same denominator
+    // applies to every candidate. It makes the number mean what it says,
+    // which matters because it is reported and because a learned ranker
+    // would otherwise be fitting to a constant.
+    let answerable = terms
+        .iter()
+        .filter(|t| index.document_frequency(t) > 0)
+        .count()
+        .max(1);
+    f.coverage = present as f64 / answerable as f64;
     f.prose = if document.term_count < MIN_TERMS_TO_JUDGE_SHAPE {
         1.0
     } else {
@@ -544,7 +559,18 @@ mod tests {
         let hits = search(&ix, "q10 temperature coefficient neuron", 5);
         assert_eq!(hits.len(), 1, "a three-of-four match should be reachable");
         assert_eq!(url_of(&ix, &hits[0]), "https://bio.example/q10");
-        assert_eq!(hits[0].features.coverage, 0.75);
+        // Coverage is measured against what the corpus can answer with.
+        // "neuron" appears in no document here, so a page holding the other
+        // three has everything available — penalising it for a word nothing
+        // uses would measure the query's vocabulary, not the page.
+        assert_eq!(hits[0].features.coverage, 1.0);
+        // And a term the corpus does have but this page lacks still counts.
+        let mut ix2 = Index::new();
+        ix2.add("https://bio.example/q10", "Q10", "", "the q10 coefficient and temperature");
+        ix2.add("https://bio.example/cells", "Cells", "", "a neuron is a cell");
+        let hits2 = search(&ix2, "q10 temperature coefficient neuron", 5);
+        let q10 = hits2.iter().find(|h| url_of(&ix2, h).ends_with("/q10")).unwrap();
+        assert_eq!(q10.features.coverage, 0.75, "a term another page has must still count");
     }
 
     /// Widening must not change which document wins: a document with the whole

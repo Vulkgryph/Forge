@@ -248,7 +248,12 @@ impl ToolExecutor {
             "web_search" => {
                 crate::tools::search::web_search(args, crate::tools::search::index_path(&self.project_root)).await
             }
-            "web_fetch" => web::web_fetch(args, summarizer).await,
+            "web_fetch" => {
+                // The search index, so a guessed URL that 404s can be answered
+                // with the real ones instead of just a status code.
+                let index = crate::tools::search::index_path(&self.project_root);
+                web::web_fetch(args, summarizer, Some(index.as_path())).await
+            }
             "project_overview" => self.project_overview().await,
             _ => {
                 if let Some(tool) = self.custom_tools.iter().find(|tool| tool.name == name) {

@@ -269,21 +269,26 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_fetch".to_string(),
-                description: "Fetch a web page and extract specific information. Requires a prompt describing what to look for. Returns a focused answer, not raw page text. Use after web_search to read full content, or to fetch any URL directly.".to_string(),
+                description: "Read one page and extract what you ask for. Requires a prompt \
+                    describing what to look for; returns a focused answer rather than raw page \
+                    text. \
+                    Use it on a URL you were GIVEN — one the user supplied, or one web_search \
+                    returned. Do not guess or construct a URL from a site's name and a plausible \
+                    filename: guessed paths are the usual reason this call fails, and a failed \
+                    call costs as much as a successful one. If you want a page on a site and do \
+                    not have its URL, call web_search with that site in `sites` and use the URLs \
+                    it returns.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "The URL to fetch"
+                            "description": "The URL to read. Use one you were given or that web_search \
+                                returned, not one you constructed."
                         },
                         "prompt": {
                             "type": "string",
                             "description": "What information to extract from the page"
-                        },
-                        "max_length": {
-                            "type": "integer",
-                            "description": "Max chars of raw content to send to summarizer (default 20000)"
                         }
                     },
                     "required": ["url", "prompt"]

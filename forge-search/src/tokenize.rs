@@ -37,6 +37,47 @@ fn is_inner(c: char) -> bool {
     matches!(c, '_' | '+' | '#' | '-' | '.')
 }
 
+/// Inner punctuation that is folded away when a term is indexed or looked
+/// up, so two spellings of one token are one term.
+///
+/// `-`, `.` and `_` only. Not `+` or `#`, which carry meaning that folding
+/// destroys: "c++" and "c#" would both become "c" and collide with the letter.
+fn is_foldable(c: char) -> bool {
+    matches!(c, '-' | '.' | '_')
+}
+
+/// The form a term is indexed and searched under.
+///
+/// Inner punctuation removed, so `10w-30`, `10W30` and `10-w30` are the same
+/// term, as are `no_std` and `nostd`, or `node.js` and `nodejs`.
+///
+/// Case is already handled — terms are lowercased on the way in — so this is
+/// only about punctuation, which was the remaining way to write one thing two
+/// ways and have it not match. Measured before this existed: a query for
+/// `10w30` found the page spelling it `10W30` and missed the one spelling it
+/// `10W-30`; `10w-30` did the reverse; and `10-w30` matched nothing at all.
+///
+/// Borrowed when nothing changes, which is the overwhelming majority of terms
+/// and matters because this runs on every lookup.
+///
+/// This is normalisation, not fuzzy matching. It makes variant spellings of
+/// the same token identical; it does not find typos, and deliberately so —
+/// edit distance over a term dictionary is expensive and matches things that
+/// were never meant to match.
+pub fn canonical(term: &str) -> std::borrow::Cow<'_, str> {
+    if !term.contains(is_foldable) {
+        return std::borrow::Cow::Borrowed(term);
+    }
+    let folded: String = term.chars().filter(|c| !is_foldable(*c)).collect();
+    // A term made only of punctuation would fold to nothing. The tokenizer
+    // should not produce one, but the literal is the safer answer than "".
+    if folded.is_empty() {
+        std::borrow::Cow::Borrowed(term)
+    } else {
+        std::borrow::Cow::Owned(folded)
+    }
+}
+
 fn is_word(c: char) -> bool {
     c.is_alphanumeric()
 }
@@ -129,6 +170,47 @@ mod tests {
     #[test]
     fn plain_prose_splits_into_words() {
         assert_eq!(t("The quick brown fox."), vec!["the", "quick", "brown", "fox"]);
+    }
+
+    /// The motivating case: one lubricant grade, three spellings.
+    #[test]
+    fn punctuation_variants_fold_to_one_term() {
+        for spelling in ["10w-30", "10w30", "10-w30", "1-0w3-0"] {
+            assert_eq!(canonical(spelling), "10w30", "{spelling}");
+        }
+    }
+
+    #[test]
+    fn underscores_and_dots_fold_too() {
+        assert_eq!(canonical("no_std"), "nostd");
+        assert_eq!(canonical("node.js"), "nodejs");
+        assert_eq!(canonical("read_to_string"), "readtostring");
+    }
+
+    /// `+` and `#` are not folded: "c++" and "c#" would both become "c" and
+    /// collide with the letter.
+    #[test]
+    fn plus_and_hash_are_not_folded() {
+        assert_eq!(canonical("c++"), "c++");
+        assert_eq!(canonical("c#"), "c#");
+        assert_eq!(canonical("f#"), "f#");
+    }
+
+    /// Nothing to fold means nothing allocated, which matters on a path that
+    /// runs for every term of every lookup.
+    #[test]
+    fn an_unpunctuated_term_is_borrowed() {
+        assert!(matches!(canonical("allocator"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(canonical("10w-30"), std::borrow::Cow::Owned(_)));
+    }
+
+    /// Folding is idempotent, so indexing and looking up cannot disagree.
+    #[test]
+    fn folding_twice_changes_nothing() {
+        for t in ["10w-30", "no_std", "c++", "plain"] {
+            let once = canonical(t).to_string();
+            assert_eq!(canonical(&once), once, "{t}");
+        }
     }
 
     #[test]

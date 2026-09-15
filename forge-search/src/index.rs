@@ -163,7 +163,13 @@ impl Index {
 
     /// The documents containing `term`, or an empty slice.
     pub fn postings(&self, term: &str) -> &[Posting] {
-        self.postings.get(term).map(|v| v.as_slice()).unwrap_or(&[])
+        // Canonicalised here rather than at every call site. This is the one
+        // place every read goes through — `document_frequency`, `positions`,
+        // `candidates` and the ranker all reach the postings by this method —
+        // so folding here is what makes a lookup and an insertion agree
+        // without each caller having to remember to do it.
+        let term = crate::tokenize::canonical(term);
+        self.postings.get(term.as_ref()).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// How many live documents contain `term`.
@@ -210,18 +216,26 @@ impl Index {
         let term_count = (tokens.len() + title_tokens.len()) as u32;
 
         let id = self.docs.len() as DocId;
-        let mut grouped: HashMap<&str, Vec<u32>> = HashMap::new();
+        // Grouped under the canonical form, so the two spellings of one token
+        // share a posting list instead of being unrelated terms.
+        let mut grouped: HashMap<std::borrow::Cow<str>, Vec<u32>> = HashMap::new();
         for t in &tokens {
-            grouped.entry(&t.term).or_default().push(t.position as u32);
+            grouped
+                .entry(crate::tokenize::canonical(&t.term))
+                .or_default()
+                .push(t.position as u32);
         }
         let body_end = tokens.len() as u32;
         for t in &title_tokens {
-            grouped.entry(&t.term).or_default().push(body_end + t.position as u32);
+            grouped
+                .entry(crate::tokenize::canonical(&t.term))
+                .or_default()
+                .push(body_end + t.position as u32);
         }
         for (term, mut positions) in grouped {
             positions.sort_unstable();
             self.postings
-                .entry(term.to_string())
+                .entry(term.into_owned())
                 .or_default()
                 .push(Posting { doc: id, positions });
         }
@@ -271,17 +285,50 @@ impl Index {
         if dead == 0 {
             return 0;
         }
-        let mut rebuilt = Index::new();
-        for doc in self.docs.iter().filter(|d| d.live) {
-            rebuilt.add_attributed(
-                &doc.url,
-                &doc.title,
-                &doc.description,
-                &doc.text,
-                &doc.attribution,
-            );
+        // Documents are moved and their postings renumbered, not re-derived.
+        //
+        // Re-adding them would re-tokenise `doc.text`, which is capped for
+        // snippets — so compacting a document longer than the cap silently
+        // dropped every term past it. The same mistake the save format used to
+        // make, and worse here because `trim_to` calls this, so it fired on
+        // any index that outgrew its page limit.
+        let mut renumbered: std::collections::HashMap<DocId, DocId> =
+            std::collections::HashMap::new();
+        let mut docs: Vec<Document> = Vec::with_capacity(self.live_docs as usize);
+        for (old, doc) in self.docs.iter().enumerate() {
+            if doc.live {
+                renumbered.insert(old as DocId, docs.len() as DocId);
+                docs.push(doc.clone());
+            }
         }
-        *self = rebuilt;
+
+        let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
+        for (term, list) in &self.postings {
+            let kept: Vec<Posting> = list
+                .iter()
+                .filter_map(|p| {
+                    renumbered.get(&p.doc).map(|&doc| Posting {
+                        doc,
+                        positions: p.positions.clone(),
+                    })
+                })
+                .collect();
+            // A term only the dead documents had goes with them, which is the
+            // space this is reclaiming.
+            if !kept.is_empty() {
+                postings.insert(term.clone(), kept);
+            }
+        }
+
+        self.by_url = docs
+            .iter()
+            .enumerate()
+            .map(|(id, d)| (d.url.clone(), id as DocId))
+            .collect();
+        self.total_terms = docs.iter().map(|d| d.term_count as u64).sum();
+        self.live_docs = docs.len() as u32;
+        self.docs = docs;
+        self.postings = postings;
         dead
     }
 
@@ -467,7 +514,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 impl Index {
     /// Write the index to `path`.
@@ -480,17 +527,59 @@ impl Index {
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
 
-        let live: Vec<&Document> = self.docs.iter().filter(|d| d.live).collect();
-        // New ids, dense, in the order written — the reader rebuilds postings
-        // from the documents' own text, so nothing else has to agree.
+        // Dense new ids in the order written, and a map from the old ids so
+        // the postings can be renumbered to match.
+        let mut renumbered: HashMap<DocId, DocId> = HashMap::new();
+        let mut live: Vec<&Document> = Vec::new();
+        for (old, doc) in self.docs.iter().enumerate() {
+            if doc.live {
+                renumbered.insert(old as DocId, live.len() as DocId);
+                live.push(doc);
+            }
+        }
+
         put_u32(&mut out, live.len() as u32);
-        for doc in live {
+        for doc in &live {
             put_str(&mut out, &doc.url);
             put_str(&mut out, &doc.title);
             put_str(&mut out, &doc.description);
             put_str(&mut out, &doc.text);
             put_str(&mut out, &doc.attribution);
             put_u32(&mut out, doc.prose_share as u32);
+            put_u32(&mut out, doc.term_count);
+        }
+
+        // The postings, written out rather than rebuilt from the text on load.
+        //
+        // They used to be rebuilt, and that was wrong in a way that only
+        // showed after a save: the text stored for snippets is capped, so
+        // re-tokenising it produced postings for the capped part only. A
+        // 50 kB page lost every term past 32 kB — measured, its term count
+        // fell from 6,409 to 4,097 and a word near the end went from one hit
+        // to none. The first search after a crawl found it and every later one
+        // did not, which is the worst shape a bug can have.
+        //
+        // The postings *are* the index. Deriving them from a lossy copy of
+        // their own source was the mistake.
+        let mut terms: Vec<&String> = self.postings.keys().collect();
+        // Sorted so the file is byte-identical for an identical index, which
+        // makes a diff of two indexes mean something.
+        terms.sort_unstable();
+        put_u32(&mut out, terms.len() as u32);
+        for term in terms {
+            put_str(&mut out, term);
+            let live_postings: Vec<&Posting> = self.postings[term]
+                .iter()
+                .filter(|p| renumbered.contains_key(&p.doc))
+                .collect();
+            put_u32(&mut out, live_postings.len() as u32);
+            for posting in live_postings {
+                put_u32(&mut out, renumbered[&posting.doc]);
+                put_u32(&mut out, posting.positions.len() as u32);
+                for position in &posting.positions {
+                    put_u32(&mut out, *position);
+                }
+            }
         }
         std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
     }
@@ -516,6 +605,9 @@ impl Index {
         }
         let count = take_u32(&bytes, &mut at)?;
         let mut index = Index::new();
+        // Documents are restored, not re-added: re-adding would re-tokenise
+        // the capped text and rebuild postings from it, which is the bug this
+        // format exists to fix. Everything the ranker needs is read back.
         for _ in 0..count {
             let url = take_str(&bytes, &mut at)?;
             let title = take_str(&bytes, &mut at)?;
@@ -523,12 +615,41 @@ impl Index {
             let text = take_str(&bytes, &mut at)?;
             let attribution = take_str(&bytes, &mut at)?;
             let share = take_u32(&bytes, &mut at)?;
-            let id = index.add_attributed(&url, &title, &description, &text, &attribution);
-            // Recomputing would measure the capped text, which is a different
-            // number — see `Document::prose_share`. The stored one is kept.
-            if let Some(doc) = index.docs.get_mut(id as usize) {
-                doc.prose_share = share.min(100) as u8;
+            let term_count = take_u32(&bytes, &mut at)?;
+            let id = index.docs.len() as DocId;
+            index.docs.push(Document {
+                url: url.clone(),
+                title,
+                description,
+                text,
+                term_count,
+                live: true,
+                prose_share: share.min(100) as u8,
+                attribution,
+            });
+            index.by_url.insert(url, id);
+            index.live_docs += 1;
+            index.total_terms += term_count as u64;
+        }
+
+        let term_count = take_u32(&bytes, &mut at)?;
+        for _ in 0..term_count {
+            let term = take_str(&bytes, &mut at)?;
+            let postings = take_u32(&bytes, &mut at)?;
+            let mut list = Vec::with_capacity(postings as usize);
+            for _ in 0..postings {
+                let doc = take_u32(&bytes, &mut at)?;
+                if doc as usize >= index.docs.len() {
+                    return Err(format!("posting for document {doc}, which is not in the file"));
+                }
+                let n = take_u32(&bytes, &mut at)?;
+                let mut positions = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    positions.push(take_u32(&bytes, &mut at)?);
+                }
+                list.push(Posting { doc, positions });
             }
+            index.postings.insert(term, list);
         }
         Ok(index)
     }
@@ -836,6 +957,54 @@ mod tests {
         let hits = crate::query::search(&ix, "minreplicas replica", 10);
         assert!(!hits.is_empty(), "the trimmed index answers nothing");
         assert!(hits.len() <= 5);
+    }
+
+    /// A document must not lose its deep terms to a save.
+    ///
+    /// Postings used to be rebuilt on load by re-tokenising the stored text,
+    /// which is capped for snippets — so a page longer than the cap came back
+    /// searchable only as far as the cap. Measured on a 50 kB page: term count
+    /// fell from 6,409 to 4,097 and a word near the end went from one hit to
+    /// none. The first search after a crawl found it and every later one did
+    /// not, which is the worst shape a bug can have.
+    #[test]
+    fn a_term_past_the_snippet_cap_survives_a_save() {
+        let mut ix = Index::new();
+        let filler = "Filler about unrelated matters. ".repeat(1600);
+        ix.add("https://a.test/long", "Long", "", &format!("{filler}thirtytwo degrees celsius"));
+        let before = ix.document(0).unwrap().term_count;
+        assert!(ix.document(0).unwrap().text.len() < TEXT_KEPT + 1, "fixture not capped");
+        assert_eq!(ix.document_frequency("celsius"), 1);
+
+        let dir = std::env::temp_dir().join(format!("forge-deep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("i.bin");
+        ix.save(&path).unwrap();
+        let back = Index::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.document(0).unwrap().term_count, before, "term count shrank on load");
+        assert_eq!(back.document_frequency("celsius"), 1, "a term past the cap was lost");
+        assert_eq!(crate::query::search(&back, "thirtytwo celsius", 3).len(), 1);
+    }
+
+    /// And must not lose them to a compaction either — which is worse, since
+    /// `trim_to` compacts and fires on any index that outgrows its cap.
+    #[test]
+    fn a_term_past_the_snippet_cap_survives_a_compaction() {
+        let mut ix = Index::new();
+        let filler = "Filler about unrelated matters. ".repeat(1600);
+        ix.add("https://a.test/long", "Long", "", &format!("{filler}thirtytwo degrees celsius"));
+        ix.add("https://a.test/dead", "Dead", "", "this one goes away");
+        let before = ix.document(0).unwrap().term_count;
+        assert!(ix.remove(1));
+        assert_eq!(ix.compact(), 1);
+
+        assert_eq!(ix.len(), 1);
+        assert_eq!(ix.document(0).unwrap().term_count, before, "term count shrank on compaction");
+        assert_eq!(ix.document_frequency("celsius"), 1, "a term past the cap was lost");
+        // And the dead document's own terms really did go.
+        assert_eq!(ix.document_frequency("away"), 0);
     }
 
     /// Prose share is stored rather than recomputed on load, because the two

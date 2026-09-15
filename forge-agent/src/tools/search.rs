@@ -255,12 +255,19 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
 
 /// Most pages kept in the on-disk index.
 ///
-/// The index is a cache of crawled pages that live next to the project, so an
-/// unbounded one leaks into somebody's working directory. Measured at roughly
-/// twelve kilobytes of index per page, which puts this at about seven
-/// megabytes — a few crawls' worth kept, and the oldest pages dropped after
-/// that. A dropped page costs about a second to fetch again if it is wanted;
-/// keeping every page ever read to avoid that is the wrong way round.
+/// The index is a cache of crawled pages that lives next to the project, so an
+/// unbounded one leaks into somebody's working directory.
+///
+/// Measured rather than estimated, and the estimate was wrong: an index file
+/// is about 1.8 times the text it stores, because it now persists its postings
+/// instead of rebuilding them. At roughly twelve kilobytes of text per page
+/// that puts this cap near thirteen megabytes, not the seven originally
+/// claimed here.
+///
+/// Still the right trade. A dropped page costs about a second to fetch again
+/// if it is wanted, and keeping every page ever read to avoid that is the
+/// wrong way round — but the figure belongs in the comment honestly, since it
+/// is the number anyone changing this cap will reason from.
 const MAX_INDEXED_PAGES: usize = 600;
 
 /// How many passages to return.

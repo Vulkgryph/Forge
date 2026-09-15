@@ -32,13 +32,25 @@ use forge_search::query;
 /// addresses crawlers by name.
 pub(crate) const USER_AGENT: &str = concat!("forge-search/", env!("CARGO_PKG_VERSION"));
 
-/// Where a crawl starts when the query names no site of its own.
+/// Sites crawled when the caller names none.
 ///
-/// Small and technical on purpose. A general crawl of the web from a handful
-/// of seeds is a research project; a crawl of the documentation an agent
-/// actually asks about is a few hundred pages and useful immediately. The list
-/// is configurable precisely because whoever runs Forge knows better than this
-/// file what their agent needs to read.
+/// Small and technical on purpose: a general crawl of the web from a handful
+/// of seeds is a research project, while a crawl of the documentation an agent
+/// actually asks about is useful immediately.
+///
+/// They are no longer crawled speculatively, and the reason is a measurement.
+/// A real headless run asked what engine oil a Ford 8N takes, sent
+/// `"sites": []`, and this list sent it to crawl the Rust standard library
+/// documentation — a hundred and twenty pages, two minutes, no results, and a
+/// hundred and twenty pages of Rust docs left in the index to be matched
+/// against later questions. Crawling the wrong corpus is worse than crawling
+/// nothing, because it costs the time *and* pollutes what comes next.
+///
+/// So with no sites given the index is searched and nothing is fetched. The
+/// same run showed why that is the right trade: asked for sites, the agent
+/// named tractordata.com, ntractorclub.com, myfordtractors.com and
+/// yesterdaystractors.com without being told any of them. The model knows
+/// where to look; it only has to be asked.
 const DEFAULT_SEEDS: &[&str] = &[
     "https://doc.rust-lang.org/book/",
     "https://doc.rust-lang.org/std/",
@@ -209,11 +221,24 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
     // Seeds from the query when it names a site, so "search docs.rs for
     // tokio" reaches somewhere the default list does not. A query that names
     // no site uses the configured defaults.
-    let seeds: Vec<String> = args
+    // An empty array counts as "no preference", not as "crawl nothing".
+    //
+    // A model that does not want to constrain the crawl writes `"sites": []`,
+    // which is a reasonable way to say it. Taken literally that produced a
+    // crawl with no seeds and the tool failed outright with "no usable seed
+    // URLs in []" — observed on the first call of a real headless run, where
+    // it cost the agent a turn before it started guessing sites by hand.
+    let given: Vec<String> = args
         .get("sites")
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|s| s.as_str()).map(String::from).collect())
-        .unwrap_or_else(|| DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect());
+        .unwrap_or_default();
+    let asked_for_sites = !given.is_empty();
+    let seeds: Vec<String> = if asked_for_sites {
+        given
+    } else {
+        DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect()
+    };
 
     let max_pages = args
         .get("max_pages")
@@ -226,7 +251,7 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
     // because the fetcher blocks and blocking a worker starves everything
     // else the agent is doing.
     let result = tokio::task::spawn_blocking(move || {
-        run(&query_text, &seeds, max_results, max_pages, index_path, handle)
+        run(&query_text, &seeds, asked_for_sites, max_results, max_pages, index_path, handle)
     })
     .await
     .map_err(|e| anyhow::anyhow!("search task failed: {e}"))?;
@@ -237,6 +262,7 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
 fn run(
     query_text: &str,
     seeds: &[String],
+    asked_for_sites: bool,
     max_results: usize,
     max_pages: usize,
     index_path: std::path::PathBuf,
@@ -253,7 +279,22 @@ fn run(
     let mut hits = query::search(&index, query_text, max_results);
     timing.search_ms = search_start.elapsed().as_millis();
 
-    if hits.is_empty() {
+    // Crawl when the index cannot answer — or when the caller named sites the
+    // index has never read.
+    //
+    // The second half is the important one. Naming `sites` is an instruction
+    // to go and read them, and gating the crawl purely on whether the current
+    // index answers the query threw that instruction away: a stale index
+    // matched, so the crawl was skipped and the results came from whatever had
+    // been crawled before. Observed in a real headless run, where the agent
+    // asked for two tractor forums and got pages from a site it had not named,
+    // four calls in a row, and never once saw the source it asked for.
+    //
+    // Phrased as "has this site been read" rather than "were sites named", so
+    // asking twice for the same site is answered from the index instead of
+    // fetching it again.
+    let decision = should_crawl(!hits.is_empty(), asked_for_sites, hosts_already_read(&index, seeds));
+    if decision {
         let fetcher = HttpFetcher::new(handle, 2 * 1024 * 1024);
         let limits = Limits {
             max_pages,
@@ -302,6 +343,43 @@ fn run(
     Ok(render(query_text, &hits, &timing))
 }
 
+/// Whether to fetch anything, given what the index could already do.
+///
+/// Two rules, both learned from a real headless run.
+///
+/// Crawling only happens toward sites somebody chose. Without that condition
+/// an unanswerable query crawls the default list whatever the question was
+/// about — see [`DEFAULT_SEEDS`] for the two minutes of Rust documentation
+/// that bought nothing for a question about a tractor.
+///
+/// And naming a site the index has not read is reason enough on its own, even
+/// when the index does answer the query. Gating purely on whether the current
+/// index answers threw the instruction away: a stale index matched, the crawl
+/// was skipped, and the results came from a site the caller never named. Four
+/// calls in a row, in the run this is taken from.
+fn should_crawl(index_answered: bool, asked_for_sites: bool, hosts_read: bool) -> bool {
+    asked_for_sites && (!index_answered || !hosts_read)
+}
+
+/// Whether the index already holds a page from every host named in `seeds`.
+///
+/// Host-level rather than URL-level: a seed is a starting point for a crawl,
+/// not a page anyone asked for by name, so having read the site is what makes
+/// re-crawling it pointless.
+fn hosts_already_read(index: &Index, seeds: &[String]) -> bool {
+    let read: std::collections::HashSet<String> = index
+        .urls()
+        .filter_map(|u| forge_search::url::Url::parse(u).ok().map(|p| p.host))
+        .collect();
+    seeds.iter().all(|seed| {
+        forge_search::url::Url::parse(seed)
+            .map(|u| read.contains(&u.host))
+            // An unparseable seed is reported by the crawl itself; it should
+            // not make this claim the site was read.
+            .unwrap_or(false)
+    })
+}
+
 /// The tool result the model sees.
 ///
 /// The timing line is for the model as much as for a person: a search that
@@ -323,8 +401,10 @@ fn render(query_text: &str, hits: &[query::Result_], timing: &Timing) -> String 
             ));
         } else {
             out.push_str(&format!(
-                "The index holds {} pages and none matched. Pass `sites` to crawl somewhere \
-                 new.\n",
+                "The index holds {} page(s) and none matched, and no crawl was attempted \
+                 because no `sites` were given. This tool only knows what it has been pointed \
+                 at — name the sites worth reading for this question in `sites` and call again. \
+                 Guessing is fine; a site that turns out to be wrong costs one call.\n",
                 timing.index_size,
             ));
         }
@@ -372,6 +452,93 @@ pub fn index_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without sites, nothing is fetched.
+    ///
+    /// Measured: a real run asked about a tractor, sent `"sites": []`, and the
+    /// default list sent it to crawl the Rust standard library docs for two
+    /// minutes — no results, and a hundred and twenty pages of Rust docs left
+    /// in the index to be matched against later questions. Crawling the wrong
+    /// corpus costs the time and then pollutes what comes next, so it is worse
+    /// than crawling nothing.
+    #[test]
+    fn nothing_is_fetched_when_no_sites_were_named() {
+        // index cannot answer, no sites named: still no crawl.
+        assert!(!should_crawl(false, false, false));
+        // index can answer, no sites named: no crawl either.
+        assert!(!should_crawl(true, false, false));
+    }
+
+    /// A named site the index has not read is crawled even when the index
+    /// answers the query — otherwise the instruction is discarded, which is
+    /// what happened for four calls running in the run this comes from.
+    #[test]
+    fn a_named_unread_site_is_crawled_even_when_the_index_answers() {
+        assert!(should_crawl(true, true, false));
+        assert!(should_crawl(false, true, false));
+    }
+
+    /// And a site already read is answered from the index rather than fetched
+    /// again, so asking twice is cheap.
+    #[test]
+    fn a_named_site_already_read_is_not_refetched() {
+        assert!(!should_crawl(true, true, true));
+        // Unless the index cannot actually answer, in which case there is
+        // nothing to lose by looking again.
+        assert!(should_crawl(false, true, true));
+    }
+
+    /// An empty `sites` array means "no preference", not "crawl nothing".
+    ///
+    /// Observed on the first call of a real headless run: the agent wrote
+    /// `"sites": []`, which is a fair way to say it does not want to constrain
+    /// the crawl, and the tool failed with "no usable seed URLs in []".
+    #[test]
+    fn an_empty_sites_array_falls_back_to_the_defaults() {
+        let args = serde_json::json!({ "query": "x", "sites": [] });
+        let given: Vec<String> = args
+            .get("sites")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).map(String::from).collect())
+            .unwrap_or_default();
+        assert!(given.is_empty(), "the fixture does not reproduce the shape");
+        // Which is the branch the tool now takes.
+        let seeds: Vec<String> = if given.is_empty() {
+            DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect()
+        } else {
+            given
+        };
+        assert!(!seeds.is_empty(), "an empty array still produced no seeds");
+    }
+
+    /// Naming sites is an instruction to read them. The index answering the
+    /// query is not a reason to ignore it.
+    ///
+    /// This is the failure it pins down: a real headless run asked for two
+    /// tractor forums and got pages from a site it had not named, four calls
+    /// running, because a stale index matched and the crawl was skipped.
+    #[test]
+    fn a_site_the_index_has_never_read_is_still_crawled() {
+        let mut index = Index::new();
+        index.add("https://already.test/page", "Oil", "", "engine oil is straight 30 weight");
+        // The index answers the query, but not from the site being asked for.
+        assert!(!query::search(&index, "engine oil", 3).is_empty());
+        assert!(
+            !hosts_already_read(&index, &["https://never-read.test/board".to_string()]),
+            "a site that was never crawled was treated as read",
+        );
+        // And a site it has read is not fetched again.
+        assert!(hosts_already_read(&index, &["https://already.test/other".to_string()]));
+    }
+
+    /// A seed that does not parse must not count as read, or a typo would
+    /// silently skip the crawl it was meant to start.
+    #[test]
+    fn an_unparseable_seed_does_not_count_as_read() {
+        let mut index = Index::new();
+        index.add("https://a.test/p", "", "", "text");
+        assert!(!hosts_already_read(&index, &["not a url".to_string()]));
+    }
 
     /// The budget has to permit the pages that were asked for. A fixed
     /// 25 seconds at one request per second stopped every crawl at about 25

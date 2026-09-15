@@ -207,8 +207,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     snippets. This is a real index, not a scrape of someone else's results page, so it is \
                     reliable — but it only knows what it has crawled. A query the index cannot answer \
                     triggers a crawl first, which takes a couple of minutes; every later query is \
-                    milliseconds. If the results are off-topic, the index simply has not read the right \
-                    pages: pass `sites` with the URLs to crawl rather than rephrasing the query, and \
+                    milliseconds. IMPORTANT: it only knows what it has been pointed at, so you must \
+                    pass `sites` — with no `sites` it searches the existing index and fetches nothing. \
+                    Name the sites worth reading for the question; guessing is fine, since a wrong \
+                    site costs one call. If the results are off-topic the index has not read the right \
+                    pages: change `sites` rather than rephrasing the query, and \
                     raise `max_pages` rather than repeating the same call — a second crawl restarts \
                     from the seeds instead of continuing. For \
                     biomedical or life-sciences literature use search_papers instead, which reaches \
@@ -227,9 +230,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "sites": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "URLs to crawl when the index cannot answer the query. Use this \
-                                to point the crawler at the right documentation instead of hoping the \
-                                default seeds cover it. Crawling stays on the hosts given here."
+                            "description": "URLs to crawl. Effectively required: without it nothing is \
+                                fetched and only the existing index is searched. Name the sites that would \
+                                actually carry the answer — official docs, a project's own site, the forum \
+                                where the subject is discussed. Crawling stays on the hosts given here, and \
+                                a host already read is answered from the index instead of refetched."
                         },
                         "max_pages": {
                             "type": "integer",

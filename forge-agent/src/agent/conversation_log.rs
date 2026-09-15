@@ -17,9 +17,10 @@ pub struct ConversationLog {
 impl ConversationLog {
     /// Open or create a conversation log at the given path.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Through `workdir` so `.forge` carries its self-excluding
+        // `.gitignore`: a conversation log is the last thing that should end
+        // up staged in somebody's repository.
+        crate::workdir::ensure_parent_of(path)?;
 
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).append(true);
@@ -663,9 +664,7 @@ pub fn write_meta(workspace_root: &Path, meta: &SessionMeta) -> Result<()> {
         .join("sessions")
         .join(&meta.id)
         .join("meta.json");
-    if let Some(parent) = meta_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    crate::workdir::ensure_parent_of(&meta_path)?;
     let json = serde_json::to_string_pretty(meta)?;
     std::fs::write(&meta_path, json)?;
     Ok(())

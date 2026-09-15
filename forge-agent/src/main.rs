@@ -13,6 +13,7 @@ mod auth;
 mod config;
 mod headless;
 mod tools;
+mod workdir;
 
 /// Format an OAuth token-refresh failure into a clean multi-line message.
 /// The underlying error has already been distilled to "<message> (code: X)" by

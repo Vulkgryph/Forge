@@ -194,6 +194,10 @@ pub struct Timing {
     pub search_ms: u128,
     pub index_size: usize,
     pub results: usize,
+    /// Pages dropped from the index to keep it bounded. Reported rather than
+    /// silent: an agent that queried a page last week and cannot find it now
+    /// should be able to tell eviction from the page having changed.
+    pub evicted: usize,
     /// The crawl ran out of time rather than pages.
     ///
     /// Worth telling the model, but not as "ask again and it continues" — the
@@ -248,6 +252,16 @@ pub async fn web_search(args: &serde_json::Value, index_path: std::path::PathBuf
 
     result
 }
+
+/// Most pages kept in the on-disk index.
+///
+/// The index is a cache of crawled pages that live next to the project, so an
+/// unbounded one leaks into somebody's working directory. Measured at roughly
+/// twelve kilobytes of index per page, which puts this at about seven
+/// megabytes — a few crawls' worth kept, and the oldest pages dropped after
+/// that. A dropped page costs about a second to fetch again if it is wanted;
+/// keeping every page ever read to avoid that is the wrong way round.
+const MAX_INDEXED_PAGES: usize = 600;
 
 /// How many passages to return.
 ///
@@ -325,12 +339,17 @@ fn run(
         timing.disallowed = report.disallowed;
         timing.timed_out = report.timed_out;
 
+        // Bounded before saving, so the file next to the project cannot grow
+        // without limit. Oldest pages go first — see `Index::trim_to`.
+        let dropped = index.trim_to(MAX_INDEXED_PAGES);
+        if dropped > 0 {
+            timing.evicted = dropped;
+        }
+
         // Saved even when the search that follows finds nothing: the pages
         // were fetched, and throwing them away means fetching them again for
         // the next query.
-        if let Some(parent) = index_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let _ = crate::workdir::ensure_parent_of(&index_path);
         let _ = index.save(&index_path);
 
         let again = std::time::Instant::now();
@@ -433,7 +452,7 @@ fn render(
 
     if timing.crawled {
         out.push_str(&format!(
-            "[crawled {} pages in {}ms{}; index now {} pages; search {}ms. \
+            "[crawled {} pages in {}ms{}; index now {} pages{}; search {}ms. \
              Later searches use the index and do not crawl.]\n",
             timing.fetched,
             timing.crawl_ms,
@@ -444,6 +463,11 @@ fn render(
                 ""
             },
             timing.index_size,
+            if timing.evicted > 0 {
+                format!(" ({} oldest dropped to stay under the cap)", timing.evicted)
+            } else {
+                String::new()
+            },
             timing.search_ms,
         ));
     } else {

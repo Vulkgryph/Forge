@@ -639,8 +639,7 @@ const ABANDONED: Duration = Duration::from_secs(60 * 60);
 
 impl RewindLock {
     fn acquire(project_root: &Path) -> Result<Self> {
-        let forge_dir = project_root.join(".forge");
-        std::fs::create_dir_all(&forge_dir)?;
+        let forge_dir = crate::workdir::ensure(project_root)?;
         let path = forge_dir.join("rewind.lock");
 
         let held = || {

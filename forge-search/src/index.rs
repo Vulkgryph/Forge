@@ -285,6 +285,46 @@ impl Index {
         dead
     }
 
+    /// Drop the oldest documents until at most `max` remain, reclaiming their
+    /// space. Returns how many went.
+    ///
+    /// An index of crawled pages is a cache, and a cache with no bound is a
+    /// leak. This one lives next to the project it belongs to, so the leak is
+    /// in somebody's working directory: measured at roughly twelve kilobytes
+    /// per page, an unbounded index reaches tens of megabytes after a few
+    /// afternoons of research and keeps going.
+    ///
+    /// Oldest by insertion, which is free — document ids are handed out in
+    /// order, so the id *is* the arrival order and no timestamp has to be
+    /// stored or trusted. It is a proxy for "least likely to be wanted" rather
+    /// than a measurement of it, which is the usual trade for an eviction
+    /// policy that costs nothing.
+    ///
+    /// Evicted pages are not lost, only forgotten: a later query that needs
+    /// them crawls them again at about a second each. Keeping them forever to
+    /// avoid that is the wrong way round.
+    pub fn trim_to(&mut self, max: usize) -> usize {
+        if self.live_docs as usize <= max {
+            return 0;
+        }
+        let mut dropped = 0;
+        // Ascending ids, so oldest first.
+        for id in 0..self.docs.len() as DocId {
+            if self.live_docs as usize <= max {
+                break;
+            }
+            if self.remove(id) {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            // Otherwise the postings of the removed documents stay, which is
+            // most of what was taking the space.
+            self.compact();
+        }
+        dropped
+    }
+
     /// Every document containing *all* the given terms.
     ///
     /// Intersection rather than union: a query of several words is a request
@@ -751,6 +791,53 @@ mod tests {
 
     /// The text kept for snippets is capped, and cutting it must not split a
     /// character.
+    /// A cache with no bound is a leak, and this one leaks into somebody's
+    /// project directory.
+    #[test]
+    fn trimming_drops_the_oldest_and_reclaims_the_space() {
+        let mut ix = Index::new();
+        for i in 0..10 {
+            ix.add(&format!("https://a.test/{i}"), "", "", &format!("page number {i} content"));
+        }
+        assert_eq!(ix.trim_to(4), 6);
+        assert_eq!(ix.len(), 4);
+        let left: Vec<String> = ix.urls().map(str::to_string).collect();
+        for gone in 0..6 {
+            assert!(
+                !left.iter().any(|u| u.ends_with(&format!("/{gone}"))),
+                "page {gone} survived: {left:?}",
+            );
+        }
+        for kept in 6..10 {
+            assert!(left.iter().any(|u| u.ends_with(&format!("/{kept}"))), "{left:?}");
+        }
+        // And the postings went with them, which is where the space was.
+        assert_eq!(ix.document_frequency("0"), 0, "an evicted page left its postings behind");
+        assert!(ix.document_frequency("9") > 0, "a surviving page lost its postings");
+    }
+
+    #[test]
+    fn trimming_an_index_already_small_enough_does_nothing() {
+        let mut ix = Index::new();
+        ix.add("https://a.test/1", "", "", "text");
+        assert_eq!(ix.trim_to(10), 0);
+        assert_eq!(ix.len(), 1);
+    }
+
+    /// The surviving documents must still be searchable — a trim that leaves
+    /// an index that cannot answer is worse than no trim.
+    #[test]
+    fn an_index_still_answers_after_a_trim() {
+        let mut ix = Index::new();
+        for i in 0..20 {
+            ix.add(&format!("https://a.test/{i}"), "Scaling", "", "minReplicas controls the replica count");
+        }
+        ix.trim_to(5);
+        let hits = crate::query::search(&ix, "minreplicas replica", 10);
+        assert!(!hits.is_empty(), "the trimmed index answers nothing");
+        assert!(hits.len() <= 5);
+    }
+
     /// Prose share is stored rather than recomputed on load, because the two
     /// are different numbers: it is measured over the whole text, and only the
     /// capped head survives a save. Recomputing would measure the navigation.

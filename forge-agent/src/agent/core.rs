@@ -4007,6 +4007,8 @@ impl Agent {
         self.update_meta();
 
         // Create plan file path
+        // Via `workdir` so `.forge` gets its self-excluding `.gitignore`.
+        let _ = crate::workdir::ensure(self.executor.project_root());
         let plans_dir = self.executor.project_root().join(".forge").join("plans");
         let _ = std::fs::create_dir_all(&plans_dir);
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();

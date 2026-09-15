@@ -30,6 +30,13 @@ use forge_search::query;
 
 use super::search::HttpFetcher;
 
+/// Most articles kept in the on-disk index.
+///
+/// Higher per item than the web index allows itself: an article is tens of
+/// thousands of terms that cost a licensed request to fetch, and there are far
+/// fewer of them than crawled pages.
+const MAX_ARTICLES_KEPT: usize = 200;
+
 /// How many passages to return.
 ///
 /// Not a parameter. See the note on `search::MAX_RESULTS`: a knob the model
@@ -93,9 +100,11 @@ fn run(
         .run(query_text, max_articles, &mut index);
     let fetch_ms = fetch_start.elapsed().as_millis();
 
-    if let Some(parent) = index_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    // Bounded like the web index, but generously: an article is tens of
+    // thousands of terms of text that took a licensed request to get, and
+    // there are far fewer of them than crawled pages.
+    index.trim_to(MAX_ARTICLES_KEPT);
+    let _ = crate::workdir::ensure_parent_of(&index_path);
     // Saved even when the query that follows finds nothing: the articles were
     // fetched, and discarding them means fetching them again.
     let _ = index.save(&index_path);

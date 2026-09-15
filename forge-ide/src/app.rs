@@ -4844,14 +4844,16 @@ pub enum BrowserCommand {
 /// ignoring the one corpus this project has privileged access to.
 const BROWSER_START: &str = "";
 
-/// Where a typed search goes.
-///
-/// A person typing words into a browser is a person using a search engine,
-/// which raises none of the questions that crawling one does — the request is
-/// a browser's, made by a human, which is the intended use of the thing.
-///
-/// Substituted with the query percent-encoded.
-const SEARCH_TEMPLATE: &str = "https://duckduckgo.com/?q=";
+// There is no search-engine template here, deliberately.
+//
+// There was one, and it made another search engine the path of least
+// resistance in a tool whose point is not needing one: an empty index meant
+// typed words found nothing, and the page then offered a button to go and ask
+// somebody else. Removed. Words search Forge's index, and an empty index
+// offers to read a site rather than to leave.
+//
+// Nothing is blocked by this. It is a browser — anyone who wants another
+// search engine types its address and gets it.
 
 /// Whether what somebody typed is an address or something to search for.
 ///
@@ -4879,34 +4881,18 @@ pub fn looks_like_address(typed: &str) -> bool {
     dotted || host.contains(':')
 }
 
-/// The URL to load for something somebody typed.
+/// The URL to load for an address somebody typed.
+///
+/// Only reached once the text is known to be an address — words go to Forge's
+/// own index, and there is nowhere else for them to go. A bare host gets a
+/// scheme, since demanding one would inconvenience only the people who would
+/// notice.
 pub fn address_for(typed: &str) -> String {
     let typed = typed.trim();
-    if !looks_like_address(typed) {
-        return format!("{SEARCH_TEMPLATE}{}", forge_search_encode(typed));
-    }
     if typed.starts_with("http://") || typed.starts_with("https://") {
         return typed.to_string();
     }
     format!("https://{typed}")
-}
-
-/// Percent-encode a query.
-///
-/// Written out rather than pulled in: `forge-search` has this, but the IDE
-/// does not depend on it and adding the dependency for one function would be
-/// the wrong trade.
-fn forge_search_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 /// Where the shared web view goes this frame, and what it shows.
@@ -14934,9 +14920,9 @@ impl IdeApp {
                         // The distinction that matters: an empty index has not
                         // failed to answer, it has nothing to answer from.
                         let message = if tab.index_pages == 0 {
-                            "Nothing has been indexed for this project yet. The agent fills \
-                             this in when it searches — or press the button below to look on \
-                             the web."
+                            "Nothing has been indexed for this project yet. Name a site below \
+                             and Forge will read it — or let the agent search, which fills this \
+                             in as it goes."
                         } else {
                             "Nothing indexed matches that. The index only holds what has been \
                              crawled, so this is as likely to mean the pages were never read \
@@ -15066,16 +15052,12 @@ impl IdeApp {
                                         });
                                     }
                                 });
-                                ui.add_space(8.0);
-                                // And the way out, still deliberate.
-                                let label =
-                                    format!("Search the web for {:?} instead", tab.searched);
-                                if ui.button(label).clicked() {
-                                    commands.push(BrowserCommand::Go(format!(
-                                        "{SEARCH_TEMPLATE}{}",
-                                        forge_search_encode(&tab.searched),
-                                    )));
-                                }
+                                // No button here offering another search
+                                // engine. There was one, and it made leaving
+                                // the easiest thing to do from the page whose
+                                // whole point is that you need not. Anyone who
+                                // wants one types its address — this is a
+                                // browser.
                             }
                         }
                     }
@@ -19179,23 +19161,49 @@ mod auto_save_tests {
         }
     }
 
-    /// A bare host gets a scheme; a search gets encoded into the query.
+    /// A bare host gets a scheme. Words are not turned into anything — they
+    /// go to Forge's index, and there is nowhere else for them to go.
+    ///
+    /// The two tests that used to be here checked a search becoming a
+    /// DuckDuckGo URL with its query percent-encoded. That behaviour is gone:
+    /// making another search engine the easiest thing to reach from Forge's
+    /// own results page was the wrong default in a tool built not to need one.
     #[test]
-    fn an_address_is_completed_and_a_search_is_encoded() {
+    fn an_address_is_completed_but_words_are_not_a_url() {
         assert_eq!(super::address_for("example.com"), "https://example.com");
         assert_eq!(super::address_for("https://example.com"), "https://example.com");
         assert_eq!(super::address_for("  example.com  "), "https://example.com");
-
-        let searched = super::address_for("ford 8n oil");
-        assert!(searched.starts_with("https://duckduckgo.com/?q="), "{searched}");
-        assert!(searched.ends_with("ford%208n%20oil"), "{searched}");
+        assert_eq!(super::address_for("http://example.com/p"), "http://example.com/p");
+        // Words never reach it — `looks_like_address` sends them to the index.
+        assert!(!super::looks_like_address("ford 8n engine oil"));
     }
 
-    /// The characters that would break a query string cannot survive in one.
+    /// Nothing here hands a query to an outside search engine.
+    ///
+    /// Structural, because the previous version of this file did exactly that
+    /// in one line, and a grep is the only thing that notices it coming back.
     #[test]
-    fn a_search_cannot_break_out_of_the_query() {
-        let searched = super::address_for("a&b=c #d");
-        assert!(searched.contains("a%26b%3Dc%20%23d"), "{searched}");
+    fn no_outside_search_engine_is_wired_in() {
+        let src = include_str!("app.rs");
+        // Comments explain why it is absent, so only code counts.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Assembled rather than written out, because this test reads the
+        // file it lives in — a literal here would match itself and fail.
+        let engines = [
+            ["duckduck", "go.com"].concat(),
+            ["google.com", "/search"].concat(),
+            ["bing.com", "/search"].concat(),
+        ];
+        for engine in engines {
+            assert!(
+                !code.contains(&engine),
+                "{engine} is wired in again — words belong to Forge's index",
+            );
+        }
     }
 
     fn savable(modified: bool, has_path: bool, is_diff: bool, is_image: bool, remote: bool) -> bool {

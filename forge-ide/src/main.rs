@@ -5,7 +5,6 @@ mod dap;
 #[cfg(target_os = "macos")]
 mod dock_install;
 mod dock_menu;
-mod websearch;
 #[cfg(target_os = "macos")]
 mod webview;
 #[cfg(feature = "vulkan-renderer")]
@@ -499,10 +498,6 @@ impl IdeWindow {
         let commands = self.app.take_browser_commands();
         for command in &commands {
             match command {
-                // Both resolved in the app, which knows what was typed and
-                // owns the crawl.
-                crate::app::BrowserCommand::Go(_) => {}
-                crate::app::BrowserCommand::Crawl { .. } => {}
                 crate::app::BrowserCommand::Back => {
                     if let Some(view) = &self.webview {
                         view.go_back();
@@ -551,11 +546,10 @@ impl IdeWindow {
             self.last_page = Some(page);
         }
 
-        // Tell the tab where the browser actually got to — following a link or
-        // clearing a bot check moves it without the tab having asked.
-        let editing = self.egui.ctx.memory(|m| m.focused().is_some());
+        // Tell the tab where the browser actually got to — clearing a bot
+        // check moves it without the tab having asked.
         if let Some(at) = view.url() {
-            self.app.browser_moved(&at, view.can_go_back(), view.can_go_forward(), editing);
+            self.app.browser_moved(&at, view.can_go_back(), view.can_go_forward());
         }
 
         // egui measures in points from the top-left; AppKit from the

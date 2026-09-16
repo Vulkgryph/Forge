@@ -29,7 +29,6 @@ forge-proto       = { path = "forge-proto" }
 # The search engine, for the browser tab's own results page. A workspace
 # crate, not a third-party one — and it is the whole point of having written
 # it that Forge's browser searches Forge's index rather than somebody else's.
-forge-search      = { path = "../forge-search" }
 egui-wgpu         = { version = "0.29", default-features = false }
 wgpu              = "22"
 pollster          = "0.3"

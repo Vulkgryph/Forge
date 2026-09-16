@@ -6,11 +6,11 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Changed
 
-- **The browser's start page is the library, not an empty search box.** It opened on a search field over a corpus of whatever happened to have been crawled, which is the version of this feature that reads as broken: type a question, get nothing, conclude the search is defective. What is actually there is a set of sites Forge has read, and that is worth seeing before anything is typed.
+- **The in-window browser is now only for the pages a bot check refuses.** It had grown into a small web browser: an address bar, a search page over Forge's own crawled index, a library of what had been read, and a box for crawling a new site. An editor does not need to contain that, and none of it was the reason the browser was added.
 
-  The page now lists them — one row per site, how many pages, how long ago it was read — largest first, with each row linking to the shallowest page held from that site so the list is also a way back to somewhere you have been. The age is the part that earns the row: "forty pages from learn.microsoft.com, read two months ago" is a fact somebody can act on, and it is exactly the fact a search box withholds. A search that finds nothing shows the shelves too, so a miss still tells you what there was to miss.
+  What is left is the part that cannot be done any other way. A site that answers an automated request with a bot check is doing access control, and Forge does not try to defeat it — no spoofed identity, no solver, no replaying a cookie through an HTTP client that would then be claiming to be a browser it is not. The page is shown to the person sitting in front of the window, in a real browser engine, and they decide. A challenge cleared in Safari leaves its cookie in Safari, so the page genuinely has to be fetched by a browser Forge can read back out of.
 
-  An index with nothing in it says so, and says why: this is not a web search engine and cannot find a site for you — type an address and go read one.
+  So the tab has back, forward, reload, "Send to agent", and the address shown but not editable. There is no longer a **New Browser Tab** command or menu entry, because there is nowhere for it to open onto: a tab appears when the agent asks for one and not otherwise. That removed 1,376 lines and the IDE's dependency on `forge-search` entirely — searching the crawled index is the agent's job, through its own tools, which is where it was always better placed.
 
 ### Fixed
 

@@ -101,32 +101,6 @@ pub struct Buffer {
     pub browser: Option<BrowserTab>,
 }
 
-/// What a browser tab is currently showing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BrowserMode {
-    /// Forge's own results, from Forge's own index, drawn by the editor.
-    ///
-    /// The default, and the reason is not pride: the index is right here and
-    /// it holds what this project has actually been reading. A browser that
-    /// opened onto somebody else's search engine would be ignoring the one
-    /// corpus it has privileged access to.
-    #[default]
-    Home,
-    /// A web page, in the native view.
-    Page,
-}
-
-/// One result from Forge's index.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ForgeHit {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-    /// The licence the text is held under, when the source stated one — an
-    /// article from Europe PMC does, a crawled page does not.
-    pub attribution: String,
-}
-
 /// A tab showing a web page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BrowserTab {
@@ -142,10 +116,6 @@ pub struct BrowserTab {
     pub request_id: Option<String>,
     /// Whether the page has been handed to the agent yet.
     pub handed_over: bool,
-    /// What is typed in the address bar, which is not the same as where the
-    /// browser is: it diverges while someone is typing, and is put back in
-    /// step when they navigate or the page changes under them.
-    pub bar: String,
     /// Where the browser reported itself to be, last time it said.
     ///
     /// Shown in the bar when nobody is editing it, and it is not `url`
@@ -154,42 +124,6 @@ pub struct BrowserTab {
     pub at: String,
     pub can_back: bool,
     pub can_forward: bool,
-    pub mode: BrowserMode,
-    /// Results from Forge's index for `searched`.
-    pub results: Vec<ForgeHit>,
-    /// What `results` are for, so the page can say so and a repeat of the same
-    /// query does not reload the index.
-    pub searched: String,
-    /// How many pages the index holds, shown because it is the honest measure
-    /// of what a search here can possibly find.
-    pub index_pages: usize,
-    /// What the last crawl managed, if one has run — how many pages it read,
-    /// and how many a bot check refused.
-    pub crawl_note: String,
-    /// The sites the index holds pages from, largest first.
-    ///
-    /// The honest front page for this thing. It is not a search engine and
-    /// cannot find a site nobody pointed it at, so an empty search box invites
-    /// a question it usually cannot answer — while a list of the shelves it
-    /// does have is useful before anything is typed, and tells a person
-    /// whether the answer could be in there at all.
-    pub shelves: Vec<Shelf>,
-}
-
-/// One site in the library, flattened for drawing.
-///
-/// A copy rather than `forge_search::library::Shelf` so the view holds no
-/// borrow of an index it loads and drops per search, and so the fields are the
-/// ones a row actually renders.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Shelf {
-    pub host: String,
-    pub pages: usize,
-    /// How long ago the newest page was read, already in words — "today",
-    /// "3 days ago", or empty when the index cannot say.
-    pub age: String,
-    /// A page to open, for somebody who wants to go and look.
-    pub example: String,
 }
 
 fn is_image_ext(ext: &str) -> bool {
@@ -311,18 +245,9 @@ impl Buffer {
                 url: url.to_string(),
                 request_id,
                 handed_over: false,
-                bar: if url.is_empty() { String::new() } else { url.to_string() },
                 at: url.to_string(),
                 can_back: false,
                 can_forward: false,
-                // A tab opened onto a page shows it; one opened with no page
-                // shows Forge's own search.
-                mode: if url.is_empty() { BrowserMode::Home } else { BrowserMode::Page },
-                results: Vec::new(),
-                searched: String::new(),
-                index_pages: 0,
-                crawl_note: String::new(),
-                shelves: Vec::new(),
             }),
         }
     }

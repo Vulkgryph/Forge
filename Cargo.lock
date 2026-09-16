@@ -1781,7 +1781,6 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "forge-proto",
- "forge-search",
  "git2",
  "libloading",
  "notify",

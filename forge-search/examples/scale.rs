@@ -23,7 +23,15 @@ fn main() {
         (n.powf(u) as usize).min(vocab.len()) - 1
     };
 
-    println!("{:>8} {:>9} {:>8} {:>8} {:>9} {:>9}", "pages", "file", "save", "load", "1 term", "3 terms");
+    // `+60 pages` is the column the on-disk format exists for: what a crawler
+    // pays to add a batch to an index it already has. The format used to be
+    // one file rewritten in full, which made that column equal to `index` —
+    // and a permanent crawler saving every sixty pages would have written
+    // around 35 TB a day against a consumer SSD's 300-600 TB of endurance.
+    println!(
+        "{:>8} {:>9} {:>8} {:>10} {:>8} {:>9} {:>9}",
+        "pages", "index", "save", "+60 pages", "load", "1 term", "3 terms"
+    );
     for pages in [1_000usize, 5_000, 20_000, 50_000] {
         let mut ix = Index::new();
         for p in 0..pages {
@@ -33,14 +41,27 @@ fn main() {
                 .join(" ");
             ix.add(&format!("https://h{}.test/{p}", p % 500), "Page", "", &body);
         }
-        let dir = std::env::temp_dir().join("forge-scale-zipf");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("i.bin");
+        // A fresh directory per run, so the measured size is this run's.
+        let path = std::env::temp_dir().join(format!("forge-scale-zipf-{pages}"));
+        let _ = std::fs::remove_dir_all(&path);
 
         let t = std::time::Instant::now();
         ix.save(&path).unwrap();
         let save = t.elapsed();
-        let size = std::fs::metadata(&path).unwrap().len();
+        let size = bytes_in(&path);
+
+        // Then the incremental case: sixty more pages onto an index of this
+        // size, which is a crawl batch.
+        for p in pages..pages + 60 {
+            let body: String = (0..800)
+                .map(|w| vocab[pick(p * 7919 + w * 104_729)].as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            ix.add(&format!("https://h{}.test/{p}", p % 500), "Page", "", &body);
+        }
+        ix.save(&path).unwrap();
+        let appended = bytes_in(&path) - size;
+
         let t = std::time::Instant::now();
         let back = Index::load(&path).unwrap();
         let load = t.elapsed();
@@ -80,9 +101,20 @@ fn main() {
         let n = forge_search::query::search(&back, &narrow, 10);
         let three = t.elapsed();
 
-        println!("{:>8} {:>6.1} MB {:>7.0?} {:>7.0?} {:>8.2?} {:>8.2?}   broad term in {} of {} pages, {} hits / narrow {} hits",
-            pages, size as f64 / 1048576.0, save, load, one, three,
+        println!("{:>8} {:>6.1} MB {:>7.0?} {:>7.2} MB {:>7.0?} {:>8.2?} {:>8.2?}   broad term in {} of {} pages, {} hits / narrow {} hits",
+            pages, size as f64 / 1048576.0, save, appended as f64 / 1048576.0, load, one, three,
             broad_df, pages, b.len(), n.len());
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&path).ok();
     }
+}
+
+/// Every byte in an index directory.
+fn bytes_in(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }

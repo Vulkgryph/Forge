@@ -575,7 +575,7 @@ fn render_spread(out: &mut String, spread: &[forge_search::query::Mention]) {
 
 /// Where the index lives for a workspace.
 pub fn index_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
-    workspace_root.join(".forge").join("search-index.bin")
+    workspace_root.join(".forge").join("search-index")
 }
 
 #[cfg(test)]
@@ -707,7 +707,7 @@ mod tests {
     fn the_index_path_is_inside_the_workspace() {
         let p = index_path(std::path::Path::new("/work/proj"));
         assert!(p.starts_with("/work/proj/.forge"));
-        assert_eq!(p.file_name().unwrap(), "search-index.bin");
+        assert_eq!(p.file_name().unwrap(), "search-index");
     }
 
     /// The result tells the model whether it paid for a crawl, so it does not

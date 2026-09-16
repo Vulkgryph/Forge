@@ -15125,7 +15125,7 @@ impl IdeApp {
 
     /// Search Forge's own index, and show the results on Forge's own page.
     ///
-    /// The index is the agent's: `.forge/search-index.bin`, holding whatever
+    /// The index is the agent's: `.forge/search-index/`, holding whatever
     /// has been crawled for this project and whatever articles were fetched
     /// under a licence that allowed keeping them. So this searches what Forge
     /// has actually read, which is a small corpus and a relevant one.
@@ -15135,7 +15135,7 @@ impl IdeApp {
     /// anything the agent has crawled since, and holding it would mean caring
     /// about invalidation for no gain.
     fn search_forge_index(&mut self, query: &str) {
-        let path = self.cwd.join(".forge").join("search-index.bin");
+        let path = self.cwd.join(".forge").join("search-index");
         let index = forge_search::index::Index::load(&path).unwrap_or_else(|_| {
             // No index yet is the ordinary case in a project where the agent
             // has not searched anything. An empty one answers nothing, which
@@ -15213,7 +15213,7 @@ impl IdeApp {
             // owed per host, and two crawls at once halve it for whichever
             // host got both.
             if self.crawling.is_none() {
-                let path = self.cwd.join(".forge").join("search-index.bin");
+                let path = self.cwd.join(".forge").join("search-index");
                 self.crawling = Some(crate::websearch::start(
                     query,
                     &address_for(seed),

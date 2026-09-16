@@ -16,6 +16,14 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **The search index is a directory of append-only segments, so growing it no longer rewrites it.** The index was one file, written in full on every save. At the fifty-thousand-page cap that is 556 MB written to add sixty pages, and a crawler saving each batch would have written on the order of 35 TB a day — a consumer SSD is rated for 300–600 TB in total, so a fortnight of that ends the drive.
+
+  A save now writes only what it added, as a new file, and appends a line to a small text manifest naming the segments in order. Measured on the scale benchmark: adding sixty pages writes 0.98 MB whether the index holds a thousand pages or fifty thousand, against 11.7 MB and 556.8 MB for the old full rewrite. The figure is flat because the cost tracks what was added rather than what was already there, which is the whole property.
+
+  Segments are never edited, so removal is expressed by name: a segment carries the URLs it retires, and a load applies them. Compacting on removal was the first attempt and it defeated the format — refreshing one stale page removes one document, which would have made that save rewrite everything. A real compaction happens when more than a quarter of the index is dead, which is where it earns the write.
+
+  The index lives at `.forge/search-index/` rather than `.forge/search-index.bin`; an old file is simply not found, and a missing index already means "crawl again". Verified on two live crawls: the first segment comes back byte for byte after the second save, and queries answer out of both.
+
 - **`web_search` is on by default, and no longer describes itself as broken.** Its schema still told the model it scraped DuckDuckGo and was "UNRELIABLE", with instructions not to retry. All true of the scrape; none of it true of the index Forge now crawls itself, and left in place it steered the model away from a tool that works. The description now says what the tool is, and documents `sites` and `max_pages` — which existed and were undocumented, so the model could not aim a crawl.
 
   The config default that disabled it is gone too; its own note said "off until there is a real search behind it", and there is. This reaches fresh installs only: the app serialises `disabled_tools`, so anyone who has run Forge before has `["web_search"]` on disk, which is indistinguishable from having chosen it and is therefore left alone. The tools menu turns it back on.

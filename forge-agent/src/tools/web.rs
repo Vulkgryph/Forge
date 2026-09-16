@@ -430,7 +430,7 @@ mod tests {
         for (url, title, body) in pages {
             ix.add(url, title, "", body);
         }
-        let path = dir.join("search-index.bin");
+        let path = dir.join("search-index");
         ix.save(&path).unwrap();
         path
     }

@@ -45,8 +45,15 @@ pub struct Document {
     ///
     /// Read through [`Index::text`], which knows where to find it.
     text: Option<String>,
-    /// Where the text is in the index file, when it is not in memory.
+    /// Where the text is in its segment file, when it is not in memory.
     text_at: Option<(u64, u32)>,
+    /// Which segment file holds that text, as an index into
+    /// [`Index::segments`].
+    ///
+    /// Needed because the index is no longer one file. A document written in
+    /// the first save stays in the first segment for as long as it lives, and
+    /// its offset means nothing without knowing which file to apply it to.
+    segment: u16,
     /// How many terms the document has, which ranking needs in order to stop
     /// preferring long documents simply for containing more words.
     pub term_count: u32,
@@ -164,10 +171,32 @@ pub struct Index {
     /// the finished index is linear. Empty means "not computed", and search
     /// falls back to scoring everything — correct, just slower.
     block_max_tf: HashMap<String, Vec<u32>>,
-    /// The file this index was loaded from, for reading document text on
-    /// demand. `None` for one built in memory, whose text is all in memory
+    /// The segment files backing this index, in the order the manifest names
+    /// them — which is also the order document ids were assigned. Empty for an
+    /// index built in memory and never saved, whose text is all in memory
     /// anyway.
-    source: Option<std::path::PathBuf>,
+    segments: Vec<std::path::PathBuf>,
+    /// How many documents are already in a segment.
+    ///
+    /// The watermark that makes a save append rather than rewrite. Documents
+    /// below it are on disk and their bytes are never written again; a save
+    /// encodes `docs[persisted..]` into a new file and adds a line to the
+    /// manifest. The one case that breaks the rule is removal, which no
+    /// append can express — see [`Index::save`].
+    persisted: usize,
+    /// URLs of documents removed since the last save that were already in a
+    /// segment, waiting to be written as the new segment's tombstones.
+    ///
+    /// The alternative was to compact whenever anything was removed, and that
+    /// turned out to undo the format: a crawler that refreshes one stale page
+    /// removes one document, and a rewrite-on-removal makes that save write
+    /// the whole index. A tombstone is a URL — tens of bytes to retire a page
+    /// instead of hundreds of megabytes.
+    ///
+    /// Only for persisted documents. Removing one added since the last save
+    /// needs nothing recorded: it was never written, so there is nothing on
+    /// disk to contradict.
+    tombstones: Vec<String>,
 }
 
 impl Document {
@@ -262,6 +291,13 @@ impl Index {
     ) -> DocId {
         if let Some(&existing) = self.by_url.get(url) {
             self.remove(existing);
+            // Re-crawling is not removing. `remove` will have queued a
+            // tombstone if the old copy was on disk; the new copy is about to
+            // go into a later segment, and a load already prefers the later
+            // copy of a URL. Leaving the tombstone in would make a segment
+            // both retire and re-add the same page, so which one won would
+            // depend on the order a reader applied them in.
+            self.tombstones.retain(|t| t != url);
         }
         let tokens = tokenize::tokenize(text);
         // Title terms are indexed as well, at positions after the body, so a
@@ -302,6 +338,7 @@ impl Index {
             description: description.to_string(),
             text: Some(truncate_on_boundary(text, TEXT_KEPT)),
             text_at: None,
+            segment: 0,
             term_count,
             live: true,
             prose_share: prose_share(text),
@@ -330,7 +367,12 @@ impl Index {
         doc.live = false;
         let count = doc.term_count;
         let url = std::mem::take(&mut doc.url);
+        let persisted = (id as usize) < self.persisted;
         self.by_url.remove(&url);
+        if persisted {
+            // On disk, so the removal has to be recorded to survive a reload.
+            self.tombstones.push(url);
+        }
         self.live_docs -= 1;
         self.total_terms = self.total_terms.saturating_sub(count as u64);
         true
@@ -379,6 +421,10 @@ impl Index {
                 postings.insert(term.clone(), kept);
             }
         }
+
+        // Nothing dead is left, so nothing needs retiring — and the next save
+        // writes every surviving document into one fresh segment anyway.
+        self.tombstones.clear();
 
         self.by_url = docs
             .iter()
@@ -552,7 +598,9 @@ impl Index {
         if let Some(text) = &doc.text {
             return text.clone();
         }
-        let (Some((offset, len)), Some(path)) = (doc.text_at, self.source.as_ref()) else {
+        let (Some((offset, len)), Some(path)) =
+            (doc.text_at, self.segments.get(doc.segment as usize))
+        else {
             return String::new();
         };
         read_at(path, offset, len).unwrap_or_default()
@@ -572,7 +620,9 @@ impl Index {
         if let Some(text) = &document.text {
             return text.clone();
         }
-        let (Some((offset, len)), Some(path)) = (document.text_at, self.source.as_ref()) else {
+        let (Some((offset, len)), Some(path)) =
+            (document.text_at, self.segments.get(document.segment as usize))
+        else {
             return String::new();
         };
         read_at(path, offset, len).unwrap_or_default()
@@ -693,61 +743,162 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
+
+/// Compact when dead documents are more than this fraction of the index, as a
+/// divisor — 4 for a quarter.
+///
+/// Lucene's merge policy asks the same question and lands in the same region.
+/// Lower, and a maintained index rewrites itself over churn it could have
+/// retired by name; higher, and the segments keep bytes nothing will ever read
+/// while every query pays to skip over their postings.
+const DEAD_SHARE_TO_COMPACT: usize = 4;
 
 impl Index {
-    /// Write the index to `path`.
+    /// Write anything not yet on disk, as a new segment.
     ///
-    /// Only live documents are written, so saving is also how the file gets
-    /// compacted — a long-running crawler's index does not accumulate the
-    /// pages it has replaced.
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        // Computed here so the file carries them and a loaded index can skip
-        // from its first query. `&self` rather than `&mut`, so this is done on
-        // a copy of the bounds rather than mutating during a save.
-        let mut bounds: HashMap<&String, Vec<u32>> = HashMap::new();
-        for (term, postings) in &self.postings {
-            bounds.insert(
-                term,
-                postings
-                    .chunks(BLOCK)
-                    .map(|b| b.iter().map(|p| p.positions.len() as u32).max().unwrap_or(0))
-                    .collect(),
-            );
+    /// `path` is a directory. Inside it, each segment is a file written once
+    /// and never modified again, and a small manifest says which segments
+    /// exist and in what order.
+    ///
+    /// This is the shape that makes a growing index affordable. The previous
+    /// format was one file rewritten in full on every save: at the fifty
+    /// thousand page cap that is 556 MB written to add sixty pages, and a
+    /// permanent crawler saving every sixty pages would write about 35 TB a
+    /// day — a fortnight of that ends a consumer SSD. Appending writes the new
+    /// pages and a manifest of a few kilobytes, so the cost of a save tracks
+    /// what was added rather than what is already there.
+    ///
+    /// Removing a document is the exception, and deliberately so: a segment
+    /// cannot be edited, so eviction rewrites everything as a single fresh
+    /// segment. That is a large write, and it happens when the index is
+    /// trimmed rather than every time it grows — which is the right place for
+    /// it, since compaction is exactly when a full rewrite earns its cost.
+    pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+
+        // A removed document cannot be taken out of the segment holding it, so
+        // an append retires it by name instead and only a compaction actually
+        // reclaims the space. Compacting on every removal was the first
+        // attempt and it defeated the format: refreshing one stale page
+        // removes one document, which would have made that save rewrite the
+        // whole index.
+        //
+        // So: compact when enough of the index is dead to be worth the write,
+        // append otherwise. At the threshold a rewrite costs a quarter more
+        // than the live data it keeps, and it happens once per quarter of the
+        // index turning over rather than once per page.
+        let dead = self.docs.iter().filter(|d| !d.live).count();
+        let rewriting = self.segments.is_empty() || dead * DEAD_SHARE_TO_COMPACT > self.docs.len();
+
+        if rewriting {
+            // In memory as well as on disk. Left in place, the dead documents
+            // would keep the share above the threshold and make every
+            // subsequent save a rewrite.
+            self.compact();
+            self.persisted = 0;
+        }
+
+        let ids: Vec<DocId> = (self.persisted as DocId..self.docs.len() as DocId)
+            .filter(|&i| self.docs[i as usize].live)
+            .collect();
+
+        // Nothing added and nothing retired: leave the directory alone rather
+        // than rewriting a manifest to say what it already says. A save that
+        // changes nothing is the common case once a crawl has settled, and it
+        // should cost nothing.
+        if ids.is_empty() && self.tombstones.is_empty() && !rewriting {
+            return Ok(());
+        }
+
+        // A name no existing file has, even when compacting. `encode_segment`
+        // reads the text of documents out of the segments being replaced, so
+        // writing over one of them would be reading and writing the same file;
+        // the encode happens to complete first today, and relying on that is
+        // the kind of ordering that survives until someone streams the write.
+        let bytes = self.encode_segment(&ids);
+        let name = format!("seg-{:05}.bin", next_segment_number(path));
+        let file = path.join(&name);
+
+        // Where the text blob starts, taken from the header the encoder just
+        // back-patched — the same number a reader takes from it.
+        let base = u64::from_le_bytes(
+            bytes[16..24].try_into().map_err(|_| "bad segment header")?,
+        );
+
+        std::fs::write(&file, &bytes).map_err(|e| format!("write {}: {e}", file.display()))?;
+
+        let mut names: Vec<String> = if rewriting {
+            Vec::new()
+        } else {
+            self.segments
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        names.push(name);
+        write_manifest(path, &names)?;
+
+        // Superseded segments are unlinked only after the manifest has stopped
+        // naming them. A crash between the two leaves a directory that still
+        // opens, with a stale file in it — whereas the other order leaves a
+        // manifest naming a file that is gone, which opens as nothing at all.
+        let replaced = std::mem::take(&mut self.segments);
+        self.segments = names.iter().map(|n| path.join(n)).collect();
+        if rewriting {
+            for old in replaced {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+
+        // Where each document just written now lives. Text is dropped from
+        // memory at the same time, which is the other half of not loading it:
+        // a document that has been saved can be read back a page at a time.
+        let segment = (self.segments.len() - 1) as u16;
+        let mut written = base;
+        for &id in &ids {
+            let doc = &mut self.docs[id as usize];
+            let len = doc.text_len() as u32;
+            doc.segment = segment;
+            doc.text_at = Some((written, len));
+            doc.text = None;
+            written += len as u64;
+        }
+        self.persisted = self.docs.len();
+        self.tombstones.clear();
+        Ok(())
+    }
+
+    /// One segment's bytes: the given documents, with local ids, and only the
+    /// postings that point at them.
+    fn encode_segment(&self, ids: &[DocId]) -> Vec<u8> {
+        let mut local: HashMap<DocId, DocId> = HashMap::new();
+        for (n, &id) in ids.iter().enumerate() {
+            local.insert(id, n as DocId);
         }
 
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
 
-        // Dense new ids in the order written, and a map from the old ids so
-        // the postings can be renumbered to match.
-        let mut renumbered: HashMap<DocId, DocId> = HashMap::new();
-        let mut live: Vec<&Document> = Vec::new();
-        for (old, doc) in self.docs.iter().enumerate() {
-            if doc.live {
-                renumbered.insert(old as DocId, live.len() as DocId);
-                live.push(doc);
-            }
-        }
-
-        // Document text goes to a blob at the end of the file, and each
-        // record carries where to find it. A loaded index then holds the
-        // metadata a query needs and reads text only for what it ranks.
         let mut text_blob: Vec<u8> = Vec::new();
-        let mut text_spans: Vec<(u64, u32)> = Vec::with_capacity(live.len());
-        for doc in &live {
-            let text = self.text_of(doc);
-            text_spans.push((text_blob.len() as u64, text.len() as u32));
+        let mut spans: Vec<(u64, u32)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let text = self.text_of(&self.docs[id as usize]);
+            spans.push((text_blob.len() as u64, text.len() as u32));
             text_blob.extend_from_slice(text.as_bytes());
         }
 
-        put_u32(&mut out, live.len() as u32);
-        // Patched once the blob's position is known, which is only after
-        // everything before it has been written.
+        put_u32(&mut out, ids.len() as u32);
         let base_at = out.len();
         put_u64(&mut out, 0);
-        for (doc, (offset, len)) in live.iter().zip(&text_spans) {
+        for (&id, (offset, len)) in ids.iter().zip(&spans) {
+            let doc = &self.docs[id as usize];
             put_str(&mut out, &doc.url);
             put_str(&mut out, &doc.title);
             put_str(&mut out, &doc.description);
@@ -758,68 +909,87 @@ impl Index {
             put_u32(&mut out, *len);
         }
 
-        // The postings, written out rather than rebuilt from the text on load.
-        //
-        // They used to be rebuilt, and that was wrong in a way that only
-        // showed after a save: the text stored for snippets is capped, so
-        // re-tokenising it produced postings for the capped part only. A
-        // 50 kB page lost every term past 32 kB — measured, its term count
-        // fell from 6,409 to 4,097 and a word near the end went from one hit
-        // to none. The first search after a crawl found it and every later one
-        // did not, which is the worst shape a bug can have.
-        //
-        // The postings *are* the index. Deriving them from a lossy copy of
+        // Postings, written rather than rebuilt from the text. They used to be
+        // rebuilt, and that was wrong in a way only a save revealed: the text
+        // kept for snippets is capped, so re-tokenising it produced postings
+        // for the capped part alone. A 50 kB page lost every term past 32 kB.
+        // The postings *are* the index; deriving them from a lossy copy of
         // their own source was the mistake.
         let mut terms: Vec<&String> = self.postings.keys().collect();
-        // Sorted so the file is byte-identical for an identical index, which
-        // makes a diff of two indexes mean something.
         terms.sort_unstable();
-        put_u32(&mut out, terms.len() as u32);
+        // Only terms this segment's documents actually use.
+        let mut kept: Vec<(&String, Vec<&Posting>)> = Vec::new();
         for term in terms {
+            let mine: Vec<&Posting> = self.postings[term]
+                .iter()
+                .filter(|p| local.contains_key(&p.doc))
+                .collect();
+            if !mine.is_empty() {
+                kept.push((term, mine));
+            }
+        }
+        put_u32(&mut out, kept.len() as u32);
+        for (term, mine) in kept {
             put_str(&mut out, term);
-            // The block bounds for this term, before its postings — a reader
-            // that wants to skip needs them before deciding what to read.
-            let term_bounds = bounds.get(term).map(|v| v.as_slice()).unwrap_or(&[]);
-            put_u32(&mut out, term_bounds.len() as u32);
-            for bound in term_bounds {
+            // Bounds over this segment's own blocks, since a reader skips
+            // within a segment.
+            let bounds: Vec<u32> = mine
+                .chunks(BLOCK)
+                .map(|b| b.iter().map(|p| p.positions.len() as u32).max().unwrap_or(0))
+                .collect();
+            put_u32(&mut out, bounds.len() as u32);
+            for bound in &bounds {
                 put_u32(&mut out, *bound);
             }
-            let live_postings: Vec<&Posting> = self.postings[term]
-                .iter()
-                .filter(|p| renumbered.contains_key(&p.doc))
-                .collect();
-            put_u32(&mut out, live_postings.len() as u32);
-            for posting in live_postings {
-                put_u32(&mut out, renumbered[&posting.doc]);
+            put_u32(&mut out, mine.len() as u32);
+            for posting in mine {
+                put_u32(&mut out, local[&posting.doc]);
                 put_u32(&mut out, posting.positions.len() as u32);
                 for position in &posting.positions {
                     put_u32(&mut out, *position);
                 }
             }
         }
-        // The blob last, and its absolute position back-patched into the
-        // header so a reader can turn a record's relative offset into a seek.
+
+        // The pages this segment retires, by URL. Last of the record sections
+        // so that a reader has already seen this segment's own documents when
+        // it applies them — which only matters for the ordering to be stated
+        // somewhere, since `add` makes sure a segment never both retires and
+        // re-adds the same page.
+        put_u32(&mut out, self.tombstones.len() as u32);
+        for url in &self.tombstones {
+            put_str(&mut out, url);
+        }
+
         let base = out.len() as u64;
         out[base_at..base_at + 8].copy_from_slice(&base.to_le_bytes());
         out.extend_from_slice(&text_blob);
-
-        std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+        out
     }
 
-    /// Read an index written by [`Index::save`].
+    /// Read an index written by [`save`](Self::save).
     ///
-    /// Postings are rebuilt from the stored text rather than stored themselves.
-    /// That trades a little load time for a file that cannot be internally
-    /// inconsistent: there is no way for the postings on disk to disagree with
-    /// the documents, because there are no postings on disk.
+    /// `path` is the directory. Segments are read in the order the manifest
+    /// names them, and document ids are assigned in that order — so an id is
+    /// stable for as long as no compaction happens, and postings from each
+    /// segment are offset onto it.
     pub fn load(path: &Path) -> Result<Self, String> {
-        // Only the part before the text blob.
-        //
-        // Moving text out of the deserialising was not enough on its own:
-        // `fs::read` still pulled the whole file in, so the third of it that
-        // is document text was read and then ignored. The blob's position is
-        // in the header, so the header is read first and then exactly the
-        // prefix that matters.
+        let names = read_manifest(path)?;
+        let mut index = Index::new();
+        for name in &names {
+            let file = path.join(name);
+            index.read_segment(&file)?;
+            index.segments.push(file);
+        }
+        index.persisted = index.docs.len();
+        Ok(index)
+    }
+
+    /// Add one segment's documents and postings to this index.
+    fn read_segment(&mut self, path: &Path) -> Result<(), String> {
+        // Only the part before the text blob: the blob's position is in the
+        // header, so the header is read first and then exactly the prefix that
+        // matters. Text is left on disk and read per document.
         let bytes = read_prefix(path)?;
         if bytes.len() < 12 || &bytes[..8] != MAGIC {
             return Err("not a forge-search index".into());
@@ -833,11 +1003,9 @@ impl Index {
         }
         let count = take_u32(&bytes, &mut at)?;
         let text_base = take_u64(&bytes, &mut at)?;
-        let mut index = Index::new();
-        index.source = Some(path.to_path_buf());
-        // Documents are restored, not re-added: re-adding would re-tokenise
-        // the capped text and rebuild postings from it, which is the bug this
-        // format exists to fix. Everything the ranker needs is read back.
+        let segment = self.segments.len() as u16;
+        let base = self.docs.len() as DocId;
+
         for _ in 0..count {
             let url = take_str(&bytes, &mut at)?;
             let title = take_str(&bytes, &mut at)?;
@@ -847,52 +1015,146 @@ impl Index {
             let term_count = take_u32(&bytes, &mut at)?;
             let text_offset = take_u64(&bytes, &mut at)?;
             let text_len = take_u32(&bytes, &mut at)?;
-            let id = index.docs.len() as DocId;
-            index.docs.push(Document {
+            let id = self.docs.len() as DocId;
+            // A later segment holding the same URL is the newer copy of that
+            // page, so it replaces the earlier one — which is how a re-crawl
+            // updates a page without any segment being edited.
+            if let Some(&existing) = self.by_url.get(&url) {
+                self.remove(existing);
+            }
+            self.docs.push(Document {
                 url: url.clone(),
                 title,
                 description,
-                // Left on disk. This is the whole point of the format: the
-                // text is a third of the file and almost nothing reads it.
                 text: None,
                 text_at: Some((text_base + text_offset, text_len)),
+                segment,
                 term_count,
                 live: true,
                 prose_share: share.min(100) as u8,
                 attribution,
             });
-            index.by_url.insert(url, id);
-            index.live_docs += 1;
-            index.total_terms += term_count as u64;
+            self.by_url.insert(url, id);
+            self.live_docs += 1;
+            self.total_terms += term_count as u64;
         }
 
         let term_count = take_u32(&bytes, &mut at)?;
         for _ in 0..term_count {
             let term = take_str(&bytes, &mut at)?;
             let bound_count = take_u32(&bytes, &mut at)?;
-            let mut term_bounds = Vec::with_capacity(bound_count as usize);
+            let mut bounds = Vec::with_capacity(bound_count as usize);
             for _ in 0..bound_count {
-                term_bounds.push(take_u32(&bytes, &mut at)?);
+                bounds.push(take_u32(&bytes, &mut at)?);
             }
             let postings = take_u32(&bytes, &mut at)?;
             let mut list = Vec::with_capacity(postings as usize);
             for _ in 0..postings {
-                let doc = take_u32(&bytes, &mut at)?;
-                if doc as usize >= index.docs.len() {
-                    return Err(format!("posting for document {doc}, which is not in the file"));
+                let local = take_u32(&bytes, &mut at)?;
+                if local >= count {
+                    return Err(format!("posting for document {local}, which is not in {}", path.display()));
                 }
                 let n = take_u32(&bytes, &mut at)?;
                 let mut positions = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     positions.push(take_u32(&bytes, &mut at)?);
                 }
-                list.push(Posting { doc, positions });
+                list.push(Posting { doc: base + local, positions });
             }
-            index.block_max_tf.insert(term.clone(), term_bounds);
-            index.postings.insert(term, list);
+            // Merged onto whatever earlier segments contributed. Ids rise with
+            // segment order, so appending keeps each list sorted.
+            self.postings.entry(term.clone()).or_default().extend(list);
+            self.block_max_tf.entry(term).or_default().extend(bounds);
         }
-        Ok(index)
+
+        // Pages this segment retires. They are in an earlier segment, which
+        // cannot be edited, so a load is where the removal takes effect.
+        let retired = take_u32(&bytes, &mut at)?;
+        for _ in 0..retired {
+            let url = take_str(&bytes, &mut at)?;
+            if let Some(&id) = self.by_url.get(&url) {
+                self.remove(id);
+            }
+        }
+        // Not carried forward as pending work: these are already recorded in
+        // the segment just read, and re-writing them into the next one would
+        // grow every segment by the whole history of what has ever been
+        // removed. `persisted` is set by the caller once every segment is in.
+        self.tombstones.clear();
+        Ok(())
     }
+}
+
+/// The manifest's name inside an index directory.
+const MANIFEST: &str = "segments.txt";
+
+/// Write the list of segments, newest last.
+///
+/// Text rather than the packed form the segments use, because this is the one
+/// file a person might reasonably want to read: it says what an index
+/// directory is made of, and a directory whose manifest can be inspected with
+/// `cat` is a directory whose state can be diagnosed without this crate.
+///
+/// Written to a temporary name and renamed over the old one. Rename is atomic
+/// on every filesystem this runs on, so a reader either sees the whole old
+/// manifest or the whole new one. A manifest half-written is an index that
+/// cannot be opened at all, which is the one failure worth ruling out — a
+/// segment is immutable and a stale one is harmless, but there is only ever
+/// one manifest.
+fn write_manifest(dir: &Path, names: &[String]) -> Result<(), String> {
+    let mut text = String::new();
+    text.push_str("forge-search segments 1\n");
+    for name in names {
+        text.push_str(name);
+        text.push('\n');
+    }
+    let staging = dir.join("segments.txt.new");
+    std::fs::write(&staging, text).map_err(|e| format!("write {}: {e}", staging.display()))?;
+    std::fs::rename(&staging, dir.join(MANIFEST))
+        .map_err(|e| format!("replace manifest in {}: {e}", dir.display()))
+}
+
+/// The next unused segment number in `dir`.
+///
+/// One past the highest already there, rather than one past the manifest's
+/// length, so a name is never reused — not after a compaction that dropped
+/// segments from the middle of the count, and not after a crash that left a
+/// segment behind that no manifest names.
+fn next_segment_number(dir: &Path) -> u32 {
+    let mut highest = None;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(digits) = name.strip_prefix("seg-").and_then(|n| n.strip_suffix(".bin")) else {
+            continue;
+        };
+        if let Ok(n) = digits.parse::<u32>() {
+            highest = Some(highest.map_or(n, |h: u32| h.max(n)));
+        }
+    }
+    highest.map_or(0, |h| h + 1)
+}
+
+/// The segment names an index directory claims, in order.
+fn read_manifest(dir: &Path) -> Result<Vec<String>, String> {
+    let path = dir.join(MANIFEST);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("forge-search segments 1") => {}
+        Some(other) => return Err(format!("{} is not a forge-search manifest: {other:?}", path.display())),
+        None => return Err(format!("{} is empty", path.display())),
+    }
+    Ok(lines
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        // A name, not a path: a manifest must not be able to name a file
+        // outside its own directory.
+        .filter(|l| !l.contains('/') && !l.contains('\\') && *l != "." && *l != "..")
+        .map(str::to_string)
+        .collect())
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -1071,7 +1333,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.bin");
 
-        let ix = indexed();
+        let mut ix = indexed();
         ix.save(&path).expect("save");
         let back = Index::load(&path).expect("load");
 
@@ -1142,10 +1404,18 @@ mod tests {
     fn a_newer_version_is_refused_by_name() {
         let dir = std::env::temp_dir().join(format!("forge-search-ver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("future.bin");
-        std::fs::write(&p, [MAGIC.as_slice(), &99u32.to_le_bytes(), &0u32.to_le_bytes()].concat()).unwrap();
+        // A manifest naming one segment from a format this build cannot read.
+        // The manifest itself is readable, which is the point of keeping it in
+        // its own file and its own format: the complaint is about the segment,
+        // not about the directory.
+        std::fs::write(
+            dir.join("seg-00000.bin"),
+            [MAGIC.as_slice(), &99u32.to_le_bytes(), &0u32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        write_manifest(&dir, &["seg-00000.bin".to_string()]).unwrap();
 
-        let err = Index::load(&p).expect_err("should refuse");
+        let err = Index::load(&dir).expect_err("should refuse");
         assert!(err.contains("version 99"), "unhelpful: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1258,6 +1528,274 @@ mod tests {
         assert_eq!(ix.document_frequency("celsius"), 1, "a term past the cap was lost");
         // And the dead document's own terms really did go.
         assert_eq!(ix.document_frequency("away"), 0);
+    }
+
+    /// A scratch directory named for the test, since tests run as threads of
+    /// one process and a name keyed on the process id has already had two of
+    /// them delete each other's fixtures.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forge-seg-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The segment files in an index directory, in manifest order.
+    fn segments_in(dir: &Path) -> Vec<String> {
+        read_manifest(dir).unwrap()
+    }
+
+    /// The whole reason for the format: a save writes what was added, not what
+    /// was already there. The earlier segment must come back byte for byte,
+    /// because "append-only" is a claim about the bytes on disk and nothing
+    /// less checks it.
+    #[test]
+    fn a_second_save_leaves_the_first_segment_untouched() {
+        let dir = scratch("append");
+        let mut ix = indexed();
+        ix.save(&dir).unwrap();
+
+        let first = segments_in(&dir);
+        assert_eq!(first.len(), 1, "a first save should write one segment");
+        let before = std::fs::read(dir.join(&first[0])).unwrap();
+
+        ix.add("https://d.example/new", "Later", "", "A page added after the first save.");
+        ix.save(&dir).unwrap();
+
+        let after = segments_in(&dir);
+        assert_eq!(after.len(), 2, "a second save should add a segment, not replace one");
+        assert_eq!(after[0], first[0], "the manifest reordered or renamed a segment");
+        assert_eq!(
+            std::fs::read(dir.join(&first[0])).unwrap(),
+            before,
+            "the first segment was rewritten — the save is not append-only"
+        );
+
+        // And the second segment is the size of what was added, not of the
+        // whole index. This is the number the format exists for.
+        let added = std::fs::metadata(dir.join(&after[1])).unwrap().len();
+        assert!(
+            added < before.len() as u64,
+            "adding one page wrote {added} bytes against {} already on disk",
+            before.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Documents from every segment are searchable, with ids assigned in
+    /// manifest order — a reader that stopped at the first segment would still
+    /// pass a round-trip test on a freshly built index.
+    #[test]
+    fn a_query_reaches_documents_in_every_segment() {
+        let dir = scratch("across");
+        let mut ix = indexed();
+        ix.save(&dir).unwrap();
+        ix.add("https://d.example/threads", "Thread safety", "", "A no_std crate can still be thread safe.");
+        ix.save(&dir).unwrap();
+
+        let back = Index::load(&dir).unwrap();
+        assert_eq!(back.len(), 4);
+        // Three documents mention no_std, one of them from the second segment.
+        assert_eq!(back.document_frequency("no_std"), 3, "postings did not merge across segments");
+        let hits = crate::query::search(&back, "thread safe", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://d.example/threads");
+        // Text lives in the second segment file; a snippet proves the offset
+        // was applied to the right one.
+        assert!(hits[0].snippet.contains("thread safe"), "snippet: {:?}", hits[0].snippet);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save with nothing new must not write. Once a crawl settles this is
+    /// every save, and a manifest rewritten to say what it already said is the
+    /// same wear the format is meant to avoid — in miniature.
+    #[test]
+    fn a_save_with_nothing_new_writes_nothing() {
+        let dir = scratch("idle");
+        let mut ix = indexed();
+        ix.save(&dir).unwrap();
+        let before = segments_in(&dir);
+        let stamp = std::fs::metadata(dir.join(MANIFEST)).unwrap().modified().unwrap();
+
+        ix.save(&dir).unwrap();
+        ix.save(&dir).unwrap();
+
+        assert_eq!(segments_in(&dir), before, "an idle save added a segment");
+        assert_eq!(
+            std::fs::metadata(dir.join(MANIFEST)).unwrap().modified().unwrap(),
+            stamp,
+            "an idle save rewrote the manifest"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Filler pages, so a test can cross or stay under the compaction
+    /// threshold on purpose rather than by accident. A small fixture is all
+    /// dead the moment anything is removed from it.
+    fn padded(n: usize) -> Index {
+        let mut ix = Index::new();
+        for i in 0..n {
+            ix.add(
+                &format!("https://pad.test/{i}"),
+                &format!("Page {i}"),
+                "",
+                &format!("Filler page number {i} about nothing in particular."),
+            );
+        }
+        ix
+    }
+
+    /// Removing a page must not rewrite the index. This is the case that
+    /// defeated the first attempt: a crawler refreshing one stale page removes
+    /// one document, and compacting on removal made that save write everything.
+    /// The page is retired by name instead.
+    #[test]
+    fn removing_a_page_is_retired_by_name_not_by_rewriting() {
+        let dir = scratch("retire");
+        let mut ix = padded(8);
+        ix.save(&dir).unwrap();
+        let first = segments_in(&dir);
+        let before = std::fs::read(dir.join(&first[0])).unwrap();
+
+        let gone = ix.by_url["https://pad.test/3"];
+        assert!(ix.remove(gone));
+        ix.save(&dir).unwrap();
+
+        let names = segments_in(&dir);
+        assert_eq!(names.len(), 2, "a removal should append, not compact");
+        assert_eq!(
+            std::fs::read(dir.join(&first[0])).unwrap(),
+            before,
+            "the segment holding the removed page was rewritten"
+        );
+        // A tombstone is a URL. The segment carrying one is tiny next to the
+        // index it retires a page from.
+        let tomb = std::fs::metadata(dir.join(&names[1])).unwrap().len();
+        assert!(tomb < 200, "retiring one page wrote {tomb} bytes");
+
+        let back = Index::load(&dir).unwrap();
+        assert_eq!(back.len(), 7);
+        assert!(!back.contains_url("https://pad.test/3"), "the removal did not survive a reload");
+        assert!(back.contains_url("https://pad.test/4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tombstones are not free forever, so past a threshold the index is
+    /// rewritten and the space actually comes back — and the superseded files
+    /// go with it rather than accumulating.
+    #[test]
+    fn enough_dead_pages_trigger_a_compaction() {
+        let dir = scratch("threshold");
+        let mut ix = padded(8);
+        ix.save(&dir).unwrap();
+        // Two of eight is a quarter, which is not more than a quarter.
+        for i in [0usize, 1] {
+            let id = ix.by_url[&format!("https://pad.test/{i}")];
+            assert!(ix.remove(id));
+        }
+        ix.save(&dir).unwrap();
+        assert_eq!(segments_in(&dir).len(), 2, "a quarter dead should still append");
+
+        // The third crosses it.
+        let id = ix.by_url["https://pad.test/2"];
+        assert!(ix.remove(id));
+        ix.save(&dir).unwrap();
+
+        let names = segments_in(&dir);
+        assert_eq!(names.len(), 1, "past the threshold the index should be rewritten");
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("seg-"))
+            .collect();
+        assert_eq!(left, names, "superseded segments were left behind: {left:?}");
+
+        let back = Index::load(&dir).unwrap();
+        assert_eq!(back.len(), 5);
+        for i in 0..3 {
+            assert!(!back.contains_url(&format!("https://pad.test/{i}")));
+        }
+        assert!(back.contains_url("https://pad.test/7"));
+
+        // And a compaction leaves nothing pending, so the next idle save is
+        // still free.
+        let after = std::fs::metadata(dir.join(MANIFEST)).unwrap().modified().unwrap();
+        ix.save(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join(MANIFEST)).unwrap().modified().unwrap(),
+            after,
+            "a save straight after a compaction wrote again"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-crawling a page puts a newer copy in a later segment while the older
+    /// one stays where it is. The load has to prefer the later copy, or an
+    /// index would answer from a page it has already replaced.
+    #[test]
+    fn a_later_segment_supersedes_an_earlier_copy_of_the_same_page() {
+        let dir = scratch("recrawl");
+        // Padded, so replacing one page does not by itself put a quarter of
+        // the index out of date and trigger a compaction.
+        let mut ix = padded(8);
+        ix.add("https://a.test/spec", "Spec", "", "The limit is forty units.");
+        ix.save(&dir).unwrap();
+
+        // Append-only on disk, so the older copy is still in segment zero.
+        ix.add("https://a.test/spec", "Spec", "", "The limit is ninety units.");
+        ix.save(&dir).unwrap();
+        assert_eq!(segments_in(&dir).len(), 2);
+
+        let back = Index::load(&dir).unwrap();
+        assert_eq!(back.len(), 9, "both copies of the page are live");
+        assert_eq!(back.document_frequency("ninety"), 1);
+        assert_eq!(back.document_frequency("forty"), 0, "the superseded copy still answers");
+        let hits = crate::query::search(&back, "limit units", 3);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("ninety"), "snippet: {:?}", hits[0].snippet);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest must not be able to name a file outside its own directory.
+    /// It is a plain text file so that it can be read; that also means it can
+    /// be edited, and by something other than a person.
+    #[test]
+    fn a_manifest_cannot_escape_its_directory() {
+        let dir = scratch("escape");
+        let mut ix = indexed();
+        ix.save(&dir).unwrap();
+        let real = segments_in(&dir).remove(0);
+        std::fs::write(
+            dir.join(MANIFEST),
+            format!("forge-search segments 1\n../../etc/passwd\n..\n.\n{real}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(read_manifest(&dir).unwrap(), vec![real]);
+        assert_eq!(Index::load(&dir).unwrap().len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory with no manifest is not an index, and says so rather than
+    /// opening as an empty one — an empty index is indistinguishable from a
+    /// crawl that found nothing, and silently starting over is how a save then
+    /// overwrites what was there.
+    #[test]
+    fn a_directory_without_a_manifest_is_not_an_index() {
+        let dir = scratch("bare");
+        assert!(Index::load(&dir).is_err());
+        std::fs::write(dir.join(MANIFEST), "some other program's file\n").unwrap();
+        let err = Index::load(&dir).expect_err("should refuse");
+        assert!(err.contains("not a forge-search manifest"), "unhelpful: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Prose share is stored rather than recomputed on load, because the two

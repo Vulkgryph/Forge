@@ -275,7 +275,7 @@ fn attribution_of(index: &Index, url: &str) -> Option<String> {
 /// Separate from the web index: see the note at the top of the module on why
 /// the two corpora are not mixed.
 pub fn index_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
-    workspace_root.join(".forge").join("paper-index.bin")
+    workspace_root.join(".forge").join("paper-index")
 }
 
 #[cfg(test)]
@@ -375,7 +375,7 @@ mod tests {
     async fn live_search_papers_returns_cited_passages() {
         let dir = std::env::temp_dir().join(format!("forge-papers-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("paper-index.bin");
+        let path = dir.join("paper-index");
 
         let args = serde_json::json!({
             "query": "\"pyramidal neuron\" AND \"patch clamp\" AND temperature",

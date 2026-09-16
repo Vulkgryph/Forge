@@ -94,7 +94,7 @@ fn main() {
     let mut ranks: Vec<Vec<Option<usize>>> = vec![Vec::new(); variants.len()];
 
     for case in &cases {
-        let path = format!("{root}/{}/.forge/search-index.bin", case.index);
+        let path = format!("{root}/{}/.forge/search-index", case.index);
         let Ok(ix) = Index::load(std::path::Path::new(&path)) else {
             eprintln!("skipping {}: no index at {path}", case.index);
             continue;

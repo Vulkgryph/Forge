@@ -15,7 +15,7 @@
 //! ?? .forge/
 //!
 //! $ find .forge -type f
-//! .forge/search-index.bin                                 1.5 MB
+//! .forge/search-index/                                    1.5 MB
 //! .forge/sessions/20260915_140302_809/conversation.jsonl
 //! ```
 //!
@@ -138,7 +138,7 @@ mod tests {
             return; // No git here; the content test above still applies.
         }
         let dir = ensure(&root).unwrap();
-        std::fs::write(dir.join("search-index.bin"), b"binary").unwrap();
+        std::fs::write(dir.join("search-index-stray"), b"binary").unwrap();
         std::fs::create_dir_all(dir.join("sessions/x")).unwrap();
         std::fs::write(dir.join("sessions/x/conversation.jsonl"), b"{}").unwrap();
 

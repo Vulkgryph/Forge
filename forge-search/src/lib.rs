@@ -12,6 +12,9 @@
 //!   engine needs the words and the hyperlinks, never the tree.
 //! - [`tokenize`] — text into terms. Decides what can be found at all.
 //! - [`index`] — the inverted index: which documents hold a term, and where.
+//! - [`library`] — what has been read, grouped by site. The honest face of
+//!   the whole crate: it cannot find a site nobody pointed it at, so what it
+//!   offers a person is a view of the shelves it does have.
 //! - [`jats`] — a journal article, where the title is not in the `<title>`
 //!   element and the bibliography is not part of the paper.
 //! - [`query`] — the operators a person typed, and the passage of each
@@ -34,6 +37,7 @@ pub mod fetch;
 pub mod html;
 pub mod index;
 pub mod jats;
+pub mod library;
 pub mod query;
 pub mod rank;
 pub mod robots;

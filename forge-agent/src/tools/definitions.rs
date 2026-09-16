@@ -203,16 +203,21 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_search".to_string(),
-                description: "Search the web. Give it a query and, if you know where to look, the \
-                    sites worth reading; it crawls them, indexes what it finds, and returns the \
-                    passages that answer the query along with where the sources agree or differ. \
-                    This is Forge's own index, not a scrape of anyone else's results page, so it \
-                    answers reliably — but it only knows what it has read. \
-                    Naming sites in `sites` is how it learns something new: a first call on a new \
-                    site takes a couple of minutes, every later query against it is instant. \
-                    Guessing a site is fine; a wrong one costs one call. \
-                    Without `sites` it searches only what has already been read and fetches \
-                    nothing. \
+                description: "Read websites and search what was read. This is not a web search \
+                    engine and cannot find a site for you: it has no index of the web and no way \
+                    to discover one, so it only ever knows the sites it has been pointed at. \
+                    Point it at them in `sites` — the official documentation, the project's own \
+                    site, the forum where the subject is discussed — and it crawls them, keeps a \
+                    local index, and returns the passages that answer the query plus where the \
+                    sources agree or differ. \
+                    Deciding where to look is your job and you are good at it; guessing is fine, \
+                    and a site that turns out to be wrong costs one call. \
+                    A first call on a new site takes a couple of minutes; every later query \
+                    against it is instant and offline, because the pages are kept. \
+                    Naming `sites` also narrows the answer to those sites, so results cannot come \
+                    from something unrelated that was read earlier. \
+                    Without `sites` nothing is fetched: it searches everything already read, and \
+                    if that finds nothing it tells you which sites it holds so you can pick one. \
                     After a site has been read, query it again here rather than guessing page URLs \
                     for web_fetch — the index already holds the pages. \
                     For biomedical or life-sciences literature use search_papers instead.".to_string(),
@@ -229,7 +234,9 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                             "description": "Sites to read, as URLs — the homepage or a relevant section is \
                                 enough, it crawls from there. Name the places that would actually carry the \
                                 answer: official documentation, a project's own site, the forum where the \
-                                subject is discussed. Omit only when the answer should already be in the index."
+                                subject is discussed. These also scope the search, so name every site whose \
+                                pages should be allowed to answer. Omit only when the answer should already \
+                                be in the index."
                         }
                     },
                     "required": ["query"]

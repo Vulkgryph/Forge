@@ -155,11 +155,29 @@ const MIN_TERMS_TO_JUDGE_SHAPE: u32 = 150;
 /// Returns at most `limit`, best first. The candidate set comes from the
 /// index's intersection, so this ranks documents that contain every term.
 pub fn search(index: &Index, query: &str, limit: usize) -> Vec<Hit> {
+    search_within(index, query, limit, |_| true)
+}
+
+/// As [`search`], over the documents `keep` accepts.
+///
+/// The filter is applied to the candidate set, before scoring and before the
+/// limit — not to the results afterwards. Filtering afterwards is the obvious
+/// implementation and it is wrong: the limit would already have thrown away
+/// the wanted documents to make room for ones about to be discarded, so
+/// narrowing to a site the index holds fifty pages from could return nothing
+/// at all because a larger site filled the list first.
+pub fn search_within(
+    index: &Index,
+    query: &str,
+    limit: usize,
+    keep: impl Fn(crate::index::DocId) -> bool,
+) -> Vec<Hit> {
     let terms: Vec<String> = tokenize::terms(query);
     if terms.is_empty() {
         return Vec::new();
     }
     let mut candidates = index.candidates(&terms);
+    candidates.retain(|&doc| keep(doc));
     if candidates.len() < limit && terms.len() > 1 {
         // A strict reading came up short, so accept documents missing some of
         // the query. `coverage` multiplies the score by the fraction found, so
@@ -171,9 +189,14 @@ pub fn search(index: &Index, query: &str, limit: usize) -> Vec<Hit> {
         // word. A two-word query does end up as a union, which is the right
         // reading when nothing contains both.
         let least = (terms.len() + 1) / 2;
-        let widened = index.candidates_at_least(&terms, least);
+        let widened: Vec<crate::index::DocId> = index
+            .candidates_at_least(&terms, least)
+            .into_iter()
+            .map(|(doc, _)| doc)
+            .filter(|&doc| keep(doc))
+            .collect();
         if widened.len() > candidates.len() {
-            candidates = widened.into_iter().map(|(doc, _)| doc).collect();
+            candidates = widened;
         }
     }
     let mut hits: Vec<Hit> = candidates

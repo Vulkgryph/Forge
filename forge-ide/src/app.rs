@@ -4857,6 +4857,43 @@ const BROWSER_START: &str = "";
 // Nothing is blocked by this. It is a browser — anyone who wants another
 // search engine types its address and gets it.
 
+/// The library, flattened for drawing.
+///
+/// Ages are put into words here rather than in the view, because the view runs
+/// sixty times a second and this runs once per search. "3 days ago" does not
+/// change between frames.
+fn read_shelves(index: &forge_search::index::Index) -> Vec<crate::buffer::Shelf> {
+    forge_search::library::shelves(index)
+        .into_iter()
+        .map(|s| crate::buffer::Shelf {
+            host: s.host,
+            pages: s.pages,
+            age: age_in_words(s.last_read),
+            example: s.example,
+        })
+        .collect()
+}
+
+/// How long ago a Unix timestamp was, in words. Empty when there is no time —
+/// which happens for an index that was never saved, and must render as nothing
+/// rather than as 1970.
+fn age_in_words(then: u64) -> String {
+    if then == 0 {
+        return String::new();
+    }
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let days = now.as_secs().saturating_sub(then) / 86_400;
+    match days {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        2..=30 => format!("{days} days ago"),
+        31..=364 => format!("{} month(s) ago", days / 30),
+        _ => format!("{} year(s) ago", days / 365),
+    }
+}
+
 /// Whether what somebody typed is an address or something to search for.
 ///
 /// Deliberately generous about addresses: `example.com` is one, and demanding
@@ -14891,20 +14928,32 @@ impl IdeApp {
                 ui.vertical(|ui| {
                     if tab.searched.is_empty() {
                         ui.label(
-                            egui::RichText::new("Forge search")
+                            egui::RichText::new("Pages Forge has read")
                                 .size(20.0)
                                 .color(self.palette.default_fg_c()),
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Searches the {} page(s) this project has crawled — not the web. \
-                                 Type words above to search them, or an address to go there.",
-                                tab.index_pages,
-                            ))
+                            egui::RichText::new(if tab.shelves.is_empty() {
+                                "Nothing yet. This is not a web search engine and cannot find a \
+                                 site for you — type an address above to go and read one, or ask \
+                                 the agent to, and what it reads is kept here and searchable \
+                                 offline."
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "{} page(s) from {} site(s), kept locally and searchable \
+                                     offline. Type words above to search them, or an address to \
+                                     go somewhere new.",
+                                    tab.index_pages,
+                                    tab.shelves.len(),
+                                )
+                            })
                             .size(12.0)
                             .color(self.palette.comment_c()),
                         );
+                        ui.add_space(14.0);
+                        self.draw_shelves(ui, &tab.shelves, commands);
                         return;
                     }
 
@@ -14937,6 +14986,10 @@ impl IdeApp {
                                 .size(12.0)
                                 .color(self.palette.comment_c()),
                         );
+                        ui.add_space(14.0);
+                        // The shelves, so a search that missed is still a page
+                        // that tells you what there was to miss.
+                        self.draw_shelves(ui, &tab.shelves, commands);
                         ui.add_space(10.0);
                     }
 
@@ -15123,6 +15176,55 @@ impl IdeApp {
         });
     }
 
+    /// The library: one row per site, with how much of it is held and how
+    /// long ago it was read.
+    ///
+    /// The age is the reason this is worth drawing at all. "Forty pages from
+    /// learn.microsoft.com, read two months ago" is a fact somebody can act
+    /// on — re-read it, or trust it — and it is the fact a search box over the
+    /// same corpus withholds. Clicking a row opens a page from that site, so
+    /// the list is also a way back to somewhere you have been.
+    fn draw_shelves(
+        &self,
+        ui: &mut egui::Ui,
+        shelves: &[crate::buffer::Shelf],
+        commands: &mut Vec<BrowserCommand>,
+    ) {
+        if shelves.is_empty() {
+            return;
+        }
+        for shelf in shelves {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(&shelf.host).size(13.0).color(self.palette.func_c()),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(&shelf.example)
+                    .clicked()
+                {
+                    commands.push(BrowserCommand::Go(shelf.example.clone()));
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  {} page(s){}",
+                        shelf.pages,
+                        if shelf.age.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · read {}", shelf.age)
+                        }
+                    ))
+                    .size(11.0)
+                    .color(self.palette.comment_c()),
+                );
+            });
+            ui.add_space(2.0);
+        }
+    }
+
     /// Search Forge's own index, and show the results on Forge's own page.
     ///
     /// The index is the agent's: `.forge/search-index/`, holding whatever
@@ -15144,6 +15246,7 @@ impl IdeApp {
         });
         let hits = forge_search::query::search(&index, query, 20);
         let pages = index.len();
+        let shelves = read_shelves(&index);
 
         let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) else {
             return;
@@ -15167,6 +15270,7 @@ impl IdeApp {
         let empty = tab.results.is_empty();
         tab.searched = query.to_string();
         tab.index_pages = pages;
+        tab.shelves = shelves;
         tab.mode = crate::buffer::BrowserMode::Home;
 
         // A single word that found nothing here might simply be a site's name.
@@ -18750,6 +18854,61 @@ mod reload_cost_probe {
 #[cfg(test)]
 mod command_palette_tests {
     use super::COMMANDS;
+
+    /// The library is what makes the empty page useful, so the rows have to
+    /// carry what a person decides on: which site, how much of it, how old.
+    #[test]
+    fn the_library_is_grouped_by_site_with_an_age() {
+        let dir = std::env::temp_dir().join("forge-ide-shelves");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut index = forge_search::index::Index::new();
+        index.add("https://learn.test/azure/deploy", "Deploy", "", "deployment settings");
+        index.add("https://learn.test/azure/", "Azure", "", "an overview of azure");
+        index.add("https://forum.test/t/9", "Thread", "", "a discussion of settings");
+        index.save(&dir).unwrap();
+        let index = forge_search::index::Index::load(&dir).unwrap();
+
+        let shelves = super::read_shelves(&index);
+        assert_eq!(shelves.len(), 2);
+        assert_eq!(shelves[0].host, "learn.test");
+        assert_eq!(shelves[0].pages, 2);
+        assert_eq!(shelves[0].age, "today");
+        // The row links somewhere worth landing rather than page nine of a
+        // thread.
+        assert_eq!(shelves[0].example, "https://learn.test/azure/");
+        assert_eq!(shelves[1].host, "forum.test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index that was never saved has no read time, and that has to render
+    /// as nothing — a zero timestamp shown as a date reads as 1970.
+    #[test]
+    fn an_unsaved_index_shows_no_age() {
+        let mut index = forge_search::index::Index::new();
+        index.add("https://docs.test/a", "Doc", "", "documentation");
+        let shelves = super::read_shelves(&index);
+        assert_eq!(shelves.len(), 1);
+        assert!(shelves[0].age.is_empty(), "age was {:?}", shelves[0].age);
+        assert!(super::age_in_words(0).is_empty());
+    }
+
+    /// The words themselves, since they are the whole content of the column.
+    #[test]
+    fn an_age_is_said_in_words() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        const DAY: u64 = 86_400;
+        assert_eq!(super::age_in_words(now), "today");
+        assert_eq!(super::age_in_words(now - DAY), "yesterday");
+        assert_eq!(super::age_in_words(now - 5 * DAY), "5 days ago");
+        assert_eq!(super::age_in_words(now - 90 * DAY), "3 month(s) ago");
+        assert_eq!(super::age_in_words(now - 800 * DAY), "2 year(s) ago");
+        // A time in the future is a clock that moved, not a negative age.
+        assert_eq!(super::age_in_words(now + 10 * DAY), "today");
+    }
 
     /// A browser tab opened by hand starts on Forge's own search, not on
     /// somebody else's.

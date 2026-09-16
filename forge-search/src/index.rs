@@ -176,6 +176,20 @@ pub struct Index {
     /// index built in memory and never saved, whose text is all in memory
     /// anyway.
     segments: Vec<std::path::PathBuf>,
+    /// When each segment was written, as Unix seconds — parallel to
+    /// [`Index::segments`].
+    ///
+    /// On the segment rather than on every document, because a segment *is*
+    /// one save at one moment. That makes the timestamp free: no field on
+    /// `Document`, no clock passed into `add`, and nothing to keep consistent
+    /// when a page is added.
+    ///
+    /// The cost is that a compaction collapses everything into one segment and
+    /// every surviving page then reads as having been fetched then. That is
+    /// wrong in the direction that matters least — a page looks fresher than it
+    /// is, so a refresh happens later than ideal rather than a stale page
+    /// being served as current — and compaction is rare by design.
+    segment_times: Vec<u64>,
     /// How many documents are already in a segment.
     ///
     /// The watermark that makes a save append rather than rewrite. Documents
@@ -238,6 +252,34 @@ impl Index {
 
     pub fn document(&self, id: DocId) -> Option<&Document> {
         self.docs.get(id as usize).filter(|d| d.live)
+    }
+
+    /// How many document slots there are, live and dead.
+    ///
+    /// The bound for iterating ids, which is not [`Index::len`] — that counts
+    /// live documents, and a removed one keeps its id until a compaction.
+    pub fn len_including_dead(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// A document's id by URL, or `None` if the index has not read it.
+    pub fn by_url_id(&self, url: &str) -> Option<DocId> {
+        self.by_url.get(url).copied()
+    }
+
+    /// When a document was read, as Unix seconds, or zero if unknown.
+    ///
+    /// Taken from the segment holding it, since a segment is one save at one
+    /// moment — see [`Index::segment_times`]. Zero for a document still in
+    /// memory, which has not been written anywhere and so has no time on disk
+    /// to report.
+    pub fn read_time(&self, doc: DocId) -> u64 {
+        self.docs
+            .get(doc as usize)
+            .filter(|d| d.text.is_none())
+            .and_then(|d| self.segment_times.get(d.segment as usize))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The documents containing `term`, or an empty slice.
@@ -743,7 +785,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 
 /// Compact when dead documents are more than this fraction of the index, as a
 /// divisor — 4 for a quarter.
@@ -851,6 +893,10 @@ impl Index {
         let replaced = std::mem::take(&mut self.segments);
         self.segments = names.iter().map(|n| path.join(n)).collect();
         if rewriting {
+            self.segment_times.clear();
+        }
+        self.segment_times.push(now_seconds());
+        if rewriting {
             for old in replaced {
                 let _ = std::fs::remove_file(old);
             }
@@ -897,6 +943,9 @@ impl Index {
         put_u32(&mut out, ids.len() as u32);
         let base_at = out.len();
         put_u64(&mut out, 0);
+        // After the text base, so the twenty-four byte prefix a reader needs
+        // to find the blob keeps its layout — see `read_prefix`.
+        put_u64(&mut out, now_seconds());
         for (&id, (offset, len)) in ids.iter().zip(&spans) {
             let doc = &self.docs[id as usize];
             put_str(&mut out, &doc.url);
@@ -1003,6 +1052,8 @@ impl Index {
         }
         let count = take_u32(&bytes, &mut at)?;
         let text_base = take_u64(&bytes, &mut at)?;
+        let written_at = take_u64(&bytes, &mut at)?;
+        self.segment_times.push(written_at);
         let segment = self.segments.len() as u16;
         let base = self.docs.len() as DocId;
 
@@ -1112,6 +1163,21 @@ fn write_manifest(dir: &Path, names: &[String]) -> Result<(), String> {
     std::fs::write(&staging, text).map_err(|e| format!("write {}: {e}", staging.display()))?;
     std::fs::rename(&staging, dir.join(MANIFEST))
         .map_err(|e| format!("replace manifest in {}: {e}", dir.display()))
+}
+
+/// The wall clock, as Unix seconds.
+///
+/// The one place this crate reads the clock. Everything else that needs a time
+/// takes one, which is what makes the crawler testable; a save is already the
+/// side-effecting end of the crate, and threading a clock through it to stamp
+/// a file would buy a test nothing it cannot get by reading the stamp back.
+///
+/// Zero before 1970, which cannot happen, rather than a panic that could.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The next unused segment number in `dir`.

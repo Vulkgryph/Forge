@@ -4,6 +4,14 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- **The browser's start page is the library, not an empty search box.** It opened on a search field over a corpus of whatever happened to have been crawled, which is the version of this feature that reads as broken: type a question, get nothing, conclude the search is defective. What is actually there is a set of sites Forge has read, and that is worth seeing before anything is typed.
+
+  The page now lists them — one row per site, how many pages, how long ago it was read — largest first, with each row linking to the shallowest page held from that site so the list is also a way back to somewhere you have been. The age is the part that earns the row: "forty pages from learn.microsoft.com, read two months ago" is a fact somebody can act on, and it is exactly the fact a search box withholds. A search that finds nothing shows the shelves too, so a miss still tells you what there was to miss.
+
+  An index with nothing in it says so, and says why: this is not a web search engine and cannot find a site for you — type an address and go read one.
+
 ### Fixed
 
 - **Dropping a file into the terminal works with a full-screen program running.** The drop handler wrote the path as raw bytes, bypassing the paste path — so a program that had asked for bracketed paste (`CSI ?2004h`) saw a burst of keystrokes instead of a paste, and was entitled to treat it quite differently. A plain shell has bracketed paste off and was unaffected, which is why this looked like it worked everywhere except where it mattered: dragging a screenshot in to show it to a CLI tool is the case the feature exists for.

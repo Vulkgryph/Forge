@@ -118,11 +118,35 @@ pub struct Result_ {
 
 /// Search, filter by the query's operators, and build a snippet for each hit.
 pub fn search(index: &Index, input: &str, limit: usize) -> Vec<Result_> {
+    search_within(index, input, limit, &[])
+}
+
+/// As [`search`], restricted to pages from `hosts`.
+///
+/// An empty `hosts` searches everything, which is what a question with no
+/// stated source means.
+///
+/// This is what makes naming a site more than a crawl instruction. Before it,
+/// every page Forge had ever read competed in one ranking, so a hundred and
+/// twenty pages of Rust documentation crawled for one question stayed in the
+/// running for every question after it — the cost of a wrong crawl was not the
+/// wasted minutes but the pollution that outlived them. Naming the sites now
+/// narrows the answer to them, so a wrong crawl is merely wasted.
+pub fn search_within(index: &Index, input: &str, limit: usize, hosts: &[String]) -> Vec<Result_> {
     let query = Query::parse(input);
     if query.is_empty() {
         return Vec::new();
     }
-    let mut hits = crate::rank::search(index, &query.required.join(" "), limit * 4);
+    // Compared on the host alone, so a caller may pass a full URL, a bare
+    // host, or one with a `www.` the pages do not use — the caller here is
+    // often a language model repeating back what somebody typed.
+    let wanted: Vec<String> = hosts.iter().filter_map(|h| normalise_host(h)).collect();
+    let mut hits = crate::rank::search_within(
+        index,
+        &query.required.join(" "),
+        limit * 4,
+        |doc| wanted.is_empty() || wanted.contains(&host_of(index, doc)),
+    );
 
     hits.retain(|hit| {
         // Excluded terms.
@@ -247,6 +271,28 @@ fn spread_across_hosts(
     kept
 }
 
+/// A host as the index spells it: no scheme, no path, no leading `www.`.
+///
+/// `None` for something with no host in it at all, which is a caller's typo
+/// rather than a site and should narrow nothing — returning an unmatchable
+/// string instead would silently answer every query with nothing.
+pub fn normalise_host(input: &str) -> Option<String> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let host = if text.contains("://") {
+        crate::url::Url::parse(text).ok()?.host
+    } else {
+        // A bare host, possibly with a path stuck to it.
+        let cut = text.split('/').next().unwrap_or(text);
+        let cut = cut.split('@').next_back().unwrap_or(cut);
+        cut.split(':').next().unwrap_or(cut).to_lowercase()
+    };
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    (!host.is_empty() && host.contains('.')).then_some(host)
+}
+
 /// The host a document came from, or its url when that cannot be parsed.
 ///
 /// The unit of independence. Two threads on one forum are one source agreeing
@@ -256,7 +302,7 @@ fn host_of(index: &Index, doc: DocId) -> String {
         .document(doc)
         .map(|d| {
             crate::url::Url::parse(&d.url)
-                .map(|u| u.host)
+                .map(|u| u.host.strip_prefix("www.").unwrap_or(&u.host).to_string())
                 .unwrap_or_else(|_| d.url.clone())
         })
         .unwrap_or_default()
@@ -572,6 +618,80 @@ fn first_words(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming a site narrows the answer to it. Without this, a crawl for one
+    /// question stayed in the running for every question after it.
+    #[test]
+    fn scoping_to_a_host_excludes_the_others() {
+        let mut ix = Index::new();
+        ix.add("https://tractors.test/t/1", "Ford 8N oil", "", "The 8N sump takes straight 30 weight oil.");
+        ix.add("https://tractors.test/t/2", "More oil", "", "Straight 30 weight oil in summer, 10 weight in winter.");
+        ix.add("https://rustdocs.test/std", "Weight", "", "A weight is a number. Oil is not mentioned here, but weight oil is.");
+
+        let all = search(&ix, "weight oil", 5);
+        assert_eq!(all.len(), 3, "fixture does not span both hosts");
+
+        let scoped = search_within(&ix, "weight oil", 5, &["tractors.test".to_string()]);
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|r| r.url.contains("tractors.test")), "{scoped:?}");
+    }
+
+    /// The filter has to reach the candidate set rather than the results. A
+    /// large site that fills the limit first would otherwise leave nothing for
+    /// the site actually asked for.
+    #[test]
+    fn a_small_host_is_reachable_behind_a_large_one() {
+        let mut ix = Index::new();
+        for i in 0..200 {
+            ix.add(&format!("https://big.test/{i}"), "Oil", "", "oil oil oil oil oil");
+        }
+        ix.add("https://small.test/one", "Oil grade", "", "The grade of oil is thirty weight.");
+
+        let scoped = search_within(&ix, "oil", 3, &["small.test".to_string()]);
+        assert_eq!(scoped.len(), 1, "the small host was crowded out before filtering");
+        assert_eq!(scoped[0].url, "https://small.test/one");
+    }
+
+    /// A model repeating back what somebody typed will not spell a host the
+    /// way the index does, so the caller's spelling is normalised rather than
+    /// required to match.
+    #[test]
+    fn a_host_is_matched_however_the_caller_spelled_it() {
+        let mut ix = Index::new();
+        ix.add("https://docs.test/guide/page", "Guide", "", "the answer is here");
+        ix.add("https://other.test/x", "Other", "", "the answer is elsewhere");
+
+        for spelling in [
+            "docs.test",
+            "https://docs.test/",
+            "https://www.docs.test/guide/page",
+            "DOCS.TEST",
+            "docs.test/guide",
+            "docs.test:443",
+        ] {
+            let hits = search_within(&ix, "answer", 5, &[spelling.to_string()]);
+            assert_eq!(hits.len(), 1, "{spelling:?} matched {} pages", hits.len());
+            assert_eq!(hits[0].url, "https://docs.test/guide/page", "{spelling:?}");
+        }
+    }
+
+    /// Something with no host in it is a typo, and must narrow nothing rather
+    /// than narrow to nothing — silently answering every query with an empty
+    /// list is the worse failure of the two.
+    #[test]
+    fn a_meaningless_scope_does_not_silence_the_search() {
+        let mut ix = Index::new();
+        ix.add("https://docs.test/x", "Doc", "", "the answer is here");
+
+        assert!(normalise_host("").is_none());
+        assert!(normalise_host("   ").is_none());
+        assert!(normalise_host("localhost").is_none());
+        assert_eq!(search_within(&ix, "answer", 5, &["".to_string()]).len(), 1);
+        assert_eq!(search_within(&ix, "answer", 5, &[]).len(), 1);
+        // But a real host that simply is not in the index narrows to nothing,
+        // which is the truthful answer.
+        assert_eq!(search_within(&ix, "answer", 5, &["absent.test".to_string()]).len(), 0);
+    }
     use crate::index::Index;
 
     /// A match past the old 8 KB snippet cap must still be reachable.

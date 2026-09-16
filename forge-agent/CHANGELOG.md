@@ -16,6 +16,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **`web_search` is a crawler with a library, not a search engine.** It was described as "Search the web", which it cannot do: it has no index of the web and no way to discover a site nobody pointed it at. A tool whose description promises more than it does gets called wrongly and then blamed for the result. It now says plainly that deciding where to look is the caller's job, that naming sites is how it learns anything, and that a first call on a site is slow while every later one is instant and offline.
+
+  Naming `sites` also **narrows the answer to them**. Before, every page Forge had ever read competed in one ranking — so the hundred and twenty pages of Rust documentation a misaimed crawl left behind stayed in the running for every question afterwards. The real cost of aiming badly was not the wasted minutes, it was that the mistake outlived them. A host is matched however it was spelled, since the caller is a model repeating back what somebody typed: `docs.example`, `https://www.docs.example/page` and `DOCS.EXAMPLE` all narrow to the same shelf.
+
+  And a result that finds nothing now **says what has been read** — site, page count, how long ago — instead of only "no results". A dead end that makes the model guess a site costs a two-minute crawl; one that lists the shelves lets it pick from them, or conclude honestly that nothing on hand can answer.
+
 - **The search index is a directory of append-only segments, so growing it no longer rewrites it.** The index was one file, written in full on every save. At the fifty-thousand-page cap that is 556 MB written to add sixty pages, and a crawler saving each batch would have written on the order of 35 TB a day — a consumer SSD is rated for 300–600 TB in total, so a fortnight of that ends the drive.
 
   A save now writes only what it added, as a new file, and appends a line to a small text manifest naming the segments in order. Measured on the scale benchmark: adding sixty pages writes 0.98 MB whether the index holds a thousand pages or fifty thousand, against 11.7 MB and 556.8 MB for the old full rewrite. The figure is flat because the cost tracks what was added rather than what was already there, which is the whole property.

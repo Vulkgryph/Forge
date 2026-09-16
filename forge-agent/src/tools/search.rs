@@ -324,8 +324,16 @@ fn run(
     // a cache file is corrupt would be the wrong trade.
     let mut index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
 
+    // Scoped to the sites the caller named, and unscoped when it named none.
+    //
+    // This is what makes `sites` mean something beyond "go and fetch these".
+    // Every page Forge had ever read used to compete in one ranking, so the
+    // hundred and twenty pages of Rust documentation a wrong crawl left behind
+    // stayed in the running for every question after it — the real cost of
+    // aiming badly was not the wasted minutes, it was that the mistake
+    // outlived them. Naming the sites now narrows the answer to them.
     let search_start = std::time::Instant::now();
-    let mut hits = query::search(&index, query_text, max_results);
+    let mut hits = query::search_within(&index, query_text, max_results, seeds);
     timing.search_ms = search_start.elapsed().as_millis();
 
     // Crawl when the index cannot answer — or when the caller named sites the
@@ -390,7 +398,7 @@ fn run(
         let _ = index.save(&index_path);
 
         let again = std::time::Instant::now();
-        hits = query::search(&index, query_text, max_results);
+        hits = query::search_within(&index, query_text, max_results, seeds);
         timing.search_ms += again.elapsed().as_millis();
     }
 
@@ -400,7 +408,7 @@ fn run(
     // not have to know a second tool exists, or make a second round trip, to
     // find out that a question is contested.
     let spread = forge_search::query::spread(&index, query_text, 25);
-    Ok(render(query_text, &hits, &spread, &timing))
+    Ok(render(query_text, &hits, &spread, &index, seeds, &timing))
 }
 
 /// Whether to fetch anything, given what the index could already do.
@@ -427,17 +435,64 @@ fn should_crawl(index_answered: bool, asked_for_sites: bool, hosts_read: bool) -
 /// not a page anyone asked for by name, so having read the site is what makes
 /// re-crawling it pointless.
 fn hosts_already_read(index: &Index, seeds: &[String]) -> bool {
-    let read: std::collections::HashSet<String> = index
-        .urls()
-        .filter_map(|u| forge_search::url::Url::parse(u).ok().map(|p| p.host))
+    let read: std::collections::HashSet<String> = forge_search::library::shelves(index)
+        .into_iter()
+        .map(|s| s.host)
         .collect();
     seeds.iter().all(|seed| {
-        forge_search::url::Url::parse(seed)
-            .map(|u| read.contains(&u.host))
+        forge_search::query::normalise_host(seed)
+            .map(|h| read.contains(&h))
             // An unparseable seed is reported by the crawl itself; it should
             // not make this claim the site was read.
             .unwrap_or(false)
     })
+}
+
+/// What the index already holds, for a result that found nothing.
+///
+/// A dead end that says only "no results" makes the model guess, and a guess
+/// costs a two-minute crawl. A dead end that says "here is what has been read"
+/// is actionable in the other direction too: the answer may be on a shelf the
+/// query simply missed, and the model can see that before deciding to fetch.
+///
+/// Bounded, because this goes into a prompt. The largest shelves are the ones
+/// worth naming, and `shelves` already sorts that way.
+fn render_library(out: &mut String, index: &Index) {
+    const SHOWN: usize = 12;
+    let shelves = forge_search::library::shelves(index);
+    if shelves.is_empty() {
+        out.push_str("Nothing has been read yet, so there is nothing to search.\n");
+        return;
+    }
+    out.push_str("\nSites already read, most pages first:\n");
+    for shelf in shelves.iter().take(SHOWN) {
+        out.push_str(&format!(
+            "  {:<34} {:>5} page(s){}\n",
+            shelf.host,
+            shelf.pages,
+            match age_in_days(shelf.last_read) {
+                Some(0) => ", read today".to_string(),
+                Some(1) => ", read yesterday".to_string(),
+                Some(n) => format!(", last read {n} days ago"),
+                None => String::new(),
+            }
+        ));
+    }
+    if shelves.len() > SHOWN {
+        out.push_str(&format!("  … and {} more\n", shelves.len() - SHOWN));
+    }
+}
+
+/// Whole days since a Unix timestamp, or `None` if there isn't one.
+fn age_in_days(then: u64) -> Option<u64> {
+    if then == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(then) / 86_400)
 }
 
 /// The tool result the model sees.
@@ -450,11 +505,20 @@ fn render(
     query_text: &str,
     hits: &[query::Result_],
     spread: &[forge_search::query::Mention],
+    index: &Index,
+    seeds: &[String],
     timing: &Timing,
 ) -> String {
     let mut out = String::new();
     if hits.is_empty() {
-        out.push_str(&format!("No results for {query_text:?}.\n"));
+        out.push_str(&format!("No results for {query_text:?}"));
+        // Said plainly, because a narrowed search that finds nothing and an
+        // unnarrowed one that finds nothing want different next moves, and the
+        // model cannot tell them apart from "no results".
+        if !seeds.is_empty() {
+            out.push_str(&format!(" within {}", seeds.join(", ")));
+        }
+        out.push_str(".\n");
         if timing.crawled {
             out.push_str(&format!(
                 "Crawled {} pages ({} indexed, {} refused by robots.txt) in {}ms and found \
@@ -465,19 +529,31 @@ fn render(
                 timing.index_size,
             ));
             render_challenges(&mut out, timing);
+        } else if seeds.is_empty() {
+            out.push_str(
+                "Nothing was fetched, because this tool only reads sites it is pointed at — \
+                 it has no way to discover one. Name the sites worth reading for this question \
+                 in `sites` and call again; guessing is fine, and a site that turns out to be \
+                 wrong costs one call.\n",
+            );
+            render_library(&mut out, index);
         } else {
             out.push_str(&format!(
-                "The index holds {} page(s) and none matched, and no crawl was attempted \
-                 because no `sites` were given. This tool only knows what it has been pointed \
-                 at — name the sites worth reading for this question in `sites` and call again. \
-                 Guessing is fine; a site that turns out to be wrong costs one call.\n",
+                "Those sites have been read already ({} page(s) held in total), so nothing was \
+                 fetched and the search was narrowed to them. Either the answer is not on them \
+                 or the terms missed it: try different terms, or name somewhere else.\n",
                 timing.index_size,
             ));
+            render_library(&mut out, index);
         }
         return out;
     }
 
-    out.push_str(&format!("{} result(s) for {query_text:?}:\n\n", hits.len()));
+    out.push_str(&format!("{} result(s) for {query_text:?}", hits.len()));
+    if !seeds.is_empty() {
+        out.push_str(&format!(" within {}", seeds.join(", ")));
+    }
+    out.push_str(":\n\n");
     for (i, hit) in hits.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, if hit.title.is_empty() { &hit.url } else { &hit.title }));
         out.push_str(&format!("   {}\n", hit.url));
@@ -720,14 +796,14 @@ mod tests {
             snippet: "something".into(),
             score: 1.0,
         }];
-        let crawled = render("q", &hits, &[], &Timing {
+        let crawled = render("q", &hits, &[], &Index::new(), &[], &Timing {
             crawled: true, fetched: 40, crawl_ms: 9000, index_size: 40, search_ms: 2,
             ..Default::default()
         });
         assert!(crawled.contains("crawled 40 pages"));
         assert!(crawled.contains("Later searches use the index"));
 
-        let cached = render("q", &hits, &[], &Timing {
+        let cached = render("q", &hits, &[], &Index::new(), &[], &Timing {
             crawled: false, index_size: 40, search_ms: 2, ..Default::default()
         });
         assert!(cached.contains("no crawl"), "{cached}");
@@ -739,7 +815,7 @@ mod tests {
     /// DuckDuckGo implementation wasted turns.
     #[test]
     fn an_empty_result_explains_itself() {
-        let empty = render("q", &[], &[], &Timing {
+        let empty = render("q", &[], &[], &Index::new(), &[], &Timing {
             crawled: true, fetched: 12, indexed: 10, disallowed: 2, crawl_ms: 3000,
             index_size: 10, ..Default::default()
         });
@@ -755,10 +831,82 @@ mod tests {
             query::Result_ { url: "https://x.example/1".into(), title: "First".into(), snippet: "one".into(), score: 2.0 },
             query::Result_ { url: "https://x.example/2".into(), title: String::new(), snippet: "two".into(), score: 1.0 },
         ];
-        let out = render("q", &hits, &[], &Timing::default());
+        let out = render("q", &hits, &[], &Index::new(), &[], &Timing::default());
         assert!(out.contains("1. First"));
         assert!(out.contains("https://x.example/1"));
         // A page with no title is listed by its URL rather than blank.
         assert!(out.contains("2. https://x.example/2"), "{out}");
+    }
+
+    /// A dead end should hand the model something to act on. Saying only "no
+    /// results" makes it guess a site, and a guess costs a two-minute crawl;
+    /// naming what has been read lets it either pick a shelf or conclude
+    /// honestly that nothing on hand can answer.
+    #[test]
+    fn an_empty_result_with_no_sites_lists_what_has_been_read() {
+        let mut index = Index::new();
+        for i in 0..4 {
+            index.add(&format!("https://docs.test/{i}"), "Doc", "", "some documentation");
+        }
+        index.add("https://forum.test/t/1", "Thread", "", "a discussion");
+
+        let out = render("q", &[], &[], &index, &[], &Timing { index_size: 5, ..Default::default() });
+        assert!(out.contains("no way to discover"), "{out}");
+        assert!(out.contains("docs.test"), "the library was not listed: {out}");
+        assert!(out.contains("forum.test"), "{out}");
+        // Largest shelf first, so the most likely place to look leads.
+        assert!(
+            out.find("docs.test") < out.find("forum.test"),
+            "shelves are not ordered by size: {out}"
+        );
+    }
+
+    /// And an empty index should say so rather than print an empty heading,
+    /// which reads as a rendering bug.
+    #[test]
+    fn an_empty_index_says_nothing_has_been_read() {
+        let out = render("q", &[], &[], &Index::new(), &[], &Timing::default());
+        assert!(out.contains("Nothing has been read yet"), "{out}");
+        assert!(!out.contains("most pages first"), "an empty library printed a heading: {out}");
+    }
+
+    /// A narrowed search that finds nothing is a different situation from an
+    /// unnarrowed one, and the result has to distinguish them — otherwise the
+    /// model's next move is a guess about which it was.
+    #[test]
+    fn a_narrowed_result_says_what_it_was_narrowed_to() {
+        let mut index = Index::new();
+        index.add("https://docs.test/a", "Doc", "", "documentation");
+        let seeds = vec!["https://docs.test/".to_string()];
+
+        let empty = render("q", &[], &[], &index, &seeds, &Timing { index_size: 1, ..Default::default() });
+        assert!(empty.contains("within https://docs.test/"), "{empty}");
+        assert!(empty.contains("read already"), "{empty}");
+        assert!(!empty.contains("no way to discover"), "wrong advice for a named site: {empty}");
+
+        let hits = vec![query::Result_ {
+            url: "https://docs.test/a".into(),
+            title: "Doc".into(),
+            snippet: "documentation".into(),
+            score: 1.0,
+        }];
+        let found = render("q", &hits, &[], &index, &seeds, &Timing { index_size: 1, ..Default::default() });
+        assert!(found.contains("within https://docs.test/"), "{found}");
+    }
+
+    /// The library line has to be readable as a fact about staleness, since
+    /// deciding whether to re-read a site is the main thing it is for.
+    #[test]
+    fn a_shelf_reports_how_long_ago_it_was_read() {
+        let dir = std::env::temp_dir().join("forge-agent-shelf-age");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut index = Index::new();
+        index.add("https://docs.test/a", "Doc", "", "documentation");
+        index.save(&dir).unwrap();
+        let index = Index::load(&dir).unwrap();
+
+        let out = render("q", &[], &[], &index, &[], &Timing::default());
+        assert!(out.contains("read today"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

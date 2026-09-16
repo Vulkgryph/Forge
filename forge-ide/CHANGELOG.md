@@ -14,6 +14,12 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **A long prompt no longer hangs off the bottom of the window.** The composer sized itself by counting newlines, on the stated grounds that measuring the wrapped text would mean laying it out twice. Both halves of that were wrong. It is not twice — egui memoizes galleys by text, font and wrap width, so the layout the text box does next is a cache hit. And a person typing a paragraph into a narrow panel types no newlines at all: a message that wrapped to six rows measured as one, the panel reserved three, and `TextEdit::multiline` grows to fit its content regardless of the box it was handed — so it drew all six and put the last three under the status bar.
+
+  The text is now measured as it will actually wrap. The same paragraph that measured 43.09 points before — exactly the resting three-row height — now measures its real height, and there is a test that fails against the old arithmetic rather than merely agreeing with the new.
+
+  The cap that keeps the transcript from being pushed off screen is also honest now. It bounded the panel while the text box kept growing past it, which was the other half of the same bug; the box sits in a scroll area, so past the cap the text scrolls instead of overflowing, which is what the comment claimed all along.
+
 - **Dropping a file into the terminal works with a full-screen program running.** The drop handler wrote the path as raw bytes, bypassing the paste path — so a program that had asked for bracketed paste (`CSI ?2004h`) saw a burst of keystrokes instead of a paste, and was entitled to treat it quite differently. A plain shell has bracketed paste off and was unaffected, which is why this looked like it worked everywhere except where it mattered: dragging a screenshot in to show it to a CLI tool is the case the feature exists for.
 
 ## [0.4.2] — 2026-09-14

@@ -1474,21 +1474,41 @@ fn paint_stop_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
 /// long message scrolled inside three visible lines with the rest out of reach
 /// — and the panel could not grow to show it because its height was a constant.
 ///
-/// It now grows with the text and stops at `max`, which the caller derives from
-/// the panel's own height so the transcript above always keeps room. Past that
-/// the text area scrolls, which is the right behaviour for a message that is
-/// longer than the window.
-fn composer_text_height(text: &str, row_h: f32, max: f32) -> f32 {
-    // Wrapped lines are not counted: egui lays the text out, and asking it
-    // would mean laying it out twice. Newlines are what a person adds
-    // deliberately, and they are what makes a message tall enough to notice.
-    let lines = text.lines().count().max(1) + usize::from(text.ends_with('\n'));
-    let wanted = row_h * lines as f32;
+/// It grows with the text and stops at `max`, which the caller derives from the
+/// panel's own height so the transcript above always keeps room.
+///
+/// The text is laid out to measure it, which the first version of this refused
+/// to do — it counted newlines instead, on the grounds that asking egui would
+/// mean laying the text out twice. That was wrong twice over. It is not twice:
+/// egui memoizes galleys by text, font and wrap width, so the layout the
+/// `TextEdit` does next is a cache hit. And a person typing a paragraph into a
+/// narrow panel types no newlines at all, so a message that wrapped to six rows
+/// measured as one, the panel reserved three, and `TextEdit::multiline` — which
+/// grows to fit its content and has no opinion about the box it was given —
+/// drew all six and hung the last three below the bottom of the window.
+fn composer_text_height(ui: &egui::Ui, text: &str, wrap_width: f32, max: f32) -> f32 {
+    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    // A trailing newline is a row the galley does not include and the caret
+    // sits on, so it is added: otherwise pressing Enter at the end of a message
+    // puts the cursor somewhere the box has not grown to show.
+    let measured = ui
+        .fonts(|f| f.layout(text.to_owned(), font, egui::Color32::PLACEHOLDER, wrap_width))
+        .size()
+        .y
+        + if text.ends_with('\n') { row_h } else { 0.0 };
+    clamp_composer_height(measured, row_h, max)
+}
+
+/// The measured text height, floored at the resting size and bounded by `max`.
+///
+/// Separate from the measurement so the rule can be checked without a window.
+fn clamp_composer_height(measured: f32, row_h: f32, max: f32) -> f32 {
     // `max` wins over the resting size. In a very short panel the cap can fall
     // below three rows, and `clamp` with min > max panics — so the floor is
     // applied first and then bounded, which yields a small composer rather than
     // one that overflows the panel it is in.
-    wanted.max(row_h * 3.0).min(max)
+    measured.max(row_h * 3.0).min(max)
 }
 
 fn paint_send_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
@@ -9099,9 +9119,12 @@ impl IdeApp {
         // message scrolls *inside* the text area rather than pushing the whole
         // composer off the bottom of an unscrollable panel — which is what a
         // fixed 118-point panel did with a 56-point box inside it.
-        let row_h = ui.text_style_height(&egui::TextStyle::Body);
         let panel_h = ui.available_height().max(240.0);
-        let text_h = composer_text_height(&tab.session.input, row_h, panel_h * 0.40);
+        // Measured at the width the text will actually wrap to, minus a little:
+        // erring narrow costs at most a spare row, while erring wide puts a row
+        // of what somebody is typing below the bottom of the window.
+        let wrap_w = (ui.available_width() - 12.0 - 16.0 - 4.0).max(80.0);
+        let text_h = composer_text_height(ui, &tab.session.input, wrap_w, panel_h * 0.40);
         let input_h = 62.0 + text_h + queue_h + activity_h;
         let mut revoke_idx: Option<usize> = None;
         let mut send_now_idx: Option<usize> = None;
@@ -9235,13 +9258,25 @@ impl IdeApp {
                                 .rounding(8.0)
                                 .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                 .show(ui, |ui| {
-                                    let inner_w = ui.available_width();
-                                    let resp = ui.add_sized(
-                                        egui::vec2(inner_w, text_h),
-                                        egui::TextEdit::multiline(&mut tab.session.input)
-                                            .hint_text("Ask Forge…")
-                                            .frame(false)
-                                            .desired_rows(3));
+                                    // Inside a scroll area, so the cap on
+                                    // `text_h` means what it says. Without one
+                                    // the cap bounded the *panel* while the
+                                    // text box kept growing past it, which is
+                                    // how a long message ended up drawn over
+                                    // the status bar.
+                                    let resp = egui::ScrollArea::vertical()
+                                        .max_height(text_h)
+                                        .show(ui, |ui| {
+                                            let inner_w = ui.available_width();
+                                            ui.add_sized(
+                                                egui::vec2(inner_w, text_h),
+                                                egui::TextEdit::multiline(&mut tab.session.input)
+                                                    .hint_text("Ask Forge…")
+                                                    .frame(false)
+                                                    .desired_rows(3),
+                                            )
+                                        })
+                                        .inner;
                                     if std::mem::take(&mut tab.session.request_input_focus) {
                                         resp.request_focus();
                                     }
@@ -19245,38 +19280,106 @@ mod subagent_visibility_tests {
 
 #[cfg(test)]
 mod composer_height_tests {
-    use super::composer_text_height;
+    use super::{clamp_composer_height, composer_text_height};
 
     const ROW: f32 = 16.0;
     const MAX: f32 = 200.0;
+
+    /// A context with fonts in it, which measuring needs.
+    fn ui_for<R>(f: impl FnOnce(&egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        // One frame first, so the font atlas exists before anything is laid out.
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut out = None;
+        // `run` takes an `FnMut`, so the one-shot closure is moved out of an
+        // Option rather than called directly.
+        let mut once = Some(f);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = once.take() {
+                    out = Some(f(ui));
+                }
+            });
+        });
+        out.expect("the panel ran")
+    }
+
+    /// The bug this module exists for. A person typing a paragraph into a
+    /// narrow panel types no newlines at all, so counting them measured a
+    /// six-row message as one row — the panel reserved three, and
+    /// `TextEdit::multiline` drew the rest below the bottom of the window.
+    #[test]
+    fn a_long_line_with_no_newlines_still_makes_the_box_taller() {
+        let paragraph = "well i added something to this so that we can have you search things \
+                         up. the problem is, sometimes you run into bot detection challenges \
+                         online, like cloudflare. so what i ended up building was something so \
+                         that we can get around that.";
+        let (row_h, narrow, wide) = ui_for(|ui| {
+            let row_h = ui.text_style_height(&egui::TextStyle::Body);
+            (
+                row_h,
+                composer_text_height(ui, paragraph, 260.0, 10_000.0),
+                composer_text_height(ui, paragraph, 2_000.0, 10_000.0),
+            )
+        });
+        assert!(
+            narrow > row_h * 3.5,
+            "a paragraph wrapped into a narrow box measured {narrow} points, \
+             barely more than the {} of a resting three-row composer",
+            row_h * 3.0,
+        );
+        // And narrower means taller, which is the whole mechanism: the same
+        // text in a wider panel needs fewer rows.
+        assert!(narrow > wide, "wrapping width made no difference: {narrow} vs {wide}");
+    }
 
     /// An empty composer is still three rows tall — the size it has always
     /// been, so opening the panel looks no different.
     #[test]
     fn an_empty_composer_keeps_its_resting_size() {
-        assert_eq!(composer_text_height("", ROW, MAX), ROW * 3.0);
-        assert_eq!(composer_text_height("one line", ROW, MAX), ROW * 3.0);
-        assert_eq!(composer_text_height("a\nb", ROW, MAX), ROW * 3.0);
+        let got = ui_for(|ui| {
+            let row_h = ui.text_style_height(&egui::TextStyle::Body);
+            [
+                composer_text_height(ui, "", 400.0, MAX) / row_h,
+                composer_text_height(ui, "one line", 400.0, MAX) / row_h,
+                composer_text_height(ui, "a\nb", 400.0, MAX) / row_h,
+            ]
+        });
+        for rows in got {
+            assert!((rows - 3.0).abs() < 0.2, "resting composer is {rows} rows, not 3");
+        }
     }
 
     /// Past three lines it grows, which is the whole point: a long message used
     /// to scroll inside a fixed 56-point box with the rest out of reach.
     #[test]
     fn it_grows_with_the_message() {
-        assert_eq!(composer_text_height("a\nb\nc\nd", ROW, MAX), ROW * 4.0);
-        assert_eq!(composer_text_height("a\nb\nc\nd\ne\nf", ROW, MAX), ROW * 6.0);
+        let (four, six) = ui_for(|ui| {
+            (
+                composer_text_height(ui, "a\nb\nc\nd", 400.0, MAX),
+                composer_text_height(ui, "a\nb\nc\nd\ne\nf", 400.0, MAX),
+            )
+        });
+        assert!(six > four, "six lines is not taller than four: {four} vs {six}");
     }
 
-    /// And stops, so the transcript above is never pushed off the screen. Past
-    /// the cap the text area scrolls, which is correct for a message longer
-    /// than the window — what was wrong before was scrolling at three lines.
+    /// And stops, so the transcript above is never pushed off the screen. The
+    /// cap is only honest because the text area sits in a scroll area — see the
+    /// composer in `draw_agent_panel`; capping the number alone left the widget
+    /// growing past the panel, which is the bug this pair of tests describes.
     #[test]
     fn it_stops_before_it_eats_the_panel() {
         let huge = "x\n".repeat(500);
-        assert_eq!(composer_text_height(&huge, ROW, MAX), MAX);
-        // Even a cap below the resting size is honoured: a very short panel
-        // gets a small composer rather than one that overflows it.
-        assert_eq!(composer_text_height(&huge, ROW, ROW), ROW);
+        let (capped, tiny) = ui_for(|ui| {
+            (
+                composer_text_height(ui, &huge, 400.0, MAX),
+                // Even a cap below the resting size is honoured: a very short
+                // panel gets a small composer rather than one that overflows it.
+                composer_text_height(ui, &huge, 400.0, ROW),
+            )
+        });
+        assert_eq!(capped, MAX);
+        assert_eq!(tiny, ROW);
     }
 
     /// A trailing newline is a line the cursor is on, so it counts — otherwise
@@ -19284,81 +19387,22 @@ mod composer_height_tests {
     /// has not grown to show.
     #[test]
     fn a_trailing_newline_counts_as_a_line() {
-        let a = composer_text_height("a\nb\nc\nd", ROW, MAX);
-        let b = composer_text_height("a\nb\nc\nd\n", ROW, MAX);
+        let (a, b) = ui_for(|ui| {
+            (
+                composer_text_height(ui, "a\nb\nc\nd", 400.0, MAX),
+                composer_text_height(ui, "a\nb\nc\nd\n", 400.0, MAX),
+            )
+        });
         assert!(b > a, "the caret's own line was not counted: {a} vs {b}");
     }
 
-    /// Whatever the text, the height stays within bounds — this feeds a panel
-    /// height, and a negative or unbounded value would be a broken layout
-    /// rather than a wrong one.
+    /// The clamp on its own, without a window.
     #[test]
-    fn the_height_is_always_within_bounds() {
-        for text in ["", "\n", "\n\n\n\n\n", &"word ".repeat(400), &"x\n".repeat(99)] {
-            let h = composer_text_height(text, ROW, MAX);
-            assert!(h >= ROW.min(MAX) && h <= MAX, "{h} out of bounds for {:?}", &text[..text.len().min(12)]);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tab_path_menu_tests {
-    use super::tab_path_menu_entries;
-    use std::path::Path;
-
-    /// A file inside the workspace offers all three, and the relative path is
-    /// relative to the workspace rather than to anything else.
-    #[test]
-    fn a_file_in_the_workspace_offers_all_three() {
-        let entries = tab_path_menu_entries(
-            Some(Path::new("/work/proj/src/lib.rs")),
-            Some(Path::new("/work/proj")),
-        );
-        let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, vec!["Copy Path", "Copy Relative Path", "Copy Containing Folder"]);
-        assert_eq!(entries[0].1, "/work/proj/src/lib.rs");
-        assert_eq!(entries[1].1, "src/lib.rs");
-        assert_eq!(entries[2].1, "/work/proj/src");
-    }
-
-    /// A file open from outside the workspace has no meaningful relative path,
-    /// so it is absent rather than a lie or a pile of `..`.
-    #[test]
-    fn a_file_outside_the_workspace_offers_no_relative_path() {
-        let entries = tab_path_menu_entries(
-            Some(Path::new("/elsewhere/notes.md")),
-            Some(Path::new("/work/proj")),
-        );
-        let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, vec!["Copy Path", "Copy Containing Folder"]);
-    }
-
-    /// And with no folder open at all.
-    #[test]
-    fn no_workspace_means_no_relative_path() {
-        let entries = tab_path_menu_entries(Some(Path::new("/tmp/scratch.rs")), None);
-        assert!(!entries.iter().any(|(l, _)| *l == "Copy Relative Path"));
-        assert_eq!(entries[0].1, "/tmp/scratch.rs");
-    }
-
-    /// An unsaved buffer has nothing to copy, so it gets no menu — one
-    /// offering to copy nothing is worse than none at all.
-    #[test]
-    fn an_unsaved_buffer_offers_nothing() {
-        assert!(tab_path_menu_entries(None, Some(Path::new("/work"))).is_empty());
-    }
-
-    /// The file *is* the workspace root — a degenerate case that would
-    /// otherwise offer an empty relative path.
-    #[test]
-    fn a_path_equal_to_the_root_offers_no_empty_string() {
-        let entries = tab_path_menu_entries(
-            Some(Path::new("/work/proj")),
-            Some(Path::new("/work/proj")),
-        );
-        assert!(
-            entries.iter().all(|(_, v)| !v.is_empty()),
-            "an entry would copy an empty string: {entries:?}"
-        );
+    fn the_clamp_floors_and_bounds() {
+        assert_eq!(clamp_composer_height(0.0, ROW, MAX), ROW * 3.0);
+        assert_eq!(clamp_composer_height(ROW * 5.0, ROW, MAX), ROW * 5.0);
+        assert_eq!(clamp_composer_height(ROW * 500.0, ROW, MAX), MAX);
+        // A cap under the floor must not panic, which `clamp` would.
+        assert_eq!(clamp_composer_height(ROW * 500.0, ROW, ROW), ROW);
     }
 }

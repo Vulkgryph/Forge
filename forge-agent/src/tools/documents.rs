@@ -6,6 +6,16 @@
 //! came from, and the corpus most people actually have is a folder of reports,
 //! notes, papers or exported logs rather than a website.
 //!
+//! ## Sections, not files
+//!
+//! A file is indexed as the sections it is made of, each keyed by the lines it
+//! occupies — `file:///path/to/runbook.md#L120-186`. That is what makes a
+//! result worth having to an agent: the passage is named by the headings
+//! leading to it, and the range is what `read_file` takes, so getting the rest
+//! of the section costs sixty lines rather than the whole file. Context is the
+//! budget, and spending three thousand lines of it to reach forty is the thing
+//! retrieval was supposed to avoid. See `forge_search::document`.
+//!
 //! ## Why this is not `search_code`
 //!
 //! `search_code` greps, and for source that is the better tool. An identifier
@@ -60,6 +70,24 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// unknown length. Reached, the call says so and says what it stopped at.
 const MAX_FILES_PER_CALL: usize = 5_000;
 
+/// Directory names the walk does not descend into on its own.
+///
+/// A heuristic, and worth saying so. It is also the difference between working
+/// and not: this repository's `target/` is 83 GB across 663,234 files and
+/// holds ten readable documents, and walking it took thirteen seconds of the
+/// thirteen and a half a real run spent — almost all of it a `symlink_metadata`
+/// syscall per entry, to reach nothing anybody asked for.
+///
+/// Build output and vendored dependencies, then, by the names every ecosystem
+/// happens to use. `build` and `dist` are the arguable ones, since they are
+/// ordinary English words that a person's documents could reasonably live
+/// under — so this only applies to directories the walk *discovers*. A
+/// directory named in `paths` is read whatever it is called, which makes the
+/// guess a default rather than a rule.
+const NOT_DOCUMENTS: &[&str] = &[
+    "target", "node_modules", "vendor", "__pycache__", "venv", "build", "dist",
+];
+
 /// How deep to walk below the given directory.
 ///
 /// Deep enough for a documents tree organised by year and topic, shallow
@@ -98,6 +126,8 @@ pub async fn search_documents(
 struct Indexed {
     /// Files read and added this call.
     added: usize,
+    /// Sections those files were indexed as.
+    sections: usize,
     /// Files already in the index and unchanged since.
     unchanged: usize,
     /// Files skipped for being too large, with the largest seen.
@@ -110,6 +140,13 @@ struct Indexed {
     truncated: bool,
     /// Directories named that do not exist.
     missing: Vec<String>,
+    /// Build and dependency directories the walk declined to descend into,
+    /// by name and without repeats.
+    ///
+    /// Reported rather than skipped silently: a corpus that turned out to be
+    /// missing a third of itself because it lives under `dist/` should be a
+    /// visible fact, not a mystery about the ranking.
+    skipped: Vec<String>,
 }
 
 fn run(
@@ -124,14 +161,18 @@ fn run(
 
     let mut report = Indexed::default();
     if !paths.is_empty() {
-        let started = std::time::Instant::now();
+        // Which sections belong to which file, built once. A file is many
+        // documents now, so the alternative is a scan of every URL per file —
+        // three thousand files against three thousand sections is nine million
+        // string comparisons to answer a question asked once.
+        let mut held = sections_by_file(&index);
         for path in paths {
             let root = resolve(project_root, path);
             if !root.exists() {
                 report.missing.push(path.clone());
                 continue;
             }
-            walk(&root, 0, &mut index, &mut report);
+            walk(&root, 0, &mut index, &mut held, &mut report);
             if report.truncated {
                 break;
             }
@@ -140,7 +181,6 @@ fn run(
             let _ = crate::workdir::ensure_parent_of(&index_path);
             let _ = index.save(&index_path);
         }
-        let _ = started;
     }
 
     let hits = query::search(&index, query_text, MAX_RESULTS);
@@ -150,20 +190,52 @@ fn run(
 /// A path as given, against the project root when it is relative.
 fn resolve(project_root: &std::path::Path, given: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(given);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
+    let joined = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
+    tidy(&joined)
+}
+
+/// A path with its `.` components dropped.
+///
+/// `paths: ["."]` is the ordinary way to say "this project", and joining it
+/// produces `/project/./notes/a.md` — which works, and then appears in a
+/// result and in a `read_file` call the agent is being told to make. Not
+/// `canonicalize`, which also resolves symlinks: the walk deliberately does not
+/// follow those, and a path that came back pointing somewhere else would
+/// contradict it.
+fn tidy(path: &std::path::Path) -> std::path::PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// Every indexed section, grouped by the file it came from.
+///
+/// The key is the path out of a `file://` URL with its `#L…` range removed,
+/// which is the identity of the file rather than of one section of it.
+fn sections_by_file(index: &Index) -> std::collections::HashMap<String, Vec<u32>> {
+    let mut out: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
+    for id in 0..index.len_including_dead() as u32 {
+        let Some(doc) = index.document(id) else { continue };
+        let Some(rest) = doc.url.strip_prefix("file://") else { continue };
+        let file = rest.split('#').next().unwrap_or(rest);
+        out.entry(file.to_string()).or_default().push(id);
     }
+    out
 }
 
 /// Read every readable document below `dir`, adding what has changed.
-fn walk(dir: &std::path::Path, depth: usize, index: &mut Index, report: &mut Indexed) {
+fn walk(
+    dir: &std::path::Path,
+    depth: usize,
+    index: &mut Index,
+    held: &mut std::collections::HashMap<String, Vec<u32>>,
+    report: &mut Indexed,
+) {
     if report.truncated {
         return;
     }
     if dir.is_file() {
-        ingest(dir, index, report);
+        ingest(dir, index, held, report);
         return;
     }
     if depth > MAX_DEPTH {
@@ -190,21 +262,34 @@ fn walk(dir: &std::path::Path, depth: usize, index: &mut Index, report: &mut Ind
         if name.starts_with('.') {
             continue;
         }
+        // Build output and vendored dependencies — see `NOT_DOCUMENTS`. Only
+        // for directories found by walking; one named in `paths` is read.
+        if child.is_dir() && NOT_DOCUMENTS.contains(&name) {
+            if !report.skipped.iter().any(|s| s == name) {
+                report.skipped.push(name.to_string());
+            }
+            continue;
+        }
         // Symlinks are not followed, which is the cheap way to be sure a walk
         // terminates: one link back to an ancestor turns the tree into a cycle.
         if std::fs::symlink_metadata(&child).map(|m| m.is_symlink()).unwrap_or(false) {
             continue;
         }
         if child.is_dir() {
-            walk(&child, depth + 1, index, report);
+            walk(&child, depth + 1, index, held, report);
         } else if document::is_readable(&child) {
-            ingest(&child, index, report);
+            ingest(&child, index, held, report);
         }
     }
 }
 
-/// Add one file, unless it is already there and unchanged.
-fn ingest(path: &std::path::Path, index: &mut Index, report: &mut Indexed) {
+/// Add one file's sections, unless it is already there and unchanged.
+fn ingest(
+    path: &std::path::Path,
+    index: &mut Index,
+    held: &mut std::collections::HashMap<String, Vec<u32>>,
+    report: &mut Indexed,
+) {
     if report.added + report.unchanged >= MAX_FILES_PER_CALL {
         report.truncated = true;
         return;
@@ -218,15 +303,16 @@ fn ingest(path: &std::path::Path, index: &mut Index, report: &mut Indexed) {
         return;
     }
 
-    let url = file_url(path);
+    let key = path.display().to_string();
+    let existing = held.get(&key).cloned().unwrap_or_default();
 
     // Already indexed and untouched since. Skipping matters more than it
-    // looks: re-adding a file replaces its document, which marks the old one
-    // dead, and enough dead documents trigger a full rewrite of the index —
-    // so re-indexing an unchanged tree would rewrite the whole thing to
-    // produce exactly what was already there.
-    if let Some(id) = index.by_url_id(&url) {
-        let read_at = index.read_time(id);
+    // looks: re-adding a document marks the old one dead, and enough dead
+    // documents trigger a full rewrite of the index — so re-indexing an
+    // unchanged tree would rewrite the whole thing to produce exactly what was
+    // already in it.
+    if !existing.is_empty() {
+        let read_at = existing.iter().map(|&id| index.read_time(id)).min().unwrap_or(0);
         let changed = meta
             .modified()
             .ok()
@@ -246,23 +332,50 @@ fn ingest(path: &std::path::Path, index: &mut Index, report: &mut Indexed) {
     };
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(extracted) = document::extract(&bytes, name, extension) else {
+    let Some(document) = document::read(&bytes, name, extension) else {
         report.not_text += 1;
         return;
     };
 
-    index.add(&url, &extracted.title, "", &extracted.text);
+    // The old sections go first, and all of them, rather than relying on each
+    // new one replacing its predecessor by URL. An edit moves the line ranges
+    // and can rename or delete a heading, so the URLs do not line up: without
+    // this, editing a document would leave its previous sections in the index
+    // answering from text that is no longer in the file.
+    for id in existing {
+        index.remove(id);
+    }
+
+    let mut added = Vec::new();
+    for section in &document.sections {
+        let url = section_url(path, section);
+        let title = match section.title() {
+            trail if trail.is_empty() => document.title.clone(),
+            trail => trail,
+        };
+        added.push(index.add(&url, &title, "", &section.text));
+        report.sections += 1;
+    }
+    held.insert(key, added);
     report.added += 1;
 }
 
-/// A `file://` URL for a path, which is what the index keys documents by.
+/// A URL for one section: the file, then the lines it occupies.
 ///
-/// Spelled out rather than percent-encoded in full: the index uses this as an
-/// identity and the result shows it to a person, and a path full of `%20` is
-/// harder to read and no more correct. Only the characters that would make the
-/// string ambiguous are escaped.
-fn file_url(path: &std::path::Path) -> String {
-    format!("file://{}", path.display().to_string().replace(' ', "%20"))
+/// The range is the identity *and* the instruction. It makes two sections of
+/// one file distinct documents, and it is exactly what `read_file` takes — so
+/// a result says where the passage is in a form the next call can use, rather
+/// than naming a file and leaving the agent to read all of it.
+///
+/// Sections with no line numbers — HTML, whose parser collapses markup — are
+/// numbered by their position instead, which distinguishes them without
+/// claiming to locate them.
+fn section_url(path: &std::path::Path, section: &forge_search::document::Section) -> String {
+    let file = path.display().to_string().replace(' ', "%20");
+    match section.lines {
+        Some((first, last)) => format!("file://{file}#L{first}-{last}"),
+        None => format!("file://{file}#p{}", section.text.len()),
+    }
 }
 
 /// The tool result the model sees.
@@ -286,13 +399,13 @@ fn render(
             );
         } else if paths.is_empty() {
             out.push_str(&format!(
-                "{} document(s) are indexed and none matched. Try different terms, or pass \
+                "{} section(s) are indexed and none matched. Try different terms, or pass \
                  `paths` to read somewhere new.\n",
                 index.len(),
             ));
         } else {
             out.push_str(&format!(
-                "{} document(s) are indexed and none matched.\n",
+                "{} section(s) are indexed and none matched.\n",
                 index.len(),
             ));
         }
@@ -304,7 +417,19 @@ fn render(
     for (i, hit) in hits.iter().enumerate() {
         let title = if hit.title.is_empty() { &hit.url } else { &hit.title };
         out.push_str(&format!("{}. {}\n", i + 1, title));
-        out.push_str(&format!("   {}\n", display_path(&hit.url)));
+        // The path and the line range, phrased as the next call rather than as
+        // a location. The range is the point of sectioning: reading sixty lines
+        // to get the rest of a passage is a different proposition from reading
+        // three thousand, and an agent that has to work out the arguments will
+        // often just read the file.
+        let (path, lines) = split_location(&hit.url);
+        match lines {
+            Some((first, last)) => out.push_str(&format!(
+                "   {path} lines {first}-{last}   read_file(path=\"{path}\", \
+                 start_line={first}, end_line={last}) for the whole section\n",
+            )),
+            None => out.push_str(&format!("   {path}\n")),
+        }
         if !hit.snippet.is_empty() {
             out.push_str(&format!("   {}\n", hit.snippet));
         }
@@ -312,7 +437,8 @@ fn render(
     }
     render_indexing(&mut out, report);
     out.push_str(&format!(
-        "[{} document(s) indexed. read_file any of the paths above for the whole document.]\n",
+        "[{} section(s) indexed across the documents read. Each result is one section, \
+         not a whole file.]\n",
         index.len(),
     ));
     out
@@ -333,8 +459,9 @@ fn render_indexing(out: &mut String, report: &Indexed) {
     }
     if report.added > 0 || report.unchanged > 0 {
         out.push_str(&format!(
-            "Read {} new or changed document(s); {} already indexed and unchanged.\n",
-            report.added, report.unchanged,
+            "Read {} new or changed document(s) as {} section(s); {} already indexed and \
+             unchanged.\n",
+            report.added, report.sections, report.unchanged,
         ));
     }
     for (count, why) in [
@@ -352,12 +479,29 @@ fn render_indexing(out: &mut String, report: &Indexed) {
              narrower directory in `paths` to reach the rest.\n",
         ));
     }
+    if !report.skipped.is_empty() {
+        out.push_str(&format!(
+            "Did not descend into {} (build output or dependencies by convention). If the \
+             documents are in there, name that directory in `paths` directly.\n",
+            report.skipped.join(", "),
+        ));
+    }
 }
 
-/// A `file://` URL back as a path, which is what a person and `read_file`
-/// both want.
-fn display_path(url: &str) -> String {
-    url.strip_prefix("file://").unwrap_or(url).replace("%20", " ")
+/// A section URL split back into the path and the lines, which is what a
+/// person and `read_file` both want.
+fn split_location(url: &str) -> (String, Option<(usize, usize)>) {
+    let rest = url.strip_prefix("file://").unwrap_or(url);
+    let (path, fragment) = match rest.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (rest, None),
+    };
+    let path = path.replace("%20", " ");
+    let lines = fragment
+        .and_then(|f| f.strip_prefix('L'))
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
+    (path, lines)
 }
 
 #[cfg(test)]
@@ -418,7 +562,7 @@ mod tests {
 
         let second = search(&root, "alpha", &["."]);
         assert!(
-            second.contains("Read 0 new or changed document(s); 2 already indexed"),
+            second.contains("Read 0 new or changed document(s) as 0 section(s); 2 already indexed"),
             "the tree was re-read: {second}"
         );
         // And it still answers.
@@ -563,6 +707,174 @@ mod tests {
         let out = search(&root, "wolverines", &[]);
         assert!(!out.contains("Read "), "a query with no paths read files: {out}");
         assert!(out.contains("wolverines") || out.contains("a.md"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The whole point of sectioning, from the caller's side: the result names
+    /// the passage by its headings and gives the range, so the next call reads
+    /// sixty lines instead of three thousand.
+    #[test]
+    fn a_result_names_the_section_and_the_lines_to_read() {
+        let filler = |what: &str| format!("{what} ").repeat(400);
+        let source = format!(
+            "# Runbook\n\n{}\n\n## Recovery\n\n{}\n\n### Restarting the agent\n\n\
+             {} Run systemctl restart forge-agent when the socket is stale.\n",
+            filler("introduction"),
+            filler("recovery"),
+            filler("restarting"),
+        );
+        let root = tree("sections", &[("runbook.md", &source)]);
+
+        let out = search(&root, "systemctl restart stale socket", &["."]);
+        // Named by the trail, not by the file.
+        assert!(
+            out.contains("Runbook › Recovery › Restarting the agent"),
+            "the section is not named by its heading trail: {out}"
+        );
+        assert!(out.contains(" lines "), "no line range: {out}");
+        // And phrased as the call to make, arguments included.
+        assert!(out.contains("read_file(path="), "{out}");
+        assert!(out.contains("start_line="), "{out}");
+        // The range is the section's, not the file's — the answer is at the
+        // bottom of a long document.
+        let start: usize = out
+            .split("start_line=")
+            .nth(1)
+            .and_then(|r| r.split(&[',', ')'][..]).next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(start > 1, "the range starts at line {start}, so it is the whole file: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One file must not take every slot. Before sectioning this was free —
+    /// one document per file — and afterwards a long document's five best
+    /// sections would crowd out every other file unless the spread rule counts
+    /// files rather than hosts, which a `file://` URL does not have.
+    #[test]
+    fn one_document_does_not_fill_the_whole_result() {
+        let filler = |what: &str| format!("{what} ").repeat(400);
+        let mut long = String::from("# Long\n\n");
+        for i in 0..6 {
+            long.push_str(&format!("## Part {i}\n\n{} kestrel sightings here.\n\n", filler("padding")));
+        }
+        let root = tree("spread", &[
+            ("long.md", &long),
+            ("short.md", &format!("# Short\n\n{} kestrel sightings here too.\n", filler("other"))),
+        ]);
+
+        let out = search(&root, "kestrel sightings", &["."]);
+        assert!(out.contains("short.md"), "the other file was crowded out: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Editing a document must not leave its old sections answering. The URLs
+    /// do not line up after an edit — the ranges move and a heading can be
+    /// renamed — so the previous sections are removed rather than replaced one
+    /// by one.
+    #[test]
+    fn editing_a_document_retires_its_old_sections() {
+        let filler = |what: &str| format!("{what} ").repeat(400);
+        let before = format!(
+            "# Spec\n\n{}\n\n## Limits\n\n{} The ceiling is forty units.\n",
+            filler("intro"), filler("limits"),
+        );
+        let root = tree("edited", &[("spec.md", &before)]);
+        let first = search(&root, "ceiling units", &["."]);
+        assert!(first.contains("forty"), "{first}");
+
+        // The stored read time has one-second resolution, so the edit is
+        // forced past it rather than assumed to land after it.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Rewritten with a section inserted above, so every later line moves.
+        let after = format!(
+            "# Spec\n\n{}\n\n## Preface\n\n{}\n\n## Limits\n\n{} The ceiling is ninety units.\n",
+            filler("intro"), filler("preface"), filler("limits"),
+        );
+        std::fs::write(root.join("spec.md"), &after).unwrap();
+
+        let second = search(&root, "ceiling units", &["."]);
+        assert!(second.contains("ninety"), "the edit did not take: {second}");
+        assert!(
+            !second.contains("forty"),
+            "a section from before the edit is still answering: {second}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A range has to survive the round trip through the URL, since that is
+    /// what the result is built from.
+    #[test]
+    fn a_section_url_carries_the_range_and_gives_it_back() {
+        let path = std::path::Path::new("/docs/my notes/a file.md");
+        let section = forge_search::document::Section {
+            trail: vec!["Top".into()],
+            lines: Some((120, 186)),
+            text: "something".into(),
+        };
+        let url = section_url(path, &section);
+        assert_eq!(url, "file:///docs/my%20notes/a%20file.md#L120-186");
+
+        let (back, lines) = split_location(&url);
+        assert_eq!(back, "/docs/my notes/a file.md");
+        assert_eq!(lines, Some((120, 186)));
+
+        // And a section with no lines to give — HTML — is still distinct and
+        // still claims nothing about where it is.
+        let no_lines = forge_search::document::Section {
+            lines: None,
+            text: "something".into(),
+            ..Default::default()
+        };
+        let url = section_url(std::path::Path::new("/a/b.html"), &no_lines);
+        let (back, lines) = split_location(&url);
+        assert_eq!(back, "/a/b.html");
+        assert_eq!(lines, None);
+    }
+
+    /// `paths: ["."]` is the ordinary way to say "this project", and the path
+    /// it produces ends up in a `read_file` call the agent is told to make.
+    #[test]
+    fn a_dot_path_does_not_end_up_in_the_result() {
+        let root = tree("dotpath", &[("notes/a.md", "# A\n\nAbout marmots.\n")]);
+        let out = search(&root, "marmots", &["."]);
+        assert!(out.contains("notes/a.md"), "{out}");
+        assert!(!out.contains("/./"), "a bare `.` component reached the result: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build output is not a corpus. This repository's `target/` is 83 GB
+    /// across 663,234 files and holds ten readable documents; walking it took
+    /// thirteen of the thirteen and a half seconds a real run spent.
+    #[test]
+    fn build_output_is_not_walked_but_can_be_named() {
+        let root = tree("skipdirs", &[
+            ("real.md", "# Real\n\nAbout pangolins.\n"),
+            ("target/generated.md", "# Generated\n\nAlso pangolins.\n"),
+            ("node_modules/pkg/readme.md", "# Dependency\n\nPangolins again.\n"),
+        ]);
+
+        let out = search(&root, "pangolins", &["."]);
+        assert!(out.contains("Read 1 new or changed document(s)"), "{out}");
+        assert!(out.contains("real.md"), "{out}");
+        // Checked by what was indexed, not by what the text mentions — the
+        // report names the directories it declined, so the names appear.
+        assert!(!out.contains("generated.md"), "build output was indexed: {out}");
+        assert!(!out.contains("readme.md"), "a dependency was indexed: {out}");
+        // And said out loud, so a corpus that turned out to live under one of
+        // these is a visible fact rather than a mystery about the ranking.
+        assert!(out.contains("Did not descend into"), "{out}");
+        assert!(out.contains("target"), "{out}");
+
+        // Named directly, it is read — which is what makes the list a default
+        // rather than a rule.
+        let out = search(&root, "pangolins", &["target"]);
+        assert!(out.contains("generated.md"), "a named directory was still skipped: {out}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -252,8 +252,8 @@ fn spread_across_hosts(
     let mut kept: Vec<crate::rank::Hit> = Vec::new();
     let mut deferred: Vec<crate::rank::Hit> = Vec::new();
     for hit in hits {
-        let host = host_of(index, hit.doc);
-        let count = seen.entry(host).or_insert(0);
+        let source = source_of(index, hit.doc);
+        let count = seen.entry(source).or_insert(0);
         if *count < MAX_PER_HOST {
             *count += 1;
             kept.push(hit);
@@ -293,10 +293,28 @@ pub fn normalise_host(input: &str) -> Option<String> {
     (!host.is_empty() && host.contains('.')).then_some(host)
 }
 
-/// The host a document came from, or its url when that cannot be parsed.
+/// The thing a document is one of, for spreading results across sources.
 ///
-/// The unit of independence. Two threads on one forum are one source agreeing
-/// with itself; the same claim on two hosts is two sources.
+/// A host for a crawled page: two threads on one forum are one source agreeing
+/// with itself, while the same claim on two hosts is two sources.
+///
+/// A file, without its fragment, for a local document — because a local
+/// document is indexed as its sections, and each section carries a `#` range
+/// of its own. Keyed on the host this would have given every section its own
+/// group, since a `file://` URL has no host at all, and one file's five
+/// sections could take every slot in the result. The file is the unit that
+/// matters: two sections of one runbook are one source, and the second and
+/// third are still reachable through the backfill when nothing else answers.
+fn source_of(index: &Index, doc: DocId) -> String {
+    if let Some(doc) = index.document(doc) {
+        if let Some(rest) = doc.url.strip_prefix("file://") {
+            return rest.split('#').next().unwrap_or(rest).to_string();
+        }
+    }
+    host_of(index, doc)
+}
+
+/// The host a document came from, or its url when that cannot be parsed.
 fn host_of(index: &Index, doc: DocId) -> String {
     index
         .document(doc)

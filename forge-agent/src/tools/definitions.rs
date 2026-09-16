@@ -246,6 +246,48 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
+                name: "search_documents".to_string(),
+                description: "Ranked search over a directory of documents on this machine. \
+                    Pass `paths` with a folder and it reads every prose document under it \
+                    (.md, .txt, .rst, .org, .html), keeps a local index, and returns the \
+                    passages that answer the query; pass only `query` to search what is \
+                    already indexed and read nothing. Re-reading is cheap — files unchanged \
+                    since they were last read are skipped. \
+                    Use this when the question is which of many documents answers something: \
+                    a folder of reports, runbooks, notes, papers or exported write-ups. It \
+                    ranks by relevance, weighs phrases, and returns the passage rather than \
+                    every line that matched. \
+                    Do NOT use it for source code — search_code greps, which is exact, needs \
+                    no index and is the better tool for an identifier or an error string. \
+                    Do not use it for one file you can name either: read_file is better. \
+                    Tabular and record formats (.csv, .json) are not read, because a file of \
+                    fifty thousand rows is fifty thousand documents rather than one. \
+                    This index is separate from web_search's, so your own documents are not \
+                    ranked against crawled pages.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to look for. Supports quoted phrases and -excluded terms."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Directories or single files to read, absolute or relative to \
+                                the project root. Read once and kept, so omit this on later queries \
+                                against the same documents. Name the narrowest directory that holds \
+                                them: pointing at a home directory works but reads a great deal that \
+                                is not the corpus."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
                 name: "search_papers".to_string(),
                 description: "Search the biomedical and life-sciences literature through Europe PMC \
                     and search the full text of what it returns. Use this for a measured value, a \

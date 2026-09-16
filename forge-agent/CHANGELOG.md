@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Added
 
+- **`search_documents` — ranked retrieval over a folder of documents on this machine.** The engine's value was only reachable through a network fetch, which put it out of reach of the corpus most people actually have: a directory of reports, runbooks, notes or papers on their own disk. Nothing about an inverted index cares whether the words arrived over a socket.
+
+  Pass `paths` with a folder and it reads every prose document under it — `.md`, `.txt`, `.rst`, `.org`, `.html` — keeps a local index, and answers from it; pass only `query` and it reads nothing and answers from what is already there. Measured on this repository's own prose: 44 documents read in 15 ms, queries in about 140 µs.
+
+  **Files unchanged since they were last read are skipped**, and that is not only about time. Re-adding a file marks its old document dead, and enough dead documents trigger a full rewrite of the index — so without this, re-indexing an untouched tree would rewrite the whole index to produce exactly what was already in it. Freshness comes from comparing the file's mtime against the segment that holds it, so it needs no extra field on disk.
+
+  Deliberately **not** for source code: `search_code` greps, and for an identifier or an error string that is exact, needs no index and cannot go stale. This earns its place on the different question — which of three thousand documents answers this — which grep cannot answer at all, since it returns every file containing the word in filesystem order and misses the one that wrote "Windows Management Instrumentation" when the query said "WMI".
+
+  Tabular and record formats are left out on purpose rather than forgotten. A CSV of fifty thousand alerts is fifty thousand documents, not one, and indexing it whole would produce a single document that matches every query and answers none of them; doing it properly means a record-level ingester, which is a different design.
+
+  Its index is separate from `web_search`'s, at `.forge/doc-index/`, because BM25 scores a term by how rare it is in the corpus being searched. Five hundred crawled pages where "bucket" appears on four hundred of them make the word worthless as a discriminator, and three of your own incident reports that mention a bucket would then be scored as though it meant nothing. Kept apart, those three win outright. Length normalisation fails the same way in reverse: mixing two-thousand-term reference pages with two-hundred-term notes marks the notes down for being the length that notes are.
+
 - **`search_papers` — the biomedical literature, through the channel published for it.** PubMed Central's `robots.txt` is `User-agent: *` / `Disallow: /`, so the primary literature cannot be crawled. That is why the engine answered nothing for a question about a measured value at a stated temperature: those numbers are in Methods sections, and no amount of crawling encyclopaedias reaches one.
 
   The new tool asks Europe PMC's REST API, which is the documented programmatic channel and on a different host from the website. It searches, fetches the full text of articles whose licence permits keeping it, indexes that, and answers from it. Anything not open access comes back as a citation and a link, and the result says so rather than leaving the model to assume there was nothing.

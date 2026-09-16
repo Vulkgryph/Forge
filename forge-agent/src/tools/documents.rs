@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `search_documents` — ranked retrieval over a directory of documents.
+//!
+//! The same engine as `web_search`, pointed at a disk instead of a network.
+//! That is the whole idea: an inverted index does not care where the words
+//! came from, and the corpus most people actually have is a folder of reports,
+//! notes, papers or exported logs rather than a website.
+//!
+//! ## Why this is not `search_code`
+//!
+//! `search_code` greps, and for source that is the better tool. An identifier
+//! is an exact string; a regex over exact strings is precise, needs no index,
+//! and cannot go stale. Ranked retrieval earns its place on a different
+//! question — *which* of three thousand documents answers this — which grep
+//! cannot answer at all: it returns every file containing the word, in
+//! whatever order the filesystem offered them, and it misses the document that
+//! says "Windows Management Instrumentation" when the query said "WMI".
+//!
+//! So this is for prose at a scale where reading the matches is not an option.
+//! For a fifty-file repository, `search_code` and `read_file` are better and
+//! this tool should not be reached for.
+//!
+//! ## Why a separate index from the crawled one
+//!
+//! Because BM25 scores a term by how rare it is *in the corpus being
+//! searched*, so what else is in the index changes every score. Five hundred
+//! crawled pages of a vendor's documentation, where "bucket" appears on four
+//! hundred of them, make "bucket" worthless as a discriminator — and then
+//! three of your own incident reports that mention a bucket are scored as
+//! though the word meant nothing. Kept apart, "bucket" is on three of fifty
+//! documents, which is rare, and those three win outright.
+//!
+//! Length normalisation has the same problem in the other direction: BM25
+//! marks down a document that is short *for its corpus*, so mixing
+//! two-thousand-term reference pages with two-hundred-term notes penalises the
+//! notes for being the length that notes are.
+
+use anyhow::{Context, Result};
+use forge_search::document;
+use forge_search::index::Index;
+use forge_search::query;
+
+/// How many passages to return.
+///
+/// Not a parameter, for the reason given on `search::MAX_RESULTS`: a knob the
+/// model has no basis for choosing is a knob it sets arbitrarily.
+const MAX_RESULTS: usize = 5;
+
+/// Largest single file read.
+///
+/// A log can be gigabytes and a document cannot. Past this the file is skipped
+/// rather than truncated, since half a document indexes as a document and
+/// would then answer for the whole of it.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Most files indexed in one call.
+///
+/// A bound on the surprise rather than on the corpus: somebody who points this
+/// at their home directory should get a result and a note, not a wait of
+/// unknown length. Reached, the call says so and says what it stopped at.
+const MAX_FILES_PER_CALL: usize = 5_000;
+
+/// How deep to walk below the given directory.
+///
+/// Deep enough for a documents tree organised by year and topic, shallow
+/// enough that pointing at a home directory does not descend into everything
+/// ever installed.
+const MAX_DEPTH: usize = 8;
+
+/// Where the document index lives.
+pub fn index_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    workspace_root.join(".forge").join("doc-index")
+}
+
+pub async fn search_documents(
+    args: &serde_json::Value,
+    project_root: std::path::PathBuf,
+) -> Result<String> {
+    let query_text = args["query"]
+        .as_str()
+        .context("Missing 'query' argument")?
+        .to_string();
+    let paths: Vec<String> = args["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    let index_path = index_path(&project_root);
+    // Reading and tokenising thousands of files is blocking work, and doing it
+    // on a runtime worker thread stalls every other task in the process.
+    tokio::task::spawn_blocking(move || run(&query_text, &paths, &project_root, index_path))
+        .await
+        .map_err(|e| anyhow::anyhow!("document search task failed: {e}"))?
+}
+
+/// What one call did.
+#[derive(Debug, Default)]
+struct Indexed {
+    /// Files read and added this call.
+    added: usize,
+    /// Files already in the index and unchanged since.
+    unchanged: usize,
+    /// Files skipped for being too large, with the largest seen.
+    too_large: usize,
+    /// Files whose extension is readable but whose content is not text.
+    not_text: usize,
+    /// Files that could not be read at all — permissions, a broken link.
+    unreadable: usize,
+    /// Whether the per-call file cap was reached.
+    truncated: bool,
+    /// Directories named that do not exist.
+    missing: Vec<String>,
+}
+
+fn run(
+    query_text: &str,
+    paths: &[String],
+    project_root: &std::path::Path,
+    index_path: std::path::PathBuf,
+) -> Result<String> {
+    // A corrupt index is a cache of files that can be read again, so it is
+    // replaced rather than fatal.
+    let mut index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+
+    let mut report = Indexed::default();
+    if !paths.is_empty() {
+        let started = std::time::Instant::now();
+        for path in paths {
+            let root = resolve(project_root, path);
+            if !root.exists() {
+                report.missing.push(path.clone());
+                continue;
+            }
+            walk(&root, 0, &mut index, &mut report);
+            if report.truncated {
+                break;
+            }
+        }
+        if report.added > 0 {
+            let _ = crate::workdir::ensure_parent_of(&index_path);
+            let _ = index.save(&index_path);
+        }
+        let _ = started;
+    }
+
+    let hits = query::search(&index, query_text, MAX_RESULTS);
+    Ok(render(query_text, &hits, &index, paths, &report))
+}
+
+/// A path as given, against the project root when it is relative.
+fn resolve(project_root: &std::path::Path, given: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(given);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    }
+}
+
+/// Read every readable document below `dir`, adding what has changed.
+fn walk(dir: &std::path::Path, depth: usize, index: &mut Index, report: &mut Indexed) {
+    if report.truncated {
+        return;
+    }
+    if dir.is_file() {
+        ingest(dir, index, report);
+        return;
+    }
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        report.unreadable += 1;
+        return;
+    };
+
+    // Sorted, so two runs over the same tree assign ids in the same order and
+    // a result set is reproducible. `read_dir` order is the filesystem's and
+    // is not stable between machines or after a file is rewritten.
+    let mut children: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    children.sort();
+
+    for child in children {
+        if report.truncated {
+            return;
+        }
+        let Some(name) = child.file_name().and_then(|n| n.to_str()) else { continue };
+        // Dot directories and dot files. `.git` alone can hold more objects
+        // than the corpus, and `.forge` holds the index this is writing to.
+        if name.starts_with('.') {
+            continue;
+        }
+        // Symlinks are not followed, which is the cheap way to be sure a walk
+        // terminates: one link back to an ancestor turns the tree into a cycle.
+        if std::fs::symlink_metadata(&child).map(|m| m.is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        if child.is_dir() {
+            walk(&child, depth + 1, index, report);
+        } else if document::is_readable(&child) {
+            ingest(&child, index, report);
+        }
+    }
+}
+
+/// Add one file, unless it is already there and unchanged.
+fn ingest(path: &std::path::Path, index: &mut Index, report: &mut Indexed) {
+    if report.added + report.unchanged >= MAX_FILES_PER_CALL {
+        report.truncated = true;
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        report.unreadable += 1;
+        return;
+    };
+    if meta.len() > MAX_FILE_BYTES {
+        report.too_large += 1;
+        return;
+    }
+
+    let url = file_url(path);
+
+    // Already indexed and untouched since. Skipping matters more than it
+    // looks: re-adding a file replaces its document, which marks the old one
+    // dead, and enough dead documents trigger a full rewrite of the index —
+    // so re-indexing an unchanged tree would rewrite the whole thing to
+    // produce exactly what was already there.
+    if let Some(id) = index.by_url_id(&url) {
+        let read_at = index.read_time(id);
+        let changed = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() > read_at)
+            // No mtime is no evidence of freshness, so re-read.
+            .unwrap_or(true);
+        if !changed && read_at > 0 {
+            report.unchanged += 1;
+            return;
+        }
+    }
+
+    let Ok(bytes) = std::fs::read(path) else {
+        report.unreadable += 1;
+        return;
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(extracted) = document::extract(&bytes, name, extension) else {
+        report.not_text += 1;
+        return;
+    };
+
+    index.add(&url, &extracted.title, "", &extracted.text);
+    report.added += 1;
+}
+
+/// A `file://` URL for a path, which is what the index keys documents by.
+///
+/// Spelled out rather than percent-encoded in full: the index uses this as an
+/// identity and the result shows it to a person, and a path full of `%20` is
+/// harder to read and no more correct. Only the characters that would make the
+/// string ambiguous are escaped.
+fn file_url(path: &std::path::Path) -> String {
+    format!("file://{}", path.display().to_string().replace(' ', "%20"))
+}
+
+/// The tool result the model sees.
+fn render(
+    query_text: &str,
+    hits: &[query::Result_],
+    index: &Index,
+    paths: &[String],
+    report: &Indexed,
+) -> String {
+    let mut out = String::new();
+
+    if hits.is_empty() {
+        out.push_str(&format!("No results for {query_text:?}.\n"));
+        if index.is_empty() {
+            out.push_str(
+                "No documents have been indexed for this project. Pass `paths` with a \
+                 directory of documents to read — prose formats only: .md, .txt, .rst, \
+                 .org, .html. For source code use search_code, which greps and needs no \
+                 index.\n",
+            );
+        } else if paths.is_empty() {
+            out.push_str(&format!(
+                "{} document(s) are indexed and none matched. Try different terms, or pass \
+                 `paths` to read somewhere new.\n",
+                index.len(),
+            ));
+        } else {
+            out.push_str(&format!(
+                "{} document(s) are indexed and none matched.\n",
+                index.len(),
+            ));
+        }
+        render_indexing(&mut out, report);
+        return out;
+    }
+
+    out.push_str(&format!("{} result(s) for {query_text:?}:\n\n", hits.len()));
+    for (i, hit) in hits.iter().enumerate() {
+        let title = if hit.title.is_empty() { &hit.url } else { &hit.title };
+        out.push_str(&format!("{}. {}\n", i + 1, title));
+        out.push_str(&format!("   {}\n", display_path(&hit.url)));
+        if !hit.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", hit.snippet));
+        }
+        out.push('\n');
+    }
+    render_indexing(&mut out, report);
+    out.push_str(&format!(
+        "[{} document(s) indexed. read_file any of the paths above for the whole document.]\n",
+        index.len(),
+    ));
+    out
+}
+
+/// What the indexing pass did, when it did anything worth saying.
+///
+/// Every line here is a reason a document the caller expected is absent. A
+/// search that silently indexed nine files out of four thousand looks like a
+/// search that found nothing, and the model's next move would be to rephrase
+/// the query rather than to raise the real problem.
+fn render_indexing(out: &mut String, report: &Indexed) {
+    if !report.missing.is_empty() {
+        out.push_str(&format!(
+            "Not found, so nothing was read from them: {}\n",
+            report.missing.join(", "),
+        ));
+    }
+    if report.added > 0 || report.unchanged > 0 {
+        out.push_str(&format!(
+            "Read {} new or changed document(s); {} already indexed and unchanged.\n",
+            report.added, report.unchanged,
+        ));
+    }
+    for (count, why) in [
+        (report.too_large, "larger than 4 MB"),
+        (report.not_text, "not text, despite the extension"),
+        (report.unreadable, "could not be read"),
+    ] {
+        if count > 0 {
+            out.push_str(&format!("Skipped {count} file(s): {why}.\n"));
+        }
+    }
+    if report.truncated {
+        out.push_str(&format!(
+            "Stopped at {MAX_FILES_PER_CALL} files, so the corpus is incomplete — name a \
+             narrower directory in `paths` to reach the rest.\n",
+        ));
+    }
+}
+
+/// A `file://` URL back as a path, which is what a person and `read_file`
+/// both want.
+fn display_path(url: &str) -> String {
+    url.strip_prefix("file://").unwrap_or(url).replace("%20", " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch tree named for the test, since tests run as threads of one
+    /// process and a directory keyed on the process id has had two of them
+    /// delete each other's fixtures.
+    fn tree(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("forge-docs-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, body) in files {
+            let at = root.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, body).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn search(root: &std::path::Path, query: &str, paths: &[&str]) -> String {
+        let owned: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        run(query, &owned, root, root.join(".forge").join("doc-index")).unwrap()
+    }
+
+    #[test]
+    fn a_directory_of_notes_becomes_searchable() {
+        let root = tree("basic", &[
+            ("notes/keys.md", "# Rotating the signing key\n\nRotate the signing key every year.\n"),
+            ("notes/oncall.md", "# On-call\n\nEscalate to the platform team after ten minutes.\n"),
+            ("notes/lunch.txt", "Sandwiches are in the fridge.\n"),
+        ]);
+
+        let out = search(&root, "rotating the signing key", &["notes"]);
+        assert!(out.contains("Read 3 new or changed document(s)"), "{out}");
+        assert!(out.contains("Rotating the signing key"), "{out}");
+        // The path, not a file:// URL — this is what read_file wants.
+        assert!(out.contains("notes/keys.md"), "{out}");
+        assert!(!out.contains("file://"), "a URL leaked into the result: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Re-indexing an untouched tree must read nothing. This is not only
+    /// about time: re-adding a file marks its old document dead, and enough
+    /// dead documents rewrite the whole index — so a no-op call would rewrite
+    /// the index to produce exactly what was in it.
+    #[test]
+    fn an_unchanged_tree_is_not_read_twice() {
+        let root = tree("unchanged", &[
+            ("a.md", "# Alpha\n\nThe alpha document.\n"),
+            ("b.md", "# Beta\n\nThe beta document.\n"),
+        ]);
+
+        let first = search(&root, "alpha", &["."]);
+        assert!(first.contains("Read 2 new or changed document(s)"), "{first}");
+
+        let second = search(&root, "alpha", &["."]);
+        assert!(
+            second.contains("Read 0 new or changed document(s); 2 already indexed"),
+            "the tree was re-read: {second}"
+        );
+        // And it still answers.
+        assert!(second.contains("Alpha"), "{second}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A changed file is re-read, and the new text is what answers.
+    #[test]
+    fn a_changed_file_is_read_again() {
+        let root = tree("changed", &[("spec.md", "# Spec\n\nThe limit is forty units.\n")]);
+        let first = search(&root, "limit units", &["."]);
+        assert!(first.contains("forty"), "{first}");
+
+        // The stored read time has one-second resolution, so the edit is
+        // forced past it rather than assumed to land after it.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(root.join("spec.md"), "# Spec\n\nThe limit is ninety units.\n").unwrap();
+
+        let second = search(&root, "limit units", &["."]);
+        assert!(second.contains("Read 1 new or changed document(s)"), "{second}");
+        assert!(second.contains("ninety"), "the stale text answered: {second}");
+        assert!(!second.contains("forty"), "both versions are live: {second}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dot directories are skipped — `.git` alone can hold more objects than
+    /// the corpus, and `.forge` holds the index being written.
+    #[test]
+    fn dot_directories_are_not_walked() {
+        let root = tree("dots", &[
+            ("real.md", "# Real\n\nA real document about kestrels.\n"),
+            (".git/COMMIT_EDITMSG", "kestrels everywhere\n"),
+            (".hidden/notes.md", "# Hidden\n\nAlso kestrels.\n"),
+        ]);
+        let out = search(&root, "kestrels", &["."]);
+        assert!(out.contains("Read 1 new or changed document(s)"), "{out}");
+        assert!(out.contains("real.md"), "{out}");
+        assert!(!out.contains(".git"), "{out}");
+        assert!(!out.contains(".hidden"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only prose extensions. Source goes to search_code, and a CSV of fifty
+    /// thousand rows is fifty thousand documents rather than one.
+    #[test]
+    fn only_prose_formats_are_read() {
+        let root = tree("formats", &[
+            ("readme.md", "# Readme\n\nThe widget tolerance is tight.\n"),
+            ("main.rs", "// the widget tolerance is tight\nfn main() {}\n"),
+            ("data.csv", "widget,tolerance\n1,tight\n"),
+            ("config.json", "{\"widget\": \"tolerance tight\"}\n"),
+        ]);
+        let out = search(&root, "widget tolerance", &["."]);
+        assert!(out.contains("Read 1 new or changed document(s)"), "{out}");
+        assert!(out.contains("readme.md"), "{out}");
+        assert!(!out.contains("main.rs"), "{out}");
+        assert!(!out.contains("data.csv"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A named directory that does not exist has to be said out loud. Silently
+    /// indexing nothing looks identical to finding nothing, and the model
+    /// would rephrase the query instead of fixing the path.
+    #[test]
+    fn a_missing_directory_is_reported_rather_than_ignored() {
+        let root = tree("missing", &[("a.md", "# A\n\nSomething about herons.\n")]);
+        let out = search(&root, "herons", &[".", "does-not-exist"]);
+        assert!(out.contains("Not found"), "{out}");
+        assert!(out.contains("does-not-exist"), "{out}");
+        // And the directory that does exist was still read.
+        assert!(out.contains("herons") || out.contains("a.md"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty index should say what to do, not just that it found nothing.
+    #[test]
+    fn an_empty_index_says_how_to_fill_it() {
+        let root = tree("empty", &[]);
+        let out = search(&root, "anything", &[]);
+        assert!(out.contains("No documents have been indexed"), "{out}");
+        assert!(out.contains("search_code"), "it should point at the better tool: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file whose extension lies about its content must not have its bytes
+    /// indexed as words.
+    #[test]
+    fn a_binary_file_with_a_text_extension_is_skipped() {
+        let root = tree("binary", &[("real.md", "# Real\n\nAbout otters.\n")]);
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0u8; 512]);
+        std::fs::write(root.join("image.txt"), &png).unwrap();
+
+        let out = search(&root, "otters", &["."]);
+        assert!(out.contains("Skipped 1 file(s): not text"), "{out}");
+        assert!(out.contains("Read 1 new or changed document(s)"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A single file is a legitimate thing to point at, not only a directory.
+    #[test]
+    fn a_single_file_can_be_named() {
+        let root = tree("onefile", &[
+            ("wanted.md", "# Wanted\n\nA note about badgers.\n"),
+            ("other.md", "# Other\n\nAnother note about badgers.\n"),
+        ]);
+        let out = search(&root, "badgers", &["wanted.md"]);
+        assert!(out.contains("Read 1 new or changed document(s)"), "{out}");
+        assert!(out.contains("wanted.md"), "{out}");
+        assert!(!out.contains("other.md"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path with a space in it has to survive being used as an identity and
+    /// then shown back — the round trip is what the index keys on.
+    #[test]
+    fn a_path_with_a_space_round_trips() {
+        let root = tree("spaces", &[("my notes/a file.md", "# Spaced\n\nAbout puffins.\n")]);
+        let out = search(&root, "puffins", &["."]);
+        assert!(out.contains("my notes/a file.md"), "{out}");
+        assert!(!out.contains("%20"), "escaping leaked into the result: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Searching with no `paths` reads nothing and answers from what is there,
+    /// which is the cheap repeat case.
+    #[test]
+    fn a_query_with_no_paths_reads_nothing() {
+        let root = tree("norepeat", &[("a.md", "# A\n\nAbout wolverines.\n")]);
+        search(&root, "wolverines", &["."]);
+
+        let out = search(&root, "wolverines", &[]);
+        assert!(!out.contains("Read "), "a query with no paths read files: {out}");
+        assert!(out.contains("wolverines") || out.contains("a.md"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_index_lives_beside_the_web_one_not_in_it() {
+        let root = std::path::Path::new("/tmp/project");
+        let docs = index_path(root);
+        assert_eq!(docs, std::path::Path::new("/tmp/project/.forge/doc-index"));
+        assert_ne!(docs, crate::tools::search::index_path(root));
+    }
+}

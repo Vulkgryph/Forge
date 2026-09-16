@@ -111,6 +111,7 @@ fn tool_label(name: &str) -> String {
         "web_search" => "Web search",
         "web_fetch" => "Web fetch",
         "search_papers" => "Paper search",
+        "search_documents" => "Document search",
         "shell_exec" => "Shell commands",
         "delegate_task" => "Subagents",
         other => other,

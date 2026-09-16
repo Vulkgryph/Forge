@@ -4,6 +4,9 @@
 //!
 //! - [`crawl`] — what to fetch next, and when to stop. Every hard part of a
 //!   crawler is a limit.
+//! - [`document`] — readable text out of a file on disk, which is the corpus
+//!   most people actually have. The crawler's counterpart: nothing about an
+//!   inverted index cares whether the words arrived over a socket.
 //! - [`epmc`] — Europe PMC, for the literature a crawler is forbidden to
 //!   reach. Indexes only what an article's licence permits keeping.
 //! - [`fetch`] — what the engine needs from the network, as a trait it does
@@ -32,6 +35,7 @@
 //! written out.
 
 pub mod crawl;
+pub mod document;
 pub mod epmc;
 pub mod fetch;
 pub mod html;

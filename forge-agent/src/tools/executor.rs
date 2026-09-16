@@ -135,7 +135,7 @@ impl ToolExecutor {
             "enter_plan_mode" => ToolKind::Execute,
             "apply_patch" => ToolKind::Write, // <-- FIX: Added apply_patch
             "write_file" | "edit_file" => ToolKind::Write,
-            "web_search" | "web_fetch" | "search_papers" => ToolKind::Execute,
+            "web_search" | "web_fetch" | "search_papers" | "search_documents" => ToolKind::Execute,
             "shell_exec" | "delegate_task" => ToolKind::Execute,
             _ => ToolKind::Unknown,
         }
@@ -244,6 +244,9 @@ impl ToolExecutor {
                     crate::tools::papers::index_path(&self.project_root),
                 )
                 .await
+            }
+            "search_documents" => {
+                crate::tools::documents::search_documents(args, self.project_root.clone()).await
             }
             "web_search" => {
                 crate::tools::search::web_search(args, crate::tools::search::index_path(&self.project_root)).await

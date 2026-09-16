@@ -111,6 +111,9 @@ pub enum AgentEvent {
     ProcessInputNeeded {
         prompt: String,
     },
+    /// The process was not waiting after all — see the proto message of the
+    /// same name for why the guess is retracted rather than refined.
+    ProcessInputWithdrawn,
     /// A backgrounded command has emitted a prompt and needs user input.
     BackgroundPromptNeeded {
         bg_id: String,
@@ -3274,7 +3277,14 @@ impl Agent {
         // in a colon" alone is too weak a signal — a genuine interactive
         // prompt is followed by silence, ordinary tool output isn't.
         let mut pending_prompt_check: Option<(tokio::time::Instant, String)> = None;
-        const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
+        // Two seconds, not the 350ms this started at. The window is not a
+        // latency budget: a person takes seconds to read a prompt and longer
+        // to answer one, so offering input 1.65s later costs nothing anybody
+        // can feel. What it buys is most of the false positives, because the
+        // pauses that ordinary output takes — a test between assertions, a
+        // compiler between crates — are short, while a process actually
+        // blocked on stdin is silent until answered.
+        const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
         // wait=true: prefer waiting until done or timeout_secs — BUT a global
         // forced-background ceiling (below) still applies so the model cannot
         // pin the turn on a multi-hour shell forever.
@@ -3468,6 +3478,14 @@ impl Agent {
                 status = child.wait(), if !child_done => {
                     child_done = true;
                     exit_code = status.ok().and_then(|s| s.code());
+                    // A process that has exited is not waiting for anything.
+                    // Without this the dialog outlived the command itself.
+                    pending_prompt_check = None;
+                    if input_prompt_sent || input_waiting {
+                        input_prompt_sent = false;
+                        input_waiting = false;
+                        let _ = event_tx.send(AgentEvent::ProcessInputWithdrawn);
+                    }
                     if out_done { break; }
                 }
                 // 3. Unified output channel (PTY master or piped stdout/stderr)
@@ -3476,6 +3494,7 @@ impl Agent {
                         push_capped(&mut output_buf, &chunk);
                         // Pattern-based prompt detection: arm a candidate, confirmed
                         // only by the debounce arm below once output actually stops.
+                        let was_sent = input_prompt_sent;
                         if !input_prompt_sent && !child_done && looks_like_prompt(&chunk) {
                             let prompt_text = output_buf.lines().rev()
                                 .find(|l| !l.trim().is_empty())
@@ -3497,6 +3516,15 @@ impl Agent {
                             // check above) for the rest of the command's run.
                             // The only other place this resets is an actual
                             // provided-input action, which no client sends yet.
+                            //
+                            // And say so, which is the part that was missing:
+                            // resetting these flags fixed the agent's own
+                            // bookkeeping while leaving the client's dialog up,
+                            // asking for input on behalf of a command that had
+                            // already moved on.
+                            if input_waiting || was_sent {
+                                let _ = event_tx.send(AgentEvent::ProcessInputWithdrawn);
+                            }
                             input_waiting = false;
                         }
                         let now = tokio::time::Instant::now();
@@ -5004,6 +5032,23 @@ mod tests {
         assert!(looks_like_prompt("Enter password:"));
         assert!(looks_like_prompt("Overwrite existing file? (y/N)"));
         assert!(!looks_like_prompt("some output\n"));
+
+        // And the shape this cannot tell apart, recorded rather than fixed.
+        //
+        // `global storage:` is a line a test printed before a slow assertion,
+        // and it reached a real "Input needed" dialog over a `cargo test` run.
+        // Textually it is indistinguishable from `Enter password:` — same
+        // shape, same punctuation, no word that gives either away — so no
+        // reading of the text can separate them, and a list of prompt words
+        // would only move the false positives around.
+        //
+        // It is therefore still detected here, on purpose. What changed is
+        // what happens next: the candidate has to survive two seconds of
+        // silence rather than 350ms, and once output resumes or the process
+        // exits the request is withdrawn — see `AgentEvent::ProcessInputWithdrawn`.
+        // The process settles it by carrying on, which is evidence this
+        // function does not have.
+        assert!(looks_like_prompt("global storage:"));
     }
 
     #[test]

@@ -132,6 +132,22 @@ pub enum AgentMessage {
     ProcessInputNeeded {
         prompt: String,
     },
+    /// The process was not waiting after all — drop any prompt raised for it.
+    ///
+    /// Detecting a prompt means guessing from output, because nothing portable
+    /// reports that a child is blocked reading stdin. The guess is that a line
+    /// ending in a colon followed by silence is a question; ordinary output
+    /// that happens to end in a colon and then pauses looks identical, and a
+    /// test printing `global storage:` before a slow assertion trips it.
+    ///
+    /// So the guess is retracted rather than refined. More output arriving is
+    /// proof the process was never blocked — proof from the process itself,
+    /// not another reading of its text — and the agent already acted on it
+    /// internally, resetting its own flags and carrying on. What it did not do
+    /// was say so, which left a dialog on screen demanding input for a command
+    /// that had moved on: ignorable, and therefore teaching people to ignore
+    /// the ones that are real.
+    ProcessInputWithdrawn,
     /// A background process wants input; reply with `BgProcessInput`.
     BackgroundPromptNeeded {
         bg_id: String,
@@ -289,6 +305,7 @@ impl AgentMessage {
             Self::ToolResult { .. } => "tool_result",
             Self::ToolOutput { .. } => "tool_output",
             Self::ProcessInputNeeded { .. } => "process_input_needed",
+            Self::ProcessInputWithdrawn => "process_input_withdrawn",
             Self::BackgroundPromptNeeded { .. } => "background_prompt_needed",
             Self::Usage { .. } => "usage",
             Self::UsageUpdate { .. } => "usage_update",

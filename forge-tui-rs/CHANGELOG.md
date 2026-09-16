@@ -4,6 +4,11 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ## [Unreleased]
 
+### Fixed
+
+- **A withdrawn input request is dismissed.** The agent now says when a command it thought was prompting was not — see the agent's changelog for the `cargo test` output that triggered it. The prompt clears; an approval, a plan or a question does not, because those are things a person still has to answer and a stray withdrawal must not answer one on their behalf.
+
+
 ## [0.4.2] — 2026-09-14
 
 No changes in this component; released with `forge-ide` and `forge-agent`, which share its version.

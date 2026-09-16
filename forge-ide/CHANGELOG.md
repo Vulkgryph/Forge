@@ -4,6 +4,11 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A withdrawn input request is marked resolved.** The agent now says when a command it thought was prompting was not. The card stays in the transcript and says so rather than vanishing — somebody who half-read it should not be left wondering what they missed.
+
+
 ### Changed
 
 - **The in-window browser is now only for the pages a bot check refuses.** It had grown into a small web browser: an address bar, a search page over Forge's own crawled index, a library of what had been read, and a box for crawling a new site. An editor does not need to contain that, and none of it was the reason the browser was added.

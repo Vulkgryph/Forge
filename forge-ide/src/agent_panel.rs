@@ -214,6 +214,8 @@ pub enum AgentMsg {
     ProcessInputNeeded {
         #[serde(default)] prompt: String,
     },
+    /// The process was not waiting after all — retract the request.
+    ProcessInputWithdrawn,
     BackgroundPromptNeeded {
         #[serde(default)] bg_id:   String,
         #[serde(default)] command: String,
@@ -1622,6 +1624,9 @@ impl AgentSession {
             AgentMsg::ProcessInputNeeded { prompt } => {
                 self.push_input_needed(None, String::new(), prompt, policy);
             }
+            AgentMsg::ProcessInputWithdrawn => {
+                self.withdraw_input_needed();
+            }
             AgentMsg::BackgroundPromptNeeded { bg_id, command, prompt } => {
                 self.push_input_needed(Some(bg_id), command, prompt, policy);
             }
@@ -1848,6 +1853,28 @@ impl AgentSession {
             resolved: false, resolution: String::new(),
             text: String::new(), remember_confirm: String::new(),
         });
+    }
+
+    /// Retract an unanswered foreground input request.
+    ///
+    /// Resolved rather than removed, so the transcript keeps saying what
+    /// happened — a card that vanishes leaves somebody who half-read it
+    /// wondering what they missed, and the reason is the interesting part.
+    ///
+    /// Foreground only, and unanswered only: a background process's prompt is
+    /// withdrawn by its own message, and one already answered is history.
+    fn withdraw_input_needed(&mut self) {
+        for item in self.items.iter_mut().rev() {
+            if let ChatItem::InputNeeded { bg_id: None, resolved, resolution, .. } = item {
+                if !*resolved {
+                    *resolved = true;
+                    *resolution = "The command was not waiting for input after all.".into();
+                }
+                // Only the most recent one, answered or not: anything earlier
+                // belongs to a command that has already finished.
+                return;
+            }
+        }
     }
 
     fn send_input(&mut self, bg_id: Option<String>, content: String) {

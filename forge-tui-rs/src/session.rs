@@ -689,6 +689,18 @@ impl Session {
                 self.pending = Some(Pending::ProcessInput { prompt });
             }
 
+            // The command was not waiting after all, so the question goes.
+            //
+            // Only this kind of pending state is cleared. An approval, a plan
+            // or a question is something a person still has to answer, and a
+            // stray withdrawal must not dismiss one of those on their behalf —
+            // which is the mistake a bare `self.pending = None` would make.
+            AgentMessage::ProcessInputWithdrawn => {
+                if matches!(self.pending, Some(Pending::ProcessInput { .. })) {
+                    self.pending = None;
+                }
+            }
+
             AgentMessage::BackgroundPromptNeeded { bg_id, command, prompt } => {
                 self.pending = Some(Pending::BackgroundInput { bg_id, command, prompt });
             }
@@ -2017,6 +2029,70 @@ mod tests {
                 bg_id: "b1".into(), content: "yes".into(),
             })],
         );
+    }
+
+    /// A withdrawn request goes, because the command was never waiting.
+    ///
+    /// Detecting a prompt is a guess from output — a line ending in a colon
+    /// followed by silence — and `global storage:` printed by a test before a
+    /// slow assertion is indistinguishable from `Password:`. The agent already
+    /// worked out it had guessed wrong and carried on; what it did not do was
+    /// say so, so the dialog sat there asking for input on behalf of a command
+    /// that had moved on. Ignorable, and therefore training people to ignore
+    /// the ones that are real.
+    #[test]
+    fn a_withdrawn_process_prompt_is_dismissed() {
+        let mut s = session();
+        s.apply(AgentMessage::ProcessInputNeeded { prompt: "global storage:".into() });
+        assert!(matches!(s.pending, Some(Pending::ProcessInput { .. })), "nothing was raised");
+
+        s.apply(AgentMessage::ProcessInputWithdrawn);
+        assert!(s.pending.is_none(), "the dialog outlived the command: {:?}", s.pending);
+    }
+
+    /// And must not dismiss anything a person still has to answer. A stray
+    /// withdrawal that cleared an approval would be answering it for them.
+    #[test]
+    fn a_withdrawal_does_not_clear_an_approval_or_a_question() {
+        let mut s = session();
+        s.apply(AgentMessage::ToolRequest {
+            tool_name: "shell_exec".into(),
+            tool_args: "{}".into(),
+            tool_id: "t1".into(),
+            kind: "execute".into(),
+            subagent_id: None,
+            needs_approval: true,
+        });
+        let raised = s.pending.clone();
+        assert!(raised.is_some(), "no approval was raised");
+        s.apply(AgentMessage::ProcessInputWithdrawn);
+        assert_eq!(
+            format!("{:?}", s.pending),
+            format!("{raised:?}"),
+            "a withdrawal answered an approval on the user's behalf"
+        );
+
+        let mut s = session();
+        s.apply(AgentMessage::QuestionRequest {
+            question: "which one?".into(),
+            tool_id: "q1".into(),
+            items: Vec::new(),
+        });
+        s.apply(AgentMessage::ProcessInputWithdrawn);
+        assert!(
+            matches!(s.pending, Some(Pending::Question { .. })),
+            "a withdrawal dismissed a question: {:?}",
+            s.pending
+        );
+    }
+
+    /// A withdrawal with nothing pending is not an error — the agent sends one
+    /// whenever output resumes, which is usually when nothing was raised.
+    #[test]
+    fn a_withdrawal_with_nothing_pending_is_harmless() {
+        let mut s = session();
+        s.apply(AgentMessage::ProcessInputWithdrawn);
+        assert!(s.pending.is_none());
     }
 
     #[test]

@@ -4,6 +4,15 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **A command that was not waiting for input stops asking.** `cargo test -- --nocapture` streams a test's own `println!`s, and a test that prints a label before a slow assertion — `global storage:`, `struct-layout:` — produces a line ending in a colon followed by silence. That is exactly the shape of `Password:`, so it raised a real "Input needed" dialog over a test run.
+
+  No reading of the text can separate those two; a list of prompt words would only move the false positives around. So the guess is retracted instead. The agent already worked out it had guessed wrong — output resuming meant the process was never blocked, and it reset its own flags and carried on — but it never told the client, so the dialog stayed up asking for input on behalf of a command that had moved on. Ignorable, which is how people learn to ignore the ones that are real.
+
+  A new `process_input_withdrawn` message says so, sent when output resumes or the process exits. The evidence is the process carrying on, which is stronger than anything a heuristic could read off its text. The candidate also has to survive two seconds of silence now rather than 350 ms: the window is not a latency budget, since a person takes seconds to read a prompt and longer to answer, so offering input 1.65 s later costs nothing anybody can feel — and the pauses ordinary output takes between assertions or crates are short, while a process genuinely blocked on stdin is silent until answered.
+
+
 ### Added
 
 - **`search_documents` — ranked retrieval over a folder of documents on this machine.** The engine's value was only reachable through a network fetch, which put it out of reach of the corpus most people actually have: a directory of reports, runbooks, notes or papers on their own disk. Nothing about an inverted index cares whether the words arrived over a socket.

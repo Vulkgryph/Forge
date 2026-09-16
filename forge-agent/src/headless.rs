@@ -86,6 +86,8 @@ enum OutgoingMessage {
     ProcessInputNeeded {
         prompt: String,
     },
+    /// The process was not waiting after all — drop the prompt raised for it.
+    ProcessInputWithdrawn,
     BackgroundPromptNeeded {
         bg_id: String,
         command: String,
@@ -465,6 +467,7 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
         AgentEvent::ProcessInputNeeded { prompt } => OutgoingMessage::ProcessInputNeeded {
             prompt: prompt.clone(),
         },
+        AgentEvent::ProcessInputWithdrawn => OutgoingMessage::ProcessInputWithdrawn,
         AgentEvent::BackgroundPromptNeeded {
             bg_id,
             command,

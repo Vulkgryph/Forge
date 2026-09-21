@@ -839,6 +839,7 @@ mod tests {
             trail: vec!["Top".into()],
             lines: Some((120, 186)),
             text: "something".into(),
+            part: None,
         };
         let url = section_url(path, &section);
         assert_eq!(url, "file:///docs/my%20notes/a%20file.md#L120-186");

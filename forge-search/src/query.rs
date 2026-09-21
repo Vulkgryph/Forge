@@ -329,17 +329,36 @@ pub fn normalise_host(input: &str) -> Option<String> {
 /// A host for a crawled page: two threads on one forum are one source agreeing
 /// with itself, while the same claim on two hosts is two sources.
 ///
-/// A file, without its fragment, for a local document — because a local
-/// document is indexed as its sections, and each section carries a `#` range
-/// of its own. Keyed on the host this would have given every section its own
-/// group, since a `file://` URL has no host at all, and one file's five
-/// sections could take every slot in the result. The file is the unit that
-/// matters: two sections of one runbook are one source, and the second and
-/// third are still reachable through the backfill when nothing else answers.
+/// The containing directory, for a local document.
+///
+/// The file was the first answer and it is too fine. Measured on a real corpus
+/// of 176 notes: asked "new testament manuscript evidence", three of five
+/// slots went to `jehovahs_witnesses/` — its arguments, its texts, and its
+/// textual reliability, three separate files saying one thing from one point
+/// of view, while Christianity's own page on the subject was pushed to fourth.
+/// Those results were each relevant and together they were a monoculture.
+///
+/// A directory in a document tree is what a host is on the web: the best
+/// available proxy for "one source". It is a heuristic and worth saying so — a
+/// tree organised by year would key on dates, which are not viewpoints — but
+/// the alternatives are worse. The file treats one author's several notes as
+/// independent, and the whole corpus treats everything as one source and
+/// spreads nothing.
+///
+/// Nothing is lost either way: past the cap, results are deferred rather than
+/// dropped and still fill the list in score order when no other source has
+/// anything. In a flat folder, where every note shares one directory, that
+/// backfill is the whole list — so this costs nothing there.
 fn source_of(index: &Index, doc: DocId) -> String {
     if let Some(doc) = index.document(doc) {
         if let Some(rest) = doc.url.strip_prefix("file://") {
-            return rest.split('#').next().unwrap_or(rest).to_string();
+            let path = rest.split('#').next().unwrap_or(rest);
+            return match path.rfind('/') {
+                // The directory, or the file itself when it is at the root —
+                // which then behaves as it did before.
+                Some(cut) => path[..cut].to_string(),
+                None => path.to_string(),
+            };
         }
     }
     host_of(index, doc)

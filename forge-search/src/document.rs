@@ -63,13 +63,27 @@ pub struct Section {
     pub lines: Option<(usize, usize)>,
     /// The readable text, with markup stripped.
     pub text: String,
+    /// Which part of a divided section this is, one-based, when one section
+    /// was too long to keep whole.
+    ///
+    /// `None` for a section that stands on its own. It exists because the
+    /// parts are otherwise indistinguishable: they inherit the same heading
+    /// trail, so a result list showed "Christianity — Textual Reliability ›
+    /// The Gospel Contradictions" twice, at positions one and three, with
+    /// nothing to say why. Found on a real corpus; the well-structured one
+    /// this was built against never split a section at all.
+    pub part: Option<usize>,
 }
 
 impl Section {
     /// The section's name: its heading trail, or empty for an unstructured
     /// one. The caller supplies a fallback, since only it knows the file name.
     pub fn title(&self) -> String {
-        self.trail.join(" › ")
+        let name = self.trail.join(" › ");
+        match self.part {
+            Some(n) => format!("{name} (part {n})"),
+            None => name,
+        }
     }
 }
 
@@ -186,6 +200,7 @@ fn by_heading(source: &str) -> Vec<Section> {
                         trail: trail.iter().map(|(_, t)| t.clone()).collect(),
                         lines: Some((number, number)),
                         text: String::new(),
+                        part: None,
                     };
                     continue;
                 }
@@ -299,7 +314,7 @@ fn regroup(pieces: Vec<Section>) -> Vec<Section> {
 /// One oversized section cut at paragraph boundaries.
 fn split_long(section: &Section) -> Vec<Section> {
     let start = section.lines.map(|(a, _)| a);
-    let mut out = Vec::new();
+    let mut out: Vec<Section> = Vec::new();
     let mut text = String::new();
     let mut first = start;
     let mut line = start;
@@ -312,6 +327,7 @@ fn split_long(section: &Section) -> Vec<Section> {
                 trail: section.trail.clone(),
                 lines: first.zip(line),
                 text: std::mem::take(&mut text),
+                part: Some(out.len() + 1),
             });
             first = line;
         }
@@ -320,10 +336,14 @@ fn split_long(section: &Section) -> Vec<Section> {
         line = line.map(|l| l + height);
     }
     if !text.trim().is_empty() {
+        // Numbered only when there is more than one, so a section that turned
+        // out to fit after all is not labelled "part 1" of itself.
+        let part = (!out.is_empty()).then(|| out.len() + 1);
         out.push(Section {
             trail: section.trail.clone(),
             lines: first.zip(section.lines.map(|(_, b)| b)),
             text,
+            part,
         });
     }
     out
@@ -346,6 +366,7 @@ fn by_paragraph(text: &str, start: Option<usize>) -> Vec<Section> {
                 trail: Vec::new(),
                 lines: first.zip(line),
                 text: std::mem::take(&mut current),
+                part: None,
             });
             first = line;
         }
@@ -358,6 +379,7 @@ fn by_paragraph(text: &str, start: Option<usize>) -> Vec<Section> {
             trail: Vec::new(),
             lines: first.zip(line.map(|l| l.saturating_sub(1))).map(|(a, b)| (a, b.max(a))),
             text: current,
+            part: None,
         });
     }
     out
@@ -553,8 +575,30 @@ mod tests {
                 words(&section.text)
             );
             // Every piece keeps the name of what it came from.
-            assert_eq!(section.title(), "Wall");
+            assert!(section.title().starts_with("Wall"), "{}", section.title());
         }
+
+        // And the pieces are told apart. They inherit one heading trail, so
+        // without this a result list showed the same title twice with nothing
+        // to say why — seen on a real corpus, at positions one and three.
+        let titles: Vec<String> = got.sections.iter().map(|s| s.title()).collect();
+        let distinct: std::collections::HashSet<&String> = titles.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            titles.len(),
+            "two parts of one section are indistinguishable: {titles:?}",
+        );
+        assert_eq!(got.sections[0].part, Some(1));
+        assert_eq!(got.sections[1].part, Some(2));
+    }
+
+    /// A section that was never divided is not labelled a part of itself.
+    #[test]
+    fn an_undivided_section_has_no_part_number() {
+        let got = read_md("# Whole\n\nShort enough to keep.\n");
+        assert_eq!(got.sections.len(), 1);
+        assert_eq!(got.sections[0].part, None);
+        assert_eq!(got.sections[0].title(), "Whole");
     }
 
     /// A `#` inside a shell snippet is a comment, not a heading — splitting

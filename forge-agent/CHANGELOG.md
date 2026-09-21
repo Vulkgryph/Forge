@@ -59,6 +59,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **Local results spread across directories, and divided sections say which part they are.** Both found by running `search_documents` over a real corpus — 176 markdown notes organised as `<topic>/<aspect>.md` — after the well-structured corpus it was built against showed neither.
+
+  Asked "new testament manuscript evidence", three of five slots went to one topic folder: its arguments, its texts and its textual reliability, three files saying one thing from one point of view, while the page most directly on the subject was pushed to fourth. Each result was relevant and together they were a monoculture. Results were spread by *file*, which treats one author's several notes as independent sources. A directory in a document tree is what a host is on the web — the best available proxy for one source — and with that the folder takes two slots and the displaced page rises to third. Nothing is dropped either way: past the cap results are deferred and still fill the list in score order, so a flat folder behaves exactly as before.
+
+  A long section divided at a paragraph boundary also inherited one heading trail, so the same title appeared twice in one result list, at positions one and three, with nothing to say why. Parts are numbered now.
+
 - **The agent knows whether the client it is talking to can open a page, and stops giving advice that only works in one of them.** It offered the browser handoff regardless. In the IDE that is right; in a terminal it is a dead end — there is nothing to show a page in and nothing to read one back from — so the agent sent a person off to do something impossible and then waited for a result that could not arrive.
 
   The host declares it at spawn with `--host-can-browse`. A flag rather than a protocol message, because of ordering: a capability that arrives over the wire can arrive *after* the agent has already been refused a page, and the advice it gave was then based on not knowing. Spawn time is the one moment this is certainly known and cannot change. Named for the capability rather than the client, because the agent has no business knowing whether it is an editor or a terminal — only whether asking somebody to open a page is a real option.

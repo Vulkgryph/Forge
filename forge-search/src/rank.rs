@@ -232,16 +232,16 @@ pub fn features(index: &Index, doc: DocId, terms: &[String]) -> Option<Features>
         tokenize::terms(&document.title).into_iter().collect();
 
     let mut f = Features::default();
-    let mut present = 0usize;
+    let mut found = 0.0f64;
 
     for term in terms {
         let positions = index.positions(term, doc);
         if positions.is_empty() {
             continue;
         }
-        present += 1;
         let tf = positions.len() as f64;
         let weight = idf(index, term);
+        found += weight;
         // BM25's saturating term frequency, normalised by document length.
         let saturated = (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * length / average));
         f.bm25 += weight * saturated;
@@ -253,22 +253,31 @@ pub fn features(index: &Index, doc: DocId, terms: &[String]) -> Option<Features>
         }
     }
 
-    // Terms the corpus contains at all. A term in no document cannot separate
-    // one document from another, so counting it in the denominator measures
-    // the query's vocabulary rather than the document's relevance — a search
-    // for "10W30" against a corpus that only ever writes "10W-30" penalised
-    // every page equally for a word none of them use.
+    // How much of the query's *information* the document holds, not how many
+    // of its words.
     //
-    // It does not reorder anything on its own, since the same denominator
-    // applies to every candidate. It makes the number mean what it says,
-    // which matters because it is reported and because a learned ranker
-    // would otherwise be fitting to a constant.
-    let answerable = terms
+    // Weighted by IDF, because counting words equally makes coverage say the
+    // opposite of what it means. Asked "how does the agent handle a cloudflare
+    // bot check", a document about shell timeouts matches `how`, `does`, `the`,
+    // `agent`, `handle` and `check` while missing only `cloudflare` — six words
+    // of seven, so it reported 0.75 coverage and sat in the results looking
+    // like a near miss. It is not a near miss. `cloudflare` was the question;
+    // the rest is grammar. Weighted, that document loses most of the
+    // denominator and drops away, while the document that has `cloudflare`
+    // keeps nearly all of it.
+    //
+    // Terms the corpus does not contain at all are still excluded, which is a
+    // separate correction and still right: a term in no document cannot
+    // separate one document from another, so counting it measures the query's
+    // vocabulary rather than the document's relevance — a search for "10W30"
+    // against a corpus that only ever writes "10W-30" penalised every page
+    // equally for a word none of them use.
+    let answerable: f64 = terms
         .iter()
         .filter(|t| index.document_frequency(t) > 0)
-        .count()
-        .max(1);
-    f.coverage = present as f64 / answerable as f64;
+        .map(|t| idf(index, t))
+        .sum();
+    f.coverage = if answerable > 0.0 { (found / answerable).min(1.0) } else { 1.0 };
     f.prose = if document.term_count < MIN_TERMS_TO_JUDGE_SHAPE {
         1.0
     } else {
@@ -601,12 +610,11 @@ mod tests {
         assert!(hits.iter().all(|h| h.features.phrase == 0.0));
     }
 
-    /// Coverage is the fraction of the query a document contains. It used to
-    /// be 1.0 for everything, because only documents with every term were ever
-    /// candidates; now that a near miss can reach ranking, it carries real
-    /// information and is what keeps widening honest.
+    /// Coverage is the share of the query's *information* a document holds,
+    /// not the share of its words. A complete match is 1.0 and a partial one
+    /// is less, which is what keeps widening honest.
     #[test]
-    fn coverage_is_the_fraction_of_the_query_found() {
+    fn coverage_is_the_share_of_the_query_found() {
         let ix = corpus();
         // "Allocators" has the allocator but never says no_std.
         let hits = search(&ix, "no_std allocator", 10);
@@ -614,8 +622,62 @@ mod tests {
         assert_eq!(full.features.coverage, 1.0);
         let partial = hits.iter().find(|h| url_of(&ix, h).ends_with("/alloc"));
         if let Some(p) = partial {
-            assert_eq!(p.features.coverage, 0.5);
+            assert!(
+                p.features.coverage < 1.0,
+                "a document missing a query term reported full coverage",
+            );
         }
+    }
+
+    /// Missing the query's *rare* word costs more than missing its common one,
+    /// which counting words cannot express and is the whole reason coverage is
+    /// weighted.
+    ///
+    /// The case that prompted it: asked "how does the agent handle a cloudflare
+    /// bot check", a section about shell timeouts matched every word except
+    /// `cloudflare` — six of seven — and so reported 0.75 coverage and sat in
+    /// the results looking like a near miss. It is not a near miss. One word
+    /// was the question and the rest was grammar.
+    #[test]
+    fn missing_a_rare_term_costs_more_than_missing_a_common_one() {
+        let mut ix = Index::new();
+        // `common` is everywhere, so it discriminates nothing; `zebra` is in
+        // one document, so it is the whole question.
+        for i in 0..40 {
+            ix.add(
+                &format!("https://a.example/{i}"),
+                "Filler",
+                "",
+                "common words about common things, common enough to be common.",
+            );
+        }
+        ix.add("https://a.example/rare", "Rare", "", "the zebra is here, and common too.");
+        ix.add("https://a.example/only-rare", "Only rare", "", "the zebra stands alone.");
+
+        let hits = search(&ix, "common zebra", 50);
+        let by = |needle: &str| {
+            hits.iter()
+                .find(|h| url_of(&ix, h).ends_with(needle))
+                .unwrap_or_else(|| panic!("{needle} did not rank at all"))
+        };
+
+        let both = by("/rare").features.coverage;
+        let rare_only = by("/only-rare").features.coverage;
+        let common_only = by("/0").features.coverage;
+
+        assert_eq!(both, 1.0, "a document with both terms is not fully covered");
+        assert!(
+            rare_only > common_only,
+            "missing the rare term ({common_only:.3}) was not penalised more than \
+             missing the common one ({rare_only:.3})",
+        );
+        // And the gap is decisive rather than cosmetic: a document with only
+        // the common word has found almost none of what was asked.
+        assert!(
+            common_only < 0.25,
+            "a document matching only the query's commonest word reported \
+             {common_only:.3} coverage",
+        );
     }
 
     /// The case this was built for, in miniature.

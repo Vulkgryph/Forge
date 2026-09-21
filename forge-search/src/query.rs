@@ -271,6 +271,37 @@ fn spread_across_hosts(
     kept
 }
 
+/// Query terms the index holds no document for, in the order they were typed.
+///
+/// What a result cannot say for itself. Ranking necessarily ignores a term no
+/// document contains — it cannot separate one document from another, so it is
+/// excluded from the coverage denominator — but the *caller* very much needs to
+/// know, because it is the difference between "nothing here answers that" and
+/// "this corpus has never heard of the thing you asked about".
+///
+/// Asked "what oil does a tractor take" of a corpus with no `oil` and no
+/// `tractor` in it, the engine matched `what`, `does`, `a` and `take`, scored
+/// them a perfect coverage — truthfully, since those were everything findable —
+/// and returned five sections about window management. Reporting the two words
+/// that drew a blank turns that from a wrong answer into an obvious one.
+///
+/// Stop words are left out. `the` missing from an index would be a remarkable
+/// fact about the index rather than about the question, and listing it as a gap
+/// would bury the words that matter.
+pub fn unanswered_terms(index: &Index, input: &str) -> Vec<String> {
+    let query = Query::parse(input);
+    let mut out: Vec<String> = Vec::new();
+    for term in &query.required {
+        if crate::tokenize::is_stop_word(term) || index.document_frequency(term) > 0 {
+            continue;
+        }
+        if !out.contains(term) {
+            out.push(term.clone());
+        }
+    }
+    out
+}
+
 /// A host as the index spells it: no scheme, no path, no leading `www.`.
 ///
 /// `None` for something with no host in it at all, which is a caller's typo
@@ -636,6 +667,50 @@ fn first_words(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A query whose subject the index has never heard of still matches on its
+    /// grammar, and every number in the result is then truthful and useless.
+    /// The words that drew a blank are the only thing that says so.
+    #[test]
+    fn words_the_index_has_never_seen_are_reported() {
+        let mut ix = Index::new();
+        ix.add("https://a.example/1", "Windows", "", "what does a window take to restart");
+
+        // The real case: asked about a tractor, a corpus about software matched
+        // `what`, `does` and `take` and answered with window management.
+        let missing = unanswered_terms(&ix, "what oil does a tractor take");
+        assert_eq!(missing, vec!["oil", "tractor"], "{missing:?}");
+
+        // Nothing to report when the corpus knows every word.
+        assert!(unanswered_terms(&ix, "window restart").is_empty());
+    }
+
+    /// Stop words are not gaps. `the` missing from an index would be a fact
+    /// about the index rather than the question, and listing it would bury the
+    /// words that matter.
+    #[test]
+    fn stop_words_are_not_reported_as_gaps() {
+        let ix = Index::new();
+        let missing = unanswered_terms(&ix, "the oil of a tractor and the filter");
+        assert_eq!(missing, vec!["oil", "tractor", "filter"], "{missing:?}");
+    }
+
+    /// Reported once, in the order they were typed — a query that repeats a
+    /// word should not repeat the complaint.
+    #[test]
+    fn a_repeated_gap_is_reported_once() {
+        let ix = Index::new();
+        assert_eq!(unanswered_terms(&ix, "tractor oil tractor"), vec!["tractor", "oil"]);
+    }
+
+    /// An excluded term is not a gap: `-foo` asks for documents *without* foo,
+    /// so its absence is the point rather than a shortfall.
+    #[test]
+    fn an_excluded_term_is_not_a_gap() {
+        let mut ix = Index::new();
+        ix.add("https://a.example/1", "Oil", "", "the oil is thirty weight");
+        assert!(unanswered_terms(&ix, "oil -tractor").is_empty());
+    }
 
     /// Naming a site narrows the answer to it. Without this, a crawl for one
     /// question stayed in the running for every question after it.

@@ -554,6 +554,17 @@ fn render(
         out.push_str(&format!(" within {}", seeds.join(", ")));
     }
     out.push_str(":\n\n");
+    // Words the index has never seen, which no result can say for itself: a
+    // query still matches on its grammar when its subject is absent, and every
+    // number in the result is then truthful and useless.
+    let missing = forge_search::query::unanswered_terms(index, query_text);
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            "No page read so far contains {} — the results below matched on the rest \
+             of the query.\n\n",
+            missing.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", "),
+        ));
+    }
     for (i, hit) in hits.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, if hit.title.is_empty() { &hit.url } else { &hit.title }));
         out.push_str(&format!("   {}\n", hit.url));

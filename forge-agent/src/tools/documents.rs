@@ -390,6 +390,7 @@ fn render(
 
     if hits.is_empty() {
         out.push_str(&format!("No results for {query_text:?}.\n"));
+        render_unanswered(&mut out, index, query_text);
         if index.is_empty() {
             out.push_str(
                 "No documents have been indexed for this project. Pass `paths` with a \
@@ -435,6 +436,7 @@ fn render(
         }
         out.push('\n');
     }
+    render_unanswered(&mut out, index, query_text);
     render_indexing(&mut out, report);
     out.push_str(&format!(
         "[{} section(s) indexed across the documents read. Each result is one section, \
@@ -442,6 +444,28 @@ fn render(
         index.len(),
     ));
     out
+}
+
+/// Query words no indexed document contains.
+///
+/// The one thing a result list cannot say about itself. A query whose
+/// distinctive words are absent still matches on its grammar — `what oil does
+/// a tractor take` against this corpus matched `what`, `does`, `a` and `take`
+/// and returned sections about window management — and every number in the
+/// result was then truthful and useless. Two words reported as blanks turn a
+/// wrong answer into an obviously wrong one.
+fn render_unanswered(out: &mut String, index: &Index, query_text: &str) {
+    let missing = forge_search::query::unanswered_terms(index, query_text);
+    if missing.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "No indexed document contains {} — so nothing above was matched on {}. \
+         Either the documents holding that have not been read yet, or they use \
+         different words for it.\n",
+        missing.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", "),
+        if missing.len() == 1 { "it" } else { "them" },
+    ));
 }
 
 /// What the indexing pass did, when it did anything worth saying.
@@ -875,6 +899,29 @@ mod tests {
         // rather than a rule.
         let out = search(&root, "pangolins", &["target"]);
         assert!(out.contains("generated.md"), "a named directory was still skipped: {out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The result has to say when the query's subject is absent. Asked about a
+    /// tractor, a corpus of software notes matched `what`, `does` and `take`
+    /// and answered with something about deployment — truthfully scored, since
+    /// those were everything findable, and completely useless.
+    #[test]
+    fn words_the_corpus_has_never_seen_are_named_in_the_result() {
+        let root = tree("gaps", &[
+            ("notes.md", "# Deployment\n\nWhat does a deploy take? It takes a region.\n"),
+        ]);
+
+        let out = search(&root, "what oil does a tractor take", &["."]);
+        assert!(out.contains("No indexed document contains"), "{out}");
+        assert!(out.contains("\"oil\""), "{out}");
+        assert!(out.contains("\"tractor\""), "{out}");
+
+        // And says nothing when every word is known, rather than adding a line
+        // to every result.
+        let clean = search(&root, "deploy region", &[]);
+        assert!(!clean.contains("No indexed document contains"), "{clean}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

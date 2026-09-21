@@ -63,6 +63,23 @@ const MAX_RESULTS: usize = 5;
 /// would then answer for the whole of it.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Most sections one file may contribute.
+///
+/// A bound on what a single file can do to the index. At the target section
+/// size this is roughly seventeen thousand words — a long document by any
+/// measure — and past it the file is almost certainly data rather than prose.
+///
+/// Found on a real tree: a `.txt` of Wikipedia articles used as training data
+/// has no headings and a hundred thousand words, so it divided into three
+/// hundred and sixty-five sections, all named after the file's first line.
+/// Two such files put `= Robert Boulter = (part 365)` in the results twice for
+/// a query about training a network. Indexing a corpus as though it were notes
+/// does not make it findable, it makes everything else less so.
+///
+/// What is dropped is reported, because a document cut short is exactly the
+/// kind of thing that otherwise reads as the search having missed something.
+const MAX_SECTIONS_PER_FILE: usize = 50;
+
 /// Most files indexed in one call.
 ///
 /// A bound on the surprise rather than on the corpus: somebody who points this
@@ -134,6 +151,9 @@ struct Indexed {
     too_large: usize,
     /// Files whose extension is readable but whose content is not text.
     not_text: usize,
+    /// Files that divided into more sections than one file may contribute,
+    /// with the name of the largest and how many it wanted.
+    oversized: Vec<(String, usize)>,
     /// Files that could not be read at all — permissions, a broken link.
     unreadable: usize,
     /// Whether the per-call file cap was reached.
@@ -347,12 +367,22 @@ fn ingest(
     }
 
     let mut added = Vec::new();
-    for section in &document.sections {
+    // Bounded: see `MAX_SECTIONS_PER_FILE`. The head of a document is the part
+    // most likely to say what it is, so the cut is at the end rather than
+    // sampled — and it is reported, not silent.
+    if document.sections.len() > MAX_SECTIONS_PER_FILE {
+        report
+            .oversized
+            .push((key.clone(), document.sections.len()));
+    }
+    for section in document.sections.iter().take(MAX_SECTIONS_PER_FILE) {
         let url = section_url(path, section);
-        let title = match section.title() {
-            trail if trail.is_empty() => document.title.clone(),
-            trail => trail,
-        };
+        // The section's heading, or the document's own name when it has none
+        // — and the part number either way. Composed here because only the
+        // caller knows the fallback.
+        let heading = section.heading();
+        let name = if heading.is_empty() { document.title.as_str() } else { heading.as_str() };
+        let title = section.named(name);
         added.push(index.add(&url, &title, "", &section.text));
         report.sections += 1;
     }
@@ -486,6 +516,21 @@ fn render_indexing(out: &mut String, report: &Indexed) {
             "Read {} new or changed document(s) as {} section(s); {} already indexed and \
              unchanged.\n",
             report.added, report.sections, report.unchanged,
+        ));
+    }
+    if !report.oversized.is_empty() {
+        let worst = report
+            .oversized
+            .iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(name, n)| format!("{name} wanted {n}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{} file(s) divided into more than {MAX_SECTIONS_PER_FILE} sections and were \
+             indexed up to that point only ({worst}). A file that large with that little \
+             structure is usually data rather than a document; if it is one you need, \
+             search it with search_code or read it directly.\n",
+            report.oversized.len(),
         ));
     }
     for (count, why) in [
@@ -923,6 +968,48 @@ mod tests {
         // to every result.
         let clean = search(&root, "deploy region", &[]);
         assert!(!clean.contains("No indexed document contains"), "{clean}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One data file must not swamp the index.
+    ///
+    /// Found on a real tree: `data/wikitext-103/test_articles.txt` is a
+    /// hundred thousand words of Wikipedia with no headings, so it divided
+    /// into 380 sections — and four such files turned 303 documents into 1,974
+    /// sections, two of which answered a query about training a network with
+    /// the same title twice. Indexing a corpus as though it were notes does
+    /// not make it findable; it makes everything else less so.
+    #[test]
+    fn a_file_that_is_really_data_is_capped_and_reported() {
+        // No headings and far past the cap, which is what a dataset looks
+        // like to this tool.
+        let paragraph = format!("{}\n\n", "sentence about something ".repeat(60));
+        let data = paragraph.repeat(400);
+        let root = tree("capped", &[
+            ("notes.md", "# Real note\n\nAbout the training loop.\n"),
+            ("data/corpus.txt", &data),
+        ]);
+
+        let out = search(&root, "training loop", &["."]);
+        assert!(out.contains("divided into more than"), "the cap was silent: {out}");
+        assert!(out.contains("corpus.txt"), "the file was not named: {out}");
+        assert!(out.contains("search_code"), "no better tool suggested: {out}");
+
+        // The real note still answers, which is the point of capping.
+        assert!(out.contains("Real note"), "{out}");
+
+        // And the section count reflects the cap rather than the file.
+        let sections: usize = out
+            .split(" section(s) indexed")
+            .next()
+            .and_then(|s| s.rsplit('[').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(usize::MAX);
+        assert!(
+            sections <= super::MAX_SECTIONS_PER_FILE + 4,
+            "{sections} sections indexed, so the cap did not hold",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

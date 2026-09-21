@@ -79,10 +79,29 @@ impl Section {
     /// The section's name: its heading trail, or empty for an unstructured
     /// one. The caller supplies a fallback, since only it knows the file name.
     pub fn title(&self) -> String {
-        let name = self.trail.join(" › ");
+        self.named(&self.heading())
+    }
+
+    /// The heading trail alone, empty for a document with no headings.
+    pub fn heading(&self) -> String {
+        self.trail.join(" › ")
+    }
+
+    /// `name`, with the part number when this is one piece of a divided
+    /// section.
+    ///
+    /// Takes the name rather than using the trail, because a document with no
+    /// headings has no trail and the caller is the only thing that knows what
+    /// to call it — its file name, usually. Composing it here got that wrong
+    /// in a way a real corpus showed at once: a plain-text file produced
+    /// results titled `" (part 2)"`, a part number and nothing else, because
+    /// the empty trail was joined with the part and the caller's fallback
+    /// never got a chance to apply.
+    pub fn named(&self, name: &str) -> String {
         match self.part {
+            Some(n) if name.is_empty() => format!("part {n}"),
             Some(n) => format!("{name} (part {n})"),
-            None => name,
+            None => name.to_string(),
         }
     }
 }
@@ -355,6 +374,10 @@ fn split_long(section: &Section) -> Vec<Section> {
 /// numbers did not survive extraction.
 fn by_paragraph(text: &str, start: Option<usize>) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
+    // Numbered, because a file with no headings gives every section the same
+    // name — the caller falls back to the file's own — so two pieces of one
+    // plain-text file were indistinguishable in a result list. Seen on a real
+    // tree of `.txt` data.
     let mut current = String::new();
     let mut first = start;
     let mut line = start;
@@ -366,7 +389,7 @@ fn by_paragraph(text: &str, start: Option<usize>) -> Vec<Section> {
                 trail: Vec::new(),
                 lines: first.zip(line),
                 text: std::mem::take(&mut current),
-                part: None,
+                part: Some(out.len() + 1),
             });
             first = line;
         }
@@ -375,11 +398,14 @@ fn by_paragraph(text: &str, start: Option<usize>) -> Vec<Section> {
         line = line.map(|l| l + height);
     }
     if !current.trim().is_empty() {
+        // Numbered only when the file produced more than one, so a short
+        // document is not labelled part one of itself.
+        let part = (!out.is_empty()).then(|| out.len() + 1);
         out.push(Section {
             trail: Vec::new(),
             lines: first.zip(line.map(|l| l.saturating_sub(1))).map(|(a, b)| (a, b.max(a))),
             text: current,
-            part: None,
+            part,
         });
     }
     out
@@ -590,6 +616,43 @@ mod tests {
         );
         assert_eq!(got.sections[0].part, Some(1));
         assert_eq!(got.sections[1].part, Some(2));
+    }
+
+    /// A file with no headings still gives its sections distinct names.
+    ///
+    /// Plain text has no trail, so every section falls back to the document's
+    /// own name and they were indistinguishable in a result list — seen on a
+    /// real tree of `.txt` data, where two hits shared one title and a third
+    /// rendered as `" (part 2)"`: a part number and nothing else, because the
+    /// empty trail had been joined with it.
+    #[test]
+    fn untitled_sections_are_still_told_apart() {
+        let para = format!("{}\n\n", "word ".repeat(120));
+        let source = format!("A plain text file\n\n{}", para.repeat(10));
+        let got = read(source.as_bytes(), "data.txt", "txt").unwrap();
+        assert!(got.sections.len() > 1, "not enough sections to collide");
+
+        // No heading, so the caller supplies the name — and the part is what
+        // separates them.
+        let named: Vec<String> = got.sections.iter().map(|s| s.named("data.txt")).collect();
+        let distinct: std::collections::HashSet<&String> = named.iter().collect();
+        assert_eq!(distinct.len(), named.len(), "sections share one name: {named:?}");
+        assert_eq!(named[0], "data.txt (part 1)");
+
+        // And never a bare part number with no name in front of it.
+        for name in &named {
+            assert!(!name.starts_with(' '), "a nameless title: {name:?}");
+            assert!(name.contains("data.txt"), "the fallback name was lost: {name:?}");
+        }
+    }
+
+    /// With no name to fall back on either, a part still reads as something
+    /// rather than as leading whitespace.
+    #[test]
+    fn a_part_with_no_name_at_all_still_reads() {
+        let section = Section { part: Some(2), ..Section::default() };
+        assert_eq!(section.named(""), "part 2");
+        assert_eq!(section.title(), "part 2");
     }
 
     /// A section that was never divided is not labelled a part of itself.

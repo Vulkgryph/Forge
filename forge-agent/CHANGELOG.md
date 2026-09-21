@@ -59,6 +59,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **One data file can no longer swamp the document index, and sections of an untitled file are told apart.** Found by pointing `search_documents` at a machine-learning project: `data/wikitext-103/test_articles.txt` is a hundred thousand words of Wikipedia with no headings, so it divided into 380 sections, and four such files turned 303 documents into 1,974. A query about training a network was answered with the same title twice, from two datasets.
+
+  A file may now contribute at most 50 sections — roughly seventeen thousand words, a long document by any measure — and what was dropped is reported by name, with a pointer to `search_code` for a file that really is data. On that project it took the index from 1,974 sections to 754 and halved the time to build it. Indexing a corpus as though it were notes does not make it findable; it makes everything else less so.
+
+  Plain text has no headings, so every section fell back to the document's own name and they were indistinguishable in a result list — and one rendered as `" (part 2)"`, a part number and nothing else, because the empty heading trail had been joined with it. The part number now composes with whatever name the caller has, and a nameless part reads as `part 2` rather than as leading whitespace.
+
 - **Local results spread across directories, and divided sections say which part they are.** Both found by running `search_documents` over a real corpus — 176 markdown notes organised as `<topic>/<aspect>.md` — after the well-structured corpus it was built against showed neither.
 
   Asked "new testament manuscript evidence", three of five slots went to one topic folder: its arguments, its texts and its textual reliability, three files saying one thing from one point of view, while the page most directly on the subject was pushed to fourth. Each result was relevant and together they were a monoculture. Results were spread by *file*, which treats one author's several notes as independent sources. A directory in a document tree is what a host is on the web — the best available proxy for one source — and with that the folder takes two slots and the displaced page rises to third. Nothing is dropped either way: past the cap results are deferred and still fill the list in score order, so a flat folder behaves exactly as before.

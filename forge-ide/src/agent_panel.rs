@@ -1247,6 +1247,19 @@ impl AgentSession {
         let result: Result<(Child, ChildStdin), String> = (|| {
             let mut cmd = Command::new(resolve_forge_agent_path());
             cmd.arg("--headless").current_dir(cwd);
+            // This client can put a page in front of a person and hand the
+            // result back, which changes what the agent should suggest when a
+            // bot check refuses it — see the agent's `--host-can-browse`.
+            //
+            // Gated on the platform, because the capability is: `webview` is
+            // macOS-only, so on Linux or Windows this window has no browser
+            // either and claiming one would be the exact failure the flag
+            // exists to prevent — the agent would raise a request, a tab would
+            // open with nothing in it, and nobody could answer. Declaring a
+            // capability has to track the thing that provides it, or it is
+            // just a second place to be wrong.
+            #[cfg(target_os = "macos")]
+            cmd.arg("--host-can-browse");
             if let Some(id) = resume {
                 cmd.arg("--resume-session").arg(id);
             }

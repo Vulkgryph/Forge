@@ -508,7 +508,20 @@ impl SshConnection {
 
         // `cd` first so the agent's project root is the remote workspace. Its
         // own default would be whatever directory the SSH session started in.
-        let mut command = format!("cd {} && {agent} --headless", shell_quote_path(cwd));
+        // `--host-can-browse` applies to a remote agent too: the capability
+        // belongs to this client, not to the machine the agent runs on. A
+        // refused page is a public URL, so the browser here can fetch it and
+        // the HTML goes back over the same protocol.
+        //
+        // Gated on this platform rather than the remote one, for that reason —
+        // and because `webview` is macOS-only, so a Linux or Windows window
+        // has no browser to offer however capable the remote host is.
+        let can_browse = cfg!(target_os = "macos");
+        let mut command = format!(
+            "cd {} && {agent} --headless{}",
+            shell_quote_path(cwd),
+            if can_browse { " --host-can-browse" } else { "" },
+        );
         if let Some(id) = resume {
             command.push_str(&format!(" --resume-session {}", shell_quote(id)));
         }

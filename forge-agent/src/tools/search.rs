@@ -627,11 +627,27 @@ fn render_challenges(out: &mut String, timing: &Timing) {
     if !timing.challenged_hosts.is_empty() {
         out.push_str(&format!(" ({})", timing.challenged_hosts.join(", ")));
     }
-    out.push_str(
-        ". Those pages need a browser, so rewording the query or crawling again will not \
-         reach them — say so and use what else you have, or ask the user to open the page. \
-         Other sites in this search were unaffected.\n\n",
-    );
+    // What to suggest depends on what the client can actually do. Offering to
+    // have somebody open the page is good advice in the IDE and a dead end in
+    // a terminal, which has no way to show a page and no way to read one back
+    // — and an agent that suggests it there sends the user to do something
+    // impossible and then waits for a result that cannot arrive.
+    if super::refused::host_can_browse() {
+        out.push_str(
+            ". Those pages need a browser, so rewording the query or crawling again will not \
+             reach them. A request to open one has been raised with the user; carry on with \
+             what else you have meanwhile, and if the page arrives it will be in the index. \
+             Other sites in this search were unaffected.\n\n",
+        );
+    } else {
+        out.push_str(
+            ". Those pages need a browser and this client has none, so they are out of \
+             reach — rewording the query, crawling again, or asking the user to open them \
+             will not help. Say plainly that the site refused an automated request, answer \
+             from what else you have, and name the site so the user can look themselves if \
+             they want to. Other sites in this search were unaffected.\n\n",
+        );
+    }
 }
 
 /// Offer each refused page to whoever might open it.
@@ -956,6 +972,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "goes to the network; run with --ignored"]
     async fn a_live_refusal_reaches_the_queue() {
+        // Declares the capability as well as taking the lock: in-process the
+        // default is off, and off means nothing is queued — which is the
+        // behaviour a terminal gets and not what this test is about.
         let _g = refusal_guard();
         let dir = std::env::temp_dir().join("forge-live-refusal");
         let _ = std::fs::remove_dir_all(&dir);
@@ -980,6 +999,43 @@ mod tests {
         assert!(queued[0].url.contains("stackoverflow.com"), "{queued:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The advice a refusal gives depends on what the client can do.
+    ///
+    /// Offering to have somebody open the page is right in the IDE and a dead
+    /// end in a terminal, which has nothing to show a page in and nothing to
+    /// read one back from. An agent that suggests it there sends the user off
+    /// to do something impossible and then waits for a result that cannot
+    /// arrive.
+    #[test]
+    fn a_refusal_suggests_only_what_the_client_can_do() {
+        let _g = refusal_guard();
+        let timing = Timing {
+            challenged: 3,
+            challenged_hosts: vec!["walled.test".into()],
+            ..Default::default()
+        };
+
+        crate::tools::refused::set_host_can_browse(true);
+        let mut with = String::new();
+        render_challenges(&mut with, &timing);
+        assert!(with.contains("raised with the user"), "{with}");
+        assert!(with.contains("carry on"), "{with}");
+
+        crate::tools::refused::set_host_can_browse(false);
+        let mut without = String::new();
+        render_challenges(&mut without, &timing);
+        assert!(without.contains("this client has none"), "{without}");
+        // The thing it must not say: a terminal user cannot do this.
+        assert!(
+            !without.contains("asking the user to open them will help"),
+            "a terminal was told to have somebody open the page: {without}"
+        );
+        assert!(without.contains("name the site"), "no fallback offered: {without}");
+
+        // Both name the host either way, since that is actionable regardless.
+        assert!(with.contains("walled.test") && without.contains("walled.test"));
     }
 
     /// The crawl path must actually call into the queue.
@@ -1020,14 +1076,10 @@ mod tests {
         );
     }
 
-    /// Serialised, because the refusal queue is process-wide and these tests
-    /// would otherwise see each other's entries.
-    fn refusal_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::tools::refused::drain();
-        g
-    }
+    /// Serialised on the lock that owns the queue and the capability flag —
+    /// not a second lock of this module's own, which would serialise these
+    /// tests against each other and not against the ones in `refused`.
+    use crate::tools::refused::test_guard as refusal_guard;
 
     #[test]
     fn an_empty_result_with_no_sites_lists_what_has_been_read() {

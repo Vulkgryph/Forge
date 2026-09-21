@@ -18324,6 +18324,49 @@ mod command_palette_tests {
         assert_eq!(browser.request_id.as_deref(), Some("req-7"));
     }
 
+    /// This client must tell the agent it can open a page.
+    ///
+    /// The capability is declared at spawn, and if it stops being declared the
+    /// agent quietly reverts to terminal behaviour: it stops offering the
+    /// handoff, tells the model the page is out of reach, and the browser this
+    /// window contains is never used. Nothing would fail — the feature would
+    /// simply go quiet, which is the hardest kind of regression to notice.
+    ///
+    /// Both spawn paths, because a remote agent is still driven by this
+    /// client's browser: the refused page is a public URL, so it is fetched
+    /// here and the HTML goes back over the same protocol.
+    #[test]
+    fn the_agent_is_told_this_client_can_open_a_page() {
+        // Assembled, since these files are read as text.
+        let flag = ["--host-can", "-browse"].concat();
+        for (name, src) in [
+            ("local", include_str!("agent_panel.rs")),
+            ("ssh", include_str!("ssh.rs")),
+        ] {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                code.contains(&flag),
+                "the {name} spawn path no longer tells the agent this client has a \
+                 browser, so the handoff will never be offered",
+            );
+            // And the claim is gated on the thing that provides it. `webview`
+            // is macOS-only, so an ungated flag would promise a browser that a
+            // Linux or Windows window does not have — the agent would raise a
+            // request, a tab would open empty, and nobody could answer.
+            let at = code.find(&flag).expect("checked above");
+            let before = &code[at.saturating_sub(260)..at];
+            assert!(
+                before.contains("target_os = \"macos\""),
+                "the {name} spawn path claims a browser unconditionally, but the \
+                 webview only exists on macOS",
+            );
+        }
+    }
+
     /// And there is no longer a way to open one by hand, because there is
     /// nowhere for it to open onto.
     #[test]

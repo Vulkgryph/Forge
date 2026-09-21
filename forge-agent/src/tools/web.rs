@@ -52,13 +52,34 @@ fn refused(url: &str, vendor: &str, status: Option<u16>) -> String {
         // would have caught.
         None => "status 200, with the bot check in place of the page".to_string(),
     };
+    let next = next_step_for_a_refusal();
     format!(
         "Error: {url} was refused by a bot check ({vendor}) rather than served — {how}.\n\
          The address is fine; the access is not. No rewording and no retry reaches a page \
-         behind a challenge — the server will serve it to a browser and not to this tool. \
-         Use what you have from elsewhere and say that this source was unavailable, or ask \
-         the user to open the page themselves."
+         behind a challenge — the server will serve it to a browser and not to this tool.\n\
+         {next}"
     )
+}
+
+/// What to do about a page this tool cannot have, given what the client can do.
+///
+/// Split out because the right answer differs and the wrong one wastes a turn.
+/// In the IDE the page really can be opened by a person and handed back, and
+/// the request has already been raised. In a terminal it cannot: there is
+/// nothing to show a page in and nothing to read one back from, so suggesting
+/// it sends somebody off to do something impossible while the agent waits for
+/// a result that cannot arrive.
+fn next_step_for_a_refusal() -> &'static str {
+    if super::refused::host_can_browse() {
+        "A request to open it has been raised with the user. Carry on with what else you \
+         have; if the page arrives it will be added to the search index and you can query \
+         it with web_search."
+    } else {
+        "This client cannot open a browser, so the page is out of reach — asking the user \
+         to open it will not get it to you either. Say that the site refused an automated \
+         request, name it so they can look themselves if they want to, and answer from what \
+         else you have."
+    }
 }
 
 /// What the index actually holds on the host that was just guessed at.
@@ -440,14 +461,31 @@ mod tests {
     /// Checked as text because that text is the whole point: it has to tell an
     /// agent that retrying is futile, which is the opposite of what every
     /// other failure here says.
+    ///
+    /// And what it suggests instead depends on the client. Having somebody
+    /// open the page is right in the IDE and impossible in a terminal, which
+    /// has nothing to show a page in and nothing to read one back from — so
+    /// suggesting it there sends a person off to do something that cannot work
+    /// while the agent waits for a result that cannot come.
     #[test]
     fn a_refusal_says_not_to_retry_and_why() {
-        let out = refused("https://walled.test/p", "Cloudflare", Some(403));
-        assert!(out.contains("refused by a bot check (Cloudflare)"), "{out}");
-        assert!(out.contains("status 403"), "{out}");
-        assert!(out.contains("address is fine"), "{out}");
-        assert!(out.contains("no retry"), "{out}");
-        assert!(out.contains("ask") && out.contains("user"), "{out}");
+        let _g = crate::tools::refused::test_guard();
+
+        for (can_browse, wanted, unwanted) in [
+            (true, "raised with the user", "cannot open a browser"),
+            (false, "cannot open a browser", "raised with the user"),
+        ] {
+            crate::tools::refused::set_host_can_browse(can_browse);
+            let out = refused("https://walled.test/p", "Cloudflare", Some(403));
+            // The same regardless: what happened, and that retrying is futile.
+            assert!(out.contains("refused by a bot check (Cloudflare)"), "{out}");
+            assert!(out.contains("status 403"), "{out}");
+            assert!(out.contains("address is fine"), "{out}");
+            assert!(out.contains("no retry"), "{out}");
+            // And the advice that actually applies here.
+            assert!(out.contains(wanted), "can_browse={can_browse}: {out}");
+            assert!(!out.contains(unwanted), "can_browse={can_browse}: {out}");
+        }
     }
 
     /// The 200 case has to read differently, because "status 200" on its own
@@ -466,6 +504,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the network"]
     async fn live_a_walled_site_is_reported_as_refused_not_missing() {
+        // Held because this goes through `refused()`, which reads the
+        // capability flag and writes the queue. It asserts nothing about
+        // either, but a test that *touches* process-global state has to
+        // serialise on it or it races whatever else does — which is how this
+        // one intermittently failed the live test in `search`.
+        let _g = crate::tools::refused::test_guard();
         let args = json!({
             "url": "https://www.yesterdaystractors.com/",
             "prompt": "anything at all",

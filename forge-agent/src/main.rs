@@ -59,6 +59,23 @@ struct Cli {
     #[arg(long)]
     resume_session: Option<String>,
 
+    /// The client can open a web page for a person to look at, and hand the
+    /// result back. Declared by the host, because only the host knows.
+    ///
+    /// A flag rather than a message, and the reason is ordering: a capability
+    /// that arrives over the protocol can arrive *after* the agent has already
+    /// been refused a page, and then the advice it gave was based on not
+    /// knowing. Spawn time is the one moment this is certainly known and
+    /// cannot change.
+    ///
+    /// Named for the capability rather than the client. The agent has no
+    /// business knowing whether it is talking to an editor or a terminal; it
+    /// needs to know whether asking somebody to open a page is a real option
+    /// or a dead end. Forge IDE passes this; the terminal client does not,
+    /// because a terminal cannot show a page and cannot read one back.
+    #[arg(long)]
+    host_can_browse: bool,
+
     /// Log in to ChatGPT Codex via OAuth (for ChatGPT subscription Codex)
     #[arg(long)]
     login_chatgpt: bool,
@@ -81,6 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth::login_chatgpt(true).await?;
         std::process::exit(0);
     }
+
+    // What the client can do, before anything can be refused a page. See
+    // `--host-can-browse` and `tools::refused`.
+    tools::refused::set_host_can_browse(cli.host_can_browse);
 
     // Load configuration
     let mut app_config = config::AppConfig::load()?;

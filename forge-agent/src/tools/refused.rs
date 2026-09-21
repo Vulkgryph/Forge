@@ -20,7 +20,54 @@
 //! ends, because a page that turned out not to matter should stop asking to be
 //! opened. A prompt that outlives its purpose is one people learn to dismiss.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Whether the client can put a page in front of a person and hand the result
+/// back.
+///
+/// Declared once at startup by the host, which is the only thing that knows —
+/// see `--host-can-browse`. Forge IDE can; a terminal cannot, since it has no
+/// way to show a page and no way to read one back.
+///
+/// Process-global for the same reason the queue below is: the code that needs
+/// this is the message text inside a tool, and a tool has no handle on the
+/// agent and no business acquiring one.
+///
+/// Defaults to false, which is the safe direction. A client that forgets to
+/// declare the capability gets told a page cannot be opened, which is merely
+/// pessimistic; the other default would have the agent promise a browser
+/// handoff that never comes, and then wait for it.
+static CAN_BROWSE: AtomicBool = AtomicBool::new(false);
+
+/// Record what the host can do. Called once, before any tool runs.
+pub fn set_host_can_browse(can: bool) {
+    CAN_BROWSE.store(can, Ordering::Relaxed);
+}
+
+/// Whether asking somebody to open a page is a real option here.
+pub fn host_can_browse() -> bool {
+    CAN_BROWSE.load(Ordering::Relaxed)
+}
+
+/// Take exclusive use of the queue and the capability flag, for a test.
+///
+/// Both are process-global and Rust runs tests as threads of one process, so
+/// two tests touching them race — and they are in different modules, which is
+/// how this nearly went wrong: each had its own lock, which serialises a
+/// module against itself and not against the other. One lock, owned by the
+/// module that owns the state.
+///
+/// Leaves the queue empty and the capability on, since a test about the queue
+/// needs recording to be possible. A test about the off case says so itself.
+#[cfg(test)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    drain();
+    set_host_can_browse(true);
+    guard
+}
 
 /// One page that was refused, and by what.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +96,15 @@ static PENDING: Mutex<Vec<Refusal>> = Mutex::new(Vec::new());
 const MAX_PENDING: usize = 8;
 
 /// Note that `url` was refused. Duplicates and floods are dropped.
+///
+/// Nothing is queued when the host cannot open a page. A request no client can
+/// satisfy is worse than no request: the agent would raise it, nothing would
+/// answer, and the turn would end with a withdrawal for something nobody ever
+/// saw — while the user was told to do something their client cannot do.
 pub fn record(url: &str, refused_by: &str) {
+    if !host_can_browse() {
+        return;
+    }
     let Ok(mut pending) = PENDING.lock() else {
         // A poisoned lock means another thread panicked holding it. Losing a
         // browser prompt is not worth propagating that.
@@ -79,12 +134,7 @@ mod tests {
     /// Serialised, because the queue is process-wide and these tests would
     /// otherwise see each other's entries — the mistake made once already in
     /// this session with a temp directory keyed on the process id.
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        drain();
-        g
-    }
+    use super::test_guard as guard;
 
     #[test]
     fn a_refusal_is_recorded_and_drained_once() {
@@ -123,5 +173,41 @@ mod tests {
     fn draining_an_empty_queue_is_fine() {
         let _g = guard();
         assert!(drain().is_empty());
+    }
+
+    /// A client that cannot open a page queues nothing.
+    ///
+    /// A request no client can satisfy is worse than no request. The agent
+    /// would raise it, nothing would answer, the turn would end with a
+    /// withdrawal for something nobody saw — and the person would have been
+    /// told to do a thing their client cannot do. In a terminal the honest
+    /// answer is that the page is out of reach, said once, and the agent
+    /// carries on with what it has.
+    #[test]
+    fn a_host_with_no_browser_is_offered_nothing() {
+        let _g = guard();
+        set_host_can_browse(false);
+        record("https://walled.test/a", "Cloudflare");
+        record("https://walled.test/b", "Cloudflare");
+        assert!(
+            drain().is_empty(),
+            "a page was queued for a client that cannot open one",
+        );
+
+        // And the capability is what decides it, not anything about the page.
+        set_host_can_browse(true);
+        record("https://walled.test/a", "Cloudflare");
+        assert_eq!(drain().len(), 1);
+    }
+
+    /// Off by default, which is the safe direction: a host that forgets to
+    /// declare the capability gets told a page cannot be opened, which is
+    /// merely pessimistic. The other default promises a handoff that never
+    /// comes.
+    #[test]
+    fn the_capability_is_off_until_declared() {
+        let _g = guard();
+        set_host_can_browse(false);
+        assert!(!host_can_browse());
     }
 }

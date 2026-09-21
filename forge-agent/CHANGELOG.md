@@ -59,6 +59,14 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **The agent knows whether the client it is talking to can open a page, and stops giving advice that only works in one of them.** It offered the browser handoff regardless. In the IDE that is right; in a terminal it is a dead end — there is nothing to show a page in and nothing to read one back from — so the agent sent a person off to do something impossible and then waited for a result that could not arrive.
+
+  The host declares it at spawn with `--host-can-browse`. A flag rather than a protocol message, because of ordering: a capability that arrives over the wire can arrive *after* the agent has already been refused a page, and the advice it gave was then based on not knowing. Spawn time is the one moment this is certainly known and cannot change. Named for the capability rather than the client, because the agent has no business knowing whether it is an editor or a terminal — only whether asking somebody to open a page is a real option.
+
+  Forge IDE passes it on both spawn paths, local and over SSH: the capability belongs to the client rather than the machine the agent runs on, since a refused page is a public URL that the IDE's own browser can fetch and hand back over the same protocol. The terminal client passes nothing, and defaults are off — a host that forgets gets told a page cannot be opened, which is merely pessimistic, where the other default promises a handoff that never comes.
+
+  With no browser, nothing is queued at all: a request no client can satisfy is worse than no request. The agent says plainly that the site refused an automated request, names it so the user can look themselves, and answers from what else it has.
+
 - **Coverage is weighted by how rare each query word is, so a near miss has to actually be near.** It counted words equally, which made the number say the opposite of what it means. Asked "how does the agent handle a cloudflare bot check", a section about shell timeouts matched `how`, `does`, `the`, `agent`, `handle` and `check` while missing only `cloudflare` — six words of seven — so it reported 0.75 coverage and sat in the results looking like a close call. It was not a close call. One word was the question and the rest was grammar. Weighted by inverse document frequency, that section reports 0.35 and the decay below the real answer is steep instead of gradual.
 
   Terms the corpus contains nowhere are still excluded from the denominator, which is a separate and still-correct fix: a word in no document cannot separate one document from another.

@@ -431,19 +431,38 @@ fn should_crawl(index_answered: bool, asked_for_sites: bool, hosts_read: bool) -
     asked_for_sites && (!index_answered || !hosts_read)
 }
 
-/// Whether the index already holds a page from every host named in `seeds`.
+/// Pages from one host below which the site has not meaningfully been read.
+///
+/// One page is not a site, and treating it as one was actively misleading. A
+/// bot check refused a crawl of stackoverflow.com; a person opened the page in
+/// the browser and handed it over, which put exactly one page in the index —
+/// and from then on the host counted as read, so naming it skipped the crawl
+/// and the tool answered from that single page. The agent concluded it could
+/// access a site it cannot, and said so.
+///
+/// A `web_fetch` of one URL does the same thing. Five is enough to tell a
+/// crawl from an incidental page or two, while a genuinely tiny site that
+/// falls under it is merely re-crawled — a few seconds, and it refreshes what
+/// is held, since re-crawling replaces pages by URL rather than duplicating
+/// them.
+const MIN_PAGES_TO_COUNT_AS_READ: usize = 5;
+
+/// Whether the index holds enough of every host named in `seeds` to answer
+/// from instead of crawling.
 ///
 /// Host-level rather than URL-level: a seed is a starting point for a crawl,
 /// not a page anyone asked for by name, so having read the site is what makes
 /// re-crawling it pointless.
 fn hosts_already_read(index: &Index, seeds: &[String]) -> bool {
-    let read: std::collections::HashSet<String> = forge_search::library::shelves(index)
+    let read: std::collections::HashMap<String, usize> = forge_search::library::shelves(index)
         .into_iter()
-        .map(|s| s.host)
+        .map(|s| (s.host, s.pages))
         .collect();
     seeds.iter().all(|seed| {
         forge_search::query::normalise_host(seed)
-            .map(|h| read.contains(&h))
+            .map(|h| {
+                read.get(&h).copied().unwrap_or(0) >= MIN_PAGES_TO_COUNT_AS_READ
+            })
             // An unparseable seed is reported by the crawl itself; it should
             // not make this claim the site was read.
             .unwrap_or(false)
@@ -781,7 +800,15 @@ mod tests {
     #[test]
     fn a_site_the_index_has_never_read_is_still_crawled() {
         let mut index = Index::new();
-        index.add("https://already.test/page", "Oil", "", "engine oil is straight 30 weight");
+        // Enough pages to count as read — see `MIN_PAGES_TO_COUNT_AS_READ`.
+        for i in 0..MIN_PAGES_TO_COUNT_AS_READ {
+            index.add(
+                &format!("https://already.test/page{i}"),
+                "Oil",
+                "",
+                "engine oil is straight 30 weight",
+            );
+        }
         // The index answers the query, but not from the site being asked for.
         assert!(!query::search(&index, "engine oil", 3).is_empty());
         assert!(
@@ -790,6 +817,49 @@ mod tests {
         );
         // And a site it has read is not fetched again.
         assert!(hosts_already_read(&index, &["https://already.test/other".to_string()]));
+    }
+
+    /// One page is not a site, and treating it as one made the agent claim
+    /// access it does not have.
+    ///
+    /// A bot check refused a crawl of stackoverflow.com. A person opened the
+    /// page in the browser and handed it over, which put exactly one page in
+    /// the index — and from then on the host counted as read, so naming it
+    /// skipped the crawl and the tool answered from that single page. The
+    /// agent reported that it could still reach the site without help. It
+    /// could not; it was reading what it had been given.
+    #[test]
+    fn one_handed_over_page_does_not_make_a_site_read() {
+        let mut index = Index::new();
+        index.add(
+            "https://walled.test/questions/1",
+            "A question",
+            "",
+            "the answer involves a lifetime annotation",
+        );
+
+        assert!(
+            !hosts_already_read(&index, &["https://walled.test/".to_string()]),
+            "one page made a whole host look read",
+        );
+        // So the crawl is still attempted, which is what gets the refusal
+        // reported honestly instead of answered around.
+        assert!(
+            should_crawl(true, true, false),
+            "naming a barely-read site no longer triggers a crawl",
+        );
+
+        // A `web_fetch` of a single URL is the same situation.
+        let mut index = Index::new();
+        index.add("https://fetched.test/one", "One", "", "some page");
+        assert!(!hosts_already_read(&index, &["https://fetched.test/".to_string()]));
+
+        // And once enough of the site is held, it is answered from rather
+        // than crawled again.
+        for i in 1..MIN_PAGES_TO_COUNT_AS_READ {
+            index.add(&format!("https://fetched.test/{i}"), "More", "", "more pages");
+        }
+        assert!(hosts_already_read(&index, &["https://fetched.test/".to_string()]));
     }
 
     /// A seed that does not parse must not count as read, or a typo would

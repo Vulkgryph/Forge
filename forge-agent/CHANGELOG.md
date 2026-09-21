@@ -6,6 +6,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **One page from a site no longer makes the agent claim it can read the whole site.** A bot check refused a crawl of `stackoverflow.com`; a person opened the page in the browser and handed it over, which put exactly one page in the index. From then on the host counted as *read*, so naming it skipped the crawl entirely and the tool answered from that single page — and the agent reported that it could still reach the site without help. It could not. It was reading what it had been given.
+
+  A single `web_fetch` did the same thing. A host now counts as read only once the index holds at least five pages from it, which tells a crawl from an incidental page or two. A genuinely tiny site that falls under the line is merely re-crawled — a few seconds, and it refreshes what is held, since re-crawling replaces pages by URL rather than duplicating them.
+
+  Nothing is lost from the handoff: the page stays in the index and still answers queries. What goes away is the false claim of access — the crawl is attempted, the refusal is reported honestly, and the browser handoff is offered again.
+
 - **A page handed over from the browser actually resumes the work.** The last step of the bot-check rail threw its own result away. `absorb_browser_result` indexed the page and then sent an `AssistantMessage`, which is *display* — it reaches the transcript and never the conversation — so the model was never told the page existed and no turn started. Somebody cleared a challenge by hand, pressed **Send to agent**, watched a line appear, and nothing happened.
 
   The notice now goes into the conversation as a user message and runs a turn, exactly the way a finished background command does and for the reason that arm already documents: a user message is new information, while a tool result would need a matching tool call. A turn of its own is required because the page arrives *after* the turn that wanted it — the agent deliberately does not block on a person, it carries on with other sources and the request is withdrawn when the turn ends — so without one, the work somebody just did by hand reaches nothing.

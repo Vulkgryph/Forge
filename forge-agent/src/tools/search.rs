@@ -383,6 +383,8 @@ fn run(
         timing.challenged = report.challenged;
         timing.challenged_hosts = report.challenged_hosts.clone();
         timing.timed_out = report.timed_out;
+        // Queue the refused pages for a person who might open one.
+        queue_refusals(&report);
 
         // Bounded before saving, so the file next to the project cannot grow
         // without limit. Oldest pages go first — see `Index::trim_to`.
@@ -632,6 +634,33 @@ fn render_challenges(out: &mut String, timing: &Timing) {
     );
 }
 
+/// Offer each refused page to whoever might open it.
+///
+/// The link that was missing. `web_fetch` queued its refusals from the start,
+/// so a single blocked page reached the browser handoff — but a *crawl* only
+/// put its refusals in the report, and the tool turned those into prose. The
+/// result was a search that told the model "those pages need a browser, ask
+/// the user to open the page" while queueing nothing, so no browser was ever
+/// offered and there was nothing for the user to act on. Every piece of the
+/// rail worked; nothing called into it.
+///
+/// One URL per challenged host, which is what the crawler collects and the
+/// right granularity anyway: a wholly walled site refuses every page in the
+/// crawl and nobody opens ninety pages by hand, so the first one names the
+/// problem. `tools::refused` bounds the queue beyond that.
+fn queue_refusals(report: &crawl::Report) {
+    // The vendor as last seen. A crawl is nearly always walled by one system,
+    // and the report says so rather than keeping a list nobody reads.
+    let vendor = if report.challenged_by.is_empty() {
+        "an unidentified bot check"
+    } else {
+        &report.challenged_by
+    };
+    for url in &report.challenged_urls {
+        super::refused::record(url, vendor);
+    }
+}
+
 /// What several sources say, when several of them say something.
 ///
 /// Ranking answers which passage is most relevant. It does not answer whether
@@ -853,6 +882,153 @@ mod tests {
     /// results" makes it guess a site, and a guess costs a two-minute crawl;
     /// naming what has been read lets it either pick a shelf or conclude
     /// honestly that nothing on hand can answer.
+    /// A crawl's refusals reach the queue the browser handoff drains.
+    ///
+    /// The bug this exists for: every piece of the rail worked and nothing
+    /// called into it. `web_fetch` recorded its refusals, so one blocked page
+    /// offered a browser; a crawl put its refusals in the report, and the tool
+    /// rendered them as prose telling the model to "ask the user to open the
+    /// page" — while queueing nothing, so there was no page for the user to
+    /// open. Verified by asking stackoverflow.com for a real answer: the
+    /// challenge was detected, reported, and no browser ever appeared.
+    #[test]
+    fn a_crawls_refusals_are_offered_to_a_person() {
+        let _g = refusal_guard();
+
+        let report = crawl::Report {
+            challenged: 12,
+            challenged_hosts: vec!["walled.test".into(), "other.test".into()],
+            challenged_urls: vec![
+                "https://walled.test/a".into(),
+                "https://other.test/b".into(),
+            ],
+            challenged_by: "Cloudflare".into(),
+            ..Default::default()
+        };
+        queue_refusals(&report);
+
+        let queued = crate::tools::refused::drain();
+        assert_eq!(queued.len(), 2, "a crawl's refusals were not queued: {queued:?}");
+        assert_eq!(queued[0].url, "https://walled.test/a");
+        assert_eq!(queued[0].refused_by, "Cloudflare");
+        assert_eq!(queued[1].url, "https://other.test/b");
+    }
+
+    /// A crawl that was refused nothing queues nothing, or every search would
+    /// raise a browser request.
+    #[test]
+    fn a_clean_crawl_queues_nothing() {
+        let _g = refusal_guard();
+        queue_refusals(&crawl::Report { fetched: 40, indexed: 40, ..Default::default() });
+        assert!(crate::tools::refused::drain().is_empty());
+    }
+
+    /// A refusal whose vendor could not be identified is still offered. The
+    /// page is what a person opens; the name of the system that blocked it is
+    /// a detail, and withholding the offer for want of it would be absurd.
+    #[test]
+    fn an_unnamed_vendor_still_offers_the_page() {
+        let _g = refusal_guard();
+        queue_refusals(&crawl::Report {
+            challenged: 1,
+            challenged_hosts: vec!["walled.test".into()],
+            challenged_urls: vec!["https://walled.test/a".into()],
+            challenged_by: String::new(),
+            ..Default::default()
+        });
+        let queued = crate::tools::refused::drain();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert!(!queued[0].refused_by.is_empty(), "the vendor line was left blank");
+    }
+
+    /// The whole rail, against a site that really refuses.
+    ///
+    /// Ignored because it goes to the network, and worth having anyway: this
+    /// is the only check that would have caught the gap. Every structural and
+    /// unit test around it can pass while the rail is dead, which is precisely
+    /// what happened — the feature was built, reduced, and shipped twice
+    /// before a real run against stackoverflow.com showed the challenge being
+    /// detected, reported to the model, and never offered to anybody.
+    ///
+    /// stackoverflow.com serves Forge's crawler a 403 with `cf-mitigated`,
+    /// verified live alongside DataDome on reuters.com and PerimeterX on
+    /// zillow.com — see `forge-search/examples/challenges.rs`.
+    #[tokio::test]
+    #[ignore = "goes to the network; run with --ignored"]
+    async fn a_live_refusal_reaches_the_queue() {
+        let _g = refusal_guard();
+        let dir = std::env::temp_dir().join("forge-live-refusal");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let args = serde_json::json!({
+            "query": "how do tags work",
+            "sites": ["https://stackoverflow.com/"],
+        });
+        let out = web_search(&args, dir.join("search-index")).await.expect("the tool ran");
+
+        // Reported to the model, which already worked.
+        assert!(
+            out.contains("refused by a bot check"),
+            "the challenge was not reported: {out}"
+        );
+        // And offered to a person, which is the part that did not.
+        let queued = crate::tools::refused::drain();
+        assert!(
+            !queued.is_empty(),
+            "a live refusal reached the model as prose but nobody was offered the page"
+        );
+        assert!(queued[0].url.contains("stackoverflow.com"), "{queued:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crawl path must actually call into the queue.
+    ///
+    /// Structural, because the bug was not a wrong function — it was a right
+    /// function nobody called. Every unit test above passed while the rail was
+    /// dead, since they call `queue_refusals` themselves; only a real run
+    /// against a walled site showed the gap, and only after the whole feature
+    /// had been built, reduced, and shipped twice.
+    ///
+    /// The invariant: a crawl that records challenges *for display* must also
+    /// offer them *to a person*. Recording one without the other is how the
+    /// tool came to tell the model "ask the user to open the page" with no page
+    /// for the user to open.
+    #[test]
+    fn the_crawl_path_queues_what_it_reports() {
+        let src = include_str!("search.rs");
+        // Assembled from fragments, because this test reads the file it lives
+        // in — a literal here would match itself and pass on its own text.
+        let displays = ["timing.challenged", " = report.challenged;"].concat();
+        let queues = ["queue_refusals(&", "report);"].concat();
+
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(code.contains(&displays), "the report's challenge count is no longer read");
+        let at = code.find(&displays).expect("checked above");
+        // Within the same block: the call belongs beside the bookkeeping it
+        // guarantees, not somewhere else in the file that may not run.
+        let after = &code[at..(at + 600).min(code.len())];
+        assert!(
+            after.contains(&queues),
+            "a crawl records challenges for display without offering them to \
+             anybody — the browser handoff has nothing to drain",
+        );
+    }
+
+    /// Serialised, because the refusal queue is process-wide and these tests
+    /// would otherwise see each other's entries.
+    fn refusal_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::tools::refused::drain();
+        g
+    }
+
     #[test]
     fn an_empty_result_with_no_sites_lists_what_has_been_read() {
         let mut index = Index::new();

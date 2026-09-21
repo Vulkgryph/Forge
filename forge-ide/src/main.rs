@@ -514,8 +514,22 @@ impl IdeWindow {
                     }
                 }
                 crate::app::BrowserCommand::Share => {
-                    if let Some(page) = self.last_page.clone() {
-                        self.app.share_browser_page(&page.url, &page.html);
+                    // A button that does nothing and says nothing is worse
+                    // than one that fails: there is no way to tell it apart
+                    // from a working button whose result went astray, and the
+                    // whole point of this one is that somebody is waiting for
+                    // the agent to carry on.
+                    match self.last_page.clone() {
+                        Some(page) => {
+                            self.app.share_browser_page(&page.url, &page.html);
+                        }
+                        None => self.app.output_log(
+                            "Nothing to send yet — the page has not finished loading, or it \
+                             reported nothing. Wait for it to settle, or press reload, then \
+                             try again."
+                                .to_string(),
+                            crate::app::OutputLevel::Warn,
+                        ),
                     }
                 }
             }

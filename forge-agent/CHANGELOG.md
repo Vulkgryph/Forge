@@ -6,6 +6,20 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A page handed over from the browser actually resumes the work.** The last step of the bot-check rail threw its own result away. `absorb_browser_result` indexed the page and then sent an `AssistantMessage`, which is *display* — it reaches the transcript and never the conversation — so the model was never told the page existed and no turn started. Somebody cleared a challenge by hand, pressed **Send to agent**, watched a line appear, and nothing happened.
+
+  The notice now goes into the conversation as a user message and runs a turn, exactly the way a finished background command does and for the reason that arm already documents: a user message is new information, while a tool result would need a matching tool call. A turn of its own is required because the page arrives *after* the turn that wanted it — the agent deliberately does not block on a person, it carries on with other sources and the request is withdrawn when the turn ends — so without one, the work somebody just did by hand reaches nothing.
+
+  The notice also names the host to scope a query to, since the page is in the index under its own URL and `sites` narrows by host.
+
+- **A crawl's refused pages are offered to a person, instead of only described to the model.** The browser handoff had one caller. `web_fetch` queued its refusals from the start, so a single blocked page raised a browser request — but `web_search`, which is where challenges actually happen, put its refusals in the crawl report and the tool rendered them as prose. The result told the model *"those pages need a browser… ask the user to open the page"* while queueing nothing, so no browser was ever offered and there was no page for the user to open.
+
+  Every piece of the rail worked. Nothing called into it: the detection, the queue, the request, the withdrawal, the IDE's tab, the page handed back. The feature was built, reduced to challenge-handling only, and shipped twice before a real run against `stackoverflow.com` showed the challenge detected, reported, and silently dropped.
+
+  Three tests now cover it, and each was checked by removing the fix and watching it fail. A unit test on the queueing; a structural one asserting that the crawl path which records challenges *for display* also offers them *to a person*, since the bug was a correct function nobody called; and a live one against `stackoverflow.com`, which is the only check that would have caught the original gap.
+
+### Fixed
+
 - **A command that was not waiting for input stops asking.** `cargo test -- --nocapture` streams a test's own `println!`s, and a test that prints a label before a slow assertion — `global storage:`, `struct-layout:` — produces a line ending in a colon followed by silence. That is exactly the shape of `Password:`, so it raised a real "Input needed" dialog over a test run.
 
   No reading of the text can separate those two; a list of prompt words would only move the false positives around. So the guess is retracted instead. The agent already worked out it had guessed wrong — output resuming meant the process was never blocked, and it reset its own flags and carried on — but it never told the client, so the dialog stayed up asking for input on behalf of a command that had moved on. Ignorable, which is how people learn to ignore the ones that are real.

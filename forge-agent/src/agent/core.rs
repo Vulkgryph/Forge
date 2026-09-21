@@ -1120,7 +1120,31 @@ impl Agent {
                 }
                 // ── Browser handoff ───────────────────────────────────
                 UserAction::BrowserResult { request_id, final_url, html } => {
-                    self.absorb_browser_result(&request_id, &final_url, &html);
+                    // Injected as a user message and then acted on, the same
+                    // way a finished background command is — see
+                    // `UserAction::BgDone` for why a user message rather than
+                    // a tool result. The page arrives after the turn that
+                    // wanted it has ended, because the agent does not block on
+                    // a person: it carries on with other sources and the
+                    // request is withdrawn when the turn finishes. So the
+                    // arrival has to start a turn of its own, or the work
+                    // somebody just did by hand reaches nothing.
+                    let notice = self.absorb_browser_result(&request_id, &final_url, &html);
+                    let _ = self.event_tx.send(AgentEvent::AssistantMessage(notice.clone()));
+                    self.history.push(Message::user(&notice));
+                    let _ = self.log.log_run_state(RunState::Running);
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    let turn_preview = preview_text(&notice);
+                    self.ensure_git_repo_and_notify();
+                    let turn_result = self.process_turn().await;
+                    if let Err(e) = self.create_rewind_snapshot(turn_id, turn_preview) {
+                        let _ = self.event_tx.send(AgentEvent::Error(format!(
+                            "Failed to create revert snapshot: {}",
+                            e
+                        )));
+                    }
+                    let _ = self.log.log_run_state(RunState::WaitingUser);
+                    turn_result?;
                 }
                 UserAction::BrowserDeclined { request_id, reason } => {
                     self.pending_browser.remove(&request_id);
@@ -4021,7 +4045,15 @@ impl Agent {
     ///
     /// The HTML came from a real browser that really made the request. Nothing
     /// was replayed and no credential was moved — see `tools::refused`.
-    fn absorb_browser_result(&mut self, request_id: &str, final_url: &str, html: &str) {
+    /// Index a page a person opened, and say what the model should do with it.
+    ///
+    /// Returns the notice rather than only emitting it. Emitting was all this
+    /// did, and an `AssistantMessage` is display: it reaches the transcript and
+    /// not the conversation, so the model never learned the page existed. A
+    /// person cleared a bot check, pressed the button, watched a line appear,
+    /// and nothing happened — which is the whole rail working and then
+    /// discarding its result at the last step.
+    fn absorb_browser_result(&mut self, request_id: &str, final_url: &str, html: &str) -> String {
         self.pending_browser.remove(request_id);
         let page = forge_search::html::parse(html);
         let index_path = crate::tools::search::index_path(self.executor.project_root());
@@ -4032,10 +4064,16 @@ impl Agent {
         let _ = index.save(&index_path);
 
         let terms = forge_search::tokenize::terms(&page.text).len();
-        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
-            "[{final_url} was opened in a browser and added to the search index \
-             ({terms} terms). Query it with web_search.]"
-        )));
+        // The host, so the model knows what to scope a query to — the page is
+        // in the index under its own URL, and `sites` narrows by host.
+        let host = forge_search::query::normalise_host(final_url).unwrap_or_default();
+        format!(
+            "[A bot check refused {final_url}, so it was opened in a browser and the page \
+             handed over. It is now in the search index ({terms} terms){}. Carry on with \
+             what you were doing: search it with web_search{}, and use what it says.]",
+            if page.title.is_empty() { String::new() } else { format!(", titled {:?}", page.title) },
+            if host.is_empty() { String::new() } else { format!(" (sites: [\"{host}\"])") },
+        )
     }
 
     async fn handle_ask_question(&mut self, tc: &ToolCall) -> Result<String> {
@@ -5280,6 +5318,43 @@ mod repl_guard_tests {
 
 #[cfg(test)]
 mod deferred_action_tests {
+
+    /// A page a person hands over must reach the model, not just the screen.
+    ///
+    /// Structural for the same reason as the test below: the property is about
+    /// which channel the result goes down, and the bug was that it went down
+    /// the wrong one. `absorb_browser_result` emitted an `AssistantMessage`
+    /// and stopped — that is display, so the transcript said the page had
+    /// arrived while the conversation never mentioned it, and no turn started.
+    /// Somebody cleared a bot check by hand, pressed the button, watched a
+    /// line appear, and nothing happened. The entire rail worked and threw
+    /// away its result at the last step.
+    ///
+    /// Two things are required of the arm that receives a page: it pushes the
+    /// notice into `history`, so the model learns the page exists, and it runs
+    /// a turn, so the model acts on it. The page arrives *after* the turn that
+    /// wanted it has ended — the agent deliberately does not block on a person
+    /// — so without a turn of its own the work somebody just did reaches
+    /// nothing.
+    #[test]
+    fn a_delivered_page_reaches_the_model_and_starts_a_turn() {
+        let src = include_str!("core.rs");
+        // Assembled, because this test reads the file it lives in.
+        let arm = ["UserAction::BrowserResult", " { request_id, final_url, html } =>"].concat();
+        let at = src.find(&arm).expect("nothing receives a delivered page any more");
+        let body = &src[at..(at + 1400).min(src.len())];
+
+        assert!(
+            body.contains(&["self.history.push(Message::user(", "&notice)"].concat()),
+            "a delivered page is not put into the conversation, so the model \
+             cannot know the page exists",
+        );
+        assert!(
+            body.contains(&["self.process_turn", "()"].concat()),
+            "a delivered page does not start a turn, so nothing acts on the \
+             page somebody just opened by hand",
+        );
+    }
 
     /// Every nested `action_rx` consumer must park what it cannot handle.
     ///

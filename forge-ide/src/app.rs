@@ -15130,7 +15130,7 @@ impl IdeApp {
         if excess > 0 { self.output_log.drain(..excess); }
     }
 
-    fn output_log(&mut self, msg: impl Into<String>, level: OutputLevel) {
+    pub fn output_log(&mut self, msg: impl Into<String>, level: OutputLevel) {
         self.push_output(msg.into(), level);
         self.show_term = true;
     }

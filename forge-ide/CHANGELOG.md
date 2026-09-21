@@ -6,6 +6,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **Send to agent says so when there is nothing to send.** It was `if let Some(page) = …` with no else: when no page had been reported yet — still loading, or it posted nothing — the button did nothing and said nothing, which is indistinguishable from a working button whose result went astray. It now says the page has not settled and to try again.
+
 - **A withdrawn input request is marked resolved.** The agent now says when a command it thought was prompting was not. The card stays in the transcript and says so rather than vanishing — somebody who half-read it should not be left wondering what they missed.
 
 

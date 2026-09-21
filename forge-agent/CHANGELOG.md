@@ -6,6 +6,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A bot check on `robots.txt` is no longer read as permission to crawl.** Cloudflare answers `stackoverflow.com/robots.txt` with status **418** and the real file in the body. 418 falls inside "permanently gone", so the rules were discarded as absent — and a file reading `User-agent: * / Disallow: /` was treated as no restrictions at all. Forge crawled a site that forbids it, then reported the refusal it got as a bot check rather than as the site's own stated wish.
+
+  RFC 9309 does permit reading a 4xx as unrestricted, and for a genuine 404 that is right. A refusal is not a 404: it is the site answering, not staying silent. A challenged `robots.txt` now denies, and only 404 or 410 counts as absent — other refusals (401, 403, 451) mean the site declined to show its rules, which is unreadable rather than unrestricted.
+
+  When the refused response carries rules anyway, they are parsed and honoured, because it often does and respecting what a site actually said beats assuming. On Stack Overflow that reaches the same answer either way: the crawler now stops at `robots.txt` and never requests a page.
+
 - **One page from a site no longer makes the agent claim it can read the whole site.** A bot check refused a crawl of `stackoverflow.com`; a person opened the page in the browser and handed it over, which put exactly one page in the index. From then on the host counted as *read*, so naming it skipped the crawl entirely and the tool answered from that single page — and the agent reported that it could still reach the site without help. It could not. It was reading what it had been given.
 
   A single `web_fetch` did the same thing. A host now counts as read only once the index holds at least five pages from it, which tells a crawl from an incidental page or two. A genuinely tiny site that falls under the line is merely re-crawled — a few seconds, and it refreshes what is held, since re-crawling replaces pages by URL rather than duplicating them.

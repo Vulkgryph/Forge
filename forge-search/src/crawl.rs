@@ -422,11 +422,41 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             self.wait_for_host(url);
             let rules = match self.fetcher.fetch(&robots_url) {
                 Ok(r) if r.is_ok() => Robots::parse(&r.body, self.fetcher.user_agent()),
-                // Absent is permissive; unreadable is not. A 404 means the
-                // site said nothing, while a 500 means it said something that
-                // could not be read, and those deserve different answers.
-                Ok(r) if r.is_permanently_gone() => Robots::allow_all(),
+
+                // A bot check on `robots.txt` is the site answering, not the
+                // site staying silent — so it is never read as permission.
+                //
+                // This was letting Forge crawl a site that forbids it.
+                // Cloudflare answers stackoverflow.com's `robots.txt` with
+                // status 418 and the real file in the body; 418 falls inside
+                // "permanently gone", so the rules were discarded as absent
+                // and a file saying `User-agent: * / Disallow: /` was treated
+                // as no restrictions at all. RFC 9309 does permit reading 4xx
+                // as unrestricted, and for a genuine 404 that is right, but a
+                // refusal is not a 404.
+                //
+                // The body is parsed anyway when it carries rules, because it
+                // often does: honouring what the site actually said beats
+                // assuming the worst about it, and here it says the same thing
+                // either way.
+                Ok(r) if r.challenge().is_some() => {
+                    if looks_like_robots(&r.body) {
+                        Robots::parse(&r.body, self.fetcher.user_agent())
+                    } else {
+                        Robots::deny_all()
+                    }
+                }
+
+                // Absent is permissive; unreadable is not. A 404 or a 410 means
+                // the site said nothing, while a 500 means it said something
+                // that could not be read, and those deserve different answers.
+                Ok(r) if matches!(r.status, 404 | 410) => Robots::allow_all(),
+
+                // Any other refusal — 401, 403, 451 — is a site declining to
+                // show its rules rather than having none. Unreadable, so
+                // treated as unreadable.
                 Ok(_) => Robots::deny_all(),
+
                 // No response at all: treated as absent rather than as
                 // refusal, or one unreachable robots.txt stops a whole crawl
                 // over a file that may not exist.
@@ -459,6 +489,17 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
 ///
 /// The convenience form. Anything wanting to add to an existing index, or to
 /// control time, uses [`Crawler`] directly.
+/// Whether a body looks like `robots.txt` rather than an error page.
+///
+/// One directive is enough, and `user-agent` is the one every group must
+/// begin with. Deliberately not a parse: this only decides whether parsing is
+/// worth attempting on a response that was not a clean 200.
+fn looks_like_robots(body: &str) -> bool {
+    body.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_ascii_lowercase())
+        .any(|l| l.starts_with("user-agent:"))
+}
+
 pub fn crawl<F: Fetcher>(fetcher: &F, seeds: &[&str], limits: Limits) -> (Index, Report) {
     let clock = SystemClock;
     let mut crawler = Crawler::new(fetcher, &clock, limits);
@@ -474,6 +515,107 @@ pub fn crawl<F: Fetcher>(fetcher: &F, seeds: &[&str], limits: Limits) -> (Index,
 mod tests {
     use super::*;
     use crate::fetch::{Fetched, StaticFetcher};
+
+    /// A bot check on `robots.txt` is never read as permission to crawl.
+    ///
+    /// The case this comes from: Cloudflare answers stackoverflow.com's
+    /// `robots.txt` with status 418 and the real file in the body. 418 falls
+    /// inside "permanently gone", so the rules were discarded as absent — and
+    /// a file reading `User-agent: * / Disallow: /` was treated as no
+    /// restrictions at all. Forge crawled a site that forbids it, and then
+    /// reported the refusal it got as a bot check rather than as the site's
+    /// own stated wish.
+    #[test]
+    fn a_challenged_robots_txt_does_not_become_permission() {
+        let real_rules = "User-agent: *\nContent-signal: search=no, ai-train=no\nDisallow: /\n";
+        // 418 with the real rules in the body and a Cloudflare header, which
+        // is what stackoverflow.com actually serves.
+        let fetcher = StaticFetcher::new()
+            .with_response(
+                "https://walled.example/robots.txt",
+                Fetched {
+                    status: 418,
+                    final_url: "https://walled.example/robots.txt".into(),
+                    content_type: "text/plain".into(),
+                    body: real_rules.into(),
+                    headers: vec![("cf-mitigated".into(), "challenge".into())],
+                },
+            )
+            .with_page("https://walled.example/", "<html><body><p>Should never be read.</p></body></html>");
+        let clock = FakeClock::default();
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, Limits { politeness: 0.0, ..Default::default() });
+        crawler.seed("https://walled.example/").unwrap();
+        let report = crawler.run(&mut index);
+
+        assert_eq!(index.len(), 0, "a site that disallows all crawling was indexed");
+        assert_eq!(report.disallowed, 1, "the refusal was not attributed to robots.txt: {report:?}");
+        assert_eq!(report.challenged, 0, "reported as a bot check rather than as the site's own rules");
+    }
+
+    /// And a challenged `robots.txt` whose body is not rules at all — an
+    /// interstitial page — denies rather than guessing.
+    #[test]
+    fn a_challenged_robots_txt_with_no_rules_in_it_denies() {
+        let fetcher = StaticFetcher::new().with_response(
+            "https://walled.example/robots.txt",
+            Fetched {
+                status: 403,
+                final_url: "https://walled.example/robots.txt".into(),
+                content_type: "text/html".into(),
+                body: "<html><body>Just a moment...</body></html>".into(),
+                headers: Vec::new(),
+            },
+        );
+        let clock = FakeClock::default();
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, Limits { politeness: 0.0, ..Default::default() });
+        crawler.seed("https://walled.example/").unwrap();
+        let report = crawler.run(&mut index);
+        assert_eq!(index.len(), 0);
+        assert_eq!(report.disallowed, 1, "{report:?}");
+    }
+
+    /// A genuine 404 still means the site said nothing, which RFC 9309 reads
+    /// as no restrictions — and a site with no `robots.txt` is the common case
+    /// rather than an edge one.
+    #[test]
+    fn an_absent_robots_txt_is_still_permissive() {
+        let fetcher = StaticFetcher::new()
+            .with_response(
+                "https://open.example/robots.txt",
+                Fetched {
+                    status: 404,
+                    final_url: "https://open.example/robots.txt".into(),
+                    content_type: "text/plain".into(),
+                    body: "not found".into(),
+                    headers: Vec::new(),
+                },
+            )
+            .with_page(
+                "https://open.example/",
+                "<html><head><title>Open</title></head><body><p>Readable page here, with \
+                 enough words in it to be worth indexing at all.</p></body></html>",
+            );
+        let clock = FakeClock::default();
+        let mut index = Index::new();
+        let mut crawler = Crawler::new(&fetcher, &clock, Limits { politeness: 0.0, ..Default::default() });
+        crawler.seed("https://open.example/").unwrap();
+        let report = crawler.run(&mut index);
+        assert_eq!(report.disallowed, 0, "an absent robots.txt blocked the crawl: {report:?}");
+        assert_eq!(index.len(), 1, "{report:?}");
+    }
+
+    /// The shape check that decides whether a non-200 body is worth parsing.
+    #[test]
+    fn a_body_is_recognised_as_rules_or_not() {
+        assert!(looks_like_robots("User-agent: *\nDisallow: /\n"));
+        assert!(looks_like_robots("# a comment\n\nuser-agent: Googlebot\n"));
+        assert!(!looks_like_robots("<html><body>Just a moment...</body></html>"));
+        assert!(!looks_like_robots(""));
+        // A commented-out directive is not a directive.
+        assert!(!looks_like_robots("# User-agent: *\n"));
+    }
 
     /// A challenged page is refused, not missing, and never indexed.
     ///

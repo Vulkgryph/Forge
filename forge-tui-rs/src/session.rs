@@ -792,7 +792,10 @@ impl Session {
                 self.entries.push(Entry::new(
                     EntryKind::System,
                     format!(
-                        "{url} was refused by a bot check ({refused_by}).                          Opening it needs a browser, which this client does not have —                          open it yourself, or use the IDE."
+                        "{url} was refused by a bot check ({refused_by}). This client has \
+                         no browser to open it in. Open it yourself and paste what it says \
+                         as a message — that reaches the agent the same way — or use the \
+                         IDE, where the page can be handed over with a button."
                     ),
                 ));
             }
@@ -2029,6 +2032,57 @@ mod tests {
                 bg_id: "b1".into(), content: "yes".into(),
             })],
         );
+    }
+
+    /// A terminal cannot open a browser, so the handoff says so — and says
+    /// what to do instead, which has to be something that actually works.
+    ///
+    /// "Open it yourself" was the original advice and it is a dead end here:
+    /// a page opened in Safari has no way back to the agent. Pasting what it
+    /// says does reach the agent, by the ordinary route every message takes.
+    #[test]
+    fn a_terminal_explains_the_handoff_it_cannot_do() {
+        let mut s = session();
+        s.apply(AgentMessage::BrowserRequest {
+            request_id: "b1".into(),
+            url: "https://walled.test/a".into(),
+            refused_by: "Cloudflare".into(),
+        });
+
+        let said = s.entries.last().expect("nothing was said").content.clone();
+        assert!(said.contains("https://walled.test/a"), "{said}");
+        assert!(said.contains("Cloudflare"), "the system that refused is not named: {said}");
+        // Actionable, not just apologetic.
+        assert!(said.contains("paste"), "no route that works is offered: {said}");
+        assert!(said.contains("IDE"), "{said}");
+
+        // Nothing is left pending: a terminal has nothing to answer with, and
+        // the agent is not waiting on one.
+        assert!(s.pending.is_none(), "a terminal raised a prompt it cannot satisfy");
+    }
+
+    /// Wrapped source must not put runs of spaces into what a person reads.
+    ///
+    /// This message shipped with twenty-six literal spaces in the middle of
+    /// it, twice — a Rust string written across lines whose `\` continuations
+    /// were lost, so the source looked wrapped and the output was not. Nothing
+    /// caught it because nothing looked at the rendered text, and it is
+    /// invisible in a diff.
+    #[test]
+    fn nothing_the_handoff_says_contains_a_run_of_spaces() {
+        let mut s = session();
+        s.apply(AgentMessage::BrowserRequest {
+            request_id: "b1".into(),
+            url: "https://walled.test/a".into(),
+            refused_by: "Cloudflare".into(),
+        });
+        for entry in &s.entries {
+            assert!(
+                !entry.content.contains("   "),
+                "a lost line continuation left a gap in: {:?}",
+                entry.content,
+            );
+        }
     }
 
     /// A withdrawn request goes, because the command was never waiting.

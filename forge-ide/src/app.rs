@@ -15609,7 +15609,9 @@ impl IdeApp {
             self.status = format!("Saved to a temporary file — {}", path.display());
             self.output_log(
                 format!(
-                    "This tab had no file, so it was saved to {} — a temporary                      directory the system clears periodically. Choose a permanent                      location to keep it.",
+                    "This tab had no file, so it was saved to {} — a temporary \
+                     directory the system clears periodically. Choose a permanent \
+                     location to keep it.",
                     path.display(),
                 ),
                 OutputLevel::Warn,
@@ -15632,7 +15634,9 @@ impl IdeApp {
             .show(ctx, |ui| {
                 ui.set_max_width(430.0);
                 ui.label(egui::RichText::new(
-                    "This tab had no file of its own, so it was written to the                      system's temporary directory. Your work is saved, but that                      directory is cleared periodically.")
+                    "This tab had no file of its own, so it was written to the \
+                     system's temporary directory. Your work is saved, but that \
+                     directory is cleared periodically.")
                     .size(12.0));
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(path.display().to_string())

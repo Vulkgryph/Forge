@@ -6,6 +6,8 @@ All notable changes to the Forge terminal client are documented here. The format
 
 ### Fixed
 
+- **The bot-check message reads properly, and its advice now works.** It shipped with twenty-six literal spaces in the middle of it, twice — a string written across lines whose `\` continuations were lost, so the source looked wrapped and the output was not. It also said to "open it yourself", which is a dead end in a terminal: a page opened in Safari has no route back to the agent. It now says to paste what the page says, which reaches the agent by the ordinary route, or to use the IDE, where a button hands the page over.
+
 - **A withdrawn input request is dismissed.** The agent now says when a command it thought was prompting was not — see the agent's changelog for the `cargo test` output that triggered it. The prompt clears; an approval, a plan or a question does not, because those are things a person still has to answer and a stray withdrawal must not answer one on their behalf.
 
 

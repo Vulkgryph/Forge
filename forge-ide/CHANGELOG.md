@@ -6,6 +6,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **The browser is placed where the layout put it, instead of over the terminal.** The conversion from egui's coordinates into AppKit's made two assumptions — that the window's `inner_size` was the parent view's height, and that the parent counted y upward from the bottom — and computed the origin from the rectangle's lower edge. Neither is Forge's to assume: a subview's frame is in its superview's space, and both that space's height (`bounds`) and its direction (`isFlipped`) are one message send away. The browser rendered a few hundred points low and short, hanging over the terminal panel.
+
+  It now asks for both and converts from the rectangle's *top*, which is how egui measures. The arithmetic is a separate function with tests for flipped and unflipped parents, since that was the only part that was ever wrong.
+
 - **Two temporary-file messages read properly.** Same lost line continuations as above, in the warning and the dialog shown when a tab with no file of its own is saved.
 
 - **Send to agent says so when there is nothing to send.** It was `if let Some(page) = …` with no else: when no page had been reported yet — still loading, or it posted nothing — the button did nothing and said nothing, which is indistinguishable from a working button whose result went astray. It now says the page has not settled and to try again.

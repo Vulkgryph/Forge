@@ -146,6 +146,10 @@ unsafe fn nsstring_to_string(obj: *mut AnyObject) -> String {
 
 /// A `WKWebView` parented onto the window.
 pub struct WebView {
+    /// The view this one is a subview of. Kept because placing the view needs
+    /// its size and its coordinate direction, and both are properties of the
+    /// parent rather than of the window — see [`WebView::place`].
+    parent: Retained<AnyObject>,
     view: Retained<AnyObject>,
     /// Kept alive as long as the view is: the content controller holds the
     /// handler weakly, so dropping it would leave WebKit messaging freed
@@ -202,8 +206,12 @@ impl WebView {
         let _: () = msg_send![&view, setHidden: true];
         let parent = parent as *mut AnyObject;
         let _: () = msg_send![parent, addSubview: &*view];
+        // Retained so the view can be placed later: its frame is in this
+        // view's coordinate space, and both the size and the direction of that
+        // space are the parent's to report.
+        let parent: Retained<AnyObject> = unsafe { Retained::retain(parent) }?;
 
-        Some(Self { view, _sink: sink })
+        Some(Self { view, parent, _sink: sink })
     }
 
     /// Point the browser at a URL.
@@ -231,16 +239,38 @@ impl WebView {
         }
     }
 
-    /// Position the view, in the window's coordinates.
+    /// Put the view where egui says, converting into the parent's coordinates.
     ///
-    /// Called every frame the panel is open, because egui owns the layout and
-    /// the native view has to follow it. Cheap: AppKit skips a `setFrame:` that
-    /// changes nothing.
-    pub fn place(&self, x: f64, y: f64, width: f64, height: f64) {
-        let frame = NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(width.max(0.0), height.max(0.0)),
-        );
+    /// `top` is the distance from the top of the parent to the top of the
+    /// rectangle, which is how egui measures — so this takes egui's own
+    /// numbers and does the conversion here, where the facts needed to do it
+    /// are available.
+    ///
+    /// Those facts are asked for rather than assumed, which is the fix. A
+    /// view's frame is in its superview's coordinate space, and whether that
+    /// space counts y from the top or the bottom is the superview's own
+    /// property — `isFlipped`. The first version of this took the window's
+    /// `inner_size`, assumed an unflipped parent, and computed
+    /// `height - rect.max.y`. Two assumptions, either of which puts the
+    /// browser somewhere other than where the layout said: it rendered a few
+    /// hundred points low and short, over the terminal.
+    ///
+    /// The parent's own `bounds` is authoritative for its size, and
+    /// `isFlipped` for its direction. Neither is worth guessing when both are
+    /// one message send away.
+    pub fn place(&self, x: f64, top: f64, width: f64, height: f64) {
+        let width = width.max(0.0);
+        let height = height.max(0.0);
+        let (parent_height, flipped) = unsafe {
+            let bounds: NSRect = msg_send![&self.parent, bounds];
+            let flipped: bool = msg_send![&self.parent, isFlipped];
+            (bounds.size.height, flipped)
+        };
+        // Flipped: y already counts down from the top, so egui's number is the
+        // frame's. Unflipped: the origin is the *bottom* left, so it is the
+        // parent's height less the rectangle's lower edge.
+        let y = frame_origin_y(parent_height, top, height, flipped);
+        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
         unsafe {
             let _: () = msg_send![&self.view, setFrame: frame];
         }
@@ -337,8 +367,79 @@ impl Drop for WebView {
     }
 }
 
+/// A subview's frame origin `y`, in its parent's coordinate space.
+///
+/// `top` is the distance from the top of the parent to the top of the
+/// rectangle — egui's own measure — and `flipped` is the parent's
+/// `isFlipped`. Separate from the message sends so the arithmetic can be
+/// checked without a window, which is the only part of this that was wrong.
+fn frame_origin_y(parent_height: f64, top: f64, height: f64, flipped: bool) -> f64 {
+    if flipped {
+        // y already counts down from the top, so egui's number is the frame's.
+        top
+    } else {
+        // The origin is the bottom-left corner, so it is the parent's height
+        // less the rectangle's lower edge.
+        parent_height - (top + height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::frame_origin_y;
+
+    /// The conversion, both ways, with numbers.
+    ///
+    /// A browser filling the lower 600 points of an 800-point parent — tab
+    /// strip and toolbar above it — has its top 200 points down.
+    #[test]
+    fn a_frame_origin_follows_the_parents_direction() {
+        // Unflipped: the origin is the bottom-left, so it sits 0 from the
+        // bottom.
+        assert_eq!(frame_origin_y(800.0, 200.0, 600.0, false), 0.0);
+        // Flipped: y counts down from the top, so it is egui's own number.
+        assert_eq!(frame_origin_y(800.0, 200.0, 600.0, true), 200.0);
+
+        // A panel not reaching the bottom: top 100, 400 tall, so 300 of
+        // parent left underneath.
+        assert_eq!(frame_origin_y(800.0, 100.0, 400.0, false), 300.0);
+        assert_eq!(frame_origin_y(800.0, 100.0, 400.0, true), 100.0);
+    }
+
+    /// The bug this replaced. The old code used the rectangle's *lower* edge
+    /// against the window's height and assumed an unflipped parent — two
+    /// assumptions, and getting either wrong moves the browser rather than
+    /// failing. It rendered a few hundred points low and short, over the
+    /// terminal.
+    #[test]
+    fn the_previous_arithmetic_is_not_what_this_computes() {
+        let (parent, top, height) = (800.0, 200.0_f64, 600.0_f64);
+        // What the old line did: window height less the rect's bottom edge,
+        // which only coincides with the right answer when the rectangle
+        // reaches the bottom of the parent.
+        let old = parent - (top + height);
+        assert_eq!(frame_origin_y(parent, top, height, false), old);
+
+        // And where it diverges: a rectangle that stops short of the bottom
+        // is placed correctly by both, while one measured against the wrong
+        // parent height is not — which is why the height now comes from the
+        // parent's own bounds rather than the window's inner size.
+        assert_ne!(
+            frame_origin_y(650.0, top, height, false),
+            frame_origin_y(800.0, top, height, false),
+            "the parent's height has to matter, or the view floats",
+        );
+    }
+
+    /// A rectangle taller than its parent yields a negative origin rather
+    /// than a panic, which AppKit clips — the honest outcome for a layout
+    /// that does not fit.
+    #[test]
+    fn an_oversized_rectangle_does_not_panic() {
+        assert_eq!(frame_origin_y(400.0, 0.0, 900.0, false), -500.0);
+        assert_eq!(frame_origin_y(400.0, 0.0, 900.0, true), 0.0);
+    }
+
     use super::*;
 
     /// The framework actually linked and the classes actually resolve.

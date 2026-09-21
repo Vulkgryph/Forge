@@ -463,21 +463,6 @@ struct IdeWindow {
     next_repaint: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
-/// AppKit's y, from egui's.
-///
-/// egui measures points down from the top of the window; AppKit measures them
-/// up from the bottom, and a view's frame origin is its *bottom* left corner.
-/// So the distance from the bottom of the window to the bottom of the
-/// rectangle is the window's height less the rectangle's lower edge.
-///
-/// Its own function because getting it wrong does not look like a small
-/// offset — it puts the browser off the bottom of the window, or above the
-/// top, where it is indistinguishable from not having been created at all.
-#[cfg(target_os = "macos")]
-fn appkit_y(window_height_points: f64, rect_bottom_from_top: f64) -> f64 {
-    window_height_points - rect_bottom_from_top
-}
-
 impl IdeWindow {
     /// Position, show or hide the window's web view for this frame.
     ///
@@ -566,18 +551,14 @@ impl IdeWindow {
             self.app.browser_moved(&at, view.can_go_back(), view.can_go_forward());
         }
 
-        // egui measures in points from the top-left; AppKit from the
-        // bottom-left. The window's height in points is what converts them,
-        // and getting this wrong puts the browser off-screen rather than
-        // slightly askew — so it is worth stating: `y` is the distance from
-        // the bottom of the window to the *bottom* of the rectangle.
-        let scale = self.window.scale_factor();
-        let height_points = self.window.inner_size().height as f64 / scale;
-        let y = appkit_y(height_points, place.rect.max.y as f64);
-
+        // egui's own rectangle, unconverted. The conversion into AppKit's
+        // coordinates happens in `WebView::place`, which can ask the parent
+        // view for its height and its direction instead of assuming both —
+        // and assuming both was what put the browser a few hundred points low
+        // and short, over the terminal.
         view.place(
             place.rect.min.x as f64,
-            y,
+            place.rect.min.y as f64,
             place.rect.width() as f64,
             place.rect.height() as f64,
         );
@@ -1459,32 +1440,6 @@ fn main() {
 
 #[cfg(test)]
 mod startup_tests {
-    /// The coordinate flip, with numbers.
-    ///
-    /// A browser tab occupying the lower two thirds of an 800-point window —
-    /// tab strip and toolbar above it — sits 0 points from the bottom and is
-    /// 600 tall. Getting the flip backwards would put it 200 from the bottom
-    /// and hang it off the top.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn the_browser_sits_where_egui_put_it() {
-        // egui rect: top edge 200, bottom edge 800, in an 800-point window.
-        assert_eq!(super::appkit_y(800.0, 800.0), 0.0);
-        // A panel not reaching the bottom: top 100, bottom 500.
-        assert_eq!(super::appkit_y(800.0, 500.0), 300.0);
-        // Filling the window.
-        assert_eq!(super::appkit_y(600.0, 600.0), 0.0);
-    }
-
-    /// A rectangle taller than the window yields a negative origin rather
-    /// than a panic, which AppKit clips — the honest outcome for a layout that
-    /// does not fit.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn an_oversized_rectangle_does_not_panic() {
-        assert_eq!(super::appkit_y(400.0, 900.0), -500.0);
-    }
-
     use super::*;
     use std::path::PathBuf;
 

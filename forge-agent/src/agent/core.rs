@@ -1129,7 +1129,49 @@ impl Agent {
                     // request is withdrawn when the turn finishes. So the
                     // arrival has to start a turn of its own, or the work
                     // somebody just did by hand reaches nothing.
-                    let notice = self.absorb_browser_result(&request_id, &final_url, &html);
+                    let mut notices =
+                        vec![self.absorb_browser_result(&request_id, &final_url, &html)];
+
+                    // Several pages at once become one turn, not one each.
+                    //
+                    // Handing over a run of pages is the point of this now:
+                    // the site refused the crawler, so a person clears the
+                    // check and clicks through, sharing what matters. Pressing
+                    // the button five times started five turns, each with its
+                    // own model call, each told about one page — expensive, and
+                    // the agent kept re-deciding what to do in between. So
+                    // anything already waiting is absorbed first and the whole
+                    // batch is reported once.
+                    //
+                    // Non-blocking, so this only collects what is *already*
+                    // queued. Waiting for more would be guessing at whether
+                    // somebody is still browsing.
+                    loop {
+                        match self.action_rx.try_recv() {
+                            Ok(UserAction::BrowserResult { request_id, final_url, html }) => {
+                                notices.push(self.absorb_browser_result(
+                                    &request_id,
+                                    &final_url,
+                                    &html,
+                                ));
+                            }
+                            // Parked rather than dropped — this loop owns the
+                            // channel for a moment and anything else on it
+                            // still has to be handled. See `deferred_actions`.
+                            Ok(other) => self.deferred_actions.push_back(other),
+                            Err(_) => break,
+                        }
+                    }
+
+                    let notice = if notices.len() == 1 {
+                        notices.remove(0)
+                    } else {
+                        format!(
+                            "[{} pages were opened in a browser and handed over.]\n\n{}",
+                            notices.len(),
+                            notices.join("\n\n"),
+                        )
+                    };
                     let _ = self.event_tx.send(AgentEvent::AssistantMessage(notice.clone()));
                     self.history.push(Message::user(&notice));
                     let _ = self.log.log_run_state(RunState::Running);
@@ -5319,6 +5361,58 @@ mod repl_guard_tests {
 #[cfg(test)]
 mod deferred_action_tests {
 
+    /// The source of the arm that receives a delivered page, from its start to
+    /// the start of the next arm.
+    ///
+    /// Bounded by the next arm rather than by a character count. A fixed
+    /// window was the first attempt and it broke twice: once when the arm grew
+    /// to absorb a batch, and once on an off-by-one that clipped the last
+    /// assertion's needle by a single character. Neither failure said anything
+    /// about the code under test.
+    fn browser_result_arm(src: &str) -> &str {
+        // Assembled, because this test reads the file it lives in — a literal
+        // would match itself.
+        let arm = ["UserAction::BrowserResult", " { request_id, final_url, html } =>"].concat();
+        let at = src.find(&arm).expect("nothing receives a delivered page any more");
+        let rest = &src[at + arm.len()..];
+        // The next arm of the same match, which every one of them begins with.
+        let end = rest.find("                UserAction::").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Several pages handed over together become one turn, not one each.
+    ///
+    /// Handing over a run of pages is the point: the site refused the crawler,
+    /// so a person clears the check, clicks through, and shares what matters.
+    /// Pressing the button five times started five turns, each with its own
+    /// model call and each told about a single page — expensive, and the agent
+    /// re-decided what to do in between every one of them.
+    ///
+    /// Structural, like the test below, because the property is about which
+    /// channel things arrive on and how many turns follow. The two facts that
+    /// matter: the arm drains what is already queued, and anything that is not
+    /// a page is parked rather than eaten — this loop owns the action channel
+    /// for a moment, and that is exactly how a finished background command got
+    /// lost once before.
+    #[test]
+    fn several_delivered_pages_are_absorbed_into_one_turn() {
+        let src = include_str!("core.rs");
+        let body = browser_result_arm(src);
+
+        assert!(
+            body.contains(&["self.action_rx", ".try_recv()"].concat()),
+            "a delivered page no longer collects the ones already queued, so \
+             handing over five pages is five model calls",
+        );
+        assert!(
+            body.contains(&["self.deferred_actions", ".push_back(other)"].concat()),
+            "the batching loop drops actions that are not pages",
+        );
+        // And still exactly one turn for the batch.
+        let turns = body.matches(&["self.process_turn", "()"].concat()).count();
+        assert_eq!(turns, 1, "{turns} turns for one batch of pages");
+    }
+
     /// A page a person hands over must reach the model, not just the screen.
     ///
     /// Structural for the same reason as the test below: the property is about
@@ -5339,10 +5433,7 @@ mod deferred_action_tests {
     #[test]
     fn a_delivered_page_reaches_the_model_and_starts_a_turn() {
         let src = include_str!("core.rs");
-        // Assembled, because this test reads the file it lives in.
-        let arm = ["UserAction::BrowserResult", " { request_id, final_url, html } =>"].concat();
-        let at = src.find(&arm).expect("nothing receives a delivered page any more");
-        let body = &src[at..(at + 1400).min(src.len())];
+        let body = browser_result_arm(src);
 
         assert!(
             body.contains(&["self.history.push(Message::user(", "&notice)"].concat()),
@@ -5383,17 +5474,32 @@ mod deferred_action_tests {
             // passed over a wait loop in `handle_ask_question` that dropped
             // every action it did not recognise. A background command
             // completing while the user was being asked a question was lost.
+            // `Ok(_)` and `Some(_)` discard exactly as thoroughly as `_`, and
+            // the first version of this list did not include them. A batching
+            // loop added later matches on `try_recv`, where the catch-all is
+            // naturally written `Ok(other)` — so the wrong version of it is
+            // `Ok(_) => {}`, which this test would have waved through.
             let discards = matches!(
                 code,
                 "_ => {}" | "_ => {}," | "_ => continue" | "_ => continue,"
                     | "_ => { continue }" | "_ => { continue; }"
-            ) || code.starts_with("_ => {} ");
+                    | "Ok(_) => {}" | "Ok(_) => {}," | "Ok(_) => continue" | "Ok(_) => continue,"
+                    | "Some(_) => {}" | "Some(_) => {}," | "Some(_) => continue"
+                    | "Some(_) => continue,"
+            ) || code.starts_with("_ => {} ")
+                || code.starts_with("Ok(_) => {} ")
+                || code.starts_with("Some(_) => {} ");
             if !discards {
                 continue;
             }
-            // Only arms belonging to a match on an action receive.
+            // Only arms belonging to a match on an action receive — of either
+            // kind. `try_recv` was not looked for, so a non-blocking drain
+            // that ate what it did not recognise passed this test; the
+            // batching loop for handed-over pages is exactly that shape.
             let window = lines[i.saturating_sub(30)..i].join("\n");
-            if window.contains("action_rx.recv()") && window.contains("UserAction::") {
+            let receives =
+                window.contains("action_rx.recv()") || window.contains("action_rx.try_recv()");
+            if receives && window.contains("UserAction::") {
                 offenders.push(i + 1);
             }
         }

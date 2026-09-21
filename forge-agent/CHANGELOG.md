@@ -71,6 +71,18 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **Several pages handed over together become one turn, not one each.** A site that refuses the crawler can still be read by a person: clear the check, click through, and share what matters — which already worked, since nothing blocks a repeat share and the tab stays open after the agent's turn ends. What it cost was a model call per page, each turn told about one page, with the agent re-deciding what to do in between.
+
+  A delivered page now absorbs anything already queued behind it and reports the batch once. Non-blocking, so it collects only what is already waiting rather than guessing whether somebody is still browsing. Anything on the channel that is not a page is parked rather than eaten — that loop owns the action channel for a moment, and that is exactly how a background command's completion was lost once before.
+
+  Which also found a hole in the test that guards against it: `no_action_consumer_silently_discards` looked for `action_rx.recv()` and for bare `_ =>` arms, so a non-blocking drain written `Ok(_) => {}` passed it. It now sees `try_recv` and the `Ok`/`Some` spellings of a catch-all.
+
+- **A page the user handed over is reachable by `web_fetch`, not only by `web_search`.** Clearing a bot check is a person deciding to share a page. Once they have opened it and pressed the button the content is here, and the agent should reach it with whichever tool it was going to use. `web_search` already could, because it reads the index. `web_fetch` went straight to the network, was refused again, and reported the page unreachable while holding a copy of it in the index beside it.
+
+  It now falls back to the provided copy when — and only when — a bot check refuses the fetch. That order matters: a site that will serve the page should be asked for it, because the live copy is the current one. The result says where the content came from, and that other pages on the site are still behind the check, so the agent does not conclude the whole host opened up.
+
+  Nothing is fetched on that path, so nothing is bypassed: no cookie is replayed, no identity is claimed, and no request reaches the site. `robots.txt` governs what a crawler may go and take; it does not govern what a person chose to read and pass on. That is why this route needs a human at the start of it, and why it is the one way through a refusal that is honest.
+
 - **One data file can no longer swamp the document index, and sections of an untitled file are told apart.** Found by pointing `search_documents` at a machine-learning project: `data/wikitext-103/test_articles.txt` is a hundred thousand words of Wikipedia with no headings, so it divided into 380 sections, and four such files turned 303 documents into 1,974. A query about training a network was answered with the same title twice, from two datasets.
 
   A file may now contribute at most 50 sections — roughly seventeen thousand words, a long document by any measure — and what was dropped is reported by name, with a pointer to `search_code` for a file that really is data. On that project it took the index from 1,974 sections to 754 and halved the time to build it. Indexing a corpus as though it were notes does not make it findable; it makes everything else less so.

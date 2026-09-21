@@ -61,6 +61,50 @@ fn refused(url: &str, vendor: &str, status: Option<u16>) -> String {
     )
 }
 
+/// The page as it was already given to us, if it was.
+///
+/// Checked only when a bot check refuses the fetch, and that order matters: a
+/// site that will serve the page should be asked for it, because the live copy
+/// is the current one. This is the fallback for a page that cannot be fetched
+/// but is nonetheless in hand.
+///
+/// Which is the point a person makes by clearing a challenge. Once somebody
+/// has opened a page, decided to share it, and pressed the button, the content
+/// is here and both tools should be able to use it. `web_search` already
+/// could, because it reads the index; `web_fetch` went straight to the network
+/// and got refused again for a page sitting in the index beside it — so the
+/// same work had to be done twice for no reason and the agent concluded the
+/// page was unreachable while holding it.
+///
+/// Nothing is fetched here, so nothing is bypassed. No cookie is replayed, no
+/// identity is claimed, and no request reaches the site. `robots.txt` governs
+/// what a crawler may go and take; it does not govern what a person chose to
+/// read and pass on, which is why this is the one route through a refusal that
+/// is honest — and why it needs a human at the start of it.
+fn already_provided(index_path: &std::path::Path, url: &str) -> Option<String> {
+    let index = forge_search::index::Index::load(index_path).ok()?;
+    let id = index.by_url_id(url)?;
+    let doc = index.document(id)?;
+    let text = index.text(id);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let title = if doc.title.is_empty() { url.to_string() } else { doc.title.clone() };
+    let body: String = text.chars().take(MAX_LENGTH).collect();
+    let cut = if text.chars().count() > MAX_LENGTH {
+        "\n\n[truncated]"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{url} is behind a bot check, so it was not fetched — but this page was already \
+         opened in a browser by the user and handed over, so here it is from the search \
+         index.\n\n# {title}\n\n{body}{cut}\n\n\
+         [From the copy the user provided, not a fresh fetch. Other pages on this site are \
+         still behind the check; ask the user to open one if you need it.]"
+    ))
+}
+
 /// What to do about a page this tool cannot have, given what the client can do.
 ///
 /// Split out because the right answer differs and the wrong one wastes a turn.
@@ -192,6 +236,11 @@ pub async fn web_fetch(
             body: String::new(),
         };
         if let Some(vendor) = probe.challenge() {
+            // A page somebody already handed over is not refused — it is in
+            // hand. See `already_provided`.
+            if let Some(held) = index_path.and_then(|p| already_provided(p, url)) {
+                return Ok(held);
+            }
             return Ok(refused(url, vendor, Some(status.as_u16())));
         }
 
@@ -231,6 +280,9 @@ pub async fn web_fetch(
         body: html.clone(),
     };
     if let Some(vendor) = served.challenge() {
+        if let Some(held) = index_path.and_then(|p| already_provided(p, url)) {
+            return Ok(held);
+        }
         return Ok(refused(url, vendor, None));
     }
 
@@ -454,6 +506,77 @@ mod tests {
         let path = dir.join("search-index");
         ix.save(&path).unwrap();
         path
+    }
+
+    /// A page the user handed over is served by `web_fetch` too, not only by
+    /// `web_search`.
+    ///
+    /// The point a person makes by clearing a bot check. Once they have opened
+    /// a page, decided to share it, and pressed the button, the content is
+    /// here — and the agent should be able to reach it with whichever tool it
+    /// was going to use. `web_search` already could, because it reads the
+    /// index. `web_fetch` went to the network, got refused again, and reported
+    /// the page unreachable while holding a copy of it.
+    #[test]
+    fn a_page_the_user_provided_is_returned_rather_than_refused() {
+        let path = index_with("provided", &[(
+            "https://walled.test/questions",
+            "Newest Questions",
+            "the accepted answer explains that a lifetime annotation is required here",
+        )]);
+
+        let held = already_provided(&path, "https://walled.test/questions")
+            .expect("a page in the index was not offered");
+        assert!(held.contains("lifetime annotation"), "{held}");
+        assert!(held.contains("Newest Questions"), "the title was lost: {held}");
+        // It has to say where this came from, or the agent cannot tell a
+        // provided copy from a live fetch.
+        assert!(held.contains("handed over"), "{held}");
+        assert!(held.contains("not a fresh fetch"), "{held}");
+        // And that the rest of the site is still out of reach, so it does not
+        // conclude the whole host opened up.
+        assert!(held.contains("still behind the check"), "{held}");
+
+        // A URL nobody provided is not invented.
+        assert!(already_provided(&path, "https://walled.test/other").is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An indexed document with no text is not a page. Returning an empty
+    /// body as though it were the answer is worse than saying it was refused.
+    #[test]
+    fn an_empty_provided_page_is_not_offered() {
+        let path = index_with("empty-provided", &[(
+            "https://walled.test/blank",
+            "Blank",
+            "   \n\n  ",
+        )]);
+        assert!(already_provided(&path, "https://walled.test/blank").is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The whole route, against a site that really refuses: fetch is blocked,
+    /// the provided copy comes back instead.
+    #[tokio::test]
+    #[ignore = "goes to the network; run with --ignored"]
+    async fn live_a_provided_page_survives_a_real_refusal() {
+        let _g = crate::tools::refused::test_guard();
+        let url = "https://stackoverflow.com/questions";
+        let path = index_with("live-provided", &[(
+            url,
+            "Newest Questions - Stack Overflow",
+            "a distinctive sentence that only the provided copy contains, zebra zebra",
+        )]);
+
+        let args = json!({ "url": url, "prompt": "what does it say" });
+        let out = web_fetch(&args, None, Some(path.as_path())).await.expect("call");
+
+        assert!(
+            out.contains("zebra zebra"),
+            "a real refusal did not fall back to the copy the user provided: {out}"
+        );
+        assert!(!out.contains("Error:"), "{out}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The wording of a refusal, on both paths it can arrive by.

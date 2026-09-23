@@ -238,6 +238,25 @@ Crawling has limits that are not bugs. `robots.txt` is obeyed, including
 Sites that refuse crawlers are refused, and PubMed Central refuses everyone:
 its `robots.txt` is `User-agent: *` and `Disallow: /`.
 
+### If Forge has been at your site
+
+It identifies itself, and the version tells you which build:
+
+```
+forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)
+forge-agent/0.5.0 (+https://vulkgryph.com/projects/forge/)
+```
+
+The first is the crawler, the second fetches a single page somebody asked for
+by name. Neither pretends to be a browser and neither ignores `robots.txt`, so
+`Disallow` is enough to stop them — from one user at a page a second, which is
+the scale this runs at.
+
+If something is wrong anyway, **contact@vulkgryph.com**. Worth saying what
+counts as wrong: crawling you said not to, requests faster than `Crawl-delay`,
+or anything that looks like it is pretending to be something else. Those would
+be defects, and we would want to know.
+
 ## Literature, through the front door
 
 Which is why there is a second tool. `search_papers` asks Europe PMC's REST

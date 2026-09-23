@@ -53,7 +53,7 @@ impl Fetcher for Curl {
 }
 
 fn main() {
-    let fetcher = Curl { agent: concat!("forge-search/", env!("CARGO_PKG_VERSION")).to_string() };
+    let fetcher = Curl { agent: concat!("forge-search/", env!("CARGO_PKG_VERSION"), " (+https://vulkgryph.com/projects/forge/)").to_string() };
     // A spread of bot-management vendors, plus sites that should pass clean so
     // a detector that simply says "challenged" to everything is visible.
     let sites = [

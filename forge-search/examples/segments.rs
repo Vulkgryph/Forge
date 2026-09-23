@@ -63,7 +63,7 @@ impl Fetcher for Curl {
 
 fn main() {
     let fetcher = Curl {
-        agent: "forge-search/0.4.2 (+https://github.com/Vulkgryph/Forge)".into(),
+        agent: "forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)".into(),
     };
     let dir = std::env::temp_dir().join("forge-segments-live");
     let _ = std::fs::remove_dir_all(&dir);

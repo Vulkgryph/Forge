@@ -30,7 +30,16 @@ use forge_search::query;
 /// the answer it gets. It matters more here, because a crawler that lies about
 /// who it is cannot meaningfully claim to be obeying `robots.txt` — the file
 /// addresses crawlers by name.
-pub(crate) const USER_AGENT: &str = concat!("forge-search/", env!("CARGO_PKG_VERSION"));
+///
+/// The `+`-prefixed URL is the convention for a crawler that expects to be
+/// looked up. A site operator seeing an unfamiliar agent in their logs has one
+/// question — who is this and how do I reach them — and a bare name does not
+/// answer it. The alternative to being findable is being blocked by reputation,
+/// which is the outcome this project has already chosen against by refusing to
+/// pretend to be a browser.
+pub(crate) const USER_AGENT: &str = concat!(
+    "forge-search/", env!("CARGO_PKG_VERSION"), " (+https://vulkgryph.com/projects/forge/)"
+);
 
 /// Sites crawled when the caller names none.
 ///

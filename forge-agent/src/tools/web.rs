@@ -12,7 +12,12 @@ use crate::api::{ApiClient, Message};
 /// as a client you are not. An honest agent identifies itself and takes the
 /// answer it gets; `web_search` is disabled by default and does not work in
 /// practice anyway, so there is nothing to preserve by pretending.
-const FORGE_USER_AGENT: &str = concat!("forge-agent/", env!("CARGO_PKG_VERSION"));
+/// The contact URL is the same convention the crawler follows — see
+/// `search::USER_AGENT`. This tool fetches one page at a time rather than
+/// crawling, but it is still an unfamiliar name in somebody's logs.
+const FORGE_USER_AGENT: &str = concat!(
+    "forge-agent/", env!("CARGO_PKG_VERSION"), " (+https://vulkgryph.com/projects/forge/)"
+);
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -727,5 +732,28 @@ mod user_agent_tests {
         }
         assert!(super::FORGE_USER_AGENT.starts_with("forge-agent/"),
             "the user-agent should say what this is: {}", super::FORGE_USER_AGENT);
+    }
+
+    /// Both agents carry a contact URL, in the `+`-prefixed form a crawler is
+    /// expected to use.
+    ///
+    /// Saying what you are is half of it. A site operator seeing an unfamiliar
+    /// name in their logs has one question — who is this and how do I reach
+    /// them — and a bare name does not answer it. The alternative to being
+    /// findable is being blocked by reputation, which is the outcome this
+    /// project already declined when it stopped pretending to be a browser.
+    #[test]
+    fn both_agents_say_where_to_find_us() {
+        for (what, ua) in [
+            ("web_fetch", super::FORGE_USER_AGENT),
+            ("the crawler", crate::tools::search::USER_AGENT),
+        ] {
+            assert!(ua.contains("(+http"), "{what} carries no contact URL: {ua}");
+            assert!(ua.contains("vulkgryph.com"), "{what}: {ua}");
+            assert!(ua.ends_with(')'), "{what}: malformed contact suffix: {ua}");
+            // The version is still in there — "which build is hitting me" is
+            // the operator's second question.
+            assert!(ua.contains(env!("CARGO_PKG_VERSION")), "{what}: no version: {ua}");
+        }
     }
 }

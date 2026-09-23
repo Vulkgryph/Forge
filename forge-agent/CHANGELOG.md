@@ -2,6 +2,12 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Both user agents carry a contact URL**, in the `+`-prefixed form a crawler is expected to use: `forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)`, and the same for `forge-agent/`. Saying what you are is only half of it — a site operator seeing an unfamiliar name in their logs wants to know who it is and how to reach them, and a bare name does not answer that. The alternative to being findable is being blocked by reputation, which this project already declined when it stopped pretending to be a browser.
+
 ## [0.5.0] — 2026-09-23
 
 ### Fixed

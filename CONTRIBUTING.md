@@ -1,6 +1,17 @@
 # Contributing
 
-Thanks for taking an interest. This file is short on purpose — it covers the things that are specific to this repository, not general advice about writing Rust.
+**Pull requests are closed.** Forge is maintained by Vulkgryph LLC with
+contributions closed, to keep the maintenance scope constrained — see
+[Contributing](README.md#contributing) for why. **Issues are welcome**, and so
+is a fork.
+
+That is said first because the rest of this file reads like a contribution
+guide, and it would be unfair to let you work through it before mentioning it.
+It is still worth having: it is what to follow if you fork, what a bug report
+needs to be useful, and what the rules will be if pull requests open.
+
+This file is short on purpose — it covers the things that are specific to this
+repository, not general advice about writing Rust.
 
 ## Layout
 
@@ -20,7 +31,7 @@ cargo test -p forge-ide            # needs a GPU-capable toolchain
 
 ## What CI enforces
 
-- Those tests, on every push and pull request
+- Those tests, on every push
 - `RUSTFLAGS=-D warnings` — the crates are at zero warnings and should stay there
 - That `install.sh` and `update.sh` still parse, and that the macOS app bundle still builds and contains both binaries
 
@@ -46,8 +57,6 @@ Security issues do **not** go in the issue tracker — see [SECURITY.md](SECURIT
 
 ## Licence
 
-Pull requests are closed for now — see [Contributing](README.md#contributing) for
-why, and open an issue instead. This section is here for when they open, and for
-anything contributed by another route: by contributing you agree that your
-contributions are licensed under the [Apache License 2.0](LICENSE), the same as
-the rest of the project.
+By contributing — should pull requests open, or by any other route — you agree
+that your contributions are licensed under the
+[Apache License 2.0](LICENSE), the same as the rest of the project.

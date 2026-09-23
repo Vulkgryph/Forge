@@ -38,6 +38,18 @@ cargo build --release -p forge-agent
 echo "==> Building forge-server (local pty-host daemon; also the SSH remote agent)"
 cargo build --release -p forge-server
 
+# The terminal client. Not part of the bundle — it is installed separately, to
+# ~/.local/share/forge/bin/forge — but it is built here so it can never be
+# stale relative to the agent it spawns.
+#
+# It was omitted, and the omission shipped: a release binary was installed
+# carrying the commit hash of the build before it, because packaging rebuilt
+# everything except this and the stale artefact was copied out. A product that
+# is released is a product that is built by the release script, even when it
+# travels by a different route.
+echo "==> Building forge-tui-rs (the terminal client; installed separately)"
+cargo build --release -p forge-tui-rs
+
 # The remote half of SSH workspaces. forge-ide uploads this to the machine you
 # connect to, so it has to be a Linux binary and it has to travel inside the
 # app — a launched .app has / for a working directory, so nothing relative to
@@ -174,3 +186,10 @@ fi
 echo "==> Signed as: $(codesign -dv "$APP" 2>&1 | grep '^Identifier=' || echo unknown)"
 
 echo "==> Done: $APP"
+echo "==> Terminal client: $BUILD_DIR/forge-tui-rs"
+echo "    Install it with:  rm -f ~/.local/share/forge/bin/forge &&"
+echo "                      cp $BUILD_DIR/forge-tui-rs ~/.local/share/forge/bin/forge &&"
+echo "                      codesign --force --options runtime --timestamp \\"
+echo "                        --identifier com.vulkgryph.forge --sign \"$SIGN_ID\" \\"
+echo "                        ~/.local/share/forge/bin/forge"
+echo "    (rm first: overwriting a signed binary in place SIGKILLs any process running it.)"

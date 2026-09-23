@@ -24,7 +24,7 @@ use std::time::Duration;
 use forge_tui_rs::app::{App, Input, Outcome};
 use forge_tui_rs::bridge::{AgentBridge, BridgeEvent};
 use forge_tui_rs::inline::Inline;
-use forge_tui_rs::keys::{Decoder, ESCAPE_TIMEOUT};
+use forge_tui_rs::keys::Decoder;
 use forge_tui_rs::session::Effect;
 use forge_tui_rs::sys::{self, Ready};
 use forge_tui_rs::{input, term};
@@ -123,6 +123,12 @@ fn main() -> io::Result<()> {
         };
 
         // A timeout with no event is the spinner's turn.
+        // The reader thread decides how long to hold a lone `ESC` on this, and
+        // it is set here rather than at the places a turn starts and stops
+        // because those are many and this is one. Cheap: a relaxed store per
+        // pass through a loop that is already about to draw.
+        forge_tui_rs::keys::set_turn_running(app.session().activity.is_busy());
+
         let Some(first) = first else {
             app.tick();
             app.render(&mut inline, &mut out)?;
@@ -379,7 +385,12 @@ fn read_terminal(tx: mpsc::Sender<Event>) {
             return;
         }
 
-        let timeout = decoder.has_pending().then_some(ESCAPE_TIMEOUT);
+        // Asked each time rather than captured once: how long a held `ESC`
+        // waits depends on whether a turn is running, because that is what
+        // decides the cost of guessing wrong. See `keys::escape_timeout`.
+        let timeout = decoder
+            .has_pending()
+            .then(forge_tui_rs::keys::escape_timeout);
         match sys::wait_readable_many(&watched, timeout) {
             Ready::Readable(mask) => {
                 if mask & WAKE_BIT != 0 {
@@ -572,6 +583,37 @@ At a prompt: y approves, n denies; always-allow must be selected.
 
 #[cfg(test)]
 mod tests {
+    /// The reader thread's escape window is only adaptive if something tells
+    /// it when a turn is running.
+    ///
+    /// Structural, because the two halves live in different threads and the
+    /// failure is silent: `keys::escape_timeout` would simply always return
+    /// the idle value, the window would never widen mid-turn, and the bug it
+    /// exists to prevent would be back with nothing to show for it.
+    #[test]
+    fn the_event_loop_tells_the_decoder_when_a_turn_is_running() {
+        let src = include_str!("main.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Assembled, since this test reads the file it lives in.
+        let setter = ["set_turn", "_running("].concat();
+        assert!(
+            code.contains(&setter),
+            "nothing reports turn state to the key decoder, so the escape \
+             window can never widen while the agent is working",
+        );
+        // And from the activity the session actually reports, not a constant.
+        let at = code.find(&setter).expect("checked above");
+        let call = &code[at..(at + 120).min(code.len())];
+        assert!(
+            call.contains("is_busy"),
+            "turn state is not taken from the session: {call}",
+        );
+    }
+
     use super::looks_pasted;
 
     /// The reported bug: a structured message pasted into Apple's Terminal.app was

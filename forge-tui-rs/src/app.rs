@@ -505,6 +505,21 @@ impl App {
                             self.cache = None;
                         }
                     }
+                    // Say what stopped it, and how.
+                    //
+                    // A turn ending has several causes and they look identical
+                    // from the outside, which made one of them very hard to
+                    // pin down: a lone `ESC` is also the first byte of every
+                    // arrow key, so a split escape sequence cancelled the work
+                    // in progress and left no trace of why. Reported as the
+                    // agent being cancelled at random, and from the outside
+                    // that is exactly what it was.
+                    //
+                    // The window that resolves the ambiguity is wider now —
+                    // see `keys::ESCAPE_TIMEOUT` — but timing can never settle
+                    // it completely, so the next occurrence should at least
+                    // name itself instead of being a mystery.
+                    self.session_mut().push_system("Interrupted by Escape.");
                     return (
                         Outcome::Continue,
                         vec![Effect::Send(ClientMessage::CancelRun)],
@@ -4085,6 +4100,47 @@ long enough to wrap, and must stay separated from the first.";
                    "the caret sits at the end of the row it is on");
         assert!(col < 40, "and inside the window");
     }
+    /// An interruption names itself, because several things stop a turn and
+    /// they are indistinguishable once it has stopped.
+    ///
+    /// The one that was hard to find: a lone `ESC` is also the first byte of
+    /// every arrow key, so a sequence split by network jitter cancelled the
+    /// work in progress and left nothing behind saying why — it read as the
+    /// agent being killed at random. The window that resolves that ambiguity
+    /// is wider now, but timing cannot settle it completely, so the next one
+    /// should at least be reportable.
+    #[test]
+    fn an_escape_interruption_says_so() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::Thinking);
+        assert!(app.session().activity.is_busy(), "the fixture is not running");
+
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert!(matches!(effects.as_slice(), [Effect::Send(ClientMessage::CancelRun)]));
+
+        let said = app
+            .session()
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, crate::session::EntryKind::System))
+            .map(|e| e.content.clone())
+            .unwrap_or_default();
+        assert!(said.contains("Escape"), "an interruption left no trace of its cause: {said:?}");
+    }
+
+    /// And an idle Escape says nothing, or every stray keypress would leave a
+    /// line in the transcript.
+    #[test]
+    fn an_idle_escape_is_silent() {
+        let (mut app, _rows) = app_with(0);
+        assert!(!app.session().activity.is_busy());
+        let before = app.session().entries().len();
+        let (_, effects) = app.update(Input::Escape, ROWS);
+        assert!(effects.is_empty(), "an idle Escape sent something: {effects:?}");
+        assert_eq!(app.session().entries().len(), before, "an idle Escape wrote a line");
+    }
+
     /// Escape is the instinctive "stop that", and the TypeScript client cancelled
     /// a running turn with it. This did nothing at all before.
     #[test]

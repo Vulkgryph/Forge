@@ -49,11 +49,72 @@ pub enum Key {
 /// value is a compromise every terminal application makes: too short and a slow
 /// connection turns arrow keys into Escape presses, too long and Escape feels
 /// unresponsive.
-pub const ESCAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+///
+/// It was 25ms, and the comment above described the failure that then happened.
+/// Escape stops a running turn, so an arrow key whose bytes were split by more
+/// than 25ms — trivial over SSH, or on a loaded machine — did not merely insert
+/// a stray keypress: it cancelled the work in progress. Reported as the agent's
+/// process being cancelled at random, which from the outside is exactly what it
+/// looked like.
+///
+/// The cost of the other direction is real but smaller. `ESC` followed by any
+/// other byte is read as an Alt chord and dropped, so pressing Escape and
+/// typing within the window loses both. Weighed against each other: a lost
+/// keystroke is noticed and retyped, while a cancelled turn loses work that was
+/// already paid for. A hundred milliseconds is four times the margin, still far
+/// below the threshold where a "stop" feels sluggish, and in the range other
+/// terminal applications use — ncurses' own default is forty times longer.
+pub const ESCAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The same wait, while a turn is running.
+///
+/// Longer, because the cost of deciding wrongly is not the same in both
+/// directions and the evidence required should match it. Idle, a misread
+/// Escape does nothing at all. Mid-turn it cancels work the user is waiting
+/// for and has already paid for — so mid-turn it is worth being sure.
+///
+/// Four hundred milliseconds is imperceptible in that context: the agent is
+/// already working and a stop that lands two fifths of a second later feels
+/// no different. But an escape sequence split by that much is not network
+/// jitter, it is a broken link — so this is the difference between "rare" and
+/// "effectively never".
+///
+/// The ambiguity itself is unfixable in the legacy encoding: a lone `ESC` is
+/// both the Escape key and the first byte of every arrow, function key and
+/// mouse report, and only silence distinguishes them. The real fix is the
+/// Kitty keyboard protocol, which gives Escape its own sequence — see
+/// `term::PUSH_KEYBOARD` for why this decoder cannot ask for it yet.
+pub const ESCAPE_TIMEOUT_WHILE_BUSY: std::time::Duration =
+    std::time::Duration::from_millis(400);
+
+/// Whether a turn is in flight, for the reader thread's benefit.
+///
+/// Process-global because the thread that decodes keys is a singleton with no
+/// handle on the session, and threading one in for a single bool would be more
+/// machinery than the fact deserves.
+static TURN_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether a turn is running, so a held `ESC` waits accordingly.
+pub fn set_turn_running(running: bool) {
+    TURN_RUNNING.store(running, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long to hold a lone `ESC` before deciding it was the Escape key.
+pub fn escape_timeout() -> std::time::Duration {
+    if TURN_RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+        ESCAPE_TIMEOUT_WHILE_BUSY
+    } else {
+        ESCAPE_TIMEOUT
+    }
+}
 
 /// Incremental decoder over a byte stream.
 #[derive(Default)]
 pub struct Decoder {
+    /// Set when a lone `ESC` was resolved as the Escape key on a timeout, and
+    /// cleared by the next [`Decoder::feed`]. It exists so a sequence tail
+    /// that turns up late can be recognised as one rather than typed.
+    flushed_escape: bool,
     buf: Vec<u8>,
     /// True while holding a lone `ESC`, waiting to see if more follows.
     pending_escape: bool,
@@ -72,6 +133,25 @@ impl Decoder {
 
     /// Feed bytes and take whatever keys are now complete.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Key> {
+        // A sequence tail arriving right after a flushed `ESC` says the flush
+        // was wrong: nobody types `[A` by hand a moment after pressing Escape,
+        // but a split arrow key produces exactly that.
+        //
+        // Without this the tail was decoded as the characters `[` and `A` and
+        // typed into the prompt — so one split keypress both cancelled the
+        // turn and left litter in the input. The `ESC` is put back so the
+        // ordinary parser reads the whole sequence and yields the key that was
+        // actually pressed.
+        //
+        // The spurious Escape has already gone out and cannot be recalled;
+        // that is what the wider window while a turn is running is for. This
+        // handles the other half, and it is cheap to be right about.
+        if std::mem::take(&mut self.flushed_escape)
+            && self.buf.is_empty()
+            && matches!(bytes.first(), Some(b'[') | Some(b'O'))
+        {
+            self.buf.push(0x1b);
+        }
         self.buf.extend_from_slice(bytes);
         self.pending_escape = false;
         let mut keys = Vec::new();
@@ -90,12 +170,17 @@ impl Decoder {
 
     /// Resolve a lone `ESC` as the Escape key.
     ///
-    /// Called when the caller has waited [`ESCAPE_TIMEOUT`] with nothing further
+    /// Called when the caller has waited [`escape_timeout`] with nothing further
     /// arriving, which is the only evidence available that no sequence is coming.
+    ///
+    /// Silence is not proof, only the absence of contradiction, so the flush is
+    /// remembered — see [`Decoder::feed`], which takes a sequence tail arriving
+    /// late as the contradiction it is.
     pub fn flush_pending_escape(&mut self) -> Option<Key> {
         if self.buf == [0x1b] {
             self.buf.clear();
             self.pending_escape = false;
+            self.flushed_escape = true;
             return Some(Key::Escape);
         }
         None
@@ -354,6 +439,108 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// A sequence tail arriving after a premature Escape is read as the key it
+    /// belongs to, not typed as text.
+    ///
+    /// The second half of the split-arrow-key problem. The first half — the
+    /// spurious Escape cancelling a turn — is handled by waiting longer when
+    /// that would cost something. This is what happens *after* the wait was
+    /// still too short: the `[A` used to decode as the characters `[` and `A`
+    /// and land in the prompt, so one split keypress both stopped the work and
+    /// left litter behind.
+    #[test]
+    fn a_late_sequence_tail_is_not_typed_as_characters() {
+        for (tail, want) in [
+            (&b"[A"[..], Key::Up),
+            (&b"[B"[..], Key::Down),
+            (&b"[C"[..], Key::Right),
+            (&b"[D"[..], Key::Left),
+            // SS3, which some terminals use in application mode.
+            (&b"OA"[..], Key::Up),
+        ] {
+            let mut d = Decoder::new();
+            assert!(d.feed(&[0x1b]).is_empty(), "the ESC should be held");
+            assert_eq!(d.flush_pending_escape(), Some(Key::Escape));
+            assert_eq!(
+                d.feed(tail),
+                vec![want.clone()],
+                "{:?} after a flushed ESC did not come back as {want:?}",
+                String::from_utf8_lossy(tail),
+            );
+        }
+    }
+
+    /// And a real Escape followed by real typing is still real typing. The
+    /// recovery must not swallow the next thing somebody writes.
+    #[test]
+    fn typing_after_a_real_escape_is_left_alone() {
+        let mut d = Decoder::new();
+        assert!(d.feed(&[0x1b]).is_empty());
+        assert_eq!(d.flush_pending_escape(), Some(Key::Escape));
+        // `h` is not the start of any sequence, so it is a character.
+        assert_eq!(d.feed(b"hello"), vec![
+            Key::Char('h'), Key::Char('e'), Key::Char('l'), Key::Char('l'), Key::Char('o'),
+        ]);
+    }
+
+    /// The recovery applies once, to the feed directly after the flush. A `[`
+    /// typed later is a bracket.
+    #[test]
+    fn the_recovery_does_not_persist() {
+        let mut d = Decoder::new();
+        assert!(d.feed(&[0x1b]).is_empty());
+        assert_eq!(d.flush_pending_escape(), Some(Key::Escape));
+        assert_eq!(d.feed(b"x"), vec![Key::Char('x')]);
+        // Now a bracket is just a bracket, not the tail of anything.
+        assert_eq!(d.feed(b"[A"), vec![Key::Char('['), Key::Char('A')]);
+    }
+
+    /// How long a held `ESC` waits depends on what getting it wrong costs.
+    ///
+    /// The ambiguity cannot be removed: a lone `ESC` is both the Escape key
+    /// and the first byte of every arrow, function key and mouse report, and
+    /// only silence tells them apart. What can be matched to the stakes is how
+    /// much silence is required. Idle, a misread Escape does nothing. Mid-turn
+    /// it cancels work already paid for — which is what happened, over SSH,
+    /// with a 25ms window and a user scrolling the transcript while the agent
+    /// worked.
+    #[test]
+    fn the_escape_window_widens_while_a_turn_is_running() {
+        // Serialised: the flag is process-global, so two tests reading it at
+        // once would see each other's writes.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        set_turn_running(false);
+        assert_eq!(escape_timeout(), ESCAPE_TIMEOUT);
+
+        set_turn_running(true);
+        assert_eq!(escape_timeout(), ESCAPE_TIMEOUT_WHILE_BUSY);
+        assert!(
+            ESCAPE_TIMEOUT_WHILE_BUSY > ESCAPE_TIMEOUT,
+            "the destructive case is not given more evidence than the harmless one",
+        );
+
+        set_turn_running(false);
+        assert_eq!(escape_timeout(), ESCAPE_TIMEOUT, "the flag does not clear");
+    }
+
+    /// Both windows have to stay in a range that is actually usable: long
+    /// enough to survive a split sequence, short enough that a stop does not
+    /// feel broken.
+    #[test]
+    fn the_windows_are_within_reason() {
+        use std::time::Duration;
+        // Comfortably past the jitter that caused this, which was tens of
+        // milliseconds.
+        assert!(ESCAPE_TIMEOUT >= Duration::from_millis(50));
+        // And below where a person notices a key not registering.
+        assert!(ESCAPE_TIMEOUT <= Duration::from_millis(200));
+        // Mid-turn can afford much more, since the agent is already working —
+        // but not so much that a deliberate stop feels ignored.
+        assert!(ESCAPE_TIMEOUT_WHILE_BUSY <= Duration::from_millis(600));
+    }
+
     use super::*;
 
     fn decode(bytes: &[u8]) -> Vec<Key> {

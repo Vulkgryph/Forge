@@ -4,6 +4,7 @@ fn main() {
     // Always needed, regardless of renderer.
     emit_forge_server_version();
     emit_forge_agent_version();
+    emit_build_commit();
 
     // SPIR-V is only consumed by the optional Vulkan renderer (`egui_pass.rs`).
     // The default wgpu backend carries its own WGSL, so shaderc — a heavy build
@@ -68,4 +69,42 @@ fn compile_vulkan_shaders() {
             .unwrap_or_else(|e| panic!("compile {src}: {e}"));
         fs::write(out, artifact.as_binary_u8()).expect("write SPIR-V");
     }
+}
+
+/// Stamp the binary with the commit it was built from.
+///
+/// The same reasoning as the terminal client's, and the same implementation:
+/// a version number cannot answer "am I running the build I just made", since
+/// every build between two releases reports the same number. That is exactly
+/// the situation while a change is being tested.
+///
+/// Degrades rather than fails — a source tarball with no `.git`, or a machine
+/// with no `git`, still builds and reports an unknown commit.
+fn emit_build_commit() {
+    // Rebuild when HEAD moves. `.git/HEAD` changes on checkout; the ref it
+    // points at changes on commit, so both are watched — without the second, a
+    // new commit on the same branch would keep the stale stamp.
+    if let Some(git_dir) = locate_git_dir() {
+        println!("cargo:rerun-if-changed={}/HEAD", git_dir.display());
+        if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
+            if let Some(reference) = head.strip_prefix("ref: ").map(str::trim) {
+                println!("cargo:rerun-if-changed={}/{reference}", git_dir.display());
+            }
+        }
+    }
+    let commit = git(&["rev-parse", "--short=9", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=FORGE_BUILD_COMMIT={commit}");
+}
+
+fn locate_git_dir() -> Option<std::path::PathBuf> {
+    git(&["rev-parse", "--absolute-git-dir"]).map(std::path::PathBuf::from)
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }

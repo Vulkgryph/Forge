@@ -142,6 +142,51 @@ struct WindowArgs {
     cwds:      Vec<Option<std::path::PathBuf>>,
 }
 
+/// What to print and exit for, if anything — before a window is created.
+///
+/// Separate from `parse_window_args` because these are not window arguments:
+/// they are questions about the binary, and the answer is the same whatever
+/// else is on the command line.
+fn immediate_answer(args: &[String]) -> Option<String> {
+    for a in args {
+        match a.as_str() {
+            "-V" | "--version" => {
+                // The commit as well as the number. Every build between two
+                // releases reports the same version, and "am I running the
+                // build I just made" is the question actually being asked.
+                return Some(format!(
+                    "forge-ide {} · commit {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("FORGE_BUILD_COMMIT"),
+                ));
+            }
+            "-h" | "--help" => {
+                return Some(
+                    [
+                        concat!("forge-ide ", env!("CARGO_PKG_VERSION")),
+                        "",
+                        "Usage: forge-ide [PATH]...",
+                        "",
+                        "Opens each PATH as a workspace, one window per path — the equivalent",
+                        "of `code .`. With no path it restores the last session, or opens an",
+                        "empty window.",
+                        "",
+                        "Options:",
+                        "  -V, --version    Print the version and build commit",
+                        "  -h, --help       Print this",
+                        "",
+                        "Reload Window passes --reload and --reload-window <id> when it",
+                        "restarts a window; they are not meant to be typed.",
+                    ]
+                    .join("\n"),
+                );
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_window_args(args: &[String]) -> WindowArgs {
     let mut out = WindowArgs { is_reload: false, only: Vec::new(), cwds: Vec::new() };
     let mut i = 0;
@@ -1403,6 +1448,15 @@ fn main() {
     // restore the session it just saved regardless of the `restore_session`
     // setting.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Answered before anything opens a window. `forge-ide --version` used to
+    // be treated as a path to open, so it launched the editor on a workspace
+    // called "--version" and sat there — which is a slow and confusing way to
+    // find out the flag does not exist, and cost two ten-minute timeouts here
+    // before it was worth fixing.
+    if let Some(text) = immediate_answer(&args) {
+        println!("{text}");
+        return;
+    }
     let window_args = parse_window_args(&args);
     // Session files for windows that are no longer in the record are dead weight.
     // Done here, once, because the recorded set is authoritative only before any
@@ -1436,6 +1490,59 @@ fn main() {
     wake::set_waker(move || { let _ = proxy.send_event(()); });
 
     event_loop.run_app(&mut Ide::new(initial_specs)).expect("run");
+}
+
+#[cfg(test)]
+mod immediate_answer_tests {
+    use super::immediate_answer;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--version` is answered without opening anything.
+    ///
+    /// It used to be taken for a path, so the editor opened a workspace called
+    /// "--version" and sat there — a slow and confusing way to learn a flag
+    /// does not exist. It cost two ten-minute timeouts in one session before
+    /// it was worth fixing.
+    #[test]
+    fn version_and_help_are_answered_before_any_window() {
+        for flag in ["-V", "--version"] {
+            let out = immediate_answer(&args(&[flag])).unwrap_or_default();
+            assert!(out.starts_with("forge-ide "), "{flag}: {out}");
+            assert!(out.contains(env!("CARGO_PKG_VERSION")), "{flag}: {out}");
+            // The commit too — every build between releases reports the same
+            // version, and "is this the build I just made" is the real question.
+            assert!(out.contains("commit "), "{flag}: no build commit: {out}");
+        }
+        for flag in ["-h", "--help"] {
+            let out = immediate_answer(&args(&[flag])).unwrap_or_default();
+            assert!(out.contains("Usage: forge-ide"), "{flag}: {out}");
+            // Help that omits a real flag is worse than none.
+            assert!(out.contains("--version"), "{flag}: {out}");
+        }
+    }
+
+    /// Everything else falls through to the window arguments, or the editor
+    /// would stop opening folders.
+    #[test]
+    fn ordinary_arguments_are_left_alone() {
+        for a in [vec![], vec!["."], vec!["/tmp/project"], vec!["--reload"],
+                  vec!["--reload-window", "17"], vec!["/a", "/b"]] {
+            assert!(
+                immediate_answer(&args(&a)).is_none(),
+                "{a:?} was mistaken for a question about the binary",
+            );
+        }
+    }
+
+    /// A flag anywhere in the line is still a question about the binary, since
+    /// the answer does not depend on what else was typed.
+    #[test]
+    fn a_flag_after_a_path_still_answers() {
+        assert!(immediate_answer(&args(&["/tmp/project", "--version"])).is_some());
+    }
 }
 
 #[cfg(test)]

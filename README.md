@@ -141,6 +141,15 @@ this is actually used against is ARM64.
 | `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested | untested |
 | `forge-ide` | supported | untested | untested | untested |
 
+One feature is narrower than its component. When a bot check refuses the
+crawler, the agent can offer the page to a person, who opens it in a real
+browser and hands it back — and that browser is `WKWebView`, so it exists on
+macOS and nowhere else. The agent is told at startup whether its client can
+open a page at all, so on every other platform it says the site refused an
+automated request and answers from what else it has, rather than offering a
+handoff nothing can satisfy. A Linux or Windows port of the editor would need
+its own web view before that feature came with it.
+
 **supported** — developed and used on this platform every day, which is the
 evidence behind the word. CI coverage is not what it rests on, and differs by
 component: `forge-ide` is built and its tests run on a macOS runner on every

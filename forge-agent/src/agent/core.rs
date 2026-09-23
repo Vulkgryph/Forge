@@ -3321,6 +3321,11 @@ impl Agent {
         args: &serde_json::Value,
     ) -> Result<String> {
         use crate::tools::SpawnedCommand;
+        // Only the PTY path reads through this trait, and that path is
+        // unix-only — so on Windows the import is orphaned, and `-D warnings`
+        // turns an orphaned import into a failed build. Found by a Windows CI
+        // job that exists to find exactly this.
+        #[cfg(unix)]
         use tokio::io::AsyncReadExt;
 
         let SpawnedCommand {

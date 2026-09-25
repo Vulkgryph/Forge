@@ -6,6 +6,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **ChatGPT Codex no longer mints an API key nobody asked for.** Forge exchanged your OAuth `id_token` for an `sk-` API key — on login, on every token refresh, and on every token check — wrote it to `chatgpt_auth.json`, and then preferred it over the OAuth token for one request. The backend that accepts the token rejects that key, so the failure read `Incorrect API key provided: sk-svcacct…`: a credential the user never supplied, cannot find in any config, and did not know existed.
+
+  It only broke when the mint *succeeded*, which is why it came and went rather than failing consistently. The one request that used it — listing available models — now uses the OAuth token like everything else, verified live against the backend.
+
+  Nothing mints the key any more, and a key left by an older build is dropped when the token file is read, so it leaves disk on the next save. A credential nobody asked for should not sit in a file.
+
 - **Both user agents carry a contact URL**, in the `+`-prefixed form a crawler is expected to use: `forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)`, and the same for `forge-agent/`. Saying what you are is only half of it — a site operator seeing an unfamiliar name in their logs wants to know who it is and how to reach them, and a bare name does not answer that. The alternative to being findable is being blocked by reputation, which this project already declined when it stopped pretending to be a browser.
 
 ## [0.5.0] — 2026-09-23

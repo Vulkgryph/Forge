@@ -81,7 +81,16 @@ pub fn chatgpt_auth_path() -> Result<PathBuf> {
 pub fn load_chatgpt_tokens() -> Option<ChatGptTokens> {
     let path = chatgpt_auth_path().ok()?;
     let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let mut tokens: ChatGptTokens = serde_json::from_str(&content).ok()?;
+    // Drop a key minted by an older build.
+    //
+    // Forge used to exchange the id_token for an `sk-` API key on login, on
+    // refresh and on every token check, then prefer it over the OAuth token
+    // for one request. Nothing needs it now, and a credential nobody asked
+    // for should not sit on disk — so it is dropped on load and gone from the
+    // file the next time anything saves.
+    tokens.api_key = None;
+    Some(tokens)
 }
 
 pub async fn fetch_chatgpt_codex_models() -> Vec<ChatGptCodexModel> {
@@ -353,10 +362,15 @@ fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
 /// `originator=codex_cli_rs` already baked into the auth URL.
 async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexModel>> {
     let tokens = load_chatgpt_tokens()?;
-    let bearer = tokens
-        .api_key
-        .as_deref()
-        .or(Some(tokens.access_token.as_str()))?;
+    // The OAuth token, like every other request Forge makes to this backend.
+    //
+    // This used to prefer a minted `sk-` key and fall back to the token. The
+    // preference was the bug: nobody configures that key — Forge mints it from
+    // the id_token — and the backend that accepts the OAuth token rejects it,
+    // with "Incorrect API key provided: sk-svcacct…" naming a credential the
+    // user never supplied and cannot find. It only broke when the mint
+    // succeeded, which is why it came and went.
+    let bearer = tokens.access_token.as_str();
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -586,13 +600,6 @@ pub async fn get_valid_chatgpt_token(http: &reqwest::Client) -> Result<ChatGptTo
         tokens = refresh_chatgpt_tokens(http, &tokens).await?;
         save_chatgpt_tokens(&tokens)?;
     }
-    if tokens.api_key.is_none() {
-        if let Ok(api_key) = obtain_chatgpt_api_key(http, &tokens.id_token).await {
-            tokens.api_key = Some(api_key);
-        }
-        save_chatgpt_tokens(&tokens)?;
-    }
-
     Ok(tokens)
 }
 
@@ -669,8 +676,7 @@ async fn refresh_chatgpt_tokens(
         anyhow::bail!(parse_oauth_error_body(status.as_u16(), &body));
     }
 
-    let mut tokens = parse_chatgpt_token_response(resp, Some(old_tokens)).await?;
-    tokens.api_key = obtain_chatgpt_api_key(http, &tokens.id_token).await.ok();
+    let tokens = parse_chatgpt_token_response(resp, Some(old_tokens)).await?;
     Ok(tokens)
 }
 
@@ -703,38 +709,6 @@ fn parse_oauth_error_body(status: u16, body: &str) -> String {
         }
     }
     format!("HTTP {}: {}", status, body.trim())
-}
-
-async fn obtain_chatgpt_api_key(http: &reqwest::Client, id_token: &str) -> Result<String> {
-    let resp = http
-        .post(format!("{}/oauth/token", CHATGPT_ISSUER))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
-            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
-            urlencoding::encode(CHATGPT_CLIENT_ID),
-            urlencoding::encode("openai-api-key"),
-            urlencoding::encode(id_token),
-            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token"),
-        ))
-        .send()
-        .await
-        .context("ChatGPT API token exchange request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("ChatGPT API token exchange failed ({}): {}", status, body);
-    }
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("Failed to parse ChatGPT API token exchange response")?;
-    json["access_token"]
-        .as_str()
-        .map(|s| s.to_string())
-        .context("Missing access_token in ChatGPT API token exchange response")
 }
 
 async fn parse_chatgpt_token_response(
@@ -868,8 +842,7 @@ pub async fn login_chatgpt(interactive: bool) -> Result<()> {
         anyhow::bail!("ChatGPT token exchange failed ({}): {}", status, body);
     }
 
-    let mut tokens = parse_chatgpt_token_response(resp, None).await?;
-    tokens.api_key = obtain_chatgpt_api_key(&http, &tokens.id_token).await.ok();
+    let tokens = parse_chatgpt_token_response(resp, None).await?;
     save_chatgpt_tokens(&tokens)?;
 
     eprintln!("ChatGPT Codex login successful. Token saved to ~/.config/forge/chatgpt_auth.json");
@@ -1283,6 +1256,63 @@ pub fn xai_display_name(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The Codex backend is addressed with the OAuth token, never with a
+    /// minted API key.
+    ///
+    /// Structural, because the failure is a *preference* rather than a missing
+    /// branch: the old code read `tokens.api_key.or(access_token)`, so it
+    /// worked whenever the mint failed and broke whenever it succeeded. That
+    /// is why it came and went, and why it named a credential — an
+    /// `sk-svcacct…` key — that the user had never supplied and could not find
+    /// in any config.
+    #[test]
+    fn the_codex_backend_is_addressed_with_the_oauth_token() {
+        let src = include_str!("auth.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Whitespace collapsed first: the offending expression wraps across
+        // lines, and a needle that assumed one line passed against the very
+        // code it was written to catch. Checked by restoring the bug.
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Assembled, since this test reads the file it lives in.
+        let minted = ["tokens", " .api_key", " .as_deref()"].concat();
+        assert!(
+            !flat.contains(&minted),
+            "a request prefers a minted API key over the OAuth token again",
+        );
+        // And nothing mints one at all.
+        let exchange = ["obtain_chatgpt", "_api_key"].concat();
+        assert!(
+            !code.contains(&exchange),
+            "the id_token is being exchanged for an API key again; nothing sends it",
+        );
+        assert!(
+            !code.contains(&["requested_token=", "{}"].concat())
+                || !code.contains("openai-api-key"),
+            "the api-key token exchange is back",
+        );
+    }
+
+    /// A key minted by an older build is dropped rather than carried forward.
+    #[test]
+    fn a_legacy_minted_key_is_not_kept() {
+        let src = include_str!("auth.rs");
+        let loader = src
+            .split("pub fn load_chatgpt_tokens")
+            .nth(1)
+            .unwrap_or("");
+        let head = &loader[..loader.len().min(700)];
+        assert!(
+            head.contains(&["tokens", ".api_key = None"].concat()),
+            "load_chatgpt_tokens keeps a credential nobody asked for",
+        );
+    }
+
     use super::{parse_chatgpt_codex_models, xai_display_name};
 
     #[test]

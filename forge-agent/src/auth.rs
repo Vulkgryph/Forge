@@ -340,6 +340,34 @@ async fn resolve_client_version(repo: &str, cache_file: &str, fallback: &str) ->
     fallback.to_string()
 }
 
+/// Describes a credential without disclosing it: enough to tell a JWT from an
+/// `sk-` key, and one token from another across two runs, not enough to use.
+/// The prefix is no longer than the one providers already echo back in their
+/// own error bodies.
+/// Opt-in tracing for credential selection. Off by default: the shape of a
+/// token is not a secret, but it is noise nobody needs until something is
+/// wrong.
+pub(crate) fn auth_debug() -> bool {
+    std::env::var("FORGE_AUTH_DEBUG").is_ok()
+}
+
+pub(crate) fn credential_shape(token: &str) -> String {
+    if token.is_empty() {
+        return "empty".to_string();
+    }
+    let kind = if token.split('.').count() == 3 && token.starts_with("ey") {
+        "OAuth JWT"
+    } else if token.starts_with("sk-") {
+        "sk- API key"
+    } else if token.starts_with("xai-") {
+        "xAI key"
+    } else {
+        "opaque string"
+    };
+    let head: String = token.chars().take(6).collect();
+    format!("{kind}, {} chars, starts {head}\u{2026}", token.len())
+}
+
 fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
@@ -420,6 +448,19 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
         };
 
         if !resp.status().is_success() {
+            // Best-effort catalog fetch, so a failure is not fatal and falls
+            // through to the cache. But swallowing it silently is how a bad
+            // credential here stayed invisible: the catalog just looked empty.
+            // An auth failure names itself now, and the shape of what was sent.
+            let status = resp.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 || auth_debug() {
+                eprintln!(
+                    "forge: model catalog request failed ({status})\n\
+                     \u{2514} {url}\n\
+                     \u{2514} credential: {}, from chatgpt_auth.json",
+                    credential_shape(bearer),
+                );
+            }
             continue;
         }
         let Ok(body) = resp.bytes().await else {
@@ -1256,6 +1297,49 @@ pub fn xai_display_name(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::credential_shape;
+
+
+
+    // A JWT and an `sk-` key must be distinguishable at a glance, because
+    // telling them apart by eye in an error body is the whole point.
+    #[test]
+    fn credential_shape_names_the_kind_without_disclosing_the_secret() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJldmFsdWU";
+        let key = "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789";
+
+        let jwt_shape = credential_shape(jwt);
+        let key_shape = credential_shape(key);
+
+        assert!(jwt_shape.starts_with("OAuth JWT"), "{jwt_shape}");
+        assert!(key_shape.starts_with("sk- API key"), "{key_shape}");
+
+        // The secret itself must never appear. Six characters is what the
+        // provider already echoes; the rest stays out of logs the user may
+        // paste into an issue.
+        for (secret, shape) in [(jwt, &jwt_shape), (key, &key_shape)] {
+            assert!(!shape.contains(secret), "the whole credential leaked: {shape}");
+            assert!(
+                !shape.contains(&secret[..12]),
+                "more than a short prefix leaked: {shape}"
+            );
+            assert!(shape.contains(&secret[..6]), "no prefix to compare on: {shape}");
+        }
+
+        // Length is carried, so two different tokens are distinguishable
+        // across runs without either being reconstructable.
+        assert!(key_shape.contains(&key.len().to_string()), "{key_shape}");
+    }
+
+    #[test]
+    fn credential_shape_survives_the_degenerate_cases() {
+        assert_eq!(credential_shape(""), "empty");
+        // Shorter than the prefix it wants to take: must not panic.
+        assert!(credential_shape("sk-").starts_with("sk- API key"));
+        assert!(credential_shape("ab").starts_with("opaque string"));
+        // Multi-byte input must not split a character boundary.
+        assert!(credential_shape("\u{1f511}\u{1f511}\u{1f511}").contains("opaque"));
+    }
     /// The Codex backend is addressed with the OAuth token, never with a
     /// minted API key.
     ///

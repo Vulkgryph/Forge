@@ -27,6 +27,11 @@ enum Backend {
         base_url: String,
         access_token: String,
         account_id: Option<String>,
+        /// Where `access_token` came from. Carried only so a failed request can
+        /// say which of the several construction paths supplied the credential
+        /// it just got rejected — a 401 that names the source is one step of
+        /// diagnosis; one that does not cost a full re-trace of every caller.
+        token_source: &'static str,
     },
 }
 
@@ -63,10 +68,12 @@ impl Clone for Backend {
                 base_url,
                 access_token,
                 account_id,
+                token_source,
             } => Backend::ChatGptCodex {
                 base_url: base_url.clone(),
                 access_token: access_token.clone(),
                 account_id: account_id.clone(),
+                token_source,
             },
         }
     }
@@ -212,8 +219,13 @@ impl ApiClient {
                 }
             }
             EndpointType::ChatGptCodex => {
-                let mut tokens =
-                    crate::auth::load_chatgpt_tokens().unwrap_or(crate::auth::ChatGptTokens {
+                let loaded = crate::auth::load_chatgpt_tokens();
+                let mut token_source = if loaded.is_some() {
+                    "chatgpt_auth.json"
+                } else {
+                    "endpoint api_key (no usable token file)"
+                };
+                let mut tokens = loaded.unwrap_or(crate::auth::ChatGptTokens {
                         id_token: String::new(),
                         access_token: endpoint.api_key.clone().unwrap_or_default(),
                         refresh_token: String::new(),
@@ -225,6 +237,7 @@ impl ApiClient {
                     });
                 if let Some(access_token) = auth_token {
                     tokens.access_token = access_token;
+                    token_source = "caller-supplied OAuth token";
                 }
                 Backend::ChatGptCodex {
                     // The configured URL, not the constant. It is normally the
@@ -240,6 +253,7 @@ impl ApiClient {
                     },
                     access_token: tokens.access_token,
                     account_id: tokens.account_id,
+                    token_source,
                 }
             }
             EndpointType::OpenAi => Backend::OpenAi {
@@ -323,11 +337,13 @@ impl ApiClient {
                 base_url,
                 access_token,
                 account_id,
+                token_source,
             } => {
                 self.chat_responses(
                     base_url,
                     access_token,
                     account_id.as_deref(),
+                    token_source,
                     model,
                     messages,
                     tools,
@@ -362,11 +378,13 @@ impl ApiClient {
                 base_url,
                 access_token,
                 account_id,
+                token_source,
             } => {
                 self.chat_stream_responses(
                     base_url,
                     access_token,
                     account_id.as_deref(),
+                    token_source,
                     model,
                     messages,
                     tools,
@@ -1035,6 +1053,7 @@ impl ApiClient {
         base_url: &str,
         access_token: &str,
         account_id: Option<&str>,
+        token_source: &'static str,
         model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -1044,6 +1063,7 @@ impl ApiClient {
             base_url,
             access_token,
             account_id,
+            token_source,
             model,
             messages,
             tools,
@@ -1098,6 +1118,7 @@ impl ApiClient {
         base_url: &str,
         access_token: &str,
         account_id: Option<&str>,
+        token_source: &'static str,
         model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -1115,6 +1136,15 @@ impl ApiClient {
             &self.reasoning,
         );
         let mut current = access_token.to_string();
+        let mut source = token_source;
+        if crate::auth::auth_debug() {
+            eprintln!(
+                "forge: responses request \u{2192} {} as {model}\n\
+                 \u{2514} credential: {}, from {source}",
+                base_url.trim_end_matches('/'),
+                crate::auth::credential_shape(&current),
+            );
+        }
         let mut account = account_id.map(str::to_string);
         let mut auth_retry = true;
         let mut server_retries: u8 = 3; // retry transient 5xx errors up to 3 times
@@ -1138,6 +1168,7 @@ impl ApiClient {
                     Ok(tokens) => {
                         current = tokens.access_token;
                         account = tokens.account_id;
+                        source = "refreshed after a 401";
                         continue;
                     }
                     Err(e) => {
@@ -1157,9 +1188,18 @@ impl ApiClient {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let err_body = resp.text().await.unwrap_or_default();
+                // The provider names the credential it rejected but nothing
+                // about where it came from, and this backend has several
+                // construction paths. Saying which one supplied the token
+                // turns "some key is wrong" into a single place to look.
                 let _ = tx.send(StreamEvent::Error(format!(
-                    "Responses API error ({}): {}",
-                    status, err_body
+                    "Responses API error ({status}): {err_body}\n\
+                     \u{2514} sent to {url}/responses as model {model}\n\
+                     \u{2514} credential: {shape}, from {source}\n\
+                     \u{2514} account header: {account_state}",
+                    url = base_url.trim_end_matches('/'),
+                    shape = crate::auth::credential_shape(&current),
+                    account_state = if account.is_some() { "sent" } else { "absent" },
                 )));
                 return;
             }

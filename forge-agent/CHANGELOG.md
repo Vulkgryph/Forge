@@ -6,6 +6,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **A rejected credential now says where it came from.** A 401 from the Responses API named the key the provider disliked but nothing about which of the backend's several construction paths supplied it, so diagnosing one meant re-tracing every caller by hand. The error now carries the endpoint, the model, whether the account header went out, and the credential's *shape* — kind, length, and a six-character prefix, which is no more than the provider already echoes.
+
+  `FORGE_AUTH_DEBUG=1` traces the same line on every Codex request, for catching the moment a working credential turns into a failing one. The model-catalog fetch, which used to swallow every failure and merely look like an empty catalog, now reports auth failures too.
+
 - **ChatGPT Codex no longer mints an API key nobody asked for.** Forge exchanged your OAuth `id_token` for an `sk-` API key — on login, on every token refresh, and on every token check — wrote it to `chatgpt_auth.json`, and then preferred it over the OAuth token for one request. The backend that accepts the token rejects that key, so the failure read `Incorrect API key provided: sk-svcacct…`: a credential the user never supplied, cannot find in any config, and did not know existed.
 
   It only broke when the mint *succeeded*, which is why it came and went rather than failing consistently. The one request that used it — listing available models — now uses the OAuth token like everything else, verified live against the backend.

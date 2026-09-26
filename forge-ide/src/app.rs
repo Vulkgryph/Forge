@@ -7769,27 +7769,36 @@ impl IdeApp {
             let mut action: Option<BuildUpdateAction> = None;
             let running = build_stamp().to_string();
             egui::TopBottomPanel::top("build_stale_banner").show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                // The dismiss button is taken off the right edge *before* the
+                // text, because the text wraps and the button must not. Nested
+                // inside `horizontal_wrapped` it was simply the next item in the
+                // flow: once the message filled the first row it wrapped like
+                // any other item and sat alone under the buttons, right-aligned
+                // to a row of its own. The neighbouring update banner does the
+                // same thing and looks fine only because it never wraps.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("A newer build is installed.")
-                        .strong().color(egui::Color32::from_rgb(230, 210, 150)));
-                    ui.label(egui::RichText::new(format!("This window is running {running}."))
-                        .color(egui::Color32::from_gray(190)));
-                    if ui.button("Restart this window").clicked() {
-                        action = Some(BuildUpdateAction::ThisWindow);
-                    }
-                    if ui.button("Restart all windows").clicked() {
-                        action = Some(BuildUpdateAction::Everything);
-                    }
-                    // The part worth saying out loud: this is not all-or-nothing.
-                    // One window can move to the new build while the others carry
-                    // on with whatever they are in the middle of.
-                    ui.label(egui::RichText::new(
-                        "— one window at a time is fine; the others keep running.")
-                        .size(11.0).color(egui::Color32::from_gray(140)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(8.0);
-                        if ui.button("×").clicked() { action = Some(BuildUpdateAction::Later); }
+                    if ui.button("×").clicked() { action = Some(BuildUpdateAction::Later); }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("A newer build is installed.")
+                                .strong().color(egui::Color32::from_rgb(230, 210, 150)));
+                            ui.label(egui::RichText::new(format!("This window is running {running}."))
+                                .color(egui::Color32::from_gray(190)));
+                            if ui.button("Restart this window").clicked() {
+                                action = Some(BuildUpdateAction::ThisWindow);
+                            }
+                            if ui.button("Restart all windows").clicked() {
+                                action = Some(BuildUpdateAction::Everything);
+                            }
+                            // The part worth saying out loud: this is not all-or-nothing.
+                            // One window can move to the new build while the others carry
+                            // on with whatever they are in the middle of.
+                            ui.label(egui::RichText::new(
+                                "— one window at a time is fine; the others keep running.")
+                                .size(11.0).color(egui::Color32::from_gray(140)));
+                        });
                     });
                 });
             });

@@ -2,11 +2,15 @@
 
 All notable changes to Forge IDE are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge IDE adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.1] — 2026-09-25
 
 ### Added
 
 - **`forge-ide --version` and `--help`.** Neither existed, and an unrecognised argument is taken for a path to open — so asking the editor its version launched it on a workspace called `--version` and left it sitting there. A slow and confusing way to discover a flag is missing. Both are answered before any window is created, and `--version` reports the build commit as well as the number, since every build between two releases reports the same number and "is this the build I just made" is the question actually being asked.
+
+### Fixed
+
+- **The dismiss button on the "newer build is installed" banner sat on a row of its own.** The banner's message wraps, and the `×` was nested inside the wrapping container — so once the text filled the first row the button wrapped like any other item and ended up alone underneath the restart buttons, right-aligned to nothing. It is taken off the right edge before the text is laid out now, so it stays put however the message wraps.
 
 ## [0.5.0] — 2026-09-23
 

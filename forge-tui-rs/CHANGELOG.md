@@ -2,6 +2,10 @@
 
 All notable changes to the Forge terminal client are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-09-25
+
+No changes to the terminal client itself. Version-matched to the release, which fixes ChatGPT Codex authentication and plan-mode exit in `forge-agent` — both of which the terminal client uses.
+
 ## [0.5.0] — 2026-09-23
 
 ### Fixed

@@ -691,6 +691,29 @@ pub fn ensure_rolling_plan_context(history: &mut Vec<Message>, plan: &str) {
     history.insert(insert_at, Message::system(&state));
 }
 
+/// The planning-mode directive, matched by its opening words.
+///
+/// It is a system message inside the transcript rather than part of the system
+/// prompt, so leaving plan mode has to take it back out. The flag alone is not
+/// enough: the flag decides which tools are offered, the directive is what the
+/// model actually reads, and clearing only the flag leaves the model told it
+/// may not write anything while the one tool that would let it say so —
+/// `exit_plan_mode` — is no longer on offer. That is a dead end with no move
+/// out of it, and it is what a user hit.
+pub const PLAN_MODE_DIRECTIVE_MARKER: &str = "PLAN MODE ACTIVE";
+
+pub fn is_plan_mode_directive(msg: &Message) -> bool {
+    msg.role == "system"
+        && msg
+            .content
+            .as_deref()
+            .is_some_and(|c| c.trim_start().starts_with(PLAN_MODE_DIRECTIVE_MARKER))
+}
+
+pub fn remove_plan_mode_directive(history: &mut Vec<Message>) {
+    history.retain(|msg| !is_plan_mode_directive(msg));
+}
+
 pub fn remove_rolling_plan_context(history: &mut Vec<Message>) {
     history.retain(|msg| !is_rolling_plan_context(msg));
 }
@@ -1287,5 +1310,45 @@ mod tests {
             summary_with(&["no third-party crates"], "b"),
         ]);
         assert_eq!(merged.decisions.len(), 1);
+    }
+
+    #[test]
+    fn leaving_plan_mode_takes_the_directive_out_of_the_transcript() {
+        let directive = "PLAN MODE ACTIVE \u{2014} You are in planning mode.\n\
+                         - You CANNOT modify files, run commands, or make any changes";
+        let mut history = vec![
+            Message::system("sys"),
+            Message::system(directive),
+            Message::user("write the thing"),
+        ];
+
+        remove_plan_mode_directive(&mut history);
+
+        assert_eq!(history.len(), 2, "only the directive should go");
+        assert!(
+            !history.iter().any(is_plan_mode_directive),
+            "the model still reads that it may not write anything",
+        );
+        assert_eq!(history[0].content.as_deref(), Some("sys"));
+        assert_eq!(history[1].content.as_deref(), Some("write the thing"));
+    }
+
+    #[test]
+    fn the_directive_is_told_apart_from_other_system_messages() {
+        // A plan's own text may quote the directive; only a system message
+        // that opens with it is the directive itself.
+        let quoting = Message::user("PLAN MODE ACTIVE is what it said");
+        let summary = Message::system("Summary: the user asked about PLAN MODE ACTIVE");
+        assert!(!is_plan_mode_directive(&quoting), "a user message is not the directive");
+        assert!(!is_plan_mode_directive(&summary), "a mention is not the directive");
+
+        let real = Message::system("PLAN MODE ACTIVE \u{2014} You are in planning mode.");
+        assert!(is_plan_mode_directive(&real));
+
+        // Removing it twice is not an error; exit paths may overlap.
+        let mut history = vec![real];
+        remove_plan_mode_directive(&mut history);
+        remove_plan_mode_directive(&mut history);
+        assert!(history.is_empty());
     }
 }

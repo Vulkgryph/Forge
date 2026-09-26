@@ -10,7 +10,8 @@ use super::agent_def::{AgentDefinition, AgentModel};
 use super::compaction::{
     apply_rolling_window, ensure_rolling_plan_context, estimate_history_tokens,
     clamp_tool_result, extract_rolling_plan_context, fit_history_to_window,
-    perform_compaction, remove_rolling_plan_context, should_compact,
+    perform_compaction, remove_plan_mode_directive, remove_rolling_plan_context,
+    should_compact,
 };
 use super::conversation_log::ConversationLog;
 use super::log_types::{RunState, SessionMeta};
@@ -2781,6 +2782,20 @@ impl Agent {
         self.meta_written = false;
     }
 
+    /// Leave plan mode.
+    ///
+    /// The flag and the transcript directive go together. Every exit path used
+    /// to clear the flag by hand, and two of them left the directive standing:
+    /// the model kept reading "PLAN MODE ACTIVE — you CANNOT modify files …
+    /// call exit_plan_mode" while the tool list had moved on and no longer
+    /// offered `exit_plan_mode`. It correctly refused to touch anything, and
+    /// correctly reported it had no way to say so. One approved plan, and no
+    /// move left that made progress.
+    fn leave_plan_mode(&mut self) {
+        self.plan_mode = false;
+        remove_plan_mode_directive(&mut self.history);
+    }
+
     fn clear_session(&mut self) -> Result<()> {
         let _ = self.log.log_run_state(RunState::Idle);
         self.update_meta();
@@ -2800,7 +2815,7 @@ impl Agent {
         self.total_completion_tokens = 0;
         self.total_requests = 0;
         self.token_snapshots.clear();
-        self.plan_mode = false;
+        self.leave_plan_mode();
         self.plan_file_path = None;
         self.rolling_window_plan_content = None;
         self.rolling_window_completion_notice_sent = false;
@@ -4432,7 +4447,7 @@ impl Agent {
         loop {
             match self.action_rx.recv().await {
                 Some(UserAction::ClearAndApprovePlan) => {
-                    self.plan_mode = false;
+                    self.leave_plan_mode();
                     self.rolling_window_plan_approved = true;
                     self.rolling_window_plan_content = Some(content.clone());
                     self.ensure_plan_completed_todo();
@@ -4484,7 +4499,7 @@ impl Agent {
                     return Ok("Plan approved by user. Context cleared. Proceed with implementation using the full tool set.".to_string());
                 }
                 Some(UserAction::ApprovePlan) => {
-                    self.plan_mode = false;
+                    self.leave_plan_mode();
                     self.rolling_window_plan_approved = true;
                     self.rolling_window_plan_content = Some(content.clone());
                     self.ensure_plan_completed_todo();
@@ -4510,7 +4525,7 @@ impl Agent {
 
                     // "DISCUSS" sentinel: exit plan mode and ask the user what they want to change.
                     if feedback == "DISCUSS" {
-                        self.plan_mode = false;
+                        self.leave_plan_mode();
                         self.rolling_window_plan_approved = false;
                         self.rolling_window_plan_content = None;
                         self.rolling_window_completion_notice_sent = false;
@@ -5548,4 +5563,29 @@ fn hash_of(s: &str) -> u64 {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+#[cfg(test)]
+mod plan_mode_exit_tests {
+    /// Leaving plan mode means two things — clearing the flag and taking the
+    /// directive out of the transcript — and they were done separately at four
+    /// call sites until two of them forgot the second.
+    ///
+    /// Assembled, since this test reads the file it lives in, and
+    /// whitespace-collapsed because the real expression may wrap across lines.
+    /// Checked by putting a bare assignment back and watching this fail.
+    #[test]
+    fn plan_mode_is_only_ever_left_in_one_place() {
+        let code = include_str!("core.rs");
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let assignment = ["self", ".plan_mode", " = false;"].concat();
+
+        assert_eq!(
+            flat.matches(&assignment).count(),
+            1,
+            "an exit path clears the flag on its own again — it must call \
+             leave_plan_mode instead, or the model keeps reading the planning \
+             directive with no exit_plan_mode tool left to answer it",
+        );
+    }
 }

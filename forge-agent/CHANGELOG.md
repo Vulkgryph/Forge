@@ -4,6 +4,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **An approved plan could leave the agent with nothing it was allowed to do.** Approving a plan without clearing context cleared the plan-mode flag but left the "PLAN MODE ACTIVE — you CANNOT modify files" directive standing in the transcript. The flag decides which tools are offered; the directive is what the model reads. With the flag down, `exit_plan_mode` was no longer on offer — so the model was told it must not write anything, and the one tool that would have let it say otherwise was gone. It refused to implement the plan it had just written, asked to be switched out of a mode it was no longer in, and was right on both counts.
+
+  Three of the four exit paths cleared the flag by hand and two forgot the directive. They all go through one place now, and a test fails if a new exit path clears the flag on its own.
+
 ### Changed
 
 - **A rejected credential now says where it came from.** A 401 from the Responses API named the key the provider disliked but nothing about which of the backend's several construction paths supplied it, so diagnosing one meant re-tracing every caller by hand. The error now carries the endpoint, the model, whether the account header went out, and the credential's *shape* — kind, length, and a six-character prefix, which is no more than the provider already echoes.

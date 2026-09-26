@@ -1519,25 +1519,6 @@ fn paint_send_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     p.line_segment([c + egui::vec2(0.0, -5.0), c + egui::vec2( 4.0, -1.0)], s);
 }
 
-fn load_forge_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    // Bundled at the repo root — bytes are embedded so the binary stays standalone.
-    let bytes = include_bytes!("../Forge.png");
-    let decoded = crate::img::png::decode(bytes).ok()?;
-    let (w, h) = (decoded.width, decoded.height);
-    let mut pixels = decoded.rgba;
-
-    // The PNG has a solid black background; key it out so the icon blends
-    // into whatever color the activity bar uses.  Anything near-black goes
-    // fully transparent; everything else keeps its alpha.
-    for chunk in pixels.chunks_exact_mut(4) {
-        let lum = chunk[0] as u16 + chunk[1] as u16 + chunk[2] as u16;
-        if lum < 75 { chunk[3] = 0; }
-    }
-
-    let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-    Some(ctx.load_texture("forge_icon", color_image, egui::TextureOptions::LINEAR))
-}
-
 /// Decodes raw image bytes (an open image-tab buffer's file content) and
 /// uploads them as a texture for `draw_image_view` to paint.
 /// Playback controls for an animated image: rewind, play/pause, and a scrub bar.
@@ -1925,6 +1906,11 @@ fn exe_mtime() -> Option<std::time::SystemTime> {
     std::env::current_exe().and_then(|p| p.metadata()).and_then(|m| m.modified()).ok()
 }
 
+fn available_exe_mtime() -> Option<std::time::SystemTime> {
+    crate::installed_build::launch_executable()
+        .and_then(|p| p.metadata()).and_then(|m| m.modified()).ok()
+}
+
 /// The binary this process started from, captured once.
 ///
 /// Captured rather than read on demand: installing a new build replaces the file
@@ -1945,7 +1931,7 @@ fn running_build() -> Option<std::time::SystemTime> {
 /// worked. Comparing what is on disk against what this process started from says
 /// it exactly.
 fn newer_build_installed() -> bool {
-    build_is_newer(running_build(), exe_mtime())
+    build_is_newer(running_build(), available_exe_mtime())
 }
 
 /// The comparison behind `newer_build_installed`, separated so both answers can
@@ -4498,6 +4484,7 @@ pub struct IdeApp {
     /// Open, search, session, tasks) on this rather than on `cwd`.
     has_folder:      bool,
     /// What the last "Add to Dock" attempt did, shown under the button.
+    #[cfg(target_os = "macos")]
     dock_status: Option<String>,
     /// Identifies this window's stored session; see `session::load_for_window`.
     pub window_id:   u64,
@@ -4525,7 +4512,8 @@ pub struct IdeApp {
     /// One-time "want update checks?" prompt — shown once when
     /// `settings.update_check_prompted` is still false.
     show_update_prompt: bool,
-    update_check_rx: Option<std::sync::mpsc::Receiver<Option<crate::update_check::UpdateAvailable>>>,
+    update_check_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::update_check::UpdateAvailable>, String>>>,
+    update_checked: Option<std::time::Instant>,
     update_available: Option<crate::update_check::UpdateAvailable>,
     /// Whether a newer build is sitting on disk than the one this window is
     /// running, and when that was last checked. Checked on a slow cadence
@@ -4612,7 +4600,7 @@ pub struct IdeApp {
     /// touch occasionally, kept out of the row that has to fit while working.
     agent_overflow_open:        bool,
     agent_context_picker_frame: u8,
-    forge_icon:      Option<egui::TextureHandle>,
+    forge_icon:      Option<crate::render_quality::ForgeIcon>,
     /// 0.0 (cold) to 1.0 (white-hot) — climbs while any Forge Agent tab has a
     /// turn in flight, cools back down when idle. Drives the welcome-screen
     /// anvil watermark's tint, like a real forge fire. This is the *displayed*
@@ -4900,6 +4888,7 @@ impl IdeApp {
         let pending_ssh = spec.ssh_host;
         let agent_saved = crate::agent_panel::load_conversations(&cwd);
         let mut app = Self {
+            #[cfg(target_os = "macos")]
             dock_status: None,
             window_id,
             file_tree:       tree,
@@ -5059,6 +5048,7 @@ impl IdeApp {
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
             update_check_rx: None,
+            update_checked: None,
             update_available: None,
             build_is_stale: false,
             build_banner_dismissed: None,
@@ -5069,7 +5059,7 @@ impl IdeApp {
 
         app.show_update_prompt = !app.settings.update_check_prompted;
         if app.settings.check_for_updates {
-            app.update_check_rx = Some(crate::update_check::spawn_check());
+            app.start_update_check();
         }
         if !app.settings.onboarding_skipped && crate::onboarding::needs_setup() {
             app.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker);
@@ -5771,7 +5761,7 @@ impl IdeApp {
                                 let mut term_ui = ui.new_child(
                                     egui::UiBuilder::new().max_rect(term_rect));
                                 if let Some(tab) = self.terminal_tabs.get_mut(self.terminal_active) {
-                                    tab.terminal.draw(&mut term_ui);
+                                    tab.terminal.draw(&mut term_ui, self.settings.terminal_font_size);
                                 } else {
                                     term_ui.centered_and_justified(|ui| {
                                         ui.label(egui::RichText::new("No terminal — click + to start one")
@@ -5885,7 +5875,7 @@ impl IdeApp {
         // ── Right activity bar (Forge agent) ────────────────────────────────
         // Lazy-load the brand icon once.
         if self.forge_icon.is_none() {
-            self.forge_icon = load_forge_icon(ctx);
+            self.forge_icon = crate::render_quality::ForgeIcon::load();
         }
         egui::SidePanel::right("right_activity_bar")
             .exact_width(48.0)
@@ -5918,7 +5908,7 @@ impl IdeApp {
                     egui::Color32::from_gray(140)
                 };
 
-                if let Some(tex) = &self.forge_icon {
+                if let Some(tex) = &mut self.forge_icon {
                     // The PNG canvas is square but the anvil silhouette is
                     // visually wider than tall — give the icon some breathing
                     // room and center it on the slot's midpoint.
@@ -5927,7 +5917,9 @@ impl IdeApp {
                         icon_rect.center(), egui::vec2(s, s),
                     );
                     ui.painter().image(
-                        tex.id(), img_rect,
+                        tex.texture(ui.ctx(), (s * ui.ctx().pixels_per_point()).round() as usize,
+                            crate::render_quality::IconPlacement::ActivityBar),
+                        crate::render_quality::pixel_aligned_rect(ui.ctx(), img_rect),
                         egui::Rect::from_min_max(
                             egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0),
                         ),
@@ -6695,13 +6687,23 @@ impl IdeApp {
             }
         }
 
-        // Poll update-checker result (best-effort — no error path, a failed
-        // check just looks identical to "already up to date")
+        if crate::update_check::check_due(self.settings.check_for_updates,
+            self.update_check_rx.is_some(), self.update_checked.map(|t| t.elapsed())) {
+            self.start_update_check();
+        }
         if let Some(rx) = &self.update_check_rx {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok(Ok(result)) => {
+                    if result.as_ref().map(|r| &r.latest_version)
+                        != self.update_available.as_ref().map(|r| &r.latest_version) {
+                        self.update_banner_dismissed = false;
+                    }
                     self.update_available = result;
                     self.update_check_rx = None;
+                }
+                Ok(Err(error)) => {
+                    self.update_check_rx = None;
+                    self.output_log(format!("Release check failed: {error}"), OutputLevel::Warn);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => { self.update_check_rx = None; }
@@ -7456,6 +7458,7 @@ impl IdeApp {
         self.draw_debug_panel(ctx);
         self.draw_update_prompt(ctx);
         self.refresh_build_staleness();
+        ctx.request_repaint_after(Self::BUILD_CHECK_EVERY);
         self.poll_broadcasts();
         self.draw_update_banner(ctx);
         self.draw_onboarding_wizard(ctx);
@@ -7698,6 +7701,12 @@ impl IdeApp {
         if close { self.onboarding = None; }
     }
 
+    fn start_update_check(&mut self) {
+        if self.update_check_rx.is_some() { return; }
+        self.update_checked = Some(std::time::Instant::now());
+        self.update_check_rx = Some(crate::update_check::spawn_check());
+    }
+
     /// One-time "want update checks?" prompt, shown until answered once.
     fn draw_update_prompt(&mut self, ctx: &egui::Context) {
         if !self.show_update_prompt { return; }
@@ -7709,7 +7718,7 @@ impl IdeApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_max_width(360.0);
-                ui.label("Forge IDE can check GitHub for a newer release on startup. \
+                ui.label("Forge IDE can check GitHub for a newer release on startup and hourly. \
                     This is the only network call Forge IDE itself makes — nothing else \
                     is sent, and it's a plain read of the public releases page.");
                 ui.add_space(10.0);
@@ -7727,7 +7736,7 @@ impl IdeApp {
             crate::settings::save(&self.settings);
             self.show_update_prompt = false;
             if enable {
-                self.update_check_rx = Some(crate::update_check::spawn_check());
+                    self.start_update_check();
             }
         }
     }
@@ -7760,7 +7769,7 @@ impl IdeApp {
         // A newer build actually *installed* outranks news of a newer release:
         // one is something to read about, the other is something this window is
         // not running yet.
-        let dismissed_this_build = match (self.build_banner_dismissed, exe_mtime()) {
+        let dismissed_this_build = match (self.build_banner_dismissed, available_exe_mtime()) {
             (Some(said_later_to), Some(on_disk)) => said_later_to == on_disk,
             // Nothing dismissed, or the timestamp cannot be read: show it.
             _ => false,
@@ -7806,7 +7815,7 @@ impl IdeApp {
                 Some(BuildUpdateAction::ThisWindow) => self.restart_window(),
                 Some(BuildUpdateAction::Everything) => self.restart_every_window(),
                 // For this build, not for good.
-                Some(BuildUpdateAction::Later) => self.build_banner_dismissed = exe_mtime(),
+                Some(BuildUpdateAction::Later) => self.build_banner_dismissed = available_exe_mtime(),
                 None => {}
             }
             return;
@@ -7821,7 +7830,7 @@ impl IdeApp {
                 ui.label(egui::RichText::new(format!("Forge IDE {version} is available"))
                     .color(egui::Color32::from_gray(220)));
                 if ui.button("View Release").clicked() {
-                    let _ = std::process::Command::new("open").arg(&url).spawn();
+                    ctx.open_url(egui::OpenUrl::new_tab(&url));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
@@ -10433,7 +10442,7 @@ impl IdeApp {
                 // Font size
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
-                    lbl(ui, "Font Size");
+                    lbl(ui, "Editor Font Size");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
                         if ui.add(egui::Button::new("+").min_size(egui::vec2(22.0, 22.0))).clicked() {
@@ -10445,6 +10454,17 @@ impl IdeApp {
                             s.font_size = (s.font_size - 1.0).max(8.0); changed = true;
                         }
                     });
+                });
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("Editor preview: Aa Bb 0123")
+                        .monospace().size(s.font_size));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    lbl(ui, "Code text only; menus and sidebars keep their size.");
                 });
                 ui.add_space(6.0);
 
@@ -10526,7 +10546,7 @@ impl IdeApp {
 
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
-                    lbl(ui, "Font Size");
+                    lbl(ui, "Terminal Font Size");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
                         if ui.add(egui::Button::new("+").min_size(egui::vec2(22.0, 22.0))).clicked() {
@@ -10538,6 +10558,11 @@ impl IdeApp {
                             s.terminal_font_size = (s.terminal_font_size - 1.0).max(8.0); changed = true;
                         }
                     });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("Terminal preview: Aa Bb 0123")
+                        .monospace().size(s.terminal_font_size));
                 });
                 ui.add_space(6.0);
 
@@ -10728,7 +10753,7 @@ impl IdeApp {
                     ui.vertical(|ui| {
                         ui.set_max_width(ui.available_width() - 14.0);
                         ui.label(egui::RichText::new(
-                            "One request to GitHub's public releases page on startup. \
+                            "Checks GitHub releases on startup and hourly while open. \
                              Off by default — this is the only network call Forge IDE \
                              itself makes.")
                             .size(10.0).color(egui::Color32::from_gray(100)));
@@ -10934,8 +10959,12 @@ impl IdeApp {
             });
 
         self.settings_skip_all_confirm = skip_all_confirm;
-        if changed { crate::settings::save(&self.settings); }
-        if enable_updates_now { self.update_check_rx = Some(crate::update_check::spawn_check()); }
+        if changed {
+            crate::settings::save(&self.settings);
+            // Panels above were already painted using the previous settings.
+            ctx.request_repaint();
+        }
+        if enable_updates_now { self.start_update_check(); }
         if open_onboarding { self.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker); }
         if close   { self.settings_open = false; }
     }
@@ -12902,10 +12931,10 @@ impl IdeApp {
             // Ensure the icon is loaded (the right activity bar normally does
             // this, but it runs after CentralPanel on the first frame).
             if self.forge_icon.is_none() {
-                self.forge_icon = load_forge_icon(ui.ctx());
+                self.forge_icon = crate::render_quality::ForgeIcon::load();
             }
 
-            if let Some(tex) = &self.forge_icon {
+            if let Some(tex) = &mut self.forge_icon {
                 // Watermark: ~55% of the smaller panel dimension, capped at 480px
                 let logo_size = (rect.width().min(rect.height()) * 0.55).min(480.0);
                 let logo_rect = egui::Rect::from_center_size(
@@ -12913,8 +12942,9 @@ impl IdeApp {
                     egui::vec2(logo_size, logo_size),
                 );
                 ui.painter().image(
-                    tex.id(),
-                    logo_rect,
+                    tex.texture(ui.ctx(), (logo_size * ui.ctx().pixels_per_point()).round() as usize,
+                        crate::render_quality::IconPlacement::Watermark),
+                    crate::render_quality::pixel_aligned_rect(ui.ctx(), logo_rect),
                     egui::Rect::from_min_max(
                         egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0),
                     ),
@@ -14819,6 +14849,7 @@ impl IdeApp {
     /// Returns the request the agent was waiting for, if any, so the caller
     /// knows whether this satisfied a handoff or was somebody sharing
     /// something they found.
+    #[cfg(target_os = "macos")]
     pub fn share_browser_page(&mut self, at: &str, html: &str) -> bool {
         // The tab the person is looking at, not the first one — a window can
         // have several conversations and the page belongs to the one they are
@@ -14882,6 +14913,7 @@ impl IdeApp {
     }
 
     /// Take this frame's browser commands, for the event loop to apply.
+    #[cfg(target_os = "macos")]
     pub fn take_browser_commands(&mut self) -> Vec<BrowserCommand> {
         std::mem::take(&mut self.browser_commands)
     }
@@ -14892,6 +14924,7 @@ impl IdeApp {
     /// the browser without the tab having asked it to — that is the whole
     /// point of the page being open — so where it ends up is reported back
     /// rather than assumed.
+    #[cfg(target_os = "macos")]
     pub fn browser_moved(&mut self, at: &str, can_back: bool, can_forward: bool) {
         let Some(tab) = self.buffers.get_mut(self.active).and_then(|b| b.browser.as_mut()) else {
             return;
@@ -14904,6 +14937,7 @@ impl IdeApp {
     }
 
     /// Take this frame's browser placement, for the event loop to apply.
+    #[cfg(target_os = "macos")]
     pub fn take_browser_placement(&mut self) -> Option<BrowserPlacement> {
         self.browser_placement.take()
     }
@@ -15006,7 +15040,7 @@ impl IdeApp {
                 let draw_size = tex_size * scale;
                 let img_rect = egui::Rect::from_center_size(stage.center(), draw_size);
                 ui.painter().image(
-                    tex.id(), img_rect,
+                    tex.id(), crate::render_quality::pixel_aligned_rect(ui.ctx(), img_rect),
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
@@ -18124,6 +18158,45 @@ mod stale_build_tests {
     fn a_process_running_its_own_binary_is_not_behind() {
         assert!(exe_mtime().is_some(), "no binary to compare against");
         assert!(!newer_build_installed());
+    }
+
+    #[test]
+    fn installed_build_banner_restart_button_receives_clicks() {
+        let ctx = egui::Context::default();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("banner-click")), ..Default::default()
+        });
+        app.settings.check_for_updates = false;
+        app.settings.auto_save = false;
+        app.show_update_prompt = false;
+        app.onboarding = None;
+        app.show_term = false;
+        app.agent_visible = false;
+        app.build_is_stale = true;
+        app.build_checked = Some(std::time::Instant::now());
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| app.draw(ctx));
+        let output = ctx.run(input(), |ctx| app.draw(ctx));
+        let position = output.shapes.iter().find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                if text.galley.text() == "Restart this window" {
+                    return Some(text.pos + text.galley.size() * 0.5);
+                }
+            }
+            None
+        }).expect("restart action must be visible");
+        for pressed in [true, false] {
+            let mut frame = input();
+            frame.events = vec![egui::Event::PointerMoved(position), egui::Event::PointerButton {
+                pos: position, button: egui::PointerButton::Primary, pressed,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            let _ = ctx.run(frame, |ctx| app.draw(ctx));
+        }
+        assert!(app.pending_window_restart, "the editor panel swallowed the banner click");
     }
 
     /// And a window says which build it is on, which is what makes a staggered

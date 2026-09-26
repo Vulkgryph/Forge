@@ -102,6 +102,11 @@ What *can* diverge is each client's own view of the wire protocol's shape. The t
 
 ## Install / defaults
 
+For the local native Windows development installer, see [Windows installation](WINDOWS.md).
+From an existing checkout, double-click `install.cmd` to build and install both
+interfaces and the shared agent. Windows support is under development; the
+Windows guide records its current limitations.
+
 This monorepo is the **canonical** Forge source. The standalone `forge` and `Forge-IDE` checkouts are retired.
 
 ```bash

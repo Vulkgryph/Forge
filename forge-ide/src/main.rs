@@ -1,3 +1,6 @@
+// Desktop launches should not create a companion console window.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod agent_panel;
 mod app;
 mod buffer;
@@ -20,6 +23,8 @@ mod icons;
 mod img;
 mod lsp;
 mod model_proxy;
+mod installed_build;
+mod render_quality;
 mod onboarding;
 mod plugin;
 mod fmt;
@@ -47,6 +52,21 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
+
+#[cfg(windows)]
+fn forge_window_icon() -> Option<winit::window::Icon> {
+    static ICON: std::sync::OnceLock<Option<winit::window::Icon>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        let image = img::png::decode(include_bytes!("../assets/forge-icon.png")).ok()?;
+        winit::window::Icon::from_rgba(image.rgba, image.width as u32, image.height as u32).ok()
+    }).clone()
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn forge_artwork_is_a_valid_windows_icon() {
+    assert!(forge_window_icon().is_some());
+}
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
@@ -634,6 +654,12 @@ impl IdeWindow {
             .with_active(true)
             .with_inner_size(winit::dpi::LogicalSize::new(1400u32, 900u32));
 
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_window_icon(forge_window_icon()).with_taskbar_icon(forge_window_icon());
+        }
+
         // Put a reopened window back where it was. `onscreen_frame` drops a frame
         // that no longer lands on any display, in which case the platform places
         // the window as it would a new one.
@@ -1154,7 +1180,7 @@ impl ApplicationHandler for Ide {
         // the new process read the record, because the processes handing over are
         // still writing to it as they go.
         if let Some(folders) = consolidate {
-            let exe = std::env::current_exe().unwrap_or_default();
+            let exe = installed_build::launch_executable().unwrap_or_default();
             if exe.as_os_str().is_empty() || !exe.exists() {
                 eprintln!("consolidate: couldn't resolve current_exe, staying open");
             } else {
@@ -1190,7 +1216,7 @@ impl ApplicationHandler for Ide {
         // One window into a process of its own. Spawned first, so if that fails
         // the window is still here rather than closed with nothing to replace it.
         for (winit_id, window_id, cwd) in restart_ids {
-            let exe = std::env::current_exe().unwrap_or_default();
+            let exe = installed_build::launch_executable().unwrap_or_default();
             if exe.as_os_str().is_empty() || !exe.exists() {
                 eprintln!("restart_window: couldn't resolve current_exe, staying open");
                 continue;
@@ -1267,7 +1293,7 @@ impl ApplicationHandler for Ide {
         // process starts from nothing and has no other way to know what
         // else was open.
         if reload_requested {
-            let exe = std::env::current_exe().unwrap_or_default();
+            let exe = installed_build::launch_executable().unwrap_or_default();
             if exe.as_os_str().is_empty() || !exe.exists() {
                 eprintln!("reload_window: couldn't resolve current_exe, staying open");
             } else {

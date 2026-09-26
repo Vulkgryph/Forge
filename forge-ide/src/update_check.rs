@@ -1,24 +1,29 @@
-//! Update checker — one best-effort GET to the GitHub Releases API on
-//! startup, in a background thread, gated on `Settings::check_for_updates`
-//! (opt-in, off by default). Never surfaces an error; a check that fails
-//! (offline, rate-limited, GitHub down) is indistinguishable from "already
-//! up to date" from the UI's point of view.
+//! Background GitHub release checks, on startup and hourly when enabled.
+//! Failures are reported to Output without discarding an already known update.
 
 use std::sync::mpsc;
 
+#[derive(Debug)]
 pub struct UpdateAvailable {
     pub latest_version: String,
     pub url: String,
 }
 
+pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+pub fn check_due(enabled: bool, pending: bool, elapsed: Option<std::time::Duration>) -> bool {
+    enabled && !pending && elapsed.is_none_or(|age| age >= CHECK_INTERVAL)
+}
+
 /// Spawns the check on a background thread and returns immediately; poll
 /// the receiver from the draw loop the same way other background tasks in
 /// this codebase are drained (e.g. `ssh_connect_rx`).
-pub fn spawn_check() -> mpsc::Receiver<Option<UpdateAvailable>> {
+pub fn spawn_check() -> mpsc::Receiver<Result<Option<UpdateAvailable>, String>> {
     let (tx, rx) = mpsc::channel();
     let current = env!("CARGO_PKG_VERSION").to_string();
     std::thread::spawn(move || {
         let _ = tx.send(check_once(&current));
+        crate::wake::wake();
     });
     rx
 }
@@ -32,16 +37,23 @@ pub fn spawn_check() -> mpsc::Receiver<Option<UpdateAvailable>> {
 /// at worst answers with releases from before the merge.
 const RELEASES_REPO: &str = "Vulkgryph/Forge";
 
-fn check_once(current_version: &str) -> Option<UpdateAvailable> {
+fn check_once(current_version: &str) -> Result<Option<UpdateAvailable>, String> {
     let body: serde_json::Value = ureq::get(
         &format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest"),
     )
     .set("User-Agent", "forge-ide-update-check")
     .timeout(std::time::Duration::from_secs(8))
     .call()
-    .ok()?
+    .map_err(|e| e.to_string())?
     .into_json()
-    .ok()?;
+    .map_err(|e| e.to_string())?;
+
+    Ok(release_from_response(current_version, &body))
+}
+
+fn release_from_response(current_version: &str, body: &serde_json::Value) -> Option<UpdateAvailable> {
+    if body.get("draft").and_then(|v| v.as_bool()) == Some(true)
+        || body.get("prerelease").and_then(|v| v.as_bool()) == Some(true) { return None; }
 
     let tag = body.get("tag_name")?.as_str()?;
     let latest = tag.trim_start_matches('v');
@@ -92,5 +104,26 @@ mod tests {
         assert!(!is_newer("0.1.9", "0.1.9"));
         assert!(!is_newer("0.1.8", "0.1.9"));
         assert!(is_newer("1.0.0", "0.9.9"));
+    }
+
+    #[test]
+    fn release_payload_produces_an_actionable_notice_only_for_a_new_release() {
+        let mut body = serde_json::json!({"tag_name": "v0.5.2", "html_url": "https://github.com/Vulkgryph/Forge/releases/tag/v0.5.2"});
+        let notice = super::release_from_response("0.5.1", &body).unwrap();
+        assert_eq!(notice.latest_version, "0.5.2");
+        assert!(notice.url.ends_with("/v0.5.2"));
+        assert!(super::release_from_response("0.5.2", &body).is_none());
+        body["draft"] = true.into();
+        assert!(super::release_from_response("0.5.1", &body).is_none());
+    }
+
+    #[test]
+    fn checks_repeat_while_open_but_respect_opt_out_and_in_flight_requests() {
+        use super::{check_due, CHECK_INTERVAL};
+        assert!(check_due(true, false, None));
+        assert!(!check_due(false, false, None));
+        assert!(!check_due(true, true, Some(CHECK_INTERVAL)));
+        assert!(!check_due(true, false, Some(std::time::Duration::from_secs(30))));
+        assert!(check_due(true, false, Some(CHECK_INTERVAL)));
     }
 }

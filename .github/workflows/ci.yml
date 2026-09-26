@@ -47,9 +47,8 @@ jobs:
   # gate. The point is to learn what breaks without owning a Windows machine,
   # and to notice the day something that used to compile stops.
   #
-  # forge-tui-rs is deliberately absent: `sys.rs` is `#![cfg(unix)]` in its
-  # entirety, so the terminal client needs a console-API implementation before
-  # there is anything here to measure.
+  # Console mode and rendering still need a real Windows terminal; the input
+  # decoder and installer failure paths can also be exercised on this runner.
   windows-probe:
     name: what builds on Windows (informational)
     runs-on: windows-latest
@@ -59,11 +58,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Local installer failure and reinstall checks
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_windows_installer.ps1
+
       - name: Build the portable crates
-        run: cargo build -p forge-agent-proto -p forge-search --verbose
+        run: cargo build --locked -p forge-agent-proto -p forge-search -p forge-tui-rs --verbose
 
       - name: Test them
-        run: cargo test -p forge-agent-proto -p forge-search --verbose
+        run: cargo test --locked -p forge-agent-proto -p forge-search -p forge-tui-rs --verbose
 
       - name: Agent (expected to need work)
         run: cargo build -p forge-agent --verbose

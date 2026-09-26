@@ -14,13 +14,17 @@
 
 use forge_proto::*;
 use std::collections::HashMap;
-use std::io::{BufReader, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::BufReader;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
         .join("forge-ide")
@@ -32,6 +36,7 @@ fn socket_path() -> PathBuf {
 /// one workspace, and an installed layout is expected to keep them side by
 /// side too. `current_exe()` is canonicalized first since `forge-ide` is
 /// commonly run via a symlink (e.g. `~/.local/bin/forge-ide`).
+#[cfg(unix)]
 fn server_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let candidate = exe.parent()?.join("forge-server");
@@ -60,6 +65,7 @@ type PushMap = Arc<Mutex<HashMap<u32, mpsc::SyncSender<Vec<u8>>>>>;
 /// socket answers in well under a millisecond. It exists because a *wedged*
 /// daemon still `accept`s connections — connecting proves only that some process
 /// is holding the socket, so nothing short of a reply proves it is working.
+#[cfg(unix)]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Long enough for a busy daemon under load, short enough not to read as a hang.

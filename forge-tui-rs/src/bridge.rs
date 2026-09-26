@@ -338,21 +338,22 @@ pub fn find_agent_binary() -> PathBuf {
         return PathBuf::from(p);
     }
 
+    let binary = format!("forge-agent{}", std::env::consts::EXE_SUFFIX);
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("forge-agent"));
-            for rel in ["../release/forge-agent", "../debug/forge-agent"] {
-                candidates.push(dir.join(rel));
+            candidates.push(dir.join(&binary));
+            for rel in ["../release", "../debug"] {
+                candidates.push(dir.join(rel).join(&binary));
             }
         }
     }
 
     // Running from a source checkout via `cargo run`.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for rel in ["../target/release/forge-agent", "../target/debug/forge-agent"] {
-        candidates.push(manifest.join(rel));
+    for rel in ["../target/release", "../target/debug"] {
+        candidates.push(manifest.join(rel).join(&binary));
     }
 
     for candidate in candidates {
@@ -517,15 +518,25 @@ mod tests {
 
     // ── Process-level behaviour, using a stand-in agent ────────────────────
 
+    fn spawn_script(unix: &str, windows: &str) -> io::Result<AgentBridge> {
+        #[cfg(unix)]
+        let (program, args) = {
+            let _ = windows;
+            ("/bin/sh", vec!["-c".into(), unix.into()])
+        };
+        #[cfg(windows)]
+        let (program, args) = {
+            let _ = unix;
+            ("powershell.exe", vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), windows.into()])
+        };
+        AgentBridge::spawn_command(Path::new(program), &args, None)
+    }
+
     /// Spawning a real process and reading its framed output end to end.
     #[test]
     fn spawns_a_process_and_receives_its_frames() {
         let script = r#"printf '{"type":"thinking"}\n{"type":"done"}\n'"#;
-        let bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), script.to_string()],
-            None,
-        )
+        let bridge = spawn_script(script, r#"[Console]::Out.WriteLine('{"type":"thinking"}'); [Console]::Out.WriteLine('{"type":"done"}')"#)
         .expect("spawn");
 
         let mut seen = Vec::new();
@@ -544,11 +555,7 @@ mod tests {
     #[test]
     fn stderr_is_delivered_separately_from_protocol_output() {
         let script = r#"printf '{"type":"done"}\n'; printf 'a warning\n' >&2"#;
-        let bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), script.to_string()],
-            None,
-        )
+        let bridge = spawn_script(script, r#"[Console]::Out.WriteLine('{"type":"done"}'); [Console]::Error.WriteLine('a warning')"#)
         .expect("spawn");
 
         let mut protocol = Vec::new();
@@ -586,11 +593,7 @@ mod tests {
         // drop the line.
         let script =
             r#"printf '{"type":"done"}\n'; exec 1>&-; sleep 0.15; printf 'a warning\n' >&2"#;
-        let bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), script.to_string()],
-            None,
-        )
+        let bridge = spawn_script(script, r#"[Console]::Out.WriteLine('{"type":"done"}'); [Console]::Out.Close(); Start-Sleep -Milliseconds 150; [Console]::Error.WriteLine('a warning')"#)
         .expect("spawn");
 
         let mut order = Vec::new();
@@ -625,11 +628,7 @@ mod tests {
     fn sent_messages_reach_the_child_as_framed_lines() {
         // Echo stdin back as a stderr line, so the test can observe it.
         let script = r#"while IFS= read -r l; do printf '%s\n' "$l" >&2; done"#;
-        let mut bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), script.to_string()],
-            None,
-        )
+        let mut bridge = spawn_script(script, r#"while ($null -ne ($line = [Console]::In.ReadLine())) { [Console]::Error.WriteLine($line) }"#)
         .expect("spawn");
 
         bridge
@@ -659,11 +658,7 @@ mod tests {
     /// hanging the exit path.
     #[test]
     fn shutdown_kills_an_unresponsive_agent() {
-        let mut bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), "sleep 300".to_string()],
-            None,
-        )
+        let mut bridge = spawn_script("sleep 300", "Start-Sleep -Seconds 300")
         .expect("spawn");
 
         let started = std::time::Instant::now();
@@ -677,11 +672,7 @@ mod tests {
     /// Sending after the agent is gone is an error, not a panic.
     #[test]
     fn sending_to_a_dead_agent_errors() {
-        let mut bridge = AgentBridge::spawn_command(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), "exit 0".to_string()],
-            None,
-        )
+        let mut bridge = spawn_script("exit 0", "exit 0")
         .expect("spawn");
         bridge.shutdown(Duration::from_millis(200));
 

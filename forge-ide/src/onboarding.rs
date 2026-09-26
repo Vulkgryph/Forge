@@ -87,7 +87,14 @@ pub fn local_default_name() -> Option<String> {
     doc.get("models")?.get("default")?.as_str().map(str::to_string)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn forge_config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_CONFIG.with(|slot| slot.borrow().clone()) { return Some(path); }
     dirs::home_dir().map(|h| h.join(".config").join("forge").join("config.toml"))
 }
 
@@ -193,30 +200,25 @@ pub fn add_endpoint(ep: NewEndpoint) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// `HOME` is process-global — `cargo test` runs tests on multiple
-    /// threads within the same process by default, so without this, these
-    /// tests race each other's `HOME` overrides (confirmed: they pass with
-    /// `--test-threads=1` and fail intermittently without it). Held for the
-    /// lifetime of `TempHome` so only one of these tests touches `HOME` at
-    /// a time, regardless of how `cargo test` schedules them.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // HOME overrides do not affect dirs::home_dir on Windows. Keep fixtures
+    // thread-local so no test can write into the real user's configuration.
     struct TempHome {
         dir: std::path::PathBuf,
-        _guard: std::sync::MutexGuard<'static, ()>,
     }
     impl TempHome {
         fn new(tag: &str) -> Self {
-            let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = std::env::temp_dir().join(format!("forge_ide_onboarding_test_{tag}"));
+            let dir = std::env::temp_dir().join(format!("forge_ide_onboarding_test_{}_{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            unsafe { std::env::set_var("HOME", &dir); }
-            Self { dir, _guard: guard }
+            TEST_CONFIG.with(|slot| *slot.borrow_mut() = Some(dir.join(".config/forge/config.toml")));
+            Self { dir }
         }
     }
     impl Drop for TempHome {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+        fn drop(&mut self) {
+            TEST_CONFIG.with(|slot| *slot.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]

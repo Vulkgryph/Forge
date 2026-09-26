@@ -345,7 +345,7 @@ pub struct Grid {
     /// which asks for this mode precisely so that cannot happen.
     bracketed_paste: bool,
     /// Bumped on every content-affecting mutation (`process`, `resize`,
-    /// `restore_snapshot`). Lets `Terminal::draw_sized` cache its rendered
+    /// `restore_snapshot`). Lets `Terminal::draw` cache its rendered
     /// viewport `Galley` and skip rebuilding + re-shaping it on every single
     /// frame when nothing changed — see `scrollback_version` below for why
     /// this alone wasn't enough once a process is actively producing output.
@@ -393,7 +393,7 @@ impl Grid {
         }
     }
 
-    /// Cheap change signal for `Terminal::draw_sized`'s viewport Galley
+    /// Cheap change signal for `Terminal::draw`'s viewport Galley
     /// cache — see the field doc comment on `version`.
     pub fn version(&self) -> u64 { self.version }
 
@@ -1164,14 +1164,14 @@ pub struct Terminal {
     /// actively typing, then resumes its normal blink rhythm once idle.
     last_input_at: Option<std::time::Instant>,
     /// Whether the view should follow new output. See the `stick_to_bottom`
-    /// call in `draw_sized` for why this isn't left to egui.
+    /// call in `draw` for why this isn't left to egui.
     stick_bottom: bool,
     /// True while the primary button is held after being pressed inside the
     /// terminal viewport — i.e. a text-selection drag is in progress.
     ///
     /// Needed because egui's label text selection does not scroll its container:
     /// dragging past the top or bottom edge just stops extending the selection.
-    /// Tracking the gesture ourselves lets `draw_sized` scroll while it runs.
+    /// Tracking the gesture ourselves lets `draw` scroll while it runs.
     /// Gated on "press began inside" so a drag that started elsewhere (a panel
     /// splitter, say) doesn't move the terminal.
     selecting: bool,
@@ -1181,7 +1181,7 @@ pub struct Terminal {
     /// producing output) versus an idle shell prompt, which doesn't need
     /// to be repainted at 20Hz just because its tab happens to be visible.
     last_output: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Last *viewport* Galley built by `draw_sized`, keyed by `Grid::version`
+    /// Last *viewport* Galley built by `draw`, keyed by `Grid::version`
     /// and font — a hit is a cheap `Arc` clone. Kept separate from
     /// `cached_scrollback_galley` so an active viewport update doesn't force
     /// re-shaping the (often much larger, unchanging) scrollback too.
@@ -1264,7 +1264,7 @@ impl Terminal {
         }
         self.pty_id = None;
         self.cwd = new_cwd.to_path_buf();
-        // Deferred spawn, exactly like a brand-new tab — `draw_sized` calls
+        // Deferred spawn, exactly like a brand-new tab — `draw` calls
         // `spawn()` (with the panel's *current* size) the next time it runs,
         // which also resets the grid and `last_output`.
         self.pending = Some(new_cwd.to_path_buf());
@@ -1404,7 +1404,10 @@ impl Terminal {
         // This terminal won't survive a Reload Window, but is otherwise
         // fully functional — exactly how terminals worked before this
         // feature existed.
+        #[cfg(unix)]
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        #[cfg(windows)]
+        let shell = "powershell.exe";
         let pty = NativePtySystem::default();
         let pair = match pty.openpty(PtySize { rows, cols,
                                                pixel_width: 0, pixel_height: 0 }) {
@@ -1487,8 +1490,7 @@ impl Terminal {
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui) { self.draw_sized(ui, 13.0); }
-    pub fn draw_sized(&mut self, ui: &mut egui::Ui, font_size: f32) {
+    pub fn draw(&mut self, ui: &mut egui::Ui, font_size: f32) {
         let font_id = egui::FontId::monospace(font_size);
         let row_h   = mono_row_height(ui, &font_id);
         let char_w  = mono_advance(ui, &font_id);
@@ -1987,6 +1989,28 @@ pub fn key_to_pty(key: egui::Key, m: egui::Modifiers) -> Option<Vec<u8>> {
         egui::Key::PageDown   => Some(b"\x1b[6~".to_vec()),
         egui::Key::Delete     => Some(b"\x1b[3~".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod font_size_tests {
+    #[test]
+    fn changing_font_size_relayouts_existing_terminal_text_immediately() {
+        let ctx = egui::Context::default();
+        let mut terminal = super::Terminal::new(std::path::Path::new("."));
+        terminal.pending = None; // Exercise layout without starting a shell.
+        terminal.grid.lock().unwrap().process("Font size preview");
+        let mut heights = Vec::new();
+        for size in [12.0, 24.0, 12.0] {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| terminal.draw(ui, size));
+            });
+            let (_, font, galley) = terminal.cached_galley.as_ref().unwrap();
+            assert_eq!(font.size, size);
+            heights.push(galley.rows[0].rect.height());
+        }
+        assert!(heights[1] > heights[0] * 1.5);
+        assert_eq!(heights[0], heights[2]);
     }
 }
 

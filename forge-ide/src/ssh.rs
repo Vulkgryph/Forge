@@ -855,7 +855,13 @@ async fn ssh_authenticate(
     } else { false };
 
     let authed = if !authed {
-        match russh::keys::agent::client::AgentClient::connect_env().await {
+        #[cfg(unix)]
+        let agent = russh::keys::agent::client::AgentClient::connect_env().await;
+        #[cfg(windows)]
+        let agent = russh::keys::agent::client::AgentClient::connect_named_pipe(
+            std::env::var_os("SSH_AUTH_SOCK").unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into())
+        ).await;
+        match agent {
             Ok(mut agent) => {
                 let ids = agent.request_identities().await.unwrap_or_default();
                 let mut ok = false;

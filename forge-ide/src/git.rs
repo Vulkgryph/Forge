@@ -848,7 +848,9 @@ fn push_current_branch(repo: &Repository) -> Result<String, String> {
 
 #[cfg(test)]
 mod status_scan_tests {
-    use super::{FileStatus, MAX_STATUS_ENTRIES, scan_status, untracked_fits};
+    use super::{FileStatus, scan_status, untracked_fits};
+    #[cfg(unix)]
+    use super::MAX_STATUS_ENTRIES;
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {

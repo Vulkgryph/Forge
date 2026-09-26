@@ -709,18 +709,9 @@ mod window_session_tests {
         (sessions, workspace)
     }
 
-    /// `set_file_times` is not on stable, so this goes through `utimes(2)`.
     fn set_mtime(path: &Path, when: std::time::SystemTime) {
-        let secs = when.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        #[repr(C)]
-        struct TimeVal { sec: i64, usec: i64 }
-        unsafe extern "C" {
-            fn utimes(path: *const std::ffi::c_char, times: *const TimeVal) -> i32;
-        }
-        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-        let times = [TimeVal { sec: secs, usec: 0 }, TimeVal { sec: secs, usec: 0 }];
-        let rc = unsafe { utimes(c.as_ptr(), times.as_ptr()) };
-        assert_eq!(rc, 0, "utimes failed for {}", path.display());
+        std::fs::OpenOptions::new().write(true).open(path).unwrap()
+            .set_modified(when).unwrap();
     }
 
     fn state(files: &[&str]) -> SessionState {

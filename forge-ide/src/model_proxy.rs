@@ -123,15 +123,27 @@ pub fn parse_head(text: &str) -> Result<RequestHead, String> {
 /// nothing else, it is never written to the remote's disk (the lent endpoint is
 /// marked ephemeral), and it dies when the session does.
 ///
-/// `/dev/urandom` rather than a crate, per the project's no-dependencies rule.
-/// A failure to read it is fatal on purpose — the alternative is a predictable
+/// OS randomness rather than a crate, per the project's no-dependencies rule.
+/// A failure to obtain it is fatal on purpose — the alternative is a predictable
 /// token, and an unauthenticated tunnel is what this exists to prevent.
 pub fn session_token() -> Result<String, String> {
-    use std::io::Read;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| format!("could not read /dev/urandom for a session token: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .map_err(|e| format!("could not read /dev/urandom for a session token: {e}"))?;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(algorithm: *mut std::ffi::c_void, buffer: *mut u8, length: u32, flags: u32) -> i32;
+        }
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 2) };
+        if status < 0 { return Err(format!("Windows could not generate a session token: {status:#x}")); }
+    }
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 

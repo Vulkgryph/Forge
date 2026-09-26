@@ -191,10 +191,12 @@ impl WgpuPass {
     }
 
     /// Upload texture deltas, encode the frame, and present it.
-    pub fn present(&mut self, window: &Window, output: egui::FullOutput, ppp: f32) {
+    pub fn present(&mut self, window: &Window, mut output: egui::FullOutput, ppp: f32) {
         if self.dirty { self.reconfigure(window); }
 
-        for (id, delta) in &output.textures_delta.set {
+        for (id, delta) in &mut output.textures_delta.set {
+            #[cfg(windows)]
+            crate::render_quality::sharpen_font_delta(delta);
             self.renderer.update_texture(
                 &self.shared.device, &self.shared.queue, *id, delta);
         }

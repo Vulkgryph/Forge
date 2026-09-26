@@ -39,6 +39,10 @@ pub mod menu;
 pub mod screen;
 pub mod session;
 pub mod sessions;
+#[cfg(unix)]
+pub mod sys;
+#[cfg(windows)]
+#[path = "sys_windows.rs"]
 pub mod sys;
 pub mod term;
 pub mod widgets;

@@ -110,7 +110,7 @@ pub struct Settings {
     pub undo_steps: usize,
 
     // Updates
-    /// Check GitHub Releases for a newer Forge IDE version on startup. Off
+    /// Check GitHub Releases on startup and hourly while open. Off
     /// by default — this is the one network call Forge IDE makes on its
     /// own (everything else is local, or the agent panel's own subprocess),
     /// so it's an explicit opt-in rather than silently phoning home.

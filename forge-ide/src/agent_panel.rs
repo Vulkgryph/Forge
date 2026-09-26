@@ -23,22 +23,23 @@ fn default_true() -> bool { true }
 /// 3. Bare `"forge-agent"`, resolved via `PATH` — for a separate install
 ///    (forge's own `install.sh`) with no bundled copy alongside this binary.
 pub(crate) fn resolve_forge_agent_path() -> std::ffi::OsString {
+    let binary = format!("forge-agent{}", std::env::consts::EXE_SUFFIX);
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("forge-agent"));
+            candidates.push(dir.join(&binary));
         }
     }
 
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(manifest.join("../target/release/forge-agent"));
-    candidates.push(manifest.join("../target/debug/forge-agent"));
+    candidates.push(manifest.join("../target/release").join(&binary));
+    candidates.push(manifest.join("../target/debug").join(&binary));
 
     candidates.into_iter()
         .find(|p| p.is_file())
         .map(|p| p.into_os_string())
-        .unwrap_or_else(|| "forge-agent".into())
+        .unwrap_or_else(|| binary.into())
 }
 
 #[derive(Serialize)]
@@ -51,6 +52,7 @@ enum OutgoingMsg {
     ToggleAutoMode,
     UpdateEndpointReasoning { endpoint_name: String, reasoning: serde_json::Value },
     AnswerQuestion { answer: String },
+    #[cfg(target_os = "macos")]
     BrowserResult { request_id: String, final_url: String, html: String },
     ApprovePlan,
     RejectPlan { feedback: String },
@@ -1246,6 +1248,12 @@ impl AgentSession {
 
         let result: Result<(Child, ChildStdin), String> = (|| {
             let mut cmd = Command::new(resolve_forge_agent_path());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // The headless agent communicates through pipes, not a console.
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
             cmd.arg("--headless").current_dir(cwd);
             // This client can put a page in front of a person and hand the
             // result back, which changes what the agent should suggest when a
@@ -1741,6 +1749,7 @@ impl AgentSession {
     /// Always from a button. A person browsing is not publishing every page
     /// they visit to the agent, and that control is the reason the panel
     /// exists.
+    #[cfg(target_os = "macos")]
     pub fn send_browser_page(&mut self, request_id: &str, final_url: &str, html: &str) {
         let _ = self.write(&OutgoingMsg::BrowserResult {
             request_id: request_id.to_string(),

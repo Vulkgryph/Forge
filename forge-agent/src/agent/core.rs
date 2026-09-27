@@ -203,6 +203,7 @@ fn is_retryable_network_error(error: &str) -> bool {
         || lower.contains("broken pipe")
         || lower.contains("stream read error")
         || lower.contains("error decoding response body")
+        || [500, 502, 503, 504].iter().any(|status| lower.contains(&format!("api error ({status}")))
 }
 
 fn format_elapsed(duration: std::time::Duration) -> String {
@@ -1453,6 +1454,13 @@ impl Agent {
 
             // Handle stream errors
             if let Some(e) = stream_error {
+                // Preserve what the user already saw, including across restart.
+                // Incomplete tool calls are deliberately not committed or run.
+                if !accumulated_text.is_empty() {
+                    let partial = Message::assistant(&accumulated_text);
+                    let _ = self.log.log_message(&partial);
+                    self.history.push(partial);
+                }
                 if accumulated_text.is_empty()
                     && streaming_tool_calls.is_empty()
                     && is_retryable_network_error(&e)
@@ -1520,11 +1528,6 @@ impl Agent {
                         )));
                         continue;
                     }
-                }
-                if !accumulated_text.is_empty() {
-                    let partial = Message::assistant(&accumulated_text);
-                    let _ = self.log.log_message(&partial);
-                    self.history.push(partial);
                 }
                 let message = if is_provider_busy {
                     format!("Provider at capacity: {}", e)

@@ -609,7 +609,7 @@ mod tests {
         assert!(out.contains("Read 3 new or changed document(s)"), "{out}");
         assert!(out.contains("Rotating the signing key"), "{out}");
         // The path, not a file:// URL — this is what read_file wants.
-        assert!(out.contains("notes/keys.md"), "{out}");
+        assert!(out.replace('\\', "/").contains("notes/keys.md"), "{out}");
         assert!(!out.contains("file://"), "a URL leaked into the result: {out}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -760,7 +760,7 @@ mod tests {
     fn a_path_with_a_space_round_trips() {
         let root = tree("spaces", &[("my notes/a file.md", "# Spaced\n\nAbout puffins.\n")]);
         let out = search(&root, "puffins", &["."]);
-        assert!(out.contains("my notes/a file.md"), "{out}");
+        assert!(out.replace('\\', "/").contains("my notes/a file.md"), "{out}");
         assert!(!out.contains("%20"), "escaping leaked into the result: {out}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -912,7 +912,7 @@ mod tests {
     fn a_dot_path_does_not_end_up_in_the_result() {
         let root = tree("dotpath", &[("notes/a.md", "# A\n\nAbout marmots.\n")]);
         let out = search(&root, "marmots", &["."]);
-        assert!(out.contains("notes/a.md"), "{out}");
+        assert!(out.replace('\\', "/").contains("notes/a.md"), "{out}");
         assert!(!out.contains("/./"), "a bare `.` component reached the result: {out}");
 
         let _ = std::fs::remove_dir_all(&root);

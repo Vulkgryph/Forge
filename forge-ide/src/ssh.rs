@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use russh::client::{self, Handle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key, ssh_key};
@@ -94,6 +95,7 @@ pub struct FsHandles {
     next_id: Arc<Mutex<i64>>,
     pending: PendMap,
     stdin:   Arc<Mutex<Box<dyn Write + Send>>>,
+    connected: Arc<AtomicBool>,
 }
 
 /// An open connection's request path with nothing on the far end but a canned
@@ -165,6 +167,7 @@ pub fn fake_fs(reply: Result<serde_json::Value, String>, answer: bool) -> FakeFs
             next_id: Arc::new(Mutex::new(1)),
             pending,
             stdin: Arc::new(Mutex::new(Box::new(writer))),
+            connected: Arc::new(AtomicBool::new(true)),
         },
         requests,
     }
@@ -199,12 +202,22 @@ fn call_with(
     };
     let msg = Rpc::request(id, method, params);
     let (tx, rx) = mpsc::sync_channel(1);
-    handles.pending.lock().unwrap().insert(id, tx);
-    if let Ok(mut w) = handles.stdin.lock() {
-        write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
+    {
+        let mut pending = handles.pending.lock().unwrap();
+        if !handles.connected.load(Ordering::Acquire) {
+            return Err("SSH connection lost; reconnect before retrying".into());
+        }
+        pending.insert(id, tx);
     }
-    rx.recv_timeout(timeout)
-        .map_err(|_| format!("{method} timed out"))?
+    let written = handles.stdin.lock().map_err(|_| "SSH writer unavailable".to_string())
+        .and_then(|mut w| write_rpc(&mut *w, &msg).map_err(|e| e.to_string()));
+    if let Err(error) = written {
+        handles.pending.lock().unwrap().remove(&id);
+        return Err(error);
+    }
+    let result = rx.recv_timeout(timeout).map_err(|_| format!("{method} timed out"));
+    handles.pending.lock().unwrap().remove(&id);
+    result?
 }
 
 pub fn fs_list_with(
@@ -226,6 +239,7 @@ pub fn fs_list_with(
 }
 
 pub struct SshConnection {
+    connected: Arc<AtomicBool>,
     pub host:    SshHost,
     /// The remote account's home directory, resolved once at connect. Forge's
     /// own binaries live under it, and asking again per call would be a round
@@ -272,6 +286,20 @@ impl Drop for SshConnection {
 }
 
 impl SshConnection {
+    #[cfg(test)]
+    pub(crate) fn disconnected_fixture() -> Self {
+        let fake = fake_fs(Ok(serde_json::Value::Null), false);
+        fake.handles.connected.store(false, Ordering::Release);
+        Self {
+            connected: fake.handles.connected,
+            host: SshHost { name: "fixture".into(), host: "127.0.0.1".into(), port: 1,
+                user: "fixture".into(), key_path: String::new(), remote_dir: "/fixture".into() },
+            remote_home: "/fixture".into(), upstream: Arc::new(Mutex::new(None)),
+            next_id: fake.handles.next_id, pending: fake.handles.pending,
+            stdin: fake.handles.stdin, pty_pushes: Arc::new(Mutex::new(HashMap::new())),
+            _session: None, _rt: None,
+        }
+    }
     /// Connect, upload forge-server if needed, start it, return a ready client.
     /// `log` receives progress messages to display in the Output panel.
     /// `trust_new_host_key` is the user's answer to having been shown an
@@ -365,6 +393,8 @@ impl SshConnection {
         let pending:    PendMap = Arc::new(Mutex::new(HashMap::new()));
         let pty_pushes  = Arc::new(Mutex::new(HashMap::<u32, mpsc::SyncSender<Vec<u8>>>::new()));
         let next_id     = Arc::new(Mutex::new(1i64));
+        let connected = Arc::new(AtomicBool::new(true));
+        let reader_connected = Arc::clone(&connected);
 
         let p2  = Arc::clone(&pending);
         let pp2 = Arc::clone(&pty_pushes);
@@ -404,9 +434,16 @@ impl SshConnection {
                     }
                 }
             }
+            reader_connected.store(false, Ordering::Release);
+            for (_, tx) in p2.lock().unwrap().drain() {
+                let _ = tx.send(Err("SSH connection lost; the operation may not have completed".into()));
+            }
+            pp2.lock().unwrap().clear();
+            crate::wake::wake();
         });
 
         Ok(Self {
+            connected,
             host: host.clone(),
             remote_home: home.clone(),
             upstream,
@@ -434,7 +471,12 @@ impl SshConnection {
             next_id: Arc::clone(&self.next_id),
             pending: Arc::clone(&self.pending),
             stdin:   Arc::clone(&self.stdin),
+            connected: Arc::clone(&self.connected),
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 
     /// Put the agent on the remote machine, and answer where it is.
@@ -616,16 +658,7 @@ impl SshConnection {
                     timeout: std::time::Duration)
         -> Result<serde_json::Value, String>
     {
-        let id  = { let mut n = self.next_id.lock().unwrap(); let i = *n; *n += 1; i };
-        let msg = Rpc::request(id, method, params);
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.pending.lock().unwrap().insert(id, tx);
-        if let Ok(mut w) = self.stdin.lock() {
-            write_rpc(&mut *w, &msg).map_err(|e| e.to_string())?;
-        }
-        rx.recv_timeout(timeout)
-            .map_err(|_| format!("timeout waiting for {method}"))
-            .and_then(|r| r)
+        call_with(&self.fs_handles(), method, params, timeout)
     }
 
 }
@@ -808,7 +841,11 @@ async fn ssh_authenticate(
     trust_new: bool,
     upstream: &Arc<Mutex<Option<crate::model_proxy::Routes>>>,
 ) -> Result<Handle<ClientHandler>, String> {
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(std::time::Duration::from_secs(5)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
     let addr   = format!("{}:{}", host.host, host.port);
     let found  = Arc::new(Mutex::new(None));
     let handler = ClientHandler {
@@ -818,7 +855,8 @@ async fn ssh_authenticate(
         found: Arc::clone(&found),
         upstream: Arc::clone(upstream),
     };
-    let session = match client::connect(config, addr, handler).await {
+    let session = match tokio::time::timeout(std::time::Duration::from_secs(15),
+        client::connect(config, addr, handler)).await.map_err(|_| "SSH handshake timed out".to_string())? {
         Ok(s) => s,
         Err(e) => {
             // A rejected host key surfaces as an ordinary connection failure,
@@ -1056,6 +1094,11 @@ pub fn shell_quote_path(s: &str) -> String {
 /// Same search as `local_server_binary` and for the same reason: inside the
 /// .app first, since that is the only path that exists for someone who
 /// installed the .dmg, then the development layouts.
+fn remote_tools_path() -> PathBuf {
+    std::env::var_os("FORGE_REMOTE_TOOLS_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/remote-tools"))
+}
+
 fn local_agent_binary(arch: &str) -> Result<Vec<u8>, String> {
     let target = match arch {
         "x86_64"  => "x86_64-unknown-linux-musl",
@@ -1067,6 +1110,9 @@ fn local_agent_binary(arch: &str) -> Result<Vec<u8>, String> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let candidates = [
+        remote_tools_path().join(format!("forge-agent-{arch}")),
+        exe_dir.join("remote").join(format!("forge-agent-{arch}")),
+        exe_dir.parent().unwrap_or(&exe_dir).join("remote").join(format!("forge-agent-{arch}")),
         exe_dir.parent().map(|p| p.join("Resources").join(format!("forge-agent-{arch}")))
             .unwrap_or_default(),
         Path::new("target").join(target).join("release").join("forge-agent"),
@@ -1084,8 +1130,8 @@ fn local_agent_binary(arch: &str) -> Result<Vec<u8>, String> {
     }
     Err(format!(
         "This build of Forge IDE has no Linux/{arch} forge-agent bundled, so the agent \
-         cannot run on the remote machine. It is built by scripts/package_macos.sh and \
-         lives in the app's Resources."
+         cannot run on the remote machine. Build helpers with scripts/build_remote_tools.sh \
+         on Linux/WSL and supply that directory to the installer."
     ))
 }
 
@@ -1103,6 +1149,9 @@ fn local_server_binary(arch: &str) -> Result<Vec<u8>, String> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let candidates = [
+        remote_tools_path().join(format!("forge-server-{arch}")),
+        exe_dir.join("remote").join(format!("forge-server-{arch}")),
+        exe_dir.parent().unwrap_or(&exe_dir).join("remote").join(format!("forge-server-{arch}")),
         // Inside the .app, which is the only path that exists for someone who
         // installed the .dmg. Both other forms are development layouts: a
         // launched .app has `/` for a working directory, so the relative ones
@@ -1193,7 +1242,7 @@ fn bridge_channel(
             let rx = Arc::clone(&in_rx);
             let data = tokio::task::spawn_blocking(move || rx.lock().unwrap().recv()).await;
             match data {
-                Ok(Ok(bytes)) => { let _ = write_half.data_bytes(bytes).await; }
+                Ok(Ok(bytes)) => { if write_half.data_bytes(bytes).await.is_err() { break; } }
                 _ => break,
             }
         }
@@ -1406,6 +1455,125 @@ mod tests {
         let value: toml::Value = cargo_toml.parse().unwrap();
         let version = value["package"]["version"].as_str().unwrap();
         assert_eq!(SERVER_VERSION, format!("forge-server-{version}"));
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn timed_out_rpc_does_not_leak_pending_requests() {
+        let fake = fake_fs(Ok(serde_json::Value::Null), false);
+        assert!(fs_list_with(&fake.handles, "/fixture", Duration::from_millis(1)).is_err());
+        assert!(fake.handles.pending.lock().unwrap().is_empty());
+        fake.handles.connected.store(false, Ordering::Release);
+        let before = Instant::now();
+        assert!(fs_list_with(&fake.handles, "/fixture", Duration::from_secs(30)).is_err());
+        assert!(before.elapsed() < Duration::from_secs(1));
+    }
+
+    fn next(rx: &mpsc::Receiver<serde_json::Value>, kind: &str) -> serde_json::Value {
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            let value = rx.recv_timeout(end.saturating_duration_since(Instant::now())).expect("agent event deadline");
+            if value["type"] == kind { return value; }
+        }
+    }
+
+    fn agent(conn: &SshConnection, cwd: &str, resume: Option<&str>)
+        -> (mpsc::Receiver<serde_json::Value>, Box<dyn Write + Send>) {
+        let (reader, writer) = conn.spawn_agent(cwd, resume, false).expect("remote agent");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str(&line) { if tx.send(value).is_err() { break; } }
+            }
+        });
+        (rx, writer)
+    }
+
+    fn proxy_config(conn: &SshConnection) {
+        let mut routes = crate::model_proxy::Routes::new("fixture-session-token".into());
+        let prefix = routes.add(crate::model_proxy::Upstream {
+            base_url: "http://127.0.0.1:22284/v1".into(),
+            style: crate::model_proxy::AuthStyle::Bearer,
+            credential: "fixture-not-a-real-credential".into(), extra_headers: vec![],
+        });
+        let port = conn.open_model_proxy(routes).unwrap();
+        let config = format!("[models]\ndefault='fixture'\n[[models.endpoints]]\nname='fixture'\nbase_url='http://127.0.0.1:{port}{prefix}/v1'\napi_key='fixture-session-token'\nmodel_id='failure-fixture'\nmax_context_tokens=131072\nmax_output_tokens=64\nrequest_timeout_secs=3\n[agent]\nauto_approve_reads=true\nauto_approve_writes=false\nmax_history_messages=200\ncompaction_threshold=150\n");
+        conn.fs_write(&format!("{}/.config/forge/config.toml", conn.remote_home), &config).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Requires scripts/ssh_fault_proxy.py and an isolated loopback sshd/account"]
+    fn live_ssh_failure_roundtrip() {
+        let home = PathBuf::from(std::env::var("FORGE_TEST_HOME").expect("isolated test home"));
+        assert_eq!(std::env::home_dir().unwrap(), home, "Refusing to touch personal known_hosts");
+        let key_path = std::env::var("FORGE_TEST_SSH_KEY").unwrap();
+        let host = SshHost { name: "failure-fixture".into(), host: "127.0.0.1".into(),
+            port: 22283, user: "forgefault".into(), key_path, remote_dir: "/home/forgefault/workspace".into() };
+        let log = |s: &str, _: crate::OutputLevel| eprintln!("ssh fixture: {s}");
+        let unknown = SshConnection::connect(&host, None, false, &log).err().unwrap();
+        assert!(unknown.starts_with(UNKNOWN_HOST_PREFIX), "{unknown}");
+        let conn = SshConnection::connect(&host, None, true, &log).expect("SSH connect and helper upload");
+        let file = format!("{}/round trip.txt", host.remote_dir);
+        conn.fs_write(&file, "original\n").unwrap();
+        assert!(conn.fs_list(&host.remote_dir).unwrap().iter().any(|f| f.name == "round trip.txt"));
+        let value = conn.call("fs/read", serde_json::json!({"path":file})).unwrap();
+        assert_eq!(value["text"], "original\n");
+        assert!(conn.call("fs/read", serde_json::json!({"path":"/not-a-real-fixture-file"})).is_err());
+        let local = home.join("upload fixture.txt");
+        let payload = "x\0y\n".repeat(10_000);
+        std::fs::write(&local, &payload).unwrap();
+        let uploaded = conn.fs_upload(vec![local], &host.remote_dir)
+            .recv_timeout(Duration::from_secs(15)).unwrap().unwrap();
+        assert_eq!(conn.call("fs/read", serde_json::json!({"path":uploaded})).unwrap()["text"], payload);
+        let (ptx, prx) = mpsc::sync_channel(64);
+        conn.pty_pushes.lock().unwrap().insert(987, ptx);
+        conn.call("pty/open", serde_json::json!({"id":987,"cols":80,"rows":24,"cwd":host.remote_dir})).unwrap();
+        conn.call("pty/write", serde_json::json!({"id":987,"data":b"printf 'SSH_PTY_OK\\n'\n".to_vec()})).unwrap();
+        let mut output = String::new();
+        while !output.contains("SSH_PTY_OK") {
+            output.push_str(&String::from_utf8_lossy(&prx.recv_timeout(Duration::from_secs(10)).unwrap()));
+        }
+        conn.call("pty/close", serde_json::json!({"id":987})).unwrap();
+        // Use the IDE's real reverse-forwarding model proxy, not a direct model URL.
+        proxy_config(&conn);
+        let (rx, mut writer) = agent(&conn, &host.remote_dir, None);
+        let init = next(&rx, "init");
+        let session = init["session_id"].as_str().unwrap().to_owned();
+        writeln!(writer, "{}", serde_json::json!({"type":"send_message","content":"fault fixture"})).unwrap();
+        writer.flush().unwrap();
+        let error = next(&rx, "error");
+        assert!(error["message"].as_str().unwrap().contains("incomplete"), "{error}");
+        // Represent an outstanding RPC whose reply never arrived. The real
+        // transport's EOF must release it instead of waiting for its timeout.
+        let (pending_tx, pending_rx) = mpsc::sync_channel(1);
+        conn.pending.lock().unwrap().insert(i64::MAX, pending_tx);
+        std::fs::write(std::env::var("FORGE_TEST_DROP_FILE").unwrap(), "drop").unwrap();
+        let before = Instant::now();
+        while conn.is_connected() && before.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(!conn.is_connected(), "link loss not detected");
+        assert!(pending_rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("SSH connection lost"));
+        assert!(conn.fs_write(&file, "must not overwrite").is_err());
+        assert!(conn.pending.lock().unwrap().is_empty());
+        drop(writer); drop(conn);
+        std::thread::sleep(Duration::from_secs(3));
+        let conn = SshConnection::connect(&host, None, false, &log).expect("Reconnect to trusted host");
+        assert_eq!(conn.call("fs/read", serde_json::json!({"path":file})).unwrap()["text"], "original\n");
+        proxy_config(&conn);
+        let (rx, mut writer) = agent(&conn, &host.remote_dir, Some(&session));
+        next(&rx, "init");
+        let restored = next(&rx, "session_loaded");
+        assert!(restored.to_string().contains("PARTIAL-FIXTURE"), "partial response lost on remote resume");
+        writeln!(writer, "{}", serde_json::json!({"type":"send_message","content":"recover"})).unwrap();
+        writer.flush().unwrap();
+        next(&rx, "done");
+        writeln!(writer, "{{\"type\":\"quit\"}}").unwrap(); writer.flush().unwrap();
+        eprintln!("PASS: host trust, helper upload, SFTP, file read/write/error, PTY, tunneled model limit, link loss, reconnect, remote session resume");
     }
 }
 

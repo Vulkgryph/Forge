@@ -24,6 +24,18 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  linux-installer:
+    name: Linux installer packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer validation tools
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils shellcheck
+      - name: Shell and packaging checks
+        run: |
+          shellcheck install.sh scripts/test_linux_installer.sh
+          bash scripts/test_linux_installer.sh
+
   agent:
     name: agent, protocol and terminal UI
     runs-on: ubuntu-latest

@@ -411,6 +411,43 @@ impl Agent {
 
 // ── One case ────────────────────────────────────────────────────────────────
 
+/// A case's private HOME and workspace, under the directory cargo hands to
+/// integration tests — so `cargo clean` takes it and nothing is left in the
+/// system temp folder.
+///
+/// The workspace is made a git repository first, and that is the whole point.
+/// `CARGO_TARGET_TMPDIR` is `target/`, which is *inside this checkout*, and the
+/// agent resolves its worktree by walking up until it finds one. Without a repo
+/// of its own, a fixture resolved to the Forge checkout itself: every case took
+/// that one rewind lock and serialised on it, and a test fixture was taking git
+/// snapshots of — and able to run `git clean -fd` against — the working tree it
+/// was being run from. Its own `.git` stops the walk at the fixture.
+fn fixture(name: &str) -> PathBuf {
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("resilience").join(name);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".config/forge")).unwrap();
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    git(&workspace, &["init", "--quiet"]);
+    // A snapshot is a commit, and a commit needs an identity that CI may not
+    // have configured. Local to this fixture, so nothing outside it is touched.
+    git(&workspace, &["config", "user.email", "fixture@forge.invalid"]);
+    git(&workspace, &["config", "user.name", "Forge fixture"]);
+    home
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed in {}", dir.display());
+}
+
 fn config(port: u16, protocol: &str) -> String {
     format!(
         r#"
@@ -436,17 +473,7 @@ compaction_threshold = 150
 }
 
 fn run(mode: &str, protocol: &'static str) {
-    // Outside the repository, deliberately. CARGO_TARGET_TMPDIR lives under
-    // target/, which is inside the worktree — the agent walks up to find a
-    // project root, found this checkout, and took its rewind lock. Twenty-two
-    // cases then contended on it, and worse, a test fixture was snapshotting
-    // the working tree it was being run from.
-    let home: PathBuf = std::env::temp_dir()
-        .join("forge-resilience")
-        .join(format!("{protocol}-{mode}"));
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(home.join(".config/forge")).unwrap();
-    std::fs::create_dir_all(home.join("workspace")).unwrap();
+    let home = fixture(&format!("{protocol}-{mode}"));
 
     let (provider, port) = start_provider(protocol, mode);
     std::fs::write(home.join(".config/forge/config.toml"), config(port, protocol)).unwrap();
@@ -631,12 +658,7 @@ cases! {
 /// the likelier it was to stop listening.
 #[test]
 fn a_message_split_across_writes_is_not_lost() {
-    let home: PathBuf = std::env::temp_dir()
-        .join("forge-resilience")
-        .join("split-write");
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(home.join(".config/forge")).unwrap();
-    std::fs::create_dir_all(home.join("workspace")).unwrap();
+    let home = fixture("split-write");
 
     let (provider, port) = start_provider("open_ai", "ok");
     std::fs::write(home.join(".config/forge/config.toml"), config(port, "open_ai")).unwrap();

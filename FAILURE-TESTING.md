@@ -20,14 +20,17 @@ Windows stale agent locks now check native process liveness. Shell timeout clean
 
 ## Reproduce
 
-Build `forge-agent` and run (Python 3 standard library only; use a new output directory for each run):
+The provider fault matrix is part of the test suite:
 
 ```sh
-python scripts/test_resilience.py --agent target/debug/forge-agent --output /tmp/forge-fault-openai
-python scripts/test_resilience.py --agent target/debug/forge-agent --protocol anthropic --output /tmp/forge-fault-anthropic
+cargo test -p forge-agent --test resilience
 ```
 
-On Windows use `target/debug/forge-agent.exe` and a Windows output path. `FORGE_CONFIG_FILE` explicitly isolates agent configuration; the harness checks the fixture model identity before sending anything.
+Eleven cases against both the OpenAI-compatible and Anthropic streaming
+formats, each on its own loopback provider and its own HOME, run in parallel.
+It was a standalone Python harness first; as a `cargo test` it runs wherever
+the suite runs instead of having to be remembered. Evidence for a failing case
+is written beside the fixture and its path is printed in the failure message.
 
 SSH integration requires a disposable account named `forgefault`, loopback sshd on port 22282, key authentication, SFTP, and TCP forwarding. Never point this fixture at a personal account: it writes the account's Forge configuration. Run `scripts/ssh_fault_proxy.py --marker PATH` to provide the disconnecting relay on 22283 and mock model on 22284. Reset the provider with GET `http://127.0.0.1:22284/reset` before each test.
 

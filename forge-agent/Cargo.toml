@@ -81,3 +81,8 @@ libc = "0.2"
 [[bin]]
 name = "forge-agent"
 path = "src/main.rs"
+
+[dev-dependencies]
+# Already a dependency; integration tests link against dev-dependencies only,
+# so it is named again here rather than a new crate entering the tree.
+serde_json = "1"

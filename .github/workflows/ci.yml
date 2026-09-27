@@ -81,6 +81,11 @@ jobs:
 
       - name: Agent (expected to need work)
         run: cargo build -p forge-agent --verbose
+      # The provider fault matrix is black-box: it spawns the agent against a
+      # loopback fixture, so it says whether failure handling behaves the same
+      # on Windows without anyone reproducing an outage by hand.
+      - name: Agent failure matrix
+        run: cargo test -p forge-agent --test resilience --verbose
 
   ide:
     name: editor (macOS)

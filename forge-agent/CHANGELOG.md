@@ -4,6 +4,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **A message sent while the agent was talking could be silently dropped.** The headless protocol read stdin with `read_line` inside a `tokio::select!`, alongside the branch carrying the agent's own outgoing events. `read_line` is not cancellation-safe: an event arriving part way through an incoming line dropped the read *and the bytes it had already consumed*. What remained parsed as nothing, so the message went to stderr and no further, and the client waited for a reply to something the agent never saw — more likely the more the agent had to say. Stdin is read in its own task now, and the loop selects on whole lines over a channel, which is cancellation-safe.
+
 ### Changed
 
 - **The provider fault matrix runs under 

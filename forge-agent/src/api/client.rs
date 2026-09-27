@@ -588,6 +588,7 @@ impl ApiClient {
         let mut content_buf = String::new();
         let mut structured_tool_emitted = false;
         let mut saw_finish_stop = false;
+        let mut completed = false;
 
         let stream = tokio_util::io::StreamReader::new(
             response
@@ -606,7 +607,7 @@ impl ApiClient {
                         "OpenAI-compatible stream read error: {}",
                         e
                     )));
-                    break;
+                    return;
                 }
                 Ok(_) => {}
             }
@@ -619,6 +620,7 @@ impl ApiClient {
                 None => continue,
             };
             if data == "[DONE]" {
+                completed = true;
                 break;
             }
 
@@ -705,6 +707,13 @@ impl ApiClient {
 
                     // When finish_reason arrives, emit accumulated tool calls
                     if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        if reason == "length" || reason == "content_filter" {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "Provider response incomplete ({reason}); partial text was kept. Continue the response or adjust the output budget."
+                            )));
+                            return;
+                        }
+                        completed = matches!(reason, "stop" | "tool_calls" | "function_call");
                         if reason == "stop" {
                             saw_finish_stop = true;
                         }
@@ -728,6 +737,10 @@ impl ApiClient {
                     }
                 }
             }
+        }
+        if !completed {
+            let _ = tx.send(StreamEvent::Error("OpenAI-compatible stream ended before completion".into()));
+            return;
         }
         if let Some(filter) = think_filter {
             let visible = filter.finish();
@@ -903,6 +916,7 @@ impl ApiClient {
         let mut input_tokens: u32 = 0;
         let mut output_tokens: u32 = 0;
         let mut reasoning_emitted = false;
+        let mut completed = false;
 
         loop {
             line.clear();
@@ -913,7 +927,7 @@ impl ApiClient {
                         "Anthropic stream read error: {}",
                         e
                     )));
-                    break;
+                    return;
                 }
                 Ok(_) => {}
             }
@@ -1007,6 +1021,10 @@ impl ApiClient {
                     }
                 }
                 "message_delta" => {
+                    if json.pointer("/delta/stop_reason").and_then(|v| v.as_str()) == Some("max_tokens") {
+                        let _ = tx.send(StreamEvent::Error("Anthropic response incomplete (max_tokens); partial text was kept. Continue the response or adjust the output budget.".into()));
+                        return;
+                    }
                     if let Some(tok) = json
                         .pointer("/usage/output_tokens")
                         .and_then(|v| v.as_u64())
@@ -1015,12 +1033,21 @@ impl ApiClient {
                     }
                 }
                 "message_stop" => {
+                    completed = true;
                     break;
+                }
+                "error" => {
+                    let _ = tx.send(StreamEvent::Error(format!("Anthropic stream error: {data}")));
+                    return;
                 }
                 _ => {}
             }
         }
 
+        if !completed {
+            let _ = tx.send(StreamEvent::Error("Anthropic stream ended before completion".into()));
+            return;
+        }
         let usage = Some(Usage {
             prompt_tokens: input_tokens,
             completion_tokens: output_tokens,
@@ -1218,6 +1245,7 @@ impl ApiClient {
         let mut usage: Option<Usage> = None;
         let mut reasoning_emitted = false;
         let mut streamed_text = String::new();
+        let mut completed = false;
 
         loop {
             line.clear();
@@ -1228,7 +1256,7 @@ impl ApiClient {
                         "Responses API stream read error: {}",
                         e
                     )));
-                    break;
+                    return;
                 }
                 Ok(_) => {}
             }
@@ -1314,6 +1342,7 @@ impl ApiClient {
                         )));
                         return;
                     }
+                    completed = true;
                     break;
                 }
                 "response.failed" | "response.incomplete" => {
@@ -1327,6 +1356,10 @@ impl ApiClient {
             }
         }
 
+        if !completed {
+            let _ = tx.send(StreamEvent::Error("Responses API stream ended before completion".into()));
+            return;
+        }
         let _ = tx.send(StreamEvent::Done { usage });
     }
 
@@ -2133,6 +2166,59 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_stream_requires_explicit_success() {
+        use std::io::{BufRead, Read, Write};
+        for (ending, success) in [
+            ("", false),
+            ("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n", false),
+            ("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                let body = format!("event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\n{ending}");
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let client = ApiClient {
+                client: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+                backend: std::sync::Arc::new(Backend::OpenAi { base_url: String::new(), api_key: None }),
+                max_output_tokens: 64, reasoning: EndpointReasoningConfig::default(),
+                forge_session_id: None, xai_priority: false,
+            };
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            client.chat_stream_responses(&format!("http://{address}"), "fixture", None,
+                "test fixture", "fixture", &[Message::user("test")], &[], tx).await;
+            let mut done = 0;
+            let mut errors = 0;
+            let mut text = String::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Done { .. } => done += 1,
+                    StreamEvent::Error(_) => errors += 1,
+                    StreamEvent::Token(token) => text.push_str(&token),
+                    _ => {},
+                }
+            }
+            assert_eq!(text, "partial");
+            assert_eq!((done, errors), if success { (1, 0) } else { (0, 1) });
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn extract_leaked_tool_calls_parses_qwen_xml_dialect() {

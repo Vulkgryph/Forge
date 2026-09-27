@@ -5540,6 +5540,8 @@ impl IdeApp {
     /// transcript, because it is the case where the conversation really did
     /// change machines.
     fn finish_pending_agents(&mut self) {
+        // A dropped remote link must not silently move queued work onto this PC.
+        if self.ssh.as_ref().is_some_and(|s| !s.is_connected()) { return; }
         let waiting: Vec<usize> = self.agent_tabs.iter().enumerate()
             .filter(|(_, t)| t.session.pending.is_some())
             .map(|(i, _)| i)
@@ -6620,6 +6622,24 @@ impl IdeApp {
         }
 
         // Poll SSH connect result
+        if !self.ssh_connecting && self.ssh.as_ref().is_some_and(|s| !s.is_connected()) {
+            const LOST: &str = "SSH connection lost; reconnect to continue.";
+            if self.ssh_error.as_deref() != Some(LOST) {
+                self.ssh_error = Some(LOST.into());
+                self.status = LOST.into();
+                self.output_log(LOST, OutputLevel::Warn);
+                for tab in &mut self.agent_tabs {
+                    if tab.session.pending.is_some() { continue; }
+                    let mut pending = crate::agent_panel::AgentSession::pending(
+                        LOST.into(), (!tab.session.forge_session_id.is_empty())
+                            .then_some(tab.session.forge_session_id.as_str()));
+                    pending.items = std::mem::take(&mut tab.session.items);
+                    pending.input = std::mem::take(&mut tab.session.input);
+                    pending.queued = std::mem::take(&mut tab.session.queued);
+                    tab.session = pending;
+                }
+            }
+        }
         if let Some(rx) = &self.ssh_connect_rx {
             match rx.try_recv() {
                 Ok(Ok(ready)) => {
@@ -7461,6 +7481,17 @@ impl IdeApp {
         ctx.request_repaint_after(Self::BUILD_CHECK_EVERY);
         self.poll_broadcasts();
         self.draw_update_banner(ctx);
+        if self.ssh.as_ref().is_some_and(|s| !s.is_connected()) {
+            egui::TopBottomPanel::top("ssh_disconnected_banner").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("SSH connection lost. Your buffers and conversation are kept.");
+                    if ui.add_enabled(!self.ssh_connecting, egui::Button::new("Reconnect")).clicked() {
+                        self.ssh_form = self.ssh.as_ref().unwrap().host.clone();
+                        self.ssh_connect();
+                    }
+                });
+            });
+        }
         self.draw_onboarding_wizard(ctx);
     }
 
@@ -18158,6 +18189,47 @@ mod stale_build_tests {
     fn a_process_running_its_own_binary_is_not_behind() {
         assert!(exe_mtime().is_some(), "no binary to compare against");
         assert!(!newer_build_installed());
+    }
+
+    #[test]
+    fn disconnected_ssh_banner_offers_reconnect() {
+        let ctx = egui::Context::default();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(scratch("ssh-banner")), ..Default::default()
+        });
+        app.settings.check_for_updates = false;
+        app.settings.auto_save = false;
+        app.onboarding = None;
+        app.show_term = false;
+        app.agent_visible = false;
+        app.ssh = Some(crate::ssh::SshConnection::disconnected_fixture());
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| app.draw(ctx));
+        let output = ctx.run(input(), |ctx| app.draw(ctx));
+        let position = output.shapes.iter().find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                if text.galley.text() == "Reconnect" {
+                    return Some(text.pos + text.galley.size() * 0.5);
+                }
+            }
+            None
+        }).expect("disconnected SSH must offer a visible reconnect action");
+        for pressed in [true, false] {
+            let mut frame = input();
+            frame.events = vec![egui::Event::PointerMoved(position), egui::Event::PointerButton {
+                pos: position, button: egui::PointerButton::Primary, pressed,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            let _ = ctx.run(frame, |ctx| app.draw(ctx));
+        }
+        assert_eq!(app.ssh_form.host, "127.0.0.1");
+        assert_eq!(app.ssh_form.port, 1);
+        assert!(app.output_log.iter().any(|(message, _)| message.contains("Connecting to fixture@")),
+            "reconnect click did not start the connection attempt");
+        assert!(app.ssh.is_some(), "remote workspace must not fall back to local on failure");
     }
 
     #[test]

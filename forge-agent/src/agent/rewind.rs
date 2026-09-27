@@ -735,8 +735,29 @@ fn is_zombie(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// No cheap equivalent here, so a lock is only ever broken by `ABANDONED`.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_exists(pid: i32) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    if pid <= 0 { return false; }
+    // SYNCHRONIZE permits a zero-duration liveness check without terminating
+    // or modifying the process. Access denial is conservatively treated as alive.
+    unsafe {
+        let handle = OpenProcess(0x00100000, 0, pid as u32);
+        if handle.is_null() { return GetLastError() != 87; }
+        let state = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        state != 0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_exists(_pid: i32) -> bool {
     true
 }
@@ -778,6 +799,7 @@ mod tests {
     fn init_repo(path: &Path, name: &str) {
         std::fs::create_dir_all(path).unwrap();
         git(path, &["init"]);
+        git(path, &["config", "core.autocrlf", "false"]);
         git(path, &["config", "user.email", "forge@test.local"]);
         git(path, &["config", "user.name", "Forge Test"]);
         std::fs::write(path.join("file.txt"), format!("{name} base\n")).unwrap();
@@ -787,7 +809,10 @@ mod tests {
 
     /// A pid that is definitely not running: a real child, reaped.
     fn dead_pid() -> i32 {
+        #[cfg(unix)]
         let mut child = Command::new("true").spawn().expect("spawn");
+        #[cfg(windows)]
+        let mut child = Command::new("cmd").args(["/C", "exit", "0"]).spawn().expect("spawn");
         child.wait().expect("wait");
         child.id() as i32
     }
@@ -802,6 +827,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_lock_held_by_an_unreaped_child_is_stale() {
         // The exact shape seen in the wild: the editor's agent died, the editor
         // had not reaped it yet, and the leftover lock named a pid that

@@ -495,6 +495,11 @@ impl AppConfig {
     }
 
     pub fn config_path() -> Result<PathBuf> {
+        // Explicit profiles also allow failure tests to stay isolated on Windows,
+        // where Known Folder APIs intentionally ignore HOME/USERPROFILE overrides.
+        if let Some(path) = std::env::var_os("FORGE_CONFIG_FILE").filter(|p| !p.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
         let home = dirs::home_dir().context("Could not find home directory")?;
         Ok(home.join(".config").join("forge").join("config.toml"))
     }

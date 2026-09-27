@@ -25,6 +25,19 @@ pub const DEFAULT_SHELL_WAIT_TIMEOUT_SECS: u64 = 300;
 /// `rg | head`, nested `sh -c`, etc. can keep running and leave the parent
 /// turn blocked forever. Negative-PID `kill` targets the whole group first.
 pub async fn terminate_child(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        // Kill descendants before their parent disappears. Otherwise a child
+        // retaining stdout/stderr keeps the tool waiting after its timeout.
+        let taskkill = std::path::PathBuf::from(std::env::var_os("SystemRoot")
+            .unwrap_or_else(|| "C:\\Windows".into())).join("System32/taskkill.exe");
+        let mut command = tokio::process::Command::new(taskkill);
+        command.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x08000000)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), command.status()).await;
+    }
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let pgid = pid as i32;
@@ -337,10 +350,10 @@ impl ToolExecutor {
         let full_path = self.resolve_path(rel_path)?;
 
         if !full_path.exists() {
-            return Ok(format!("Error: File not found: {}", rel_path));
+            anyhow::bail!("File not found: {}", rel_path);
         }
         if !full_path.is_file() {
-            return Ok(format!("Error: Not a file: {}", rel_path));
+            anyhow::bail!("Not a file: {}", rel_path);
         }
 
         let content = std::fs::read_to_string(&full_path)
@@ -1435,7 +1448,9 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_mismatch_hint, edit_multimatch_hint, ToolExecutor, ToolKind};
+    use super::{edit_mismatch_hint, edit_multimatch_hint, ToolExecutor};
+    #[cfg(unix)]
+    use super::ToolKind;
     use serde_json::json;
 
     #[test]
@@ -1518,6 +1533,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn custom_tool_loads_and_receives_json_args() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tools_dir = dir.path().join(".agent").join("tools");
@@ -1581,7 +1597,7 @@ mod tests {
             .execute(
                 "shell_exec",
                 &json!({
-                    "command": "sleep 120",
+                    "command": if cfg!(windows) { "ping -n 121 127.0.0.1 > NUL" } else { "sleep 120" },
                     "timeout_secs": 2
                 }),
                 None,

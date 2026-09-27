@@ -23,9 +23,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-/// Long enough for a 2-second request timeout to fire and be reported, short
-/// enough that a hung agent fails the test rather than the CI job.
-const WAIT: Duration = Duration::from_secs(25);
+/// A hang-breaker, not a speed assertion.
+///
+/// This was 25 seconds, inherited from a harness that ran one case at a time.
+/// Twenty-two of them in parallel on a two-core runner is a different load —
+/// several hold a provider thread asleep for five seconds — and CI failed with
+/// exactly one case at the ceiling, a different one each run, while the whole
+/// matrix takes about three seconds on an unloaded machine. That is a budget
+/// that was too tight, not a fault. Generous here costs nothing when the agent
+/// is behaving and still fails the job rather than hanging it when it is not.
+const WAIT: Duration = Duration::from_secs(90);
 
 // ── The fake provider ───────────────────────────────────────────────────────
 

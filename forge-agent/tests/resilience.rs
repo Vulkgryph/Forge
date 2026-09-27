@@ -25,13 +25,13 @@ use serde_json::{json, Value};
 
 /// A hang-breaker, not a speed assertion.
 ///
-/// This was 25 seconds, inherited from a harness that ran one case at a time.
-/// Twenty-two of them in parallel on a two-core runner is a different load —
-/// several hold a provider thread asleep for five seconds — and CI failed with
-/// exactly one case at the ceiling, a different one each run, while the whole
-/// matrix takes about three seconds on an unloaded machine. That is a budget
-/// that was too tight, not a fault. Generous here costs nothing when the agent
-/// is behaving and still fails the job rather than hanging it when it is not.
+/// An earlier version of this comment blamed CI contention for one case always
+/// sitting at the ceiling, and raised the number. That was wrong: raising it
+/// only made the same failure take longer. The cause was the agent losing a
+/// message whose bytes were split across reads, so the case was not slow, it
+/// was waiting for a reply to something the agent had thrown away. Generous is
+/// still right for a timeout that exists to fail a hung job rather than hang
+/// it, but the number was never the point.
 const WAIT: Duration = Duration::from_secs(90);
 
 // ── The fake provider ───────────────────────────────────────────────────────
@@ -287,7 +287,16 @@ impl Agent {
             .env("FORGE_CONFIG_FILE", home.join(".config/forge/config.toml"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // Kept, not discarded. The Python harness logged this and the
+            // port did not; the first real failure was then a silent agent
+            // with nothing to read.
+            .stderr(Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home.join("stderr.log"))
+                    .expect("open stderr log"),
+            ));
 
         let mut child = command.spawn().expect("spawn forge-agent");
         let stdin = child.stdin.take().unwrap();
@@ -311,19 +320,50 @@ impl Agent {
         Agent { child, stdin, rx, events }
     }
 
+    /// One frame, one write. `writeln!` with a `{}` argument is many small
+    /// unbuffered syscalls, which is a fine thing for a pipe to do and was how
+    /// this harness first tripped the agent's stdin handling — but a test
+    /// should choose when it splits a message, not do it by accident.
     fn send(&mut self, message: Value) {
-        let _ = writeln!(self.stdin, "{message}");
+        let frame = format!("{message}\n");
+        let _ = self.stdin.write_all(frame.as_bytes());
+        let _ = self.stdin.flush();
+    }
+
+    /// Deliberately split across two writes with a gap between them, which is
+    /// what a pipe does under load and what a slow client does normally.
+    fn send_in_two_writes(&mut self, message: Value) {
+        let frame = format!("{message}\n");
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        let _ = self.stdin.write_all(head.as_bytes());
+        let _ = self.stdin.flush();
+        thread::sleep(Duration::from_millis(250));
+        let _ = self.stdin.write_all(tail.as_bytes());
         let _ = self.stdin.flush();
     }
 
     /// Wait for one of `kinds`. An agent that exits instead is a failure with a
     /// different name than a timeout, because they mean different things.
-    fn until(&mut self, kinds: &[&str]) -> Result<Value, String> {
+    fn until(&mut self, kinds: &[&str], phase: &str) -> Result<Value, String> {
         let deadline = Instant::now() + WAIT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(format!("timed out waiting for {kinds:?}"));
+                // Which wait, and what the agent had emitted by then. Without
+                // this a timeout says only that something did not arrive, and
+                // "the fault was never reported" and "the session would not
+                // take another turn" are different bugs with the same symptom.
+                let seen: Vec<String> = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|e| e.get("type").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                return Err(format!(
+                    "[{phase}] timed out waiting for {kinds:?}; agent emitted [{}]",
+                    seen.join(", ")
+                ));
             }
             match self.rx.recv_timeout(left.min(Duration::from_millis(200))) {
                 Ok(message) => {
@@ -427,7 +467,14 @@ fn run(mode: &str, protocol: &'static str) {
     );
 
     if let Err(why) = outcome {
-        panic!("{protocol}/{mode}: {why}\nevidence: {}", home.display());
+        let seen = provider.requests.lock().unwrap().len();
+        let stderr = std::fs::read_to_string(home.join("stderr.log")).unwrap_or_default();
+        let stderr = stderr.trim();
+        panic!(
+            "{protocol}/{mode}: {why}\nprovider saw {seen} request(s)\nagent stderr: {}\nevidence: {}",
+            if stderr.is_empty() { "(silent)" } else { stderr },
+            home.display()
+        );
     }
 }
 
@@ -438,7 +485,7 @@ fn case(
     home: &Path,
     carried: &mut Vec<Value>,
 ) -> Result<(), String> {
-    let init = agent.until(&["init"])?;
+    let init = agent.until(&["init"], "startup")?;
 
     // The guard that keeps this test loopback-only: if the agent did not load
     // the fixture endpoint, something else is configured and nothing is sent.
@@ -456,13 +503,13 @@ fn case(
 
     match mode {
         "cancel" => {
-            agent.until(&["assistant_token"])?;
+            agent.until(&["assistant_token"], "first token before cancel")?;
             agent.send(json!({"type": "cancel_run"}));
-            let end = agent.until(&["cancelled", "error", "done"])?;
+            let end = agent.until(&["cancelled", "error", "done"], "after cancel")?;
             expect(&end, "cancelled")?;
         }
         "restart" => {
-            agent.until(&["assistant_token"])?;
+            agent.until(&["assistant_token"], "first token before kill")?;
             let session = init
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -474,15 +521,15 @@ fn case(
             agent.close();
 
             *agent = Agent::start(home, Some(&session));
-            agent.until(&["init"])?;
-            let resumed = agent.until(&["session_loaded"])?;
+            agent.until(&["init"], "restart")?;
+            let resumed = agent.until(&["session_loaded"], "resume")?;
             let count = resumed.get("message_count").and_then(Value::as_u64).unwrap_or(0);
             if count < 1 {
                 return Err(format!("resumed session remembered nothing: {resumed}"));
             }
         }
         _ => {
-            let end = agent.until(&["done", "error", "cancelled"])?;
+            let end = agent.until(&["done", "error", "cancelled"], "the faulted turn")?;
             let faults_are_errors = matches!(
                 mode,
                 "eof" | "reset" | "output_limit" | "truncated_tool" | "stall" | "http429" | "context_limit"
@@ -506,7 +553,7 @@ fn case(
     // Whatever broke, the session must still take another turn.
     *provider.mode.lock().unwrap() = "ok".to_string();
     agent.send(json!({"type": "send_message", "content": "Recover now."}));
-    let end = agent.until(&["done", "error", "cancelled"])?;
+    let end = agent.until(&["done", "error", "cancelled"], "the recovery turn")?;
     expect(&end, "done")?;
     if !agent.saw(|e| e.get("content").and_then(Value::as_str) == Some("RECOVERED")) {
         return Err("the recovery turn produced no answer".into());
@@ -571,4 +618,52 @@ cases! {
     stalled_stream: "stall",
     cancellation: "cancel",
     kill_and_resume: "restart",
+}
+
+/// A message split across two writes, arriving while the agent is emitting
+/// events, must still be acted on.
+///
+/// It was not. `read_line` sat in the `tokio::select!` next to the agent's own
+/// outgoing events, and it is not cancellation-safe: an event arriving mid-line
+/// dropped the read and the bytes it had consumed. The tail then failed to
+/// parse, the message was logged to stderr and discarded, and the client waited
+/// for a reply to something the agent never saw. The more the agent had to say,
+/// the likelier it was to stop listening.
+#[test]
+fn a_message_split_across_writes_is_not_lost() {
+    let home: PathBuf = std::env::temp_dir()
+        .join("forge-resilience")
+        .join("split-write");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".config/forge")).unwrap();
+    std::fs::create_dir_all(home.join("workspace")).unwrap();
+
+    let (provider, port) = start_provider("open_ai", "ok");
+    std::fs::write(home.join(".config/forge/config.toml"), config(port, "open_ai")).unwrap();
+
+    let mut agent = Agent::start(&home, None);
+    agent.until(&["init"], "startup").expect("init");
+
+    // Start a turn so the agent is emitting events, then send the next message
+    // in pieces while it is busy. That is the race, made deliberate.
+    agent.send(json!({"type": "send_message", "content": "First."}));
+    agent.until(&["thinking", "assistant_token"], "first turn under way").expect("turn started");
+    agent.send_in_two_writes(json!({"type": "send_message", "content": "Second."}));
+
+    let outcome = agent
+        .until(&["done", "error", "cancelled"], "first turn")
+        .and_then(|_| agent.until(&["done", "error", "cancelled"], "the split message"));
+
+    agent.close();
+    let seen = provider.requests.lock().unwrap().len();
+    match outcome {
+        Ok(_) => assert!(
+            seen >= 2,
+            "the split message never reached the provider: {seen} request(s)"
+        ),
+        Err(why) => {
+            let stderr = std::fs::read_to_string(home.join("stderr.log")).unwrap_or_default();
+            panic!("{why}\nprovider saw {seen} request(s)\nagent stderr: {}", stderr.trim());
+        }
+    }
 }

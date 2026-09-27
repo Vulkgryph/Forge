@@ -997,8 +997,6 @@ pub async fn run_headless(
     mut app_config: crate::config::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = tokio::io::stdout();
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
 
     for msg in opening_messages(init_info) {
         let json = serde_json::to_string(&msg)?;
@@ -1007,38 +1005,75 @@ pub async fn run_headless(
         stdout.flush().await?;
     }
 
-    let mut line_buf = String::new();
     // Per-message size cap. A single JSON-newline frame must fit in 10 MB; any
     // longer is treated as a protocol error rather than an unbounded allocation.
     const MAX_HEADLESS_LINE_BYTES: usize = 10 * 1024 * 1024;
     // Channel for OAuth login background task to send JSON strings back to stdout
     let (login_tx, mut login_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
+    // Reading stdin happens in a task of its own, and the loop below selects on
+    // whole lines rather than on the read.
+    //
+    // `read_line` is not cancellation-safe, and it used to sit directly in the
+    // select — racing this process's *own outgoing events*. Every event the
+    // agent emitted could drop a read that was part way through a line, and the
+    // bytes it had already taken went with it. The next read then returned the
+    // tail of that message, which parsed as nothing, and the message was gone:
+    // logged to stderr and never acted on. A client that sent while the agent
+    // was talking could simply be ignored, more often the more the agent said.
+    //
+    // A channel receive is cancellation-safe, so losing the race now costs
+    // nothing. Whole lines only cross the boundary.
+    enum Incoming {
+        Line(String),
+        Eof,
+        Failed(std::io::Error),
+    }
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<Incoming>();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut line_buf = String::new();
+        loop {
+            line_buf.clear();
+            match reader.read_line(&mut line_buf).await {
+                Ok(0) => {
+                    let _ = line_tx.send(Incoming::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if line_buf.len() > MAX_HEADLESS_LINE_BYTES {
+                        eprintln!(
+                            "headless: dropping oversized message ({} bytes > {} cap)",
+                            line_buf.len(),
+                            MAX_HEADLESS_LINE_BYTES
+                        );
+                        continue;
+                    }
+                    if line_tx.send(Incoming::Line(std::mem::take(&mut line_buf))).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = line_tx.send(Incoming::Failed(e));
+                    return;
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             biased;
 
             // Always check stdin first so cancel/quit are never starved by output floods
-            result = reader.read_line(&mut line_buf) => {
-                match result {
-                    Ok(0) => {
+            incoming = line_rx.recv() => {
+                match incoming {
+                    None | Some(Incoming::Eof) => {
                         // EOF — TUI closed
                         let _ = action_tx.send(UserAction::Quit);
                         break;
                     }
-                    Ok(_) => {
-                        // Guard against unbounded growth: a partial line that
-                        // grows past the cap without a newline is dropped and
-                        // we resync on the next newline.
-                        if line_buf.len() > MAX_HEADLESS_LINE_BYTES {
-                            eprintln!(
-                                "headless: dropping oversized message ({} bytes > {} cap)",
-                                line_buf.len(),
-                                MAX_HEADLESS_LINE_BYTES
-                            );
-                            line_buf.clear();
-                            continue;
-                        }
+                    Some(Incoming::Line(line_buf)) => {
                         let trimmed = line_buf.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<IncomingMessage>(trimmed) {
@@ -1109,9 +1144,8 @@ pub async fn run_headless(
                                 }
                             }
                         }
-                        line_buf.clear();
                     }
-                    Err(e) => {
+                    Some(Incoming::Failed(e)) => {
                         eprintln!("headless: stdin read error: {}", e);
                         let _ = action_tx.send(UserAction::Quit);
                         break;

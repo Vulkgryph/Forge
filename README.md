@@ -102,6 +102,10 @@ What *can* diverge is each client's own view of the wire protocol's shape. The t
 
 ## Install / defaults
 
+On **Ubuntu/Debian x86-64**, run `bash install.sh` from the source directory.
+It installs missing build tools, both interfaces, and branded application-menu
+entries. See [Linux installation](LINUX.md) for options and tested scope.
+
 For the local native Windows development installer, see [Windows installation](WINDOWS.md).
 From an existing checkout, double-click `install.cmd` to build and install both
 interfaces and the shared agent. Windows support is under development; the
@@ -116,7 +120,7 @@ This monorepo is the **canonical** Forge source. The standalone `forge` and `For
 forge-update
 ```
 
-That installs:
+The older terminal-only installer above installs:
 
 | Command | Points at |
 |---|---|
@@ -124,7 +128,8 @@ That installs:
 | `forge-agent` | `target/release/forge-agent` from this workspace |
 | `forge-update` | `forge-agent/update.sh` in this repo |
 
-`forge-ide` is optional and built separately (`cargo build -p forge-ide`) when you want the editor; it is not part of the default PATH install.
+With that terminal-only installer, `forge-ide` is built separately. The root Linux
+and Windows installers include it by default.
 
 On macOS there is also a notarized `.dmg` on the [releases page](https://github.com/Vulkgryph/Forge/releases) if you would rather not build the editor yourself. It is signed with Vulkgryph LLC's Developer ID and notarized by Apple, so it opens without the unidentified-developer warning. The terminal client is not distributed that way — `install.sh` builds it from this checkout.
 

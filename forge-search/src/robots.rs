@@ -57,24 +57,43 @@ impl Robots {
     /// Groups are matched by the most specific applicable `User-agent`: an
     /// exact name beats `*`, which is the whole point of naming yourself.
     pub fn parse(text: &str, user_agent: &str) -> Self {
-        let wanted = user_agent.to_ascii_lowercase();
+        // RFC 9309 matches the *product token* — the name before any `/` —
+        // not the whole User-Agent string. `starts_with` on the full string
+        // meant a group written for `forge` also captured `forge-search`,
+        // and a site aiming a rule at some other crawler whose name happens
+        // to be a prefix of ours would have caught us too.
+        let wanted = product_token(user_agent);
+
         // Two passes rather than one: a file may put the `*` group before or
         // after the specific one, and the specific group wins regardless of
         // order. Deciding as the file is read would make the result depend on
         // the order in which the site happened to write it.
-        let specific = Self::parse_group(text, |agent| wanted.starts_with(agent) && agent != "*");
-        if specific.has_rules() {
+        let (specific, matched) = Self::parse_group(text, |agent| agent == wanted && agent != "*");
+
+        // Matched, not "matched and had rules". The difference is the standard
+        // way a site lets one crawler in:
+        //
+        //     User-agent: *
+        //     Disallow: /
+        //     User-agent: forge-search
+        //     Disallow:
+        //
+        // An empty `Disallow:` permits everything, so that group has no rules
+        // to speak of — and falling through to the wildcard on that basis
+        // turned "everyone out except you" into the blanket ban it was
+        // written to make an exception to. Which is exactly the file a site
+        // writes after someone emails to ask for access.
+        if matched {
             return specific;
         }
-        Self::parse_group(text, |agent| agent == "*")
+        Self::parse_group(text, |agent| agent == "*").0
     }
 
-    fn has_rules(&self) -> bool {
-        !self.disallowed.is_empty() || !self.allowed.is_empty() || self.crawl_delay.is_some()
-    }
-
-    fn parse_group(text: &str, matches: impl Fn(&str) -> bool) -> Self {
+    /// Returns the group's rules and whether any `User-agent` line matched at
+    /// all — which is not the same question as whether the group had rules.
+    fn parse_group(text: &str, matches: impl Fn(&str) -> bool) -> (Self, bool) {
         let mut out = Self::default();
+        let mut matched_any = false;
         // Consecutive `User-agent` lines share one group of rules, so the flag
         // stays set across them and is only cleared by a rule line.
         let mut in_group = false;
@@ -102,6 +121,7 @@ impl Robots {
                     naming_agents = true;
                     if matches(&agent) {
                         in_group = true;
+                        matched_any = true;
                     }
                 }
                 // Sitemaps are global rather than per-group, so they are
@@ -133,11 +153,17 @@ impl Robots {
                     naming_agents = false;
                     if in_group {
                         if let Ok(secs) = value.parse::<f64>() {
-                            // A negative or absurd delay is a malformed file
-                            // rather than an instruction; clamped rather than
-                            // trusted, since this value gates every request.
+                            // Recorded as written. A large value used to be
+                            // clamped to 300s and called malformed, so a site
+                            // asking for one visit a day got one every five
+                            // minutes — 288 times what it asked for, while
+                            // the code described itself as obeying. A number
+                            // a site meant is not malformed because it is
+                            // inconvenient. Negative and non-finite are still
+                            // rejected, because those are not numbers a site
+                            // can have meant.
                             if secs.is_finite() && secs >= 0.0 {
-                                out.crawl_delay = Some(secs.min(300.0));
+                                out.crawl_delay = Some(secs);
                             }
                         }
                     }
@@ -147,7 +173,7 @@ impl Robots {
                 }
             }
         }
-        out
+        (out, matched_any)
     }
 
     /// Whether `url`'s path may be fetched.
@@ -181,6 +207,19 @@ impl Robots {
             (Some(deny), Some(allow)) => allow >= deny,
         }
     }
+}
+
+/// The product token from a User-Agent string: the name before any `/`.
+///
+/// RFC 9309 matches `robots.txt` groups against this, not against the whole
+/// header. `forge-search/0.5.2 (+https://…)` has the token `forge-search`.
+fn product_token(user_agent: &str) -> String {
+    user_agent
+        .split('/')
+        .next()
+        .unwrap_or(user_agent)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Trim a rule to its comparable form.
@@ -349,18 +388,57 @@ mod tests {
     }
 
     #[test]
-    fn a_crawl_delay_is_read_and_clamped() {
+    fn a_crawl_delay_is_recorded_as_the_site_wrote_it() {
         let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "forge-search");
         assert_eq!(r.crawl_delay, Some(2.5));
 
-        // A malformed value is not an instruction. This gates every request,
-        // so it is clamped rather than trusted.
+        // Not a number the site can have meant.
         assert_eq!(Robots::parse("User-agent: *\nCrawl-delay: -5\n", "x").crawl_delay, None);
         assert_eq!(Robots::parse("User-agent: *\nCrawl-delay: abc\n", "x").crawl_delay, None);
+
+        // A large one is. This used to be clamped to 300 and the file called
+        // malformed, so a site asking for one visit a day got one every five
+        // minutes — 288 times what it asked for, from code describing itself
+        // as obeying. What can actually be honoured is the crawler's
+        // decision, and it refuses rather than quietly going faster.
         assert_eq!(
-            Robots::parse("User-agent: *\nCrawl-delay: 99999\n", "x").crawl_delay,
-            Some(300.0),
+            Robots::parse("User-agent: *\nCrawl-delay: 86400\n", "x").crawl_delay,
+            Some(86400.0),
         );
+    }
+
+    /// The standard way a site lets one crawler past a blanket ban.
+    #[test]
+    fn an_empty_disallow_in_our_own_group_is_permission_not_silence() {
+        let text = "User-agent: *\nDisallow: /\n\nUser-agent: forge-search\nDisallow:\n";
+        let r = Robots::parse(text, "forge-search/0.5.2 (+https://vulkgryph.com/)");
+        assert!(
+            r.allows(&u("https://a.example/anything")),
+            "the exception written for us was read as the ban it excepts"
+        );
+
+        // And a crawler the exception was not written for still gets the ban.
+        let other = Robots::parse(text, "some-other-bot/1.0");
+        assert!(!other.allows(&u("https://a.example/anything")));
+    }
+
+    /// RFC 9309 matches the product token, not the whole header.
+    #[test]
+    fn a_group_named_for_another_crawler_does_not_capture_this_one() {
+        // `forge` is a prefix of `forge-search`, and prefix matching on the
+        // full User-Agent string meant this group caught us.
+        let text = "User-agent: forge\nDisallow: /\n";
+        let r = Robots::parse(text, "forge-search/0.5.2 (+https://vulkgryph.com/)");
+        assert!(
+            r.allows(&u("https://a.example/page")),
+            "a rule aimed at a differently-named crawler was applied to this one"
+        );
+
+        // Our own name still matches, with or without the version suffix.
+        for ua in ["forge-search", "forge-search/0.5.2 (+https://vulkgryph.com/)"] {
+            let mine = Robots::parse("User-agent: forge-search\nDisallow: /\n", ua);
+            assert!(!mine.allows(&u("https://a.example/page")), "{ua}");
+        }
     }
 
     /// A site's own list of what it considers worth indexing is a better place

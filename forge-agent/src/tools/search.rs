@@ -248,7 +248,7 @@ pub struct Timing {
     ///
     /// Worth telling the model, but not as "ask again and it continues" — the
     /// frontier is not persisted, so a second crawl starts from the seeds and
-    /// refetches. What it should do instead is raise `max_pages`, or narrow
+    /// refetches. What it should do instead is narrow
     /// `sites`.
     pub timed_out: bool,
 }
@@ -571,7 +571,8 @@ fn render(
                 "Crawled {} pages ({} indexed, {} refused by robots.txt) in {}ms and found \
                  nothing matching. The index now holds {} pages; try different terms, or pass \
                  `sites` to crawl somewhere else. Crawling again repeats the same pages rather \
-                 than continuing, so raise `max_pages` instead of retrying as-is.\n",
+                 than continuing, so narrow `sites` to somewhere the answer is likely \
+                 to be instead of retrying as-is.\n",
                 timing.fetched, timing.indexed, timing.disallowed, timing.crawl_ms,
                 timing.index_size,
             ));
@@ -631,7 +632,7 @@ fn render(
             timing.crawl_ms,
             if timing.timed_out {
                 " (stopped on the time budget; a further crawl restarts from the seeds, so \
-                 raise max_pages rather than repeating this call)"
+                 narrow `sites` rather than repeating this call)"
             } else {
                 ""
             },

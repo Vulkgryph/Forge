@@ -164,6 +164,15 @@ pub enum AgentMessage {
     UsageUpdate {
         snapshot: UsageSnapshot,
     },
+    /// What a ChatGPT subscription has left, reported by the provider on every
+    /// response it serves. Only that endpoint sends it; a client must cope with
+    /// never seeing one.
+    UsageLimits {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary: Option<UsageWindowInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secondary: Option<UsageWindowInfo>,
+    },
     ModelSwitched {
         name: String,
         model_id: String,
@@ -309,6 +318,7 @@ impl AgentMessage {
             Self::BackgroundPromptNeeded { .. } => "background_prompt_needed",
             Self::Usage { .. } => "usage",
             Self::UsageUpdate { .. } => "usage_update",
+            Self::UsageLimits { .. } => "usage_limits",
             Self::ModelSwitched { .. } => "model_switched",
             Self::EndpointsUpdated { .. } => "endpoints_updated",
             Self::SessionCleared { .. } => "session_cleared",
@@ -391,6 +401,30 @@ pub struct RewindCheckpoint {
     pub message_count: usize,
     pub display_index: usize,
     pub keep_on_restore: bool,
+}
+
+/// One subscription window, with the wording already decided by the agent so
+/// the terminal and the editor cannot disagree about what to call it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindowInfo {
+    pub used_percent: f32,
+    pub remaining_percent: f32,
+    pub window_minutes: u64,
+    /// "weekly", "5-hour", and so on.
+    pub window_name: String,
+    pub resets_in_seconds: u64,
+    /// "5d 14h".
+    pub resets_in: String,
+}
+
+impl UsageWindowInfo {
+    /// The compact form for a status line, e.g. `weekly 8% left, 5d 14h`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} {:.0}% left, {}",
+            self.window_name, self.remaining_percent, self.resets_in
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]

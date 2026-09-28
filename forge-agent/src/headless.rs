@@ -17,6 +17,33 @@ pub struct ToolInfo {
     pub enabled: bool,
 }
 
+/// One usage window, in the form a client can show without arithmetic: the
+/// percentages and seconds as reported, plus the words for them already
+/// chosen, so the terminal and the editor cannot disagree about what to call
+/// a 10080-minute window.
+#[derive(Serialize)]
+struct UsageWindowInfo {
+    used_percent: f32,
+    remaining_percent: f32,
+    window_minutes: u64,
+    window_name: String,
+    resets_in_seconds: u64,
+    resets_in: String,
+}
+
+impl From<crate::api::client::UsageWindow> for UsageWindowInfo {
+    fn from(w: crate::api::client::UsageWindow) -> Self {
+        UsageWindowInfo {
+            used_percent: w.used_percent,
+            remaining_percent: w.remaining_percent(),
+            window_minutes: w.window_minutes,
+            window_name: w.window_name(),
+            resets_in_seconds: w.resets_in_seconds,
+            resets_in: crate::api::client::humanise_duration(w.resets_in_seconds),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutgoingMessage {
@@ -141,6 +168,16 @@ enum OutgoingMessage {
         question: String,
         tool_id: String,
         items: Vec<QuestionItemJson>,
+    },
+    /// What the ChatGPT subscription has left. Sent whenever the provider
+    /// reports it, which is on every response it serves.
+    UsageLimits {
+        /// The long window — a week on current plans. Absent for a plan that
+        /// has no such window, rather than reported as zero.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        primary: Option<UsageWindowInfo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secondary: Option<UsageWindowInfo>,
     },
     PlanModeEntered {
         plan_path: String,
@@ -549,6 +586,10 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
             question: question.clone(),
             tool_id: tool_id.clone(),
             items: items.iter().map(|i| i.into()).collect(),
+        },
+        AgentEvent::UsageLimits(limits) => OutgoingMessage::UsageLimits {
+            primary: limits.primary.map(Into::into),
+            secondary: limits.secondary.map(Into::into),
         },
         AgentEvent::PlanModeEntered { plan_path } => OutgoingMessage::PlanModeEntered {
             plan_path: plan_path.clone(),

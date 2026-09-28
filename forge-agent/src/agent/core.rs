@@ -27,6 +27,9 @@ use crate::tools::{
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     AssistantMessage(String),
+    /// What the subscription has left, reported by the provider on a response.
+    /// Only ChatGPT Codex sends this; other endpoints never emit it.
+    UsageLimits(crate::api::client::UsageLimits),
     /// A streaming text token — append to the live in-progress message in the UI.
     AssistantToken(String),
     /// Streaming complete — commit the authoritative accumulated text to scrollback.
@@ -567,6 +570,9 @@ fn parse_patch_paths(diff: &str) -> Vec<String> {
 }
 
 pub struct Agent {
+    /// Last reported subscription budget, so a client that connects or asks
+    /// mid-session has something to show without waiting for the next turn.
+    usage_limits: Option<crate::api::client::UsageLimits>,
     client: ApiClient,
     executor: ToolExecutor,
     config: AgentConfig,
@@ -700,6 +706,7 @@ impl Agent {
             total_requests: 0,
             token_snapshots: vec![],
             plan_mode: false,
+            usage_limits: None,
             plan_file_path: None,
             rolling_window_plan_content: None,
             rolling_window_completion_notice_sent: false,
@@ -810,6 +817,7 @@ impl Agent {
             total_requests: 0,
             token_snapshots: vec![],
             plan_mode: false,
+            usage_limits: None,
             plan_file_path: None,
             rolling_window_plan_content,
             rolling_window_completion_notice_sent: false,
@@ -1407,6 +1415,18 @@ impl Agent {
                             }
                             Some(crate::api::StreamEvent::Reasoning) => {
                                 let _ = self.event_tx.send(AgentEvent::Reasoning);
+                            }
+                            Some(crate::api::StreamEvent::LimitReached(message)) => {
+                                // Verbatim. It already says what happened and
+                                // what to do; "API error:" in front of it would
+                                // only contradict the first thing it says.
+                                let _ = self.event_tx.send(AgentEvent::Error(message));
+                                let _ = self.log.log_run_state(RunState::WaitingUser);
+                                return Ok(());
+                            }
+                            Some(crate::api::StreamEvent::Limits(limits)) => {
+                                self.usage_limits = Some(limits.clone());
+                                let _ = self.event_tx.send(AgentEvent::UsageLimits(limits));
                             }
                             Some(crate::api::StreamEvent::ReasoningToken(text)) => {
                                 let _ = self.event_tx.send(AgentEvent::ReasoningToken(text));

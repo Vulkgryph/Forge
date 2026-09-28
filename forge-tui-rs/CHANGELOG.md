@@ -116,3 +116,13 @@ Versioned with `forge-agent` and `forge-ide` rather than starting at 0.1.0, sinc
 - Paste detection, so a multi-line paste arrives as one message rather than sending on every newline. Apple's Terminal does not implement bracketed paste, so this is a heuristic on the read chunk.
 - Continuous backspace, caret movement within a message, and a bounded rolling window over long input.
 - The transcript's "Thinking…" line turns while a block is live, and the status line stops repeating it — two spinners were giving one state two different names.
+
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vulkgryph/Forge/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Vulkgryph/Forge/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Vulkgryph/Forge/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/Vulkgryph/Forge/releases/tag/v0.3.0

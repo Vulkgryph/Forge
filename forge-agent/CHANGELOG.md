@@ -2,6 +2,14 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A local-only setup was telling OpenAI when you started Forge.** Anyone who had ever logged in to ChatGPT Codex made two credential-bearing calls at every startup — a token refresh to `auth.openai.com` and a model-catalog fetch carrying the OAuth bearer — regardless of which endpoint they were actually using. `offline_mode` suppressed both, but that is a setting you have to know to look for, so the *default* for someone pointed at a local model was a startup that contacted a provider they were not using. Both calls now happen only when Codex is the endpoint in use. The catalog is still wanted when it is not, because `/model` lists what you could switch to — that case reads the local cache and sends nothing.
+
+- **The README's network table did not list the calls it was describing.** There was no row for the model-catalog fetch at all, and "zero outgoing network traffic" overstated what `offline_mode` can deliver: it does not stop a Codex token refresh when Codex is the endpoint in use, because the endpoint cannot be used without one. Offline mode stops Forge talking to anyone you did not ask it to; it cannot make a cloud provider local. Both are now said plainly.
+
 ## [0.5.2] — 2026-09-27
 
 ### Fixed

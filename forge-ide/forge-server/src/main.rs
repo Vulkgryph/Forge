@@ -75,14 +75,6 @@ fn main() {
     );
 }
 
-/// Local daemon mode: accept one client connection at a time on a Unix
-/// socket, forever. `pty_sessions` outlives any single connection; when a
-/// client disconnects (e.g. its process restarted) and a new one connects,
-/// existing PTY sessions' push callbacks keep working unmodified because
-/// they hold the *same* `Arc<Mutex<..>>` writer cell — swapping the boxed
-/// value inside it on reconnect transparently redirects every session's
-/// future output to the new connection, with no per-session rewiring.
-#[cfg(unix)]
 /// Bind the daemon's socket so only its owner can connect.
 ///
 /// Anything that connects can open a pty, which is code execution as this user.
@@ -93,6 +85,7 @@ fn main() {
 /// local user on the machine. So the mode is set rather than inherited, and a
 /// failure to set it refuses to serve: an unreachable daemon is a broken
 /// editor, but a world-writable one is a local privilege-escalation path.
+#[cfg(unix)]
 fn bind_owner_only(socket_path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -108,6 +101,21 @@ fn bind_owner_only(socket_path: &str) -> std::io::Result<std::os::unix::net::Uni
     Ok(listener)
 }
 
+/// Local daemon mode: accept client connections on a Unix socket, forever.
+/// `pty_sessions` outlives any single connection; when a client disconnects
+/// (e.g. its process restarted) and a new one connects, existing PTY
+/// sessions' push callbacks keep working unmodified because they hold the
+/// *same* `Arc<Mutex<..>>` writer cell — swapping the boxed value inside it
+/// on reconnect transparently redirects every session's future output to the
+/// new connection, with no per-session rewiring.
+///
+/// Unix only, and gated here rather than above `bind_owner_only`. The
+/// attribute used to sit between this doc comment and that function's, so it
+/// gated the wrong one: on Windows `bind_owner_only` vanished while this
+/// function stayed and called it, and the `cfg(not(unix))` fallback below
+/// became a duplicate definition. Two compile errors, and the reason nothing
+/// had noticed is that nothing had ever built this crate for Windows.
+#[cfg(unix)]
 fn listen_forever(
     socket_path:  &str,
     lsp_sessions: Arc<Mutex<HashMap<String, lsp::LspProxy>>>,

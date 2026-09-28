@@ -2,6 +2,18 @@
 
 All notable changes to Forge IDE are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge IDE adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-09-27
+
+### Added
+
+- **Windows.** The editor and terminal client build and run natively. An installer (`install.ps1`, or `install.cmd` to launch it) puts both in place, with optional branded shortcuts and a generated icon. Text and artwork rendering were reworked, font size changes apply live, and process restarts and update banners now follow the build that is actually installed rather than the one a window started from. `WINDOWS.md` covers what is verified and what is not.
+- **Linux.** An installer for a fresh Ubuntu system, with `LINUX.md` for the same purpose.
+- **A subscription's remaining allowance.** For ChatGPT Codex, which is the only provider that reports one, the agent panel says how much of the weekly allowance is left and when it resets — announced when it changes rather than on every response.
+
+### Fixed
+
+- **A dropped SSH connection could quietly move remote work onto the local machine.** The editor now tracks disconnection, releases requests that were waiting on it, drops timed-out entries, sends keepalives, and offers Reconnect while holding on to the remote workspace and the pending conversation. A failed reconnect cannot silently fall back to local.
+
 ## [0.5.1] — 2026-09-25
 
 ### Added

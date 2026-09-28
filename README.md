@@ -253,8 +253,8 @@ its `robots.txt` is `User-agent: *` and `Disallow: /`.
 It identifies itself, and the version tells you which build:
 
 ```
-forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)
-forge-agent/0.5.0 (+https://vulkgryph.com/projects/forge/)
+forge-search/<version> (+https://vulkgryph.com/projects/forge/)
+forge-agent/<version> (+https://vulkgryph.com/projects/forge/)
 ```
 
 The first is the crawler, the second fetches a single page somebody asked for

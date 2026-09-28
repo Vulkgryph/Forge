@@ -4,11 +4,14 @@ Forge is maintained by Vulkgryph LLC. We take security issues seriously and appr
 
 ## Scope
 
-This policy covers everything in this monorepo:
+This policy covers everything in this monorepo. Two components also keep a
+more detailed policy of their own, linked below; this file is the map, and
+reporting here is always correct.
 
-- `forge-agent` — the agent binary, which is the only component that talks to an LLM or executes tools
+- `forge-agent` — the agent binary, the only component that talks to an LLM or executes tools. Detail: [`forge-agent/SECURITY.md`](forge-agent/SECURITY.md)
+- `forge-ide` — the editor, its terminal emulator, and its pty-host daemon (`forge-server`). Detail: [`forge-ide/SECURITY.md`](forge-ide/SECURITY.md)
 - `forge-tui-rs` — the terminal client (`forge`)
-- `forge-ide` — the editor, its terminal emulator, and its pty-host daemon (`forge-server`)
+- `forge-search` — the crawler and index behind `web_search` and `search_documents`. This is the component that fetches and parses content from servers nobody controls, so it is the one most likely to be sent something hostile
 - `forge-agent-proto` — the shared wire protocol
 
 It does **not** cover:

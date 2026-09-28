@@ -147,6 +147,44 @@ jobs:
             exit 1
           fi
 
+      # Facts, not chores. A rule of the form "you touched this directory, now
+      # edit its README" fires on typo fixes and refactors, and the way people
+      # pass it is a no-op doc edit — which teaches everyone to defeat the
+      # check and fills the history with noise. These assert things that are
+      # either true or false, so passing them requires being right rather than
+      # being seen to comply.
+      - name: Documented versions are not pinned to a number that drifts
+        run: |
+          # Dated CHANGELOG entries are history and are meant to name the
+          # version they shipped in. Everything else must build the string
+          # from CARGO_PKG_VERSION, because a literal is a hostage to the next
+          # release — two examples were announcing 0.5.0 on the wire at 0.5.2.
+          if git grep -nE 'forge-(search|agent|ide|tui)/[0-9]+\.[0-9]+\.[0-9]+' \
+               -- . ':(exclude)target' ':(exclude)*CHANGELOG.md'; then
+            echo "::error::a pinned Forge version appears above; build it from CARGO_PKG_VERSION or write <version>"
+            exit 1
+          fi
+
+      - name: Documentation links resolve
+        run: |
+          python3 - <<'EOF'
+          import os, re, subprocess, sys
+          # Vendored trees are somebody else's documentation and their dead
+          # links are not ours to fix.
+          files = [f for f in subprocess.run(["git","ls-files","*.md"],capture_output=True,text=True).stdout.split()
+                   if "/vendor/" not in f and not f.startswith("vendor/")]
+          dead = []
+          for f in files:
+              base = os.path.dirname(f)
+              for m in re.finditer(r'\]\((?!https?:|mailto:)([^)#]+)', open(f,encoding="utf-8").read()):
+                  target = os.path.normpath(os.path.join(base, m.group(1).strip()))
+                  if not os.path.exists(target):
+                      dead.append(f"{f} -> {m.group(1)}")
+          for d in dead:
+              print(f"::error::dead link: {d}")
+          sys.exit(1 if dead else 0)
+          EOF
+
       - name: Installer parses
         run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh
 

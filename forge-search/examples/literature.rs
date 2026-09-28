@@ -69,7 +69,14 @@ fn main() {
     let want: usize = std::env::args().nth(2).and_then(|n| n.parse().ok()).unwrap_or(6);
 
     let fetcher = Curl {
-        agent: "forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)".into(),
+        // Built, not written. A literal here announces a version this
+        // binary is not, to the sites least able to check.
+        agent: concat!(
+            "forge-search/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://vulkgryph.com/projects/forge/)"
+        )
+        .into(),
     };
     let clock = crawl::SystemClock;
     let mut index = Index::new();

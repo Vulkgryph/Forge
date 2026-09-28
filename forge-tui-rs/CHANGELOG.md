@@ -2,6 +2,13 @@
 
 All notable changes to the Forge terminal client are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-09-27
+
+### Added
+
+- **Windows.** `sys.rs` was `#![cfg(unix)]` in its entirety, so the terminal client did not compile for Windows at all. A console-API implementation covers raw mode, reading keys, terminal size and the resize signal.
+- **`/usage` prints something.** It asked the agent for a report, stored the answer and displayed nothing, which looked like a command that did not work. It now shows the context window, the session total, and — for a subscription that reports one — how much of the allowance is left and when it resets. An endpoint that reports no allowance says so rather than staying silent, since silence reads as good news.
+
 ## [0.5.1] — 2026-09-25
 
 No changes to the terminal client itself. Version-matched to the release, which fixes ChatGPT Codex authentication and plan-mode exit in `forge-agent` — both of which the terminal client uses.

@@ -4144,7 +4144,17 @@ impl Agent {
         let index_path = crate::tools::search::index_path(self.executor.project_root());
         let mut index = forge_search::index::Index::load(&index_path)
             .unwrap_or_else(|_| forge_search::index::Index::new());
-        index.add(final_url, &page.title, &page.description, &page.text);
+        // Attributed, because this page did not come from a crawl. Something
+        // later tells the user a person opened this in a browser and handed it
+        // over, and that must be read back from a record rather than guessed
+        // from the page merely being present.
+        index.add_attributed(
+            final_url,
+            &page.title,
+            &page.description,
+            &page.text,
+            crate::tools::web::HANDED_OVER,
+        );
         let _ = crate::workdir::ensure_parent_of(&index_path);
         let _ = index.save(&index_path);
 

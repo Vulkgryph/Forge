@@ -87,7 +87,24 @@ impl HttpFetcher {
             client: reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .timeout(std::time::Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::limited(5))
+                // Every hop is judged, not just the address that was asked
+                // for. The crawler refuses a *literal* private address on
+                // sight, but a hostname that merely resolves to one looks
+                // ordinary until the lookup happens — and the lookup happens
+                // here. A redirect chain is the cheap way to aim a crawl at
+                // somebody's own machine, so each destination is resolved and
+                // refused before it is followed.
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 5 {
+                        return attempt.stop();
+                    }
+                    match attempt.url().host_str() {
+                        Some(host) if forge_search::net::is_routable_public(host) => {
+                            attempt.follow()
+                        }
+                        _ => attempt.stop(),
+                    }
+                }))
                 .build()
                 .unwrap_or_default(),
             handle,

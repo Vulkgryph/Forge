@@ -42,6 +42,7 @@ pub mod html;
 pub mod index;
 pub mod jats;
 pub mod library;
+pub mod net;
 pub mod query;
 pub mod rank;
 pub mod robots;

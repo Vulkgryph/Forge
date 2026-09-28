@@ -19,11 +19,29 @@ const FORGE_USER_AGENT: &str = concat!(
     "forge-agent/", env!("CARGO_PKG_VERSION"), " (+https://vulkgryph.com/projects/forge/)"
 );
 
+/// Marks a page a person opened in a browser and passed to the agent.
+///
+/// Written when the handover happens and required before anything claims the
+/// handover happened. One string, one meaning, both ends of the rail.
+pub(crate) const HANDED_OVER: &str = "opened in a browser by the user and handed over";
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(FORGE_USER_AGENT)
         .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Each hop resolved and judged before it is followed — see the same
+        // policy on the crawler's fetcher. A single fetch is browser-shaped
+        // and does not consult robots.txt, but "browser-shaped" does not
+        // extend to reading the machine it is running on.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.stop();
+            }
+            match attempt.url().host_str() {
+                Some(host) if forge_search::net::is_routable_public(host) => attempt.follow(),
+                _ => attempt.stop(),
+            }
+        }))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -90,6 +108,20 @@ fn already_provided(index_path: &std::path::Path, url: &str) -> Option<String> {
     let index = forge_search::index::Index::load(index_path).ok()?;
     let id = index.by_url_id(url)?;
     let doc = index.document(id)?;
+
+    // Recorded, not inferred. This used to be "the URL is in the index and the
+    // live fetch was challenged", from which it told the user a person had
+    // opened the page in a browser and handed it over. A page the crawler took
+    // three weeks ago, on a site that has since put Cloudflare in front of it,
+    // satisfies both halves and produces that sentence word for word — a claim
+    // about a human action that never happened, which the agent then repeats.
+    //
+    // The handover writes its own attribution, so the claim is now read back
+    // from what was stored at the time rather than reconstructed afterwards.
+    if doc.attribution != HANDED_OVER {
+        return None;
+    }
+
     let text = index.text(id);
     if text.trim().is_empty() {
         return None;
@@ -201,6 +233,24 @@ pub async fn web_fetch(
         .as_str()
         .context("Missing 'prompt' argument")?;
     let max_length = MAX_LENGTH;
+
+    // The address itself, before anything is sent. The model chooses this
+    // URL, and it may have read it on a page it just fetched — so it is not
+    // the user's intent by the time it arrives here, whatever it looks like.
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string));
+    match host {
+        Some(host) if forge_search::net::is_routable_public(&host) => {}
+        Some(host) => {
+            return Ok(format!(
+                "Refused: {host} is not a public address. web_fetch reaches the public \
+                 internet only — loopback, private networks and link-local addresses are \
+                 not reachable from a tool the model can aim."
+            ))
+        }
+        None => return Ok(format!("Refused: {url} has no host to fetch from.")),
+    }
 
     let client = build_http_client();
 
@@ -506,7 +556,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = forge_search::index::Index::new();
         for (url, title, body) in pages {
-            ix.add(url, title, "", body);
+            // Attributed, because this helper stands in for the handover rail:
+            // a person opened the page and passed it over. A page that merely
+            // got crawled is built with `add` — see the test below.
+            ix.add_attributed(url, title, "", body, HANDED_OVER);
         }
         let path = dir.join("search-index");
         ix.save(&path).unwrap();
@@ -545,6 +598,37 @@ mod tests {
         // A URL nobody provided is not invented.
         assert!(already_provided(&path, "https://walled.test/other").is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A page that was merely crawled must not be described as one a person
+    /// handed over.
+    ///
+    /// The old check was "the URL is in the index, and the live fetch was
+    /// challenged". Both are true of a page the crawler took weeks ago on a
+    /// site that has since put a bot check in front of it — and from that the
+    /// agent told the user somebody had opened it in a browser and passed it
+    /// on. A statement about a human action, made from a proxy for one.
+    #[test]
+    fn a_crawled_page_is_not_claimed_as_one_a_person_handed_over() {
+        let dir = std::env::temp_dir().join(format!("forge-fetch-crawled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = forge_search::index::Index::new();
+        // No attribution: this is what an ordinary crawl writes.
+        ix.add(
+            "https://walled.test/crawled-long-ago",
+            "An Old Page",
+            "",
+            "text the crawler collected before the site put up a challenge",
+        );
+        let path = dir.join("search-index");
+        ix.save(&path).unwrap();
+
+        assert!(
+            already_provided(&path, "https://walled.test/crawled-long-ago").is_none(),
+            "a crawled page was offered as one a person handed over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An indexed document with no text is not a page. Returning an empty

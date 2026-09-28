@@ -94,6 +94,14 @@ pub struct Report {
     pub indexed: usize,
     /// Refused by `robots.txt`.
     pub disallowed: usize,
+    /// Refused because the address is not on the public internet — loopback,
+    /// a private range, or link-local. Counted apart from `disallowed`
+    /// because a site did not ask for this; it is a limit on where a crawler
+    /// may be pointed at all.
+    pub not_public: usize,
+    /// Redirected off every host the caller named, while `stay_on_host` was
+    /// set. The requested host was in scope; the destination was not.
+    pub off_host: usize,
     /// Fetched but not HTML.
     pub not_html: usize,
     /// Fetched and gone — 404 and the like.
@@ -253,6 +261,16 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
     /// on it.
     pub fn seed(&mut self, url: &str) -> Result<(), String> {
         let parsed = Url::parse(url)?;
+        // A crawl is pointed at the public internet. Refused here rather than
+        // at fetch time so the caller is told why, instead of watching a crawl
+        // return nothing.
+        if crate::net::is_obviously_local(&parsed.host) {
+            return Err(format!(
+                "{}: not a public address — a crawl cannot be pointed at loopback, \
+                 a private network, or link-local addresses",
+                parsed.host
+            ));
+        }
         self.hosts.insert(parsed.host.clone());
         self.enqueue(parsed, 0);
         Ok(())
@@ -336,6 +354,33 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             // whose content lives elsewhere, and the next crawl would follow
             // the redirect and index the same page again under the other name.
             let actual = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
+
+            // Everything above was decided about the URL that was *requested*.
+            // The fetcher follows redirects internally, so what came back may
+            // be a different host entirely — one whose robots.txt was never
+            // read, which the caller never named, and which may not be on the
+            // public internet at all. A hostile page redirecting a legitimate
+            // crawl at 127.0.0.1 put the response in the index and then in
+            // front of the model, with no cooperation from the model needed.
+            if actual.host != url.host {
+                if crate::net::is_obviously_local(&actual.host) {
+                    report.not_public += 1;
+                    continue;
+                }
+                if self.limits.stay_on_host && !self.hosts.contains(&actual.host) {
+                    report.off_host += 1;
+                    continue;
+                }
+                if !self.robots_allow(&actual) {
+                    report.disallowed += 1;
+                    continue;
+                }
+                // The destination host has now been fetched from, so it owes
+                // the same politeness gap as any other.
+                let next = self.clock.now() + self.limits.politeness;
+                self.next_allowed.insert(actual.authority(), next);
+            }
+
             let page = html::parse(&fetched.body);
             index.add(&actual.as_string(), &page.title, &page.description, &page.text);
             report.indexed += 1;
@@ -855,6 +900,95 @@ mod tests {
         let (index, report, _) = run(&fetcher, Limits::default());
         assert_eq!(index.len(), 2, "the same page was indexed twice");
         assert_eq!(report.fetched, 2, "fetched {} times", report.fetched);
+    }
+
+    /// The attack this exists to stop, written as the attacker would run it.
+    ///
+    /// No cooperation from the model is needed: one page in an otherwise
+    /// ordinary crawl redirects to loopback, and without the check the
+    /// response is indexed and then read back to the model as though it were
+    /// a page from the web.
+    #[test]
+    fn a_page_cannot_redirect_the_crawler_onto_the_local_machine() {
+        let fetcher = StaticFetcher::new()
+            .with_page("https://a.example/", r#"<a href="/hop">next</a>"#)
+            .with_redirect(
+                "https://a.example/hop",
+                "http://127.0.0.1:2375/containers/json",
+                "<p>docker socket contents</p>",
+            );
+
+        let (index, report, _) = run(&fetcher, Limits::default());
+
+        assert!(
+            !index.contains_url("http://127.0.0.1:2375/containers/json"),
+            "the local machine was indexed through a redirect"
+        );
+        assert_eq!(index.len(), 1, "the local response reached the index under some other name");
+        assert_eq!(report.not_public, 1, "the refusal was not reported");
+    }
+
+    #[test]
+    fn cloud_instance_metadata_is_refused_the_same_way() {
+        // The other address worth naming: on a cloud host this one serves
+        // credentials to anything that asks.
+        let fetcher = StaticFetcher::new()
+            .with_page("https://a.example/", r#"<a href="/hop">next</a>"#)
+            .with_redirect(
+                "https://a.example/hop",
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                "<p>role credentials</p>",
+            );
+        let (index, report, _) = run(&fetcher, Limits::default());
+        assert_eq!(index.len(), 1, "metadata reached the index");
+        assert_eq!(report.not_public, 1);
+    }
+
+    #[test]
+    fn a_crawl_cannot_be_seeded_at_a_private_address() {
+        for address in [
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://169.254.169.254/",
+            "http://10.0.0.1/",
+            "http://[::1]/",
+        ] {
+            let fetcher = StaticFetcher::new();
+            let clock = FakeClock::default();
+            let mut crawler = Crawler::new(&fetcher, &clock, Limits::default());
+            assert!(
+                crawler.seed(address).is_err(),
+                "{address} was accepted as a crawl seed"
+            );
+        }
+    }
+
+    /// A redirect that crosses hosts must satisfy the destination's rules, not
+    /// the rules of the host that was asked.
+    #[test]
+    fn a_redirect_to_another_host_consults_that_host_s_robots() {
+        let fetcher = StaticFetcher::new()
+            .with_page("https://a.example/", r#"<a href="/hop">next</a>"#)
+            .with_response(
+                "https://b.example/robots.txt",
+                Fetched {
+                    status: 200,
+                    final_url: "https://b.example/robots.txt".into(),
+                    content_type: "text/plain".into(),
+                    body: "User-agent: *\nDisallow: /\n".into(),
+                    headers: Vec::new(),
+                },
+            )
+            .with_redirect("https://a.example/hop", "https://b.example/secret", "<p>kept out</p>");
+
+        let limits = Limits { stay_on_host: false, ..Default::default() };
+        let (index, report, _) = run(&fetcher, limits);
+
+        assert!(
+            !index.contains_url("https://b.example/secret"),
+            "indexed a page the destination host disallows"
+        );
+        assert!(report.disallowed >= 1, "the refusal was not reported");
     }
 
     /// Following external links from an arbitrary page is how a crawl of one

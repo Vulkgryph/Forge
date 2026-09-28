@@ -4,7 +4,7 @@ Forge IDE is maintained by Vulkgryph LLC. We take security issues seriously and 
 
 ## Scope
 
-This policy covers the Forge IDE binary (`forge-ide`), the remote daemon (`forge-server`), and the shared protocol crate (`forge-proto`) — all in this directory. It does **not** cover:
+This policy covers the Forge IDE binary (`forge-ide`), the remote daemon (`forge-server`), and the shared protocol crate (`forge-proto`) — all in this directory. The monorepo-wide [`../SECURITY.md`](../SECURITY.md) is the umbrella and lists every component; reporting there is always correct. This policy does **not** cover:
 
 - `forge-agent`, which Forge IDE's agent panel spawns independently — see [`../forge-agent/SECURITY.md`](../forge-agent/SECURITY.md)
 - Language servers, debug adapters, or other external tools Forge IDE connects to (e.g. `rust-analyzer`, `lldb-dap`, `debugpy`)

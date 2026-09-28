@@ -383,6 +383,9 @@ fn run(
             max_pages,
             max_depth: 3,
             politeness: POLITENESS,
+            // A site asking for a longer gap than this is honoured by being
+            // left alone, not by being crawled faster than it asked.
+            max_crawl_delay: crawl::Limits::default().max_crawl_delay,
             stay_on_host: true,
             max_page_bytes: 2 * 1024 * 1024,
             max_seconds: Some(crawl_budget_secs(max_pages, POLITENESS)),

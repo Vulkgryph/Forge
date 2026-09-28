@@ -92,6 +92,14 @@ pub struct Document {
     /// may be shown, quoted, or used commercially. Metadata kept only in a
     /// crawl report is metadata lost on the first save.
     pub attribution: String,
+    /// The `ETag` the server sent for this copy, if it sent one.
+    ///
+    /// Kept so the next crawl can ask "has this changed?" instead of "send
+    /// it again". A site that has not changed answers 304 with no body, and
+    /// the copy already here stays.
+    pub etag: String,
+    /// `Last-Modified`, for servers that send that instead.
+    pub last_modified: String,
 }
 
 /// One occurrence list: the positions of a term within one document.
@@ -323,6 +331,16 @@ impl Index {
     /// The same as [`add`](Self::add) but recording an attribution string —
     /// for content from a source that states a licence, which a crawled web
     /// page generally does not and a journal article always does.
+    /// Record what the server said about the copy just indexed, so the next
+    /// crawl can ask whether it is still current.
+    pub fn set_validators(&mut self, url: &str, etag: &str, last_modified: &str) {
+        let Some(&id) = self.by_url.get(url) else { return };
+        if let Some(doc) = self.docs.get_mut(id as usize) {
+            doc.etag = etag.to_string();
+            doc.last_modified = last_modified.to_string();
+        }
+    }
+
     pub fn add_attributed(
         &mut self,
         url: &str,
@@ -385,6 +403,8 @@ impl Index {
             live: true,
             prose_share: prose_share(text),
             attribution: attribution.to_string(),
+            etag: String::new(),
+            last_modified: String::new(),
         });
         self.by_url.insert(url.to_string(), id);
         // Stale: this document's postings moved the block boundaries for
@@ -785,7 +805,10 @@ fn truncate_on_boundary(s: &str, max: usize) -> String {
 // happens, this byte is how a new reader recognises an old file.
 
 const MAGIC: &[u8; 8] = b"FRGSRCH1";
-const VERSION: u32 = 8;
+// 9: documents carry the validators (`ETag`, `Last-Modified`) a conditional
+// request needs, so a re-crawl can be told "unchanged" instead of being sent
+// the page again.
+const VERSION: u32 = 9;
 
 /// Compact when dead documents are more than this fraction of the index, as a
 /// divisor — 4 for a quarter.
@@ -952,6 +975,8 @@ impl Index {
             put_str(&mut out, &doc.title);
             put_str(&mut out, &doc.description);
             put_str(&mut out, &doc.attribution);
+            put_str(&mut out, &doc.etag);
+            put_str(&mut out, &doc.last_modified);
             put_u32(&mut out, doc.prose_share as u32);
             put_u32(&mut out, doc.term_count);
             put_u64(&mut out, *offset);
@@ -1062,6 +1087,8 @@ impl Index {
             let title = take_str(&bytes, &mut at)?;
             let description = take_str(&bytes, &mut at)?;
             let attribution = take_str(&bytes, &mut at)?;
+            let etag = take_str(&bytes, &mut at)?;
+            let last_modified = take_str(&bytes, &mut at)?;
             let share = take_u32(&bytes, &mut at)?;
             let term_count = take_u32(&bytes, &mut at)?;
             let text_offset = take_u64(&bytes, &mut at)?;
@@ -1084,6 +1111,8 @@ impl Index {
                 live: true,
                 prose_share: share.min(100) as u8,
                 attribution,
+                etag,
+                last_modified,
             });
             self.by_url.insert(url, id);
             self.live_docs += 1;

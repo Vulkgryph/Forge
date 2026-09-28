@@ -139,6 +139,9 @@ pub struct Report {
     /// rather than "no", and the crawler backs off the host rather than
     /// carrying on at the same rate.
     pub rate_limited: usize,
+    /// Asked for and found unchanged — a 304. The copy already indexed is
+    /// still current, so nothing was transferred and nothing was rewritten.
+    pub unchanged: usize,
     /// Refused because the site asked for a `Crawl-delay` longer than this
     /// crawl can honour. Not a failure and not a ban: an appointment that
     /// cannot be kept inside the budget.
@@ -361,7 +364,22 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             }
             self.wait_for_host(&url);
 
-            let fetched = match self.fetcher.fetch(&url.as_string()) {
+            // What the server told us about this page last time, if it is
+            // already indexed. Sending it back is the difference between
+            // "send me the page" and "send it only if it changed" — on a
+            // site asked about repeatedly, almost every page is unchanged
+            // and the second question costs a header instead of a body.
+            let (etag, last_modified) = index
+                .by_url_id(&url.as_string())
+                .and_then(|id| index.document(id))
+                .map(|d| (d.etag.clone(), d.last_modified.clone()))
+                .unwrap_or_default();
+
+            let fetched = match self.fetcher.fetch_conditional(
+                &url.as_string(),
+                &etag,
+                &last_modified,
+            ) {
                 Ok(f) => f,
                 Err(_) => {
                     report.unreachable += 1;
@@ -369,6 +387,13 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 }
             };
             report.fetched += 1;
+
+            // The server agreeing that our copy is current. Nothing to parse,
+            // nothing to rewrite, and the copy stays exactly as it is.
+            if fetched.status == 304 {
+                report.unchanged += 1;
+                continue;
+            }
 
             // Before the status check, because a challenge can arrive as a
             // 200 and would otherwise be indexed as content — a page whose
@@ -454,6 +479,14 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
 
             let page = html::parse(&fetched.body);
             index.add(&actual.as_string(), &page.title, &page.description, &page.text);
+            // Kept for the next crawl to ask with. Only what this response
+            // actually carried — a server that sends neither gets an
+            // unconditional fetch next time, as it must.
+            index.set_validators(
+                &actual.as_string(),
+                fetched.header("etag").unwrap_or_default(),
+                fetched.header("last-modified").unwrap_or_default(),
+            );
             report.indexed += 1;
             // So a redirect target is not fetched again on its own account.
             self.seen.insert(actual.as_string());
@@ -1340,6 +1373,92 @@ mod tests {
         // An HTTP-date is recognised as a date rather than parsed into a
         // number nobody sent.
         assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), Some(DEFAULT_BACKOFF));
+    }
+
+    /// A re-crawl asks whether the page changed, rather than asking for it.
+    #[test]
+    fn a_second_crawl_sends_the_validators_the_first_one_was_given() {
+        // A fetcher that records what it was asked, and answers 304 to any
+        // conditional request — which is what a server does for a page that
+        // has not changed.
+        struct Conditional {
+            asked: std::cell::RefCell<Vec<(String, String)>>,
+        }
+        impl Fetcher for Conditional {
+            fn fetch(&self, url: &str) -> Result<Fetched, String> {
+                self.fetch_conditional(url, "", "")
+            }
+            fn fetch_conditional(
+                &self,
+                url: &str,
+                etag: &str,
+                _last_modified: &str,
+            ) -> Result<Fetched, String> {
+                self.asked.borrow_mut().push((url.to_string(), etag.to_string()));
+                if url.ends_with("robots.txt") {
+                    return Ok(Fetched {
+                        status: 404,
+                        final_url: url.into(),
+                        content_type: "text/plain".into(),
+                        body: "none".into(),
+                        headers: Vec::new(),
+                    });
+                }
+                if !etag.is_empty() {
+                    return Ok(Fetched {
+                        status: 304,
+                        final_url: url.into(),
+                        content_type: String::new(),
+                        body: String::new(),
+                        headers: Vec::new(),
+                    });
+                }
+                Ok(Fetched {
+                    status: 200,
+                    final_url: url.into(),
+                    content_type: "text/html".into(),
+                    body: "<title>P</title><p>Some words about allocators.</p>".into(),
+                    headers: vec![("etag".into(), "\"abc123\"".into())],
+                })
+            }
+        }
+
+        let fetcher = Conditional { asked: std::cell::RefCell::new(Vec::new()) };
+        let clock = FakeClock::default();
+        let limits = Limits { politeness: 0.0, max_depth: 0, ..Default::default() };
+        let mut index = Index::new();
+
+        let mut first = Crawler::new(&fetcher, &clock, limits.clone());
+        first.seed("https://a.example/page").unwrap();
+        let r1 = first.run(&mut index);
+        assert_eq!(r1.indexed, 1, "the first crawl did not index the page");
+
+        // The validator has to survive a save, or the next process asks
+        // unconditionally and the whole thing is decorative.
+        let dir = std::env::temp_dir().join(format!("forge-cond-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx");
+        index.save(&path).unwrap();
+        let mut reloaded = Index::load(&path).unwrap();
+
+        let mut second = Crawler::new(&fetcher, &clock, limits);
+        second.seed("https://a.example/page").unwrap();
+        let r2 = second.run(&mut reloaded);
+
+        assert_eq!(r2.unchanged, 1, "the 304 was not recognised as unchanged");
+        assert_eq!(r2.indexed, 0, "an unchanged page was reindexed");
+        assert_eq!(reloaded.len(), 1, "the copy was lost");
+
+        let asked = fetcher.asked.borrow();
+        let page_asks: Vec<_> = asked.iter().filter(|(u, _)| !u.ends_with("robots.txt")).collect();
+        assert_eq!(page_asks.len(), 2, "expected two page requests: {page_asks:?}");
+        assert_eq!(page_asks[0].1, "", "the first crawl should have no validator");
+        assert_eq!(
+            page_asks[1].1, "\"abc123\"",
+            "the second crawl did not send the ETag the first was given"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A gap longer than the crawl can keep is refused, not shortened.

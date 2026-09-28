@@ -4,6 +4,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Changed
+
+- **A re-crawl asks whether a page changed instead of asking for it again.** `Fetcher::fetch` took a URL and nothing else, so it was structurally incapable of sending `If-None-Match` or `If-Modified-Since` — a site asked about repeatedly took a full body for all 120 pages where almost every one would have answered 304 with no body. Documents now keep the `ETag` and `Last-Modified` the server sent, across a save, and a 304 leaves the indexed copy alone. A fetcher that cannot do this, or a server that does not implement it, is unaffected: the default is the unconditional fetch it was before.
+
 ### Fixed
 
 - **A local-only setup was telling OpenAI when you started Forge.** Anyone who had ever logged in to ChatGPT Codex made two credential-bearing calls at every startup — a token refresh to `auth.openai.com` and a model-catalog fetch carrying the OAuth bearer — regardless of which endpoint they were actually using. `offline_mode` suppressed both, but that is a setting you have to know to look for, so the *default* for someone pointed at a local model was a startup that contacted a provider they were not using. Both calls now happen only when Codex is the endpoint in use. The catalog is still wanted when it is not, because `/model` lists what you could switch to — that case reads the local cache and sends nothing.

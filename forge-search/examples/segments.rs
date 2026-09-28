@@ -63,7 +63,14 @@ impl Fetcher for Curl {
 
 fn main() {
     let fetcher = Curl {
-        agent: "forge-search/0.5.0 (+https://vulkgryph.com/projects/forge/)".into(),
+        // Built, not written. A literal here announces a version this
+        // binary is not, to the sites least able to check.
+        agent: concat!(
+            "forge-search/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://vulkgryph.com/projects/forge/)"
+        )
+        .into(),
     };
     let dir = std::env::temp_dir().join("forge-segments-live");
     let _ = std::fs::remove_dir_all(&dir);

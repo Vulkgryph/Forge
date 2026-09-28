@@ -306,6 +306,10 @@ pub struct Session {
     // ── Interaction ───────────────────────────────────────────────────────
     pub pending:     Option<Pending>,
     pub usage:       Option<UsageSnapshot>,
+    /// The subscription window worth showing: the long one when there is
+    /// one, else the burst window. `None` until a provider reports it, which
+    /// most never do.
+    pub subscription:   Option<forge_agent_proto::UsageWindowInfo>,
     pub subagents:   Vec<Subagent>,
     pub checkpoints: Vec<RewindCheckpoint>,
 
@@ -383,6 +387,7 @@ impl Session {
             turn_tokens_at_start: (0, 0),
             pending: None,
             usage: None,
+            subscription: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approved_tools: HashSet::new(),
@@ -706,8 +711,24 @@ impl Session {
             }
 
             // ── Usage and model ───────────────────────────────────────────
-            AgentMessage::Usage { snapshot } | AgentMessage::UsageUpdate { snapshot } => {
+            // Unsolicited, as a turn progresses: state only, no line.
+            AgentMessage::UsageUpdate { snapshot } => {
                 self.usage = Some(snapshot);
+            }
+
+            // Asked for, by `/usage`. It used to be stored and nothing else,
+            // so the command answered silently and there was no way to see
+            // what a subscription had left.
+            AgentMessage::Usage { snapshot } => {
+                self.usage = Some(snapshot);
+                let report = self.usage_report();
+                self.push_system(report);
+            }
+
+            // Only ChatGPT Codex reports this, so it stays None for every other
+            // endpoint and the status line simply has nothing to add.
+            AgentMessage::UsageLimits { primary, secondary } => {
+                self.subscription = primary.or(secondary);
             }
 
             AgentMessage::ModelSwitched { name, model_id, max_context_tokens } => {
@@ -1132,6 +1153,47 @@ impl Session {
     }
 
     /// Fraction of the context window in use, for the context bar.
+    /// What `/usage` prints: the context window, the session total, and — for
+    /// a subscription that reports one — how much of the allowance is left and
+    /// when it returns.
+    pub fn usage_report(&self) -> String {
+        let mut lines = Vec::new();
+        match self.usage {
+            Some(u) => {
+                let used = u.last_prompt_tokens as u64 + u.last_completion_tokens as u64;
+                if u.max_context_tokens > 0 {
+                    lines.push(format!(
+                        "context: {} of {} tokens ({:.0}%)",
+                        thousands(used),
+                        thousands(u.max_context_tokens as u64),
+                        u.context_fraction() * 100.0,
+                    ));
+                } else {
+                    lines.push(format!("context: {} tokens", thousands(used)));
+                }
+                lines.push(format!(
+                    "session: {} sent, {} received, {} request{}",
+                    thousands(u.total_prompt_tokens),
+                    thousands(u.total_completion_tokens),
+                    u.total_requests,
+                    if u.total_requests == 1 { "" } else { "s" },
+                ));
+            }
+            None => lines.push("context: nothing measured yet".to_string()),
+        }
+        match &self.subscription {
+            Some(w) => lines.push(format!(
+                "subscription: {:.0}% of the {} allowance left, resets in {}",
+                w.remaining_percent, w.window_name, w.resets_in,
+            )),
+            // Said plainly rather than omitted: "no line about my plan" is
+            // otherwise indistinguishable from "my plan is fine".
+            None => lines
+                .push("subscription: this endpoint does not report an allowance".to_string()),
+        }
+        lines.join("\n")
+    }
+
     pub fn context_fraction(&self) -> f32 {
         self.usage.map(|u| u.context_fraction()).unwrap_or(0.0)
     }
@@ -2194,7 +2256,73 @@ mod tests {
 
     // ── Usage ─────────────────────────────────────────────────────────────
 
+        fn weekly(remaining: f32) -> forge_agent_proto::UsageWindowInfo {
+        forge_agent_proto::UsageWindowInfo {
+            used_percent: 100.0 - remaining,
+            remaining_percent: remaining,
+            window_minutes: 10080,
+            window_name: "weekly".to_string(),
+            resets_in_seconds: 486_090,
+            resets_in: "5d 14h".to_string(),
+        }
+    }
+
     #[test]
+    fn asking_for_usage_prints_something() {
+        let mut s = session();
+        let before = s.entries.len();
+        s.apply(AgentMessage::Usage { snapshot: UsageSnapshot::default() });
+        assert_eq!(s.entries.len(), before + 1, "/usage answered silently");
+    }
+
+    #[test]
+    fn a_turn_progressing_does_not_print_anything() {
+        // The unsolicited update arrives repeatedly during a turn. A line for
+        // each would bury the conversation it is reporting on.
+        let mut s = session();
+        let before = s.entries.len();
+        s.apply(AgentMessage::UsageUpdate { snapshot: UsageSnapshot::default() });
+        s.apply(AgentMessage::UsageUpdate { snapshot: UsageSnapshot::default() });
+        assert_eq!(s.entries.len(), before, "an unsolicited update wrote a line");
+    }
+
+    #[test]
+    fn the_report_says_what_is_left_and_when_it_returns() {
+        let mut s = session();
+        s.apply(AgentMessage::UsageLimits { primary: Some(weekly(8.0)), secondary: None });
+        let report = s.usage_report();
+        assert!(report.contains("8% of the weekly allowance left"), "{report}");
+        assert!(report.contains("5d 14h"), "{report}");
+    }
+
+    #[test]
+    fn an_endpoint_that_reports_no_allowance_says_so() {
+        // Silence here would read as "nothing to worry about", which is a
+        // different claim from "this provider never tells us".
+        let s = session();
+        assert!(
+            s.usage_report().contains("does not report an allowance"),
+            "{}",
+            s.usage_report()
+        );
+    }
+
+    #[test]
+    fn a_spent_allowance_reads_as_zero_rather_than_disappearing() {
+        let mut s = session();
+        s.apply(AgentMessage::UsageLimits { primary: Some(weekly(0.0)), secondary: None });
+        assert!(s.usage_report().contains("0% of the weekly allowance left"));
+    }
+
+    #[test]
+    fn token_counts_are_grouped_for_reading() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+#[test]
     fn usage_updates_drive_the_context_fraction() {
         let mut s = session();
         assert_eq!(s.context_fraction(), 0.0, "no usage yet");
@@ -2680,4 +2808,18 @@ mod tests {
         );
     }
 
+}
+
+/// Thousands separators. Token counts are read, not computed, and six
+/// undivided digits are read wrong.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }

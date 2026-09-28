@@ -80,6 +80,135 @@ impl Clone for Backend {
 }
 
 /// Events emitted by the streaming API methods.
+/// What a ChatGPT subscription has left, as the Codex backend reports it on
+/// every response it serves.
+///
+/// Two windows run at once. `primary` is the long one — 10080 minutes is a
+/// week — and `secondary` is the short burst window. A plan may use only one,
+/// in which case the other arrives as zeroes and is not worth showing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageLimits {
+    pub primary: Option<UsageWindow>,
+    pub secondary: Option<UsageWindow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsageWindow {
+    pub used_percent: f32,
+    pub window_minutes: u64,
+    pub resets_in_seconds: u64,
+}
+
+impl UsageWindow {
+    /// The window in the words a person uses for it. Codex bills a week and a
+    /// five-hour burst; anything else is reported as the number of hours or
+    /// minutes rather than invented a name for.
+    pub fn window_name(&self) -> String {
+        match self.window_minutes {
+            10080 => "weekly".to_string(),
+            1440 => "daily".to_string(),
+            m if m >= 60 && m % 60 == 0 => format!("{}-hour", m / 60),
+            m => format!("{m}-minute"),
+        }
+    }
+
+    pub fn remaining_percent(&self) -> f32 {
+        (100.0 - self.used_percent).clamp(0.0, 100.0)
+    }
+}
+
+/// Roughly how long until a window resets, for a person reading it.
+///
+/// Deliberately coarse: "5 days" is what someone needs to decide whether to
+/// wait, and a countdown to the second would be false precision on a figure
+/// the server only refreshes each response.
+pub fn humanise_duration(seconds: u64) -> String {
+    match seconds {
+        0 => "now".to_string(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => {
+            let (h, m) = (s / 3600, (s % 3600) / 60);
+            if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") }
+        }
+        s => {
+            let (d, h) = (s / 86_400, (s % 86_400) / 3600);
+            if h == 0 { format!("{d}d") } else { format!("{d}d {h}h") }
+        }
+    }
+}
+
+/// Read the `x-codex-*` headers the backend attaches to every response.
+pub fn parse_usage_limits(headers: &reqwest::header::HeaderMap) -> UsageLimits {
+    let num = |name: &str| -> Option<f64> {
+        headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok()
+    };
+    let window = |prefix: &str| -> Option<UsageWindow> {
+        let minutes = num(&format!("x-codex-{prefix}-window-minutes"))? as u64;
+        // A window of zero minutes is the backend saying this plan has no such
+        // window, not a window that has just expired.
+        if minutes == 0 {
+            return None;
+        }
+        Some(UsageWindow {
+            used_percent: num(&format!("x-codex-{prefix}-used-percent")).unwrap_or(0.0) as f32,
+            window_minutes: minutes,
+            resets_in_seconds: num(&format!("x-codex-{prefix}-reset-after-seconds"))
+                .unwrap_or(0.0)
+                .max(0.0) as u64,
+        })
+    };
+    UsageLimits {
+        primary: window("primary"),
+        secondary: window("secondary"),
+    }
+}
+
+/// The plain-language form of a refusal that is a spent allowance rather than
+/// a fault. `body` is the provider's JSON error.
+///
+/// Worth its own message because the generic one — "Responses API error (429)"
+/// wrapped around a JSON blob — reads as something broken, and this is not
+/// broken. Nothing is wrong with the request, the key, or the connection: the
+/// plan is used up until a date, and the only useful things to say are which
+/// allowance, when it comes back, and that another endpoint still works.
+pub fn describe_usage_limit(body: &str, limits: &UsageLimits) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = parsed.get("error")?;
+    if error.get("type").and_then(|v| v.as_str()) != Some("usage_limit_reached") {
+        return None;
+    }
+
+    let plan = error.get("plan_type").and_then(|v| v.as_str()).unwrap_or("ChatGPT");
+    // The body names the window that was actually hit, which is the one to
+    // report — the headers describe every window, spent or not.
+    let minutes = error
+        .get("limit_window_minutes")
+        .and_then(|v| v.as_u64())
+        .or_else(|| limits.primary.map(|w| w.window_minutes));
+    let resets = error
+        .get("resets_in_seconds")
+        .and_then(|v| v.as_u64())
+        .or_else(|| limits.primary.map(|w| w.resets_in_seconds));
+
+    let which = match minutes {
+        Some(m) => {
+            let w = UsageWindow { used_percent: 100.0, window_minutes: m, resets_in_seconds: 0 };
+            format!("{} limit", w.window_name())
+        }
+        None => "usage limit".to_string(),
+    };
+    let when = match resets {
+        Some(s) if s > 0 => format!(" It resets in {}.", humanise_duration(s)),
+        _ => String::new(),
+    };
+    Some(format!(
+        "ChatGPT {plan} plan: the {which} is used up.{when} \
+         Nothing is wrong with the connection or the login — this allowance is spent. \
+         Switch to another model to keep working, or wait for the reset."
+    ))
+}
+
 pub enum StreamEvent {
     /// A text token from the model.
     Token(String),
@@ -93,6 +222,12 @@ pub enum StreamEvent {
     Done { usage: Option<Usage> },
     /// Stream ended with an error.
     Error(String),
+    /// What the subscription has left, as reported on this response.
+    Limits(UsageLimits),
+    /// The subscription's allowance is spent. Distinct from `Error` because
+    /// the agent wraps errors with "API error:", and this is not one — the
+    /// message is already the whole of what there is to say.
+    LimitReached(String),
 }
 
 struct ThinkBlockFilter {
@@ -1113,6 +1248,9 @@ impl ApiClient {
                     break;
                 }
                 StreamEvent::Error(err) => return Err(err),
+                // Non-streaming callers have no one to show this to.
+                StreamEvent::Limits(_) => {}
+                StreamEvent::LimitReached(msg) => return Err(msg),
             }
         }
 
@@ -1212,9 +1350,27 @@ impl ApiClient {
                 continue;
             }
 
+            // Only this backend reports what the subscription has left, and it
+            // does so on every response — a success is when a budget is most
+            // worth showing, since nothing has gone wrong yet.
+            let limits = parse_usage_limits(resp.headers());
+            if limits.primary.is_some() || limits.secondary.is_some() {
+                let _ = tx.send(StreamEvent::Limits(limits.clone()));
+            }
+
             if !resp.status().is_success() {
                 let status = resp.status();
                 let err_body = resp.text().await.unwrap_or_default();
+
+                // A spent allowance is not a fault, and the diagnostic block
+                // below is for faults. Nothing is wrong with the request, the
+                // credential or the connection, so none of that is worth
+                // printing: say which allowance, and when it returns.
+                if let Some(plain) = describe_usage_limit(&err_body, &limits) {
+                    let _ = tx.send(StreamEvent::LimitReached(plain));
+                    return;
+                }
+
                 // The provider names the credential it rejected but nothing
                 // about where it came from, and this backend has several
                 // construction paths. Saying which one supplied the token
@@ -2460,5 +2616,100 @@ mod tests {
         assert_eq!(sanitized[0].role, "assistant");
         assert!(sanitized[0].tool_calls.is_none());
         assert_eq!(sanitized[0].content.as_deref(), Some("text"));
+    }
+}
+
+#[cfg(test)]
+mod usage_limit_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    /// Exactly what chatgpt.com returned on a pro account that had spent its
+    /// week, captured from a live 429 rather than invented.
+    fn spent_week() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("x-codex-active-limit", "premium"),
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-primary-reset-after-seconds", "486090"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+        ] {
+            h.insert(
+                HeaderName::from_static(k),
+                HeaderValue::from_static(v),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn the_weekly_window_is_read_and_the_unused_one_is_not_invented() {
+        let limits = parse_usage_limits(&spent_week());
+        let primary = limits.primary.expect("a weekly window was reported");
+        assert_eq!(primary.window_minutes, 10080);
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.remaining_percent(), 0.0);
+        assert_eq!(primary.window_name(), "weekly");
+
+        // The backend sends a zero-minute secondary window for a plan that has
+        // none. Reporting that as "0% of a 0-minute window" would put a second
+        // meaningless figure in front of the user.
+        assert!(
+            limits.secondary.is_none(),
+            "a zero-length window is absent, not empty"
+        );
+    }
+
+    #[test]
+    fn windows_are_named_the_way_people_say_them() {
+        let named = |m| UsageWindow { used_percent: 0.0, window_minutes: m, resets_in_seconds: 0 }.window_name();
+        assert_eq!(named(10080), "weekly");
+        assert_eq!(named(1440), "daily");
+        assert_eq!(named(300), "5-hour");
+        assert_eq!(named(45), "45-minute");
+    }
+
+    #[test]
+    fn a_reset_is_described_coarsely_enough_to_act_on() {
+        assert_eq!(humanise_duration(486_090), "5d 15h");
+        assert_eq!(humanise_duration(7_200), "2h");
+        assert_eq!(humanise_duration(5_400), "1h 30m");
+        assert_eq!(humanise_duration(90), "1m");
+        assert_eq!(humanise_duration(0), "now");
+    }
+
+    /// The live body, verbatim.
+    const SPENT: &str = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1791047084,"limit_window_minutes":10080,"resets_in_seconds":486090}}"#;
+
+    #[test]
+    fn a_spent_allowance_is_explained_not_reported_as_a_fault() {
+        let message = describe_usage_limit(SPENT, &parse_usage_limits(&spent_week()))
+            .expect("a usage_limit_reached body is recognised");
+
+        // Which allowance, and when it comes back — the two things that decide
+        // whether to wait or switch.
+        assert!(message.contains("weekly"), "{message}");
+        assert!(message.contains("5d 15h"), "{message}");
+        assert!(message.contains("pro"), "{message}");
+
+        // And it must not read like something is broken, because nothing is.
+        for alarming in ["429", "error", "failed", "Unauthorized"] {
+            assert!(
+                !message.to_lowercase().contains(&alarming.to_lowercase()),
+                "reads as a fault ({alarming}): {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_left_alone() {
+        // Only a spent allowance gets the gentle treatment; a real fault must
+        // still surface as itself.
+        let other = r#"{"error":{"type":"invalid_request_error","message":"bad model"}}"#;
+        assert!(describe_usage_limit(other, &UsageLimits::default()).is_none());
+        assert!(describe_usage_limit("not json at all", &UsageLimits::default()).is_none());
     }
 }

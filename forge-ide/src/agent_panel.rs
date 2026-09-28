@@ -83,6 +83,19 @@ pub struct QuestionOption {
     #[serde(default)] pub description: String,
 }
 
+/// One subscription window. The agent has already chosen the wording, so the
+/// editor and the terminal cannot end up calling a 10080-minute window
+/// different things.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageWindowInfo {
+    #[serde(default)] pub used_percent:      f32,
+    #[serde(default)] pub remaining_percent: f32,
+    #[serde(default)] pub window_minutes:    u64,
+    #[serde(default)] pub window_name:       String,
+    #[serde(default)] pub resets_in_seconds: u64,
+    #[serde(default)] pub resets_in:         String,
+}
+
 /// Live token/context usage, as reported by `usage`/`usage_update`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -166,6 +179,10 @@ pub enum AgentMsg {
     Cancelled,
     Usage       { #[serde(default)] snapshot: UsageSnapshot },
     UsageUpdate { #[serde(default)] snapshot: UsageSnapshot },
+    UsageLimits {
+        #[serde(default)] primary:   Option<UsageWindowInfo>,
+        #[serde(default)] secondary: Option<UsageWindowInfo>,
+    },
     ModelSwitched {
         name: String,
     },
@@ -1018,6 +1035,11 @@ pub struct AgentSession {
     pub needs_resume_fallback: bool,
     /// Latest token/context usage snapshot.
     pub usage:     UsageSnapshot,
+    /// The subscription allowance, for endpoints that report one.
+    pub subscription: Option<UsageWindowInfo>,
+    /// What was last announced, so the same sentence is not repeated on every
+    /// response the provider serves.
+    pub subscription_line: Option<String>,
     /// Incremented once per tool call the agent makes; drained each frame by
     /// the UI to pulse the anvil watermark's heat, like a hammer strike.
     tool_pulses:   u32,
@@ -1151,6 +1173,8 @@ impl AgentSession {
                 resume_attempted: false,
                 needs_resume_fallback: false,
                 usage:     UsageSnapshot::default(),
+                subscription: None,
+                subscription_line: None,
                 auto_mode:   false,
                 request_input_focus: false,
             browser_events: Vec::new(),
@@ -1199,6 +1223,8 @@ impl AgentSession {
                 resume_attempted: resume.is_some(),
                 needs_resume_fallback: false,
                 usage:     UsageSnapshot::default(),
+                subscription: None,
+                subscription_line: None,
                 turn_active: false,
                 queued:      Vec::new(),
                 tool_pulses: 0,
@@ -1316,6 +1342,8 @@ impl AgentSession {
                 resume_attempted: resume.is_some(),
                 needs_resume_fallback: false,
                 usage:     UsageSnapshot::default(),
+                subscription: None,
+                subscription_line: None,
                 turn_active: false,
                 queued:      Vec::new(),
                 tool_pulses: 0,
@@ -1349,6 +1377,8 @@ impl AgentSession {
                 resume_attempted: resume.is_some(),
                 needs_resume_fallback: false,
                 usage:     UsageSnapshot::default(),
+                subscription: None,
+                subscription_line: None,
                 auto_mode:   false,
                 request_input_focus: false,
                 browser_events: Vec::new(),
@@ -1734,6 +1764,25 @@ impl AgentSession {
             }
             AgentMsg::Usage { snapshot } | AgentMsg::UsageUpdate { snapshot } => {
                 self.usage = snapshot;
+            }
+
+            // Only ChatGPT Codex reports an allowance. Announced once when it
+            // first arrives and then only when the wording would change, since
+            // it is sent on every single response and a line per turn saying
+            // the same thing is noise.
+            AgentMsg::UsageLimits { primary, secondary } => {
+                let window = primary.or(secondary);
+                if let Some(w) = &window {
+                    let line = format!(
+                        "Subscription: {:.0}% of the {} allowance left, resets in {}",
+                        w.remaining_percent, w.window_name, w.resets_in
+                    );
+                    if self.subscription_line.as_deref() != Some(line.as_str()) {
+                        self.subscription_line = Some(line.clone());
+                        self.items.push(ChatItem::Status(line));
+                    }
+                }
+                self.subscription = window;
             }
             AgentMsg::Other => {}
         }

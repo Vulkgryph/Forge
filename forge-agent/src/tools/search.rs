@@ -115,13 +115,26 @@ impl HttpFetcher {
 
 impl Fetcher for HttpFetcher {
     fn fetch(&self, url: &str) -> std::result::Result<Fetched, String> {
+        self.fetch_conditional(url, "", "")
+    }
+
+    fn fetch_conditional(
+        &self,
+        url: &str,
+        etag: &str,
+        last_modified: &str,
+    ) -> std::result::Result<Fetched, String> {
         self.handle.block_on(async {
-            let response = self
-                .client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| format!("{url}: {e}"))?;
+            let mut request = self.client.get(url);
+            // Only what the server itself gave us last time. A validator we
+            // invented would be a claim about a copy the server never sent.
+            if !etag.is_empty() {
+                request = request.header("if-none-match", etag);
+            }
+            if !last_modified.is_empty() {
+                request = request.header("if-modified-since", last_modified);
+            }
+            let response = request.send().await.map_err(|e| format!("{url}: {e}"))?;
 
             let status = response.status().as_u16();
             let final_url = response.url().to_string();

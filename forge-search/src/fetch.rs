@@ -160,6 +160,27 @@ impl Fetched {
 pub trait Fetcher {
     fn fetch(&self, url: &str) -> Result<Fetched, String>;
 
+    /// Fetch only if the copy identified by these validators is stale.
+    ///
+    /// `fetch` takes a URL and nothing else, so it was structurally unable to
+    /// send `If-None-Match` or `If-Modified-Since` — a crawl that revisited a
+    /// site took a full body for every page, where almost all of them would
+    /// have been a 304 with no body at all.
+    ///
+    /// Defaulted to an unconditional fetch so a fetcher that has no way to do
+    /// this, or no reason to, is unaffected. A server that does not implement
+    /// conditional requests simply answers 200 as before, which is why the
+    /// caller must handle both.
+    fn fetch_conditional(
+        &self,
+        url: &str,
+        etag: &str,
+        last_modified: &str,
+    ) -> Result<Fetched, String> {
+        let _ = (etag, last_modified);
+        self.fetch(url)
+    }
+
     /// How this fetcher identifies itself, for `robots.txt` matching.
     ///
     /// A crawler that reads `robots.txt` and then cannot say which rules apply

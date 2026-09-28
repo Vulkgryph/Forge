@@ -95,6 +95,16 @@ jobs:
       - name: Agent failure matrix
         run: cargo test -p forge-agent --test resilience --verbose
 
+      # Informational, deliberately, and the only step here that is. The
+      # editor runs on Windows and install.ps1 installs it, but nothing has
+      # ever built it on a runner — so whether it builds without a GPU, and
+      # what its native dependencies want from a bare machine, is unknown.
+      # Finding out is the point; failing the gate on an unknown is not.
+      # Promote this to a real step once it has been green for a while.
+      - name: Editor (informational — never built on a runner before)
+        continue-on-error: true
+        run: cargo build -p forge-ide -p forge-proto -p forge-server --verbose
+
   ide:
     name: editor (macOS)
     runs-on: macos-latest

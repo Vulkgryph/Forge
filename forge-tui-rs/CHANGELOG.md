@@ -2,6 +2,12 @@
 
 All notable changes to the Forge terminal client are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Choosing an option left the menu open, so it looked like nothing happened.** Pressing Enter on a model, a permission mode, a context strategy or offline on/off applied the change and then sat there showing the same menu — which reads as a keypress that did nothing, and invites pressing it again. A choice of one thing now ends the visit. Lists of independent switches, like turning individual tools on and off, still stay open, because somebody turning one off is plausibly about to turn another off.
+
 ## [0.5.2] — 2026-09-27
 
 ### Added

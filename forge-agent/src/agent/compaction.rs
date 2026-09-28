@@ -7,6 +7,21 @@ use crate::api::{ApiClient, Message};
 
 /// Default number of recent messages to keep after compaction.
 const ROLLING_WINDOW_SIZE: usize = 20;
+
+/// Told to the model immediately after a compaction.
+///
+/// Addressed to the specific way compaction used to end a turn: the summary
+/// reads as a report, and a report invites another report.
+const CONTINUE_AFTER_COMPACTION: &str = "\
+[System: The conversation above was condensed to free up context. This is the \
+middle of your work, not the end of it, and nobody has asked you for a status \
+update.\n\
+\n\
+Carry on from \"Current state\" toward \"Next actions\" by calling the tools you \
+need. Do not restate the summary, do not describe what you were doing, and do \
+not ask whether to continue — the summary exists so that you can continue \
+without being told again. Reply to the user only when the work is finished or \
+you are genuinely blocked.]";
 const ROLLING_PLAN_MARKER: &str = "[Forge rolling-window approved plan]";
 
 /// Perform compaction: call the LLM to summarize messages, write JSONL markers,
@@ -35,20 +50,7 @@ pub async fn perform_compaction(
     // Write the summary to the log
     log.log_compaction_summary(summary.clone())?;
 
-    // Build the new history
-    let mut new_history = Vec::new();
-
-    // 1. System prompt (static)
-    new_history.push(Message::system(system_prompt));
-
-    // 2. Compaction summary as an assistant message
-    new_history.push(Message::assistant(&summary.to_context_string()));
-
-    // 3. Rolling window of recent messages (skip system prompt)
-    if keep_rolling_window {
-        let non_system: Vec<&Message> = history.iter().filter(|m| m.role != "system").collect();
-        new_history.extend(valid_recent_window(&non_system, ROLLING_WINDOW_SIZE));
-    }
+    let new_history = rebuild_history(system_prompt, &summary, history, keep_rolling_window);
 
     let messages_after = new_history.len();
     // The window is whatever came after the system prompt and the summary.
@@ -58,6 +60,48 @@ pub async fn perform_compaction(
     log.log_compaction_commit(messages_after, rolling_window)?;
 
     Ok(new_history)
+}
+
+/// Assemble what the model sees after a compaction.
+///
+/// Separate from `perform_compaction` so it can be tested without a model
+/// call — the ordering here is the whole behaviour, and it was wrong.
+pub(crate) fn rebuild_history(
+    system_prompt: &str,
+    summary: &crate::agent::log_types::CompactionSummary,
+    history: &[Message],
+    keep_rolling_window: bool,
+) -> Vec<Message> {
+    let mut new_history = Vec::new();
+
+    // 1. System prompt (static)
+    new_history.push(Message::system(system_prompt));
+
+    // 2. The summary, as something the model said.
+    new_history.push(Message::assistant(&summary.to_context_string()));
+
+    // 3. Rolling window of recent messages (skip system prompt)
+    if keep_rolling_window {
+        let non_system: Vec<&Message> = history.iter().filter(|m| m.role != "system").collect();
+        new_history.extend(valid_recent_window(&non_system, ROLLING_WINDOW_SIZE));
+    }
+
+    // 4. What to do next, said plainly, and last so it is the most recent
+    //    instruction in the window.
+    //
+    //    Compaction happens mid-turn, between model calls, and the very next
+    //    thing that happens is the model being asked for its next move. What
+    //    it had just "said" was a status report — goal, work completed,
+    //    current state, next actions — and the natural continuation of a
+    //    status report is more talking. So a compaction could end the work:
+    //    the model would describe what it had been doing and stop, having
+    //    been interrupted by its own summary and read it as a handoff.
+    //
+    //    Nothing about the summary is wrong; it is the wrong *last word*.
+    //    This is the last word instead.
+    new_history.push(Message::system(CONTINUE_AFTER_COMPACTION));
+
+    new_history
 }
 
 /// Use the LLM to generate a structured summary of the conversation so far.
@@ -1352,3 +1396,71 @@ mod tests {
         assert!(history.is_empty());
     }
 }
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    fn summary() -> crate::agent::log_types::CompactionSummary {
+        crate::agent::log_types::CompactionSummary {
+            goal: "port the fault matrix".to_string(),
+            current_state: "three cases left".to_string(),
+            next_actions: vec!["finish the cancel case".to_string()],
+            repo_map: Vec::new(),
+            work_completed: Vec::new(),
+            commands_run: Vec::new(),
+            decisions: Vec::new(),
+            pitfalls: Vec::new(),
+        }
+    }
+
+    /// The last thing in a compacted history must be an instruction, not a
+    /// report.
+    ///
+    /// Compaction runs mid-turn and the model is asked for its next move
+    /// immediately afterwards. What it had just "said" was its own summary —
+    /// goal, work completed, current state, next actions — and the natural
+    /// continuation of a status report is another status report. So a
+    /// compaction could end the work: the agent described what it had been
+    /// doing and stopped, interrupted by its own summary and reading it as a
+    /// handoff. Reported from a live session.
+    #[test]
+    fn a_compacted_history_ends_by_saying_to_carry_on() {
+        let rebuilt = rebuild_history("sys", &summary(), &[], false);
+
+        let last = rebuilt.last().expect("a rebuilt history is never empty");
+        assert_eq!(last.role, "system", "the last word came from the model, not the harness");
+        let text = last.content.as_deref().unwrap_or_default();
+        assert!(text.contains("not the end of it"), "{text}");
+        assert!(text.contains("Next actions"), "{text}");
+        assert!(
+            text.contains("nobody has asked you for a status update"),
+            "the instruction that addresses the actual failure is missing: {text}"
+        );
+    }
+
+    /// And it stays last when recent messages are kept, or it is buried
+    /// under an old message and stops being the most recent instruction.
+    #[test]
+    fn the_directive_is_last_even_when_recent_messages_are_kept() {
+        let history = vec![
+            Message::system("sys"),
+            Message::user("do the thing"),
+            Message::assistant("part way through"),
+        ];
+        let rebuilt = rebuild_history("sys", &summary(), &history, true);
+
+        assert!(
+            rebuilt.len() > 3,
+            "the rolling window was dropped, so this proves nothing: {}",
+            rebuilt.len()
+        );
+        let last = rebuilt.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert!(
+            last.content.as_deref().unwrap_or_default().contains("not the end of it"),
+            "the window was appended after the directive, burying it"
+        );
+    }
+}
+
+

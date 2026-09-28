@@ -289,12 +289,20 @@ impl App {
                 }
                 menu::Outcome::SetPermission(mode) => {
                     self.session.set_permission_mode(mode);
+                    // Picking a mode is the whole errand. The menu used to
+                    // stay up, so the only visible result of pressing Enter
+                    // was the same menu, and the change looked like it had
+                    // not happened.
+                    self.menu = None;
                     self.cache = None;
                     (Outcome::Continue, Vec::new())
                 }
-                menu::Outcome::Act(effects) => {
-                    // Settings pages stay open so several can be changed in one
-                    // visit; anything that ends the session's state closes.
+                menu::Outcome::Act { effects, close } => {
+                    // A radio choice closes; a list of switches stays open so
+                    // several can be flipped in one visit. See `ends_the_visit`.
+                    if close {
+                        self.menu = None;
+                    }
                     self.cache = None;
                     (Outcome::Continue, effects)
                 }

@@ -150,6 +150,22 @@ enum Act {
     None,
 }
 
+/// Whether choosing this message finishes what the person came to do.
+///
+/// Most of these are radio choices: one model, one context strategy, offline
+/// on or off. Picking one is the whole errand, and leaving the menu up
+/// afterwards makes a change that did happen look like one that did not.
+///
+/// The exceptions are lists of independent switches. Someone turning a tool
+/// off is plausibly about to turn another off, and closing on each one would
+/// mean reopening the menu for every line.
+fn ends_the_visit(msg: &ClientMessage) -> bool {
+    !matches!(
+        msg,
+        ClientMessage::UpdateToolConfig { .. } | ClientMessage::UpdateSubagentConfig { .. }
+    )
+}
+
 /// One row.
 struct Item {
     label:       String,
@@ -191,8 +207,15 @@ pub enum Outcome {
     Stay,
     /// Dismissed.
     Close,
-    /// Dismissed, with messages to send.
-    Act(Vec<Effect>),
+    /// Messages to send. `close` says whether choosing this ended the visit.
+    ///
+    /// A radio choice — a model, a context strategy, offline on or off — is
+    /// finished the moment it is made, and a menu that stays open afterwards
+    /// reads as one that did nothing: the change had landed, but the only
+    /// visible result of pressing Enter was the same menu. A toggle list is
+    /// the opposite case, because somebody turning tools off expects to turn
+    /// several off.
+    Act { effects: Vec<Effect>, close: bool },
     /// Set the permission mode. Its own outcome because the mode is the client's
     /// own gate rather than something the agent is told: the menu cannot reach
     /// into the session itself, and turning it into an outgoing message is what
@@ -622,10 +645,14 @@ impl Menu {
             }
             Act::Close => Outcome::Close,
             Act::None => Outcome::Stay,
-            Act::Send(msg) => Outcome::Act(vec![Effect::Send(msg.clone())]),
-            Act::Restart { resume } => {
-                Outcome::Act(vec![Effect::Restart { resume: resume.clone() }])
-            }
+            Act::Send(msg) => Outcome::Act {
+                effects: vec![Effect::Send(msg.clone())],
+                close: ends_the_visit(msg),
+            },
+            Act::Restart { resume } => Outcome::Act {
+                effects: vec![Effect::Restart { resume: resume.clone() }],
+                close: true,
+            },
             // Choosing a mode sets it, and nothing is sent: the permission mode is
             // the client's own approval gate, and the agent goes on asking exactly
             // as before — this side decides what to do with the question.
@@ -913,6 +940,52 @@ mod tests {
 
     /// Walk to a labelled row, so tests do not hard-code indices that shift when
     /// the menu gains an entry.
+    /// Pressing Enter on a choice both applies it and ends the visit.
+    ///
+    /// It used to apply it and leave the menu up, so the only visible result
+    /// of choosing was the same menu still sitting there — which reads as a
+    /// keypress that did nothing, and invites pressing it again.
+    #[test]
+    fn choosing_a_permission_mode_ends_the_visit() {
+        let s = session();
+        let mut menu = Menu::new();
+        select(&mut menu, &s, "Settings");
+        menu.handle(Input::Enter, &s);
+        select(&mut menu, &s, "Permission mode");
+        menu.handle(Input::Enter, &s);
+        select(&mut menu, &s, "Plan");
+        assert!(
+            matches!(menu.handle(Input::Enter, &s), Outcome::SetPermission(_)),
+            "choosing a permission mode did not report the choice"
+        );
+    }
+
+    /// Which choices finish the errand, stated where the rule lives rather
+    /// than inferred from a page layout.
+    #[test]
+    fn a_radio_choice_finishes_the_errand_and_a_switch_does_not() {
+        // One of these, then done.
+        assert!(ends_the_visit(&ClientMessage::Compact));
+        assert!(ends_the_visit(&ClientMessage::ClearSession));
+        assert!(ends_the_visit(&ClientMessage::UpdateOfflineMode { enabled: true }));
+        assert!(ends_the_visit(&ClientMessage::SwitchModel {
+            name: "m".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model_id: "m".into(),
+            max_context_tokens: 1000,
+            max_output_tokens: 100,
+            endpoint_type: "open_ai".into(),
+            reasoning: Default::default(),
+        }));
+
+        // A list of independent switches: somebody turning one tool off is
+        // plausibly about to turn another off.
+        assert!(!ends_the_visit(&ClientMessage::UpdateToolConfig {
+            tool: "web_search".into(),
+            enabled: false,
+        }));
+    }
+
     fn select(menu: &mut Menu, session: &Session, label: &str) {
         for _ in 0..40 {
             let items = menu.items(session);
@@ -1101,7 +1174,7 @@ mod tests {
 
         select(&mut menu, &s, "Second");
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => match &effects[0] {
+            Outcome::Act { effects, .. } => match &effects[0] {
                 Effect::Send(ClientMessage::SwitchModel { name, model_id, base_url, .. }) => {
                     assert_eq!(name, "Second");
                     assert_eq!(model_id, "second-1");
@@ -1143,7 +1216,7 @@ mod tests {
         // read_file starts enabled, so choosing it must disable it.
         select(&mut menu, &s, "Read files");
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => match &effects[0] {
+            Outcome::Act { effects, .. } => match &effects[0] {
                 Effect::Send(ClientMessage::UpdateToolConfig { tool, enabled }) => {
                     assert_eq!(tool, "read_file");
                     assert!(!enabled, "an enabled tool toggles off");
@@ -1164,7 +1237,7 @@ mod tests {
         menu.handle(Input::Enter, &s);
         select(&mut menu, &s, "Shell commands");
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => match &effects[0] {
+            Outcome::Act { effects, .. } => match &effects[0] {
                 Effect::Send(ClientMessage::UpdateToolConfig { enabled, .. }) => {
                     assert!(enabled, "a disabled tool toggles on");
                 }
@@ -1184,7 +1257,7 @@ mod tests {
         menu.handle(Input::Enter, &s);
         select(&mut menu, &s, "truncate");
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => assert_eq!(
+            Outcome::Act { effects, .. } => assert_eq!(
                 effects,
                 vec![Effect::Send(ClientMessage::UpdateContextStrategy {
                     strategy: "truncate".into(),
@@ -1204,7 +1277,7 @@ mod tests {
         menu.handle(Input::Enter, &s);
         select(&mut menu, &s, "Offline");
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => assert_eq!(
+            Outcome::Act { effects, .. } => assert_eq!(
                 effects,
                 vec![Effect::Send(ClientMessage::UpdateOfflineMode { enabled: true })],
             ),
@@ -1219,14 +1292,14 @@ mod tests {
         select(&mut menu, &s, "Compact now");
         assert_eq!(
             menu.handle(Input::Enter, &s),
-            Outcome::Act(vec![Effect::Send(ClientMessage::Compact)]),
+            Outcome::Act { effects: vec![Effect::Send(ClientMessage::Compact)], close: true },
         );
 
         let mut menu = Menu::new();
         select(&mut menu, &s, "Clear session");
         assert_eq!(
             menu.handle(Input::Enter, &s),
-            Outcome::Act(vec![Effect::Send(ClientMessage::ClearSession)]),
+            Outcome::Act { effects: vec![Effect::Send(ClientMessage::ClearSession)], close: true },
         );
     }
 
@@ -1253,7 +1326,7 @@ mod tests {
         menu.handle(Input::Char('g'), &s);
 
         match menu.handle(Input::Enter, &s) {
-            Outcome::Act(effects) => assert_eq!(
+            Outcome::Act { effects, .. } => assert_eq!(
                 effects,
                 vec![Effect::Send(ClientMessage::RewindPreview {
                     checkpoint_id: "cp-1".into(),
@@ -1491,7 +1564,7 @@ mod tests {
         menu.handle(Input::Enter, &s);
         select(&mut menu, &s, "Plan mode");
         assert!(
-            !matches!(menu.handle(Input::Enter, &s), Outcome::Act(_)),
+            !matches!(menu.handle(Input::Enter, &s), Outcome::Act { .. }),
             "no outgoing message for a local gate",
         );
     }

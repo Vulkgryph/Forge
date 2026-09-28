@@ -21,6 +21,14 @@ repository, not general advice about writing Rust.
 | [`forge-tui-rs/`](forge-tui-rs/) | The terminal client, installed as `forge`. |
 | [`forge-ide/`](forge-ide/) | The editor, plus its terminal emulator and `forge-server` pty host. |
 | [`forge-agent-proto/`](forge-agent-proto/) | The wire protocol shared by the agent and the terminal client. |
+| [`forge-search/`](forge-search/) | The crawler and index behind `web_search` and `search_documents`. |
+
+The three that people install — `forge-agent`, `forge-tui-rs`, `forge-ide` — are
+versioned together and each keeps a `CHANGELOG.md`. The rest are internal: they
+are not released or versioned on their own, so a change to one is described in
+the changelog of whatever it changed for. `forge-search` has no changelog of its
+own for that reason, and its user-visible behaviour is recorded under
+`forge-agent`, where the tools that expose it live.
 
 `default-members` is `forge-agent` alone, so a bare `cargo build` does not pull in the editor's GPU stack. Build the others explicitly:
 
@@ -34,6 +42,8 @@ cargo test -p forge-ide            # needs a GPU-capable toolchain
 - Those tests, on every push
 - `RUSTFLAGS=-D warnings` — the crates are at zero warnings and should stay there
 - That `install.sh` and `update.sh` still parse, and that the macOS app bundle still builds and contains both binaries
+- On Windows: the agent, the protocol, search and the terminal client build and pass their tests, including the provider fault matrix. This gates. The editor is **not** built there, so a Windows regression in `forge-ide` will not be caught by CI.
+- That no documentation or installer script contains a home directory. `%USERPROFILE%`, `$HOME` or a relative path instead — an absolute path through someone's home publishes their username and only works on their machine.
 
 ## House rules
 

@@ -1,9 +1,8 @@
 # Runs the tests that guard the agent, the search engine and the two
 # protocol/UI crates on every push and pull request.
 #
-# There is also an informational Windows job. It never fails the build —
-# Windows is not supported yet, and the job exists to measure how far the
-# portable crates get without owning a Windows machine.
+# The Windows job gates, for everything it covers. It does not cover the
+# editor; see the job for what that means.
 #
 # forge-ide is built and tested on macOS only, and not on Linux. That is the same
 # reason `default-members` in the workspace root excludes it: it pulls in a GPU
@@ -52,19 +51,28 @@ jobs:
       - name: Test
         run: cargo test -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs --verbose
 
-  # What compiles on Windows today, reported rather than enforced.
+  # Windows: the agent, the protocol, search, and the terminal client.
   #
-  # Windows is not a supported platform yet, so this job must never fail the
-  # build — `continue-on-error` makes it a standing measurement instead of a
-  # gate. The point is to learn what breaks without owning a Windows machine,
-  # and to notice the day something that used to compile stops.
+  # This was informational and `continue-on-error`, from when Windows was not
+  # a supported platform. It is now, and the comment saying otherwise outlived
+  # the fact. Everything below builds and passes here, so it gates.
   #
-  # Console mode and rendering still need a real Windows terminal; the input
-  # decoder and installer failure paths can also be exercised on this runner.
+  # The argument for gating is what happened while it did not. The job went red
+  # twice, both times for a real defect — the headless loop discarding a
+  # message that arrived while the agent was talking — and because the job
+  # could not fail the build, nothing was blocked and it was found only because
+  # someone went looking. A measurement nobody is obliged to read is not a
+  # check.
+  #
+  # What this does NOT cover: forge-ide. The editor runs on Windows and is
+  # installed by install.ps1, but its GPU stack and native dependencies
+  # (libz-sys, openssl-sys via git2 and russh) are not built on this runner, so
+  # a Windows regression in the editor will not be caught here. That gap is
+  # real and is the next thing to close; it is not an argument for ungating the
+  # parts that are covered.
   windows-probe:
-    name: what builds on Windows (informational)
+    name: Windows (agent, protocol, search, terminal client)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +87,7 @@ jobs:
       - name: Test them
         run: cargo test --locked -p forge-agent-proto -p forge-search -p forge-tui-rs --verbose
 
-      - name: Agent (expected to need work)
+      - name: Agent
         run: cargo build -p forge-agent --verbose
       # The provider fault matrix is black-box: it spawns the agent against a
       # loopback fixture, so it says whether failure handling behaves the same
@@ -115,10 +123,16 @@ jobs:
       # A home directory in the documentation is somebody's username published
       # on a public repository, and an instruction that works on exactly one
       # machine. `%USERPROFILE%`, `$HOME` or a relative path is always what was
-      # meant. Prose only: source and tests use placeholder paths legitimately.
+      # meant.
+      #
+      # Prose and scripts, not source: tests use paths like /home/sysadmin and
+      # /Users/someone as deliberate placeholders, and a check that shouted
+      # about those would be switched off inside a week. Platform docs and
+      # installers are where this actually happens, because they get written by
+      # running real commands on a real machine.
       - name: No home directories in the documentation
         run: |
-          if git grep -nIE 'C:\\Users\\|/Users/[A-Za-z]|/home/[A-Za-z]' -- '*.md'; then
+          if git grep -nIE 'C:\\Users\\|/Users/[A-Za-z]|/home/[A-Za-z]' -- '*.md' '*.ps1' '*.sh' '*.cmd'; then
             echo "::error::a home directory is published above; use %USERPROFILE%, \$HOME or a relative path"
             exit 1
           fi

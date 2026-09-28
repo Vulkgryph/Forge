@@ -645,7 +645,10 @@ Initial public release.
 - Five-way setup wizard: local LLM / Claude subscription / ChatGPT Codex subscription / direct API key / skip
 - Cross-platform browser launching for OAuth flows (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows)
 
-[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vulkgryph/Forge/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Vulkgryph/Forge/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Vulkgryph/Forge/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...v0.4.0

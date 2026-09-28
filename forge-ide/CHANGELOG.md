@@ -752,3 +752,13 @@ Prompted by a live reference screenshot (a competing IDE's agent panel) plus fee
 
 A fuller breakdown of what was finished versus in progress lived in a working
 file that was never published; this changelog is the record that remains.
+
+[Unreleased]: https://github.com/Vulkgryph/Forge/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vulkgryph/Forge/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Vulkgryph/Forge/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Vulkgryph/Forge/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/Vulkgryph/Forge/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Vulkgryph/Forge/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Vulkgryph/Forge/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/Vulkgryph/Forge/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/Vulkgryph/Forge/releases/tag/v0.3.0

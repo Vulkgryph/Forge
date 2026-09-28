@@ -105,13 +105,29 @@ pub async fn fetch_chatgpt_codex_models() -> Vec<ChatGptCodexModel> {
 /// out perfectly valid entries just because the network call failed or was
 /// rate-limited, not because the model is actually gone.
 pub async fn fetch_chatgpt_codex_models_with_provenance() -> (Vec<ChatGptCodexModel>, bool) {
+    fetch_chatgpt_codex_models_inner(true).await
+}
+
+/// The same catalog without going to the network.
+///
+/// For a session whose endpoint is not Codex. The list is still wanted — it
+/// is what `/model` offers to switch *to* — but wanting a menu is not a
+/// reason to send somebody's OAuth token anywhere. Whatever is on disk is
+/// good enough to name a model, and the live call happens if and when they
+/// actually switch.
+pub async fn fetch_chatgpt_codex_models_cached() -> (Vec<ChatGptCodexModel>, bool) {
+    fetch_chatgpt_codex_models_inner(false).await
+}
+
+async fn fetch_chatgpt_codex_models_inner(allow_network: bool) -> (Vec<ChatGptCodexModel>, bool) {
     // 1) Live backend query using the user's ChatGPT OAuth token. This is
     //    the source of truth — the codex CLI's local cache seeds from this
     //    same endpoint. We don't need the CLI installed; we just need the
-    //    `client_version` query parameter the backend requires, and the
-    //    same originator/user-agent the CLI sends.
-    if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
-        return (models, true);
+    //    `client_version` query parameter the backend requires.
+    if allow_network {
+        if let Some(models) = fetch_chatgpt_codex_models_from_backend().await {
+            return (models, true);
+        }
     }
 
     // 2) Local Codex CLI cache, if the user happens to have it installed

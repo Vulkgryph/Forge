@@ -66,8 +66,9 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
 |---|---|
 | LLM endpoint | Always — but if it's local (`127.0.0.1:1234`, etc.) that traffic stays on your machine |
 | `web_search` / `web_fetch` tools | Only when the model invokes them. Disable both via `agent.disabled_tools = ["web_search", "web_fetch"]` if you want them off the table |
-| Codex subscription auth | Only on login + periodic token refresh, only if you're using the ChatGPT Codex provider |
-| Codex version self-check | Background, once a week, only if you're actively using Codex; if GitHub is unreachable forge falls back to a cached value |
+| Codex subscription auth | Login, and a token refresh when the stored one is near expiry. Only when ChatGPT Codex is the endpoint in use — having logged in once does not make this happen on other endpoints |
+| Codex model catalog | Once at startup, only when Codex is the endpoint in use. On any other endpoint the list `/model` offers comes from a local cache and nothing is sent |
+| Codex version self-check | Background, at most once a week, only if you're actively using Codex; if GitHub is unreachable forge falls back to a cached value. `offline_mode` or `FORGE_NO_AUTO_VERSION_CHECK=1` stops it |
 
 **Minimum offline setup**:
 
@@ -87,7 +88,16 @@ Simplest route, instead of the four steps above: set `offline_mode = true` under
 `[agent]`, or toggle it from the tools menu. It forces off the web tools, the
 weekly version self-check, and the Codex model-catalog fetch in one move.
 
-After that, Forge has zero outgoing network traffic outside your local LLM.
+After that, Forge makes no outgoing request except to the endpoint you
+configured — which, for a local model, means nothing leaves the machine.
+
+One exception, stated because it is the kind of thing that should not be
+discovered: if ChatGPT Codex is the endpoint you are using, `offline_mode`
+does not stop Forge refreshing that subscription's token, because the
+endpoint cannot be used without it. Offline mode makes Forge stop talking to
+anyone you did not ask it to talk to; it cannot make a cloud provider local.
+If you want nothing to leave the machine at all, the endpoint has to be a
+local one.
 
 One detail about the requests Forge does make: they carry an `x-forge-session`
 header, so a provider's logs can group one conversation's requests together

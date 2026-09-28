@@ -218,17 +218,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // running when the user asked for no incidental traffic.
     auth::set_offline_mode(app_config.agent.offline_mode);
 
-    // In offline mode, this whole block only runs if the active endpoint is
-    // itself ChatGPT Codex — otherwise it's pure incidental network traffic
-    // for a catalog of models this session isn't even using.
+    // Two credential-bearing calls used to happen here for anyone with Codex
+    // tokens on disk, whatever endpoint they were actually using: a token
+    // refresh to auth.openai.com, and a catalog fetch carrying the OAuth
+    // bearer. `offline_mode` suppressed both, but that is a setting somebody
+    // has to know to find — so the default for a user pointed at a local
+    // model was a startup that phoned OpenAI twice about a provider they were
+    // not using.
+    //
+    // The catalog is still wanted when Codex is inactive, because `/model`
+    // lists what you could switch *to*. Wanting a menu is not a reason to
+    // send a token, so that case now reads the local cache and sends nothing.
+    // The live call happens when Codex is the endpoint in use — which is the
+    // moment it is actually about to matter.
     let chatgpt_logged_in = auth::load_chatgpt_tokens().is_some();
-    if chatgpt_logged_in
-        && (!app_config.agent.offline_mode
-            || endpoint.endpoint_type == config::EndpointType::ChatGptCodex)
-    {
-        let http = reqwest::Client::new();
-        let _ = auth::get_valid_chatgpt_token(&http).await;
-        let (mut discovered, is_live) = auth::fetch_chatgpt_codex_models_with_provenance().await;
+    let codex_is_active = endpoint.endpoint_type == config::EndpointType::ChatGptCodex;
+    if chatgpt_logged_in && (!app_config.agent.offline_mode || codex_is_active) {
+        let (mut discovered, is_live) = if codex_is_active {
+            let http = reqwest::Client::new();
+            let _ = auth::get_valid_chatgpt_token(&http).await;
+            auth::fetch_chatgpt_codex_models_with_provenance().await
+        } else {
+            auth::fetch_chatgpt_codex_models_cached().await
+        };
         // Only a genuine, non-empty live response is trustworthy enough to
         // prune by — an empty *live* result is more likely a transient
         // parsing/API hiccup than "you now have zero Codex models", and any
@@ -687,3 +699,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = agent_handle.await;
     Ok(())
 }
+#[cfg(test)]
+mod startup_traffic_tests {
+    /// A session that is not using Codex must not make Codex network calls at
+    /// startup, whatever tokens happen to be on disk.
+    ///
+    /// Two used to fire for anyone who had ever logged in: a refresh to
+    /// auth.openai.com and a catalog fetch carrying the OAuth bearer. Both
+    /// ran on the default configuration, so someone pointed at a local model
+    /// — the setup the README describes as having no outgoing traffic — was
+    /// telling OpenAI when they started Forge.
+    ///
+    /// Structural, because the alternative is asserting on a socket that must
+    /// not be opened, and "no packet was sent" is not something a unit test
+    /// can observe. Assembled, since this test reads the file it lives in,
+    /// and whitespace-collapsed because the real expression wraps.
+    #[test]
+    fn codex_is_only_contacted_when_codex_is_the_endpoint_in_use() {
+        let code = include_str!("main.rs");
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let refresh = ["auth", "::get_valid_chatgpt_token"].concat();
+        let live = ["auth", "::fetch_chatgpt_codex_models_with_provenance"].concat();
+
+        // Both live calls sit inside the `codex_is_active` arm. The cached
+        // variant is the one reachable otherwise.
+        let guarded = flat.find("if codex_is_active {").expect("the guard is gone");
+        let arm_end = flat[guarded..].find("} else {").expect("the guard lost its else") + guarded;
+        let arm = &flat[guarded..arm_end];
+
+        assert!(arm.contains(&refresh), "the token refresh left the guarded arm");
+        assert!(arm.contains(&live), "the live catalog fetch left the guarded arm");
+
+        // And nothing outside it reaches the network for a catalog.
+        let after = &flat[arm_end..];
+        assert!(
+            !after.contains(&live),
+            "a live Codex fetch runs outside the arm that checks the endpoint"
+        );
+    }
+}
+

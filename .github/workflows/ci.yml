@@ -112,6 +112,17 @@ jobs:
       # Shell syntax only — running the installer would write into the runner's
       # home directory and fetch a toolchain. Catches the class of mistake that
       # breaks `install.sh` for everyone while every test still passes.
+      # A home directory in the documentation is somebody's username published
+      # on a public repository, and an instruction that works on exactly one
+      # machine. `%USERPROFILE%`, `$HOME` or a relative path is always what was
+      # meant. Prose only: source and tests use placeholder paths legitimately.
+      - name: No home directories in the documentation
+        run: |
+          if git grep -nIE 'C:\\Users\\|/Users/[A-Za-z]|/home/[A-Za-z]' -- '*.md'; then
+            echo "::error::a home directory is published above; use %USERPROFILE%, \$HOME or a relative path"
+            exit 1
+          fi
+
       - name: Installer parses
         run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh
 

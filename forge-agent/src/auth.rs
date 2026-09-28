@@ -384,10 +384,30 @@ fn fetch_chatgpt_codex_models_from_cache() -> Vec<ChatGptCodexModel> {
 /// OAuth tokens. The official codex CLI seeds its local cache from this same
 /// endpoint, but Forge users typically don't have that CLI installed.
 ///
-/// We pose as codex CLI in the request headers — same originator id the
-/// official tool uses, matching User-Agent — so the backend treats us
-/// identically. Tokens are obtained via the same OAuth flow with
-/// `originator=codex_cli_rs` already baked into the auth URL.
+/// Forge identifies itself as Forge. It used to send `codex_cli_rs` as both
+/// User-Agent and originator — presenting to OpenAI as OpenAI's own client —
+/// on the assumption that the backend required it. It does not: the same
+/// request with an honest User-Agent and no originator returns 200 from both
+/// this endpoint and `/responses`, measured against a live account. So the
+/// spoofing bought nothing and cost the one thing worth keeping, which is
+/// that a service can tell who is calling it.
+///
+/// The OAuth authorize URL still carries OpenAI's published Codex client id
+/// and `originator`, because that is how the "Sign in with ChatGPT" flow is
+/// invoked at all. Using a published public client to start the flow it was
+/// published for is a different act from claiming to be that client on every
+/// later request.
+/// How Forge identifies itself to a model provider.
+///
+/// `forge-search` is the crawler and says so; this is the agent talking to an
+/// API, so it carries its own name. Both point at the same page, so an
+/// operator who wants to know what is calling them has somewhere to go.
+const API_USER_AGENT: &str = concat!(
+    "forge-agent/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://vulkgryph.com/projects/forge/)"
+);
+
 async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexModel>> {
     let tokens = load_chatgpt_tokens()?;
     // The OAuth token, like every other request Forge makes to this backend.
@@ -436,11 +456,7 @@ async fn fetch_chatgpt_codex_models_from_backend() -> Option<Vec<ChatGptCodexMod
             .get(&url)
             .bearer_auth(bearer)
             .header("accept", "application/json")
-            .header(
-                "user-agent",
-                format!("codex_cli_rs/{}", codex_client_version),
-            )
-            .header("originator", "codex_cli_rs")
+            .header("user-agent", API_USER_AGENT)
             .send()
             .await
         else {
@@ -1297,6 +1313,46 @@ pub fn xai_display_name(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Forge does not present itself to a provider as that provider's own
+    /// client.
+    ///
+    /// It used to send `codex_cli_rs` as User-Agent and originator on every
+    /// API request, believing the backend required it. Measured against a
+    /// live account, it does not: an honest User-Agent with no originator
+    /// returns 200 from both the model catalog and `/responses`. So the
+    /// spoofing bought nothing, and it sat against a test in `web.rs` that
+    /// forbids the same thing for the web tools, a README saying the crawler
+    /// "neither pretends to be a browser", and the reason Anthropic
+    /// subscription support was dropped.
+    ///
+    /// The authorize URL is exempt and stays: OpenAI publishes that client id
+    /// for the "Sign in with ChatGPT" flow, and starting a published flow is
+    /// not the same act as claiming to be its client afterwards.
+    ///
+    /// Assembled, since this test reads the file it lives in.
+    #[test]
+    fn requests_do_not_claim_to_be_another_vendors_client() {
+        let code = include_str!("auth.rs");
+        let spoof = ["codex", "_cli", "_rs"].concat();
+
+        for (n, line) in code.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue; // the comments explain the history on purpose
+            }
+            if !line.contains(&spoof) {
+                continue;
+            }
+            assert!(
+                line.contains("oauth/authorize"),
+                "line {} presents Forge as another vendor's client outside the \
+                 authorize URL: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
     use super::credential_shape;
 
 

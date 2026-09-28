@@ -3,7 +3,7 @@
 From this checkout, double-click **install.cmd**, or run in PowerShell:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Micah\Forge\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 The default installs both interfaces and their shared agent. It builds the

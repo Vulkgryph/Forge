@@ -32,6 +32,35 @@ use crate::index::Index;
 use crate::robots::Robots;
 use crate::url::Url;
 
+/// Google's documented `robots.txt` size limit, and the conventional one.
+/// A body past it is not a rules file anyone wrote by hand.
+const MAX_ROBOTS_BYTES: usize = 500 * 1024;
+
+/// How long to stand off a host that said 429 or 503 without saying when.
+pub(crate) const DEFAULT_BACKOFF: f64 = 60.0;
+
+/// The longest stand-off a crawl will take from a `Retry-After`. Past this the
+/// wait is longer than most crawls live, and the host is simply left alone for
+/// the rest of this one.
+pub(crate) const MAX_BACKOFF: f64 = 300.0;
+
+/// `Retry-After` in either of its two forms.
+///
+/// Delta-seconds is the common one. The HTTP-date form is accepted as far as
+/// recognising that it *is* a date — without a clock to compare against, the
+/// honest reading is "a while", not a number parsed out of thin air.
+pub(crate) fn parse_retry_after(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<f64>() {
+        return if secs.is_finite() && secs >= 0.0 { Some(secs) } else { None };
+    }
+    // Looks like an HTTP-date (RFC 9110 prefixes it with a weekday).
+    if value.len() > 4 && value[..4].contains(',') {
+        return Some(DEFAULT_BACKOFF);
+    }
+    None
+}
+
 /// What a crawl is permitted to do.
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -51,6 +80,13 @@ pub struct Limits {
     /// be blocked, and a blocked reputation attaches to Forge rather than to
     /// an anonymous scraper.
     pub politeness: f64,
+    /// Longest `Crawl-delay` this crawler will agree to.
+    ///
+    /// A site asking for longer is not refused because the number is wrong —
+    /// it is refused because a crawl that must finish inside a time budget
+    /// cannot honour it, and the alternative was silently going 288 times
+    /// faster than asked while reporting itself as obedient.
+    pub max_crawl_delay: f64,
     /// Whether to leave the seeds' hosts.
     ///
     /// Off by default, and that is the important default: following external
@@ -76,6 +112,10 @@ impl Default for Limits {
             max_pages: 200,
             max_depth: 3,
             politeness: 1.0,
+            // Five minutes. Long enough that almost every site asking for a
+            // gap is honoured, short enough that a crawl with a budget can
+            // keep the appointment.
+            max_crawl_delay: 300.0,
             stay_on_host: true,
             max_page_bytes: 2 * 1024 * 1024,
             max_seconds: None,
@@ -94,6 +134,15 @@ pub struct Report {
     pub indexed: usize,
     /// Refused by `robots.txt`.
     pub disallowed: usize,
+    /// The site asked, in real time, for less — a 429 or a 503. Counted
+    /// apart from `missing` because it is the one refusal that says "later"
+    /// rather than "no", and the crawler backs off the host rather than
+    /// carrying on at the same rate.
+    pub rate_limited: usize,
+    /// Refused because the site asked for a `Crawl-delay` longer than this
+    /// crawl can honour. Not a failure and not a ban: an appointment that
+    /// cannot be kept inside the budget.
+    pub crawl_delay_too_long: usize,
     /// Refused because the address is not on the public internet — loopback,
     /// a private range, or link-local. Counted apart from `disallowed`
     /// because a site did not ask for this; it is a limit on where a crawler
@@ -336,6 +385,28 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 continue;
             }
 
+            // A site asking for less, right now. This used to be counted as
+            // "missing" and the crawl carried on at the same rate, which is
+            // worse than ignoring a static Crawl-delay: that is a standing
+            // preference, this is the server saying it is struggling, while
+            // it is struggling. Under a user agent that names us, ignoring it
+            // is the fastest route onto a blocklist by name.
+            //
+            // `is_permanently_gone` already classified these correctly and
+            // was already tested — it simply had no caller outside its own
+            // tests.
+            if matches!(fetched.status, 429 | 503) {
+                let backoff = fetched
+                    .header("retry-after")
+                    .and_then(parse_retry_after)
+                    .unwrap_or(DEFAULT_BACKOFF)
+                    .clamp(1.0, MAX_BACKOFF);
+                let next = self.clock.now() + backoff;
+                self.next_allowed.insert(url.authority(), next);
+                report.rate_limited += 1;
+                continue;
+            }
+
             if !fetched.is_ok() {
                 report.missing += 1;
                 continue;
@@ -457,16 +528,37 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         sources as f64 / self.pages_linked as f64 >= TEMPLATE_SHARE
     }
 
-    /// Whether `robots.txt` permits this URL, fetching the file once per host.
+        /// Whether `robots.txt` permits this URL, fetching the file once per host.
     fn robots_allow(&mut self, url: &Url) -> bool {
+        // Keyed by scheme *and* authority, per RFC 9309, which scopes a
+        // robots.txt to (scheme, host, port). Keying on the authority alone
+        // meant whichever scheme was seen first decided the rules for both,
+        // so an http page could be governed by the https file or the reverse.
+        // Politeness stays keyed on the bare authority, because a server is
+        // one server however you reach it.
+        let key = format!("{}://{}", url.scheme, url.authority());
         let host = url.authority();
-        if !self.robots.contains_key(&host) {
-            let robots_url = format!("{}://{}/robots.txt", url.scheme, host);
+        if !self.robots.contains_key(&key) {
+            let robots_url = format!("{}/robots.txt", key);
             // The robots fetch is itself subject to politeness — it is a
             // request to the same host as everything else.
             self.wait_for_host(url);
-            let rules = match self.fetcher.fetch(&robots_url) {
-                Ok(r) if r.is_ok() => Robots::parse(&r.body, self.fetcher.user_agent()),
+            let fetched = self.fetch_robots(&robots_url);
+            let rules = match fetched {
+                // A 200 is not enough on its own. A robots.txt that redirects
+                // to a login page, or an SPA serving its shell for unknown
+                // paths, arrives as a perfectly good 200 whose body parses to
+                // zero directives — which reads as "no restrictions" and is
+                // the most permissive possible answer to a question that was
+                // never answered. `looks_like_robots` was already written for
+                // the challenge branch; the clean path needed it just as much.
+                Ok(r) if r.is_ok() => {
+                    if looks_like_robots(&r.body) {
+                        Robots::parse(&r.body, self.fetcher.user_agent())
+                    } else {
+                        Robots::deny_all()
+                    }
+                }
 
                 // A bot check on `robots.txt` is the site answering, not the
                 // site staying silent — so it is never read as permission.
@@ -502,14 +594,63 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 // treated as unreadable.
                 Ok(_) => Robots::deny_all(),
 
-                // No response at all: treated as absent rather than as
-                // refusal, or one unreachable robots.txt stops a whole crawl
-                // over a file that may not exist.
-                Err(_) => Robots::allow_all(),
+                // A transport failure is not silence either. `deny_all`'s own
+                // documentation already said it was for "a 500, or a timeout"
+                // — the doc was right and the code was not, returning
+                // allow_all and no retry. A host that selectively drops this
+                // crawler's connections is a cheap and standard anti-bot
+                // measure, and reading that as "no restrictions" rewarded it.
+                // Retried once by `fetch_robots` before arriving here.
+                Err(_) => Robots::deny_all(),
             };
-            self.robots.insert(host.clone(), rules);
+
+            // The site's own gap applies from its first page, not from its
+            // second. The politeness stamp was written before these rules
+            // existed, so a site asking for thirty seconds still got its
+            // first page one second after robots.txt.
+            if let Some(delay) = rules.crawl_delay {
+                let next = self.clock.now() + delay.max(self.limits.politeness);
+                self.next_allowed.insert(host.clone(), next);
+            }
+            self.robots.insert(key.clone(), rules);
         }
-        self.robots[&host].allows(url)
+
+        // A gap longer than this crawl can keep is refused rather than
+        // quietly shortened.
+        if let Some(delay) = self.robots[&key].crawl_delay {
+            if delay > self.limits.max_crawl_delay {
+                return false;
+            }
+        }
+        self.robots[&key].allows(url)
+    }
+
+    /// Fetch `robots.txt`, once retried, and bounded in size.
+    ///
+    /// The retry is because the failure this distinguishes — a host dropping
+    /// this crawler's connections — looks exactly like a transient network
+    /// blip, and the consequence of getting it wrong is now refusing the
+    /// whole host. One retry is cheap and makes the refusal mean something.
+    fn fetch_robots(&self, robots_url: &str) -> Result<crate::fetch::Fetched, String> {
+        let mut last = self.fetcher.fetch(robots_url);
+        if last.is_err() {
+            last = self.fetcher.fetch(robots_url);
+        }
+        // Google's documented cap. A body past it is not a rules file anyone
+        // wrote, and the truncated remainder would parse to something the
+        // site never said.
+        if let Ok(r) = &last {
+            if r.body.len() > MAX_ROBOTS_BYTES {
+                return Ok(crate::fetch::Fetched {
+                    status: r.status,
+                    final_url: r.final_url.clone(),
+                    content_type: r.content_type.clone(),
+                    body: String::new(),
+                    headers: r.headers.clone(),
+                });
+            }
+        }
+        last
     }
 
     /// Wait until this host may be contacted, then record the next time.
@@ -1081,13 +1222,146 @@ mod tests {
         assert!(report.disallowed > 0);
     }
 
-    /// But an unreachable one is treated as absent, or a single network blip
-    /// on a file that may not exist stops everything.
+    /// An unreachable `robots.txt` stops the host, and that is a reversal.
+    ///
+    /// It used to be read as absent, on the reasoning that a network blip
+    /// should not stop a crawl over a file that may not exist. But a file
+    /// that does not exist arrives as a 404, which is still treated as
+    /// permission — `Err` means the server could not be talked to at all.
+    /// A host that selectively drops this crawler's connections is a cheap
+    /// and standard anti-bot measure, and reading that as "no restrictions"
+    /// rewarded it. `deny_all`'s own documentation already said it covered
+    /// "a 500, or a timeout"; the code disagreed with the doc, and the doc
+    /// was right.
+    ///
+    /// The fetch is retried once first, so a genuine blip does not cost the
+    /// host.
     #[test]
-    fn an_unreachable_robots_file_does_not_stop_the_crawl() {
+    fn an_unreachable_robots_file_stops_the_host_rather_than_opening_it() {
         let fetcher = site().with_unreachable("https://a.example/robots.txt");
+        let (index, report, _) = run(&fetcher, Limits::default());
+        assert_eq!(index.len(), 0, "crawled a host whose rules could not be read at all");
+        assert!(report.disallowed > 0, "the refusal was not reported");
+    }
+
+    /// The distinction that makes the reversal above affordable: a site with
+    /// no robots.txt answers 404, and 404 is still permission.
+    #[test]
+    fn a_site_with_no_robots_file_is_still_crawled() {
+        let fetcher = site().with_response(
+            "https://a.example/robots.txt",
+            Fetched {
+                status: 404,
+                final_url: "https://a.example/robots.txt".into(),
+                content_type: "text/plain".into(),
+                body: "not found".into(),
+                headers: Vec::new(),
+            },
+        );
         let (index, _, _) = run(&fetcher, Limits::default());
-        assert_eq!(index.len(), 4, "a missing robots.txt blocked the crawl");
+        assert_eq!(index.len(), 4, "an absent robots.txt blocked the crawl");
+    }
+
+    /// A 200 whose body is not a rules file is not permission either.
+    ///
+    /// A robots.txt that redirects to a login page, or an SPA serving its
+    /// shell for unknown paths, arrives as a clean 200 that parses to zero
+    /// directives — the most permissive possible answer to a question nobody
+    /// answered.
+    #[test]
+    fn a_200_that_is_not_a_rules_file_is_not_read_as_permission() {
+        let fetcher = site().with_response(
+            "https://a.example/robots.txt",
+            Fetched {
+                status: 200,
+                final_url: "https://a.example/login".into(),
+                content_type: "text/html".into(),
+                body: "<html><body><h1>Sign in to continue</h1></body></html>".into(),
+                headers: Vec::new(),
+            },
+        );
+        let (index, report, _) = run(&fetcher, Limits::default());
+        assert_eq!(index.len(), 0, "a login page was read as robots.txt permission");
+        assert!(report.disallowed > 0);
+    }
+
+    /// A 429 is the server asking for less while it is struggling. It used
+    /// to be counted as "missing" and the crawl carried straight on.
+    #[test]
+    fn a_rate_limited_host_is_backed_off_rather_than_hammered() {
+        let fetcher = site().with_response(
+            "https://a.example/two",
+            Fetched {
+                status: 429,
+                final_url: "https://a.example/two".into(),
+                content_type: "text/html".into(),
+                body: String::new(),
+                headers: vec![("retry-after".into(), "120".into())],
+            },
+        );
+        let (_, report, clock) = run(&fetcher, Limits::default());
+
+        assert_eq!(report.rate_limited, 1, "the 429 was not recognised as one");
+        assert_eq!(report.missing, 0, "a 429 was filed as a missing page");
+        assert!(
+            clock.waits.borrow().iter().any(|&w| w >= 119.0),
+            "asked to wait 120s and did not: {:?}",
+            clock.waits.borrow()
+        );
+    }
+
+    #[test]
+    fn a_503_without_a_retry_after_still_backs_off() {
+        let fetcher = site().with_response(
+            "https://a.example/two",
+            Fetched {
+                status: 503,
+                final_url: "https://a.example/two".into(),
+                content_type: "text/html".into(),
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        let (_, report, clock) = run(&fetcher, Limits::default());
+        assert_eq!(report.rate_limited, 1);
+        assert!(
+            clock.waits.borrow().iter().any(|&w| w >= 59.0),
+            "no default stand-off was taken: {:?}",
+            clock.waits.borrow()
+        );
+    }
+
+    #[test]
+    fn retry_after_is_read_in_both_of_its_forms() {
+        assert_eq!(parse_retry_after("120"), Some(120.0));
+        assert_eq!(parse_retry_after("  30  "), Some(30.0));
+        assert_eq!(parse_retry_after("-5"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        // An HTTP-date is recognised as a date rather than parsed into a
+        // number nobody sent.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), Some(DEFAULT_BACKOFF));
+    }
+
+    /// A gap longer than the crawl can keep is refused, not shortened.
+    #[test]
+    fn a_crawl_delay_beyond_what_we_can_honour_is_refused() {
+        let fetcher = site().with_response(
+            "https://a.example/robots.txt",
+            Fetched {
+                status: 200,
+                final_url: "https://a.example/robots.txt".into(),
+                content_type: "text/plain".into(),
+                // One visit a day. Used to be clamped to five minutes.
+                body: "User-agent: *\nCrawl-delay: 86400\n".into(),
+                headers: Vec::new(),
+            },
+        );
+        let (index, _, clock) = run(&fetcher, Limits::default());
+        assert_eq!(index.len(), 0, "crawled a site 288x faster than it asked");
+        assert!(
+            clock.waits.borrow().iter().all(|&w| w < 86400.0),
+            "waited the full day instead of declining"
+        );
     }
 
     /// The reason time is injected: politeness is the behaviour most worth

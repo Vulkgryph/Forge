@@ -30,6 +30,7 @@ fn main() {
 
     let fetcher = Curl { agent: "forge-search/0.1 (measurement)".into() };
     let limits = crawl::Limits {
+        max_crawl_delay: 300.0,
         max_pages: pages, max_depth: 4,
         politeness: std::env::var("POLITENESS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
         stay_on_host: true, max_page_bytes: 2 * 1024 * 1024,

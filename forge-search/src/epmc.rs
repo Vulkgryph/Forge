@@ -225,6 +225,10 @@ pub struct Report {
     pub citation_only: usize,
     /// Requests that got no response.
     pub unreachable: usize,
+    /// Europe PMC asked for less, in real time — a 429 or a 503. Counted
+    /// apart from `unreachable` because it means "later", not "gone", and
+    /// the connector stands off rather than continuing at the same rate.
+    pub rate_limited: usize,
     /// Full texts fetched that turned out to hold nothing readable.
     pub empty: usize,
     /// Every record seen, indexed or not, so a caller can cite what it could
@@ -264,6 +268,11 @@ impl<'a, F: Fetcher, C: crate::crawl::Clock> Connector<'a, F, C> {
         self.wait();
         let body = match self.fetcher.fetch(&search_url(query, page)) {
             Ok(response) if response.is_ok() => response.body,
+            Ok(response) if matches!(response.status, 429 | 503) => {
+                self.back_off(&response);
+                report.rate_limited += 1;
+                return report;
+            }
             Ok(_) | Err(_) => {
                 report.unreachable += 1;
                 return report;
@@ -290,6 +299,12 @@ impl<'a, F: Fetcher, C: crate::crawl::Clock> Connector<'a, F, C> {
             self.wait();
             let full = match self.fetcher.fetch(&full_text_url(&found.pmcid)) {
                 Ok(response) if response.is_ok() => response.body,
+                Ok(response) if matches!(response.status, 429 | 503) => {
+                    self.back_off(&response);
+                    report.rate_limited += 1;
+                    report.articles.push(found);
+                    continue;
+                }
                 Ok(_) | Err(_) => {
                     report.unreachable += 1;
                     report.articles.push(found);
@@ -328,6 +343,20 @@ impl<'a, F: Fetcher, C: crate::crawl::Clock> Connector<'a, F, C> {
     }
 
     /// Hold off until the API may be asked again.
+    /// Stand off after the server asked for less.
+    ///
+    /// Same shape as the crawler's: honour `Retry-After` when it is sent,
+    /// otherwise take the default gap. Counted and paced rather than filed
+    /// as unreachable and retried immediately.
+    fn back_off(&mut self, response: &crate::fetch::Fetched) {
+        let backoff = response
+            .header("retry-after")
+            .and_then(crate::crawl::parse_retry_after)
+            .unwrap_or(crate::crawl::DEFAULT_BACKOFF)
+            .clamp(1.0, crate::crawl::MAX_BACKOFF);
+        self.next_allowed = self.clock.now() + backoff;
+    }
+
     fn wait(&mut self) {
         if self.next_allowed > 0.0 {
             self.clock.sleep_until(self.next_allowed);

@@ -155,15 +155,44 @@ jobs:
       # being seen to comply.
       - name: Documented versions are not pinned to a number that drifts
         run: |
-          # Dated CHANGELOG entries are history and are meant to name the
-          # version they shipped in. Everything else must build the string
-          # from CARGO_PKG_VERSION, because a literal is a hostage to the next
-          # release — two examples were announcing 0.5.0 on the wire at 0.5.2.
-          if git grep -nE 'forge-(search|agent|ide|tui)/[0-9]+\.[0-9]+\.[0-9]+' \
-               -- . ':(exclude)target' ':(exclude)*CHANGELOG.md'; then
-            echo "::error::a pinned Forge version appears above; build it from CARGO_PKG_VERSION or write <version>"
-            exit 1
-          fi
+          python3 - <<'EOF'
+          import re, subprocess, sys
+          # What this protects: a version literal that reaches somebody —
+          # printed in documentation, or sent on the wire as a user agent.
+          # Two examples were announcing 0.5.0 at 0.5.2, which is a lie told
+          # to the sites least able to check it.
+          #
+          # What it must not flag, because the first version of this check
+          # did and that is how a check gets switched off:
+          #   - dated CHANGELOG entries, which are history and are supposed
+          #     to name the version they shipped in
+          #   - comments and doc comments, which illustrate the format
+          #   - test fixtures, which need a concrete string to parse
+          pin = re.compile(r'forge-(search|agent|ide|tui)/[0-9]+\.[0-9]+\.[0-9]+')
+          bad = []
+          files = subprocess.run(["git","ls-files","*.md","*.rs"],
+                                 capture_output=True,text=True).stdout.split()
+          for f in files:
+              if f.endswith("CHANGELOG.md") or "/vendor/" in f:
+                  continue
+              in_tests = False
+              for n, line in enumerate(open(f,encoding="utf-8"), 1):
+                  if f.endswith(".rs"):
+                      if "#[cfg(test)]" in line:
+                          in_tests = True
+                      if in_tests:
+                          continue
+                      stripped = line.lstrip()
+                      if stripped.startswith("//"):
+                          continue
+                  if pin.search(line):
+                      bad.append(f"{f}:{n}: {line.strip()}")
+          for b in bad:
+              print(f"::error::pinned version: {b}")
+          if bad:
+              print("build it from CARGO_PKG_VERSION, or write <version>")
+          sys.exit(1 if bad else 0)
+          EOF
 
       - name: Documentation links resolve
         run: |

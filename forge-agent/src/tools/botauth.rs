@@ -30,6 +30,18 @@
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
+/// Whether re-crawls may echo a site's `ETag` back to it. Off unless the
+/// operator turns it on — see `AgentConfig::send_etag`.
+static SEND_ETAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_send_etag(on: bool) {
+    SEND_ETAG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn send_etag() -> bool {
+    SEND_ETAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The process-wide signer, set once at startup from config.
 ///
 /// Same shape as `auth::set_offline_mode`: the crawler is reached through

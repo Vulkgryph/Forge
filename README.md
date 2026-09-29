@@ -262,6 +262,26 @@ by name. Neither pretends to be a browser and neither ignores `robots.txt`, so
 `Disallow` is enough to stop them — from one user at a page a second, which is
 the scale this runs at.
 
+**What a site learns about the person running Forge: nothing that
+distinguishes them from anyone else running it.** The complete set of headers
+sent is `Host`, `Accept`, and the user agent above — measured, not assumed.
+No cookies, no `Referer`, no `Accept-Language`, no client hints, no machine or
+session identifier. The agent's own session id travels only to the model
+endpoint the user configured, never to a crawled site.
+
+Two things do vary. The **IP address**, which is true of any HTTP client and
+which Forge will not hide — routing around it would be the kind of evasion this
+project declines. And **which pages get requested**, which is inherent to
+crawling.
+
+One thing deliberately does *not* vary: on a re-crawl, Forge returns
+`If-Modified-Since` but **not** `If-None-Match`. `Last-Modified` is a property
+of the content — every visitor sees the same value, so echoing it identifies
+nobody. An `ETag` is chosen by the server and can be minted per visitor, which
+is a known tracking technique. Most of the bandwidth saving comes from the
+harmless one, so that is the default; `agent.send_etag = true` opts in to the
+other where a site issues no `Last-Modified`.
+
 A user agent is only a claim, though, and anyone can write one. If the
 operator has configured a signing key, requests also carry a **Web Bot Auth**
 signature — `draft-meunier-webbotauth-httpsig-protocol`, built on RFC 9421

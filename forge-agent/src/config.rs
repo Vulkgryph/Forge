@@ -194,6 +194,20 @@ pub struct AgentConfig {
     /// Signing is only useful once the matching public key is published at
     /// `<web_bot_auth_directory>/.well-known/http-message-signatures-directory`.
     /// A signature nobody can look up is a header nobody can check.
+    /// Whether a re-crawl may echo back the `ETag` a site issued.
+    ///
+    /// Off by default, and the asymmetry is the point. `Last-Modified` is a
+    /// property of the content — every visitor gets the same value, so
+    /// returning it tells a site nothing about who is asking. An `ETag` is
+    /// chosen by the server and *can* be made unique per visitor, which is a
+    /// documented tracking technique. Forge sends the harmless one always and
+    /// the correlatable one only if asked.
+    ///
+    /// Turning this on saves bandwidth on sites that issue no `Last-Modified`
+    /// — many CDNs — at the cost of handing that site a token it minted for
+    /// you.
+    #[serde(default)]
+    pub send_etag: bool,
     #[serde(default)]
     pub web_bot_auth_key: Option<String>,
     /// The origin publishing that key. Required when `web_bot_auth_key` is set.
@@ -415,6 +429,7 @@ impl Default for AppConfig {
                 web_tool_model: None,
             },
             agent: AgentConfig {
+                send_etag: false,
                 web_bot_auth_key: None,
                 web_bot_auth_directory: None,
                 auto_approve_reads: true,

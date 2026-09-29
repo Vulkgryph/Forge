@@ -99,24 +99,18 @@ impl HttpFetcher {
             client: reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .timeout(std::time::Duration::from_secs(20))
-                // Every hop is judged, not just the address that was asked
-                // for. The crawler refuses a *literal* private address on
-                // sight, but a hostname that merely resolves to one looks
-                // ordinary until the lookup happens — and the lookup happens
-                // here. A redirect chain is the cheap way to aim a crawl at
-                // somebody's own machine, so each destination is resolved and
-                // refused before it is followed.
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.previous().len() >= 5 {
-                        return attempt.stop();
-                    }
-                    match attempt.url().host_str() {
-                        Some(host) if forge_search::net::is_routable_public(host) => {
-                            attempt.follow()
-                        }
-                        _ => attempt.stop(),
-                    }
-                }))
+                // Followed by hand, in `fetch_conditional`. reqwest's redirect
+                // policy can decide whether to follow a hop but cannot rewrite
+                // the headers that go with it — and it strips only
+                // Authorization, Cookie, Proxy-Authorization and
+                // WWW-Authenticate on a cross-host redirect, so a Web Bot Auth
+                // signature would travel verbatim to the next host. It signs
+                // `@authority`, so arriving at www.example.com carrying a
+                // signature over example.com means the verifier computes a
+                // different base and the check fails: worse than sending
+                // nothing, by this code's own rule elsewhere. Each hop is
+                // signed for the host it actually reaches.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             handle,
@@ -138,7 +132,10 @@ impl Fetcher for HttpFetcher {
         last_modified: &str,
     ) -> std::result::Result<Fetched, String> {
         self.handle.block_on(async {
-            let mut request = self.client.get(url);
+            let mut current = url.to_string();
+            let mut hops = 0usize;
+            let response = loop {
+            let mut request = self.client.get(&current);
 
             // Signed when a key is configured. The authority is what the
             // signature covers, so it is taken from the URL rather than
@@ -146,7 +143,7 @@ impl Fetcher for HttpFetcher {
             // reaches is worse than no signature, because it looks like a
             // forgery rather than an omission.
             if let Some(signer) = &self.signer {
-                if let Some(authority) = reqwest::Url::parse(url)
+                if let Some(authority) = reqwest::Url::parse(&current)
                     .ok()
                     .and_then(|u| u.host_str().map(|h| match u.port() {
                         Some(p) => format!("{h}:{p}"),
@@ -185,7 +182,44 @@ impl Fetcher for HttpFetcher {
             if !last_modified.is_empty() {
                 request = request.header("if-modified-since", last_modified);
             }
-            let response = request.send().await.map_err(|e| format!("{url}: {e}"))?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("{current}: {e}"))?;
+
+            // Redirects, by hand. Every destination is resolved and refused
+            // before it is followed — a hostile page redirecting a crawl at
+            // somebody's own machine is the cheap attack, and a hostname that
+            // merely resolves somewhere private looks ordinary until the
+            // lookup happens.
+            let code = response.status().as_u16();
+            if matches!(code, 301 | 302 | 303 | 307 | 308) {
+                if hops >= 5 {
+                    break response;
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let Some(location) = location else { break response };
+                // Relative targets are the common case, so resolve against
+                // the URL that produced them rather than requiring absolute.
+                let Ok(next) = reqwest::Url::parse(&current)
+                    .and_then(|base| base.join(&location))
+                else {
+                    break response;
+                };
+                match next.host_str() {
+                    Some(host) if forge_search::net::is_routable_public(host) => {}
+                    _ => break response,
+                }
+                current = next.to_string();
+                hops += 1;
+                continue;
+            }
+            break response;
+            };
 
             let status = response.status().as_u16();
             let final_url = response.url().to_string();
@@ -1325,5 +1359,41 @@ mod tests {
         let out = render("q", &[], &[], &index, &[], &Timing::default());
         assert!(out.contains("read today"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod redirect_signing_tests {
+    /// The fetcher must sign the hop it is about to make, not the URL it was
+    /// originally handed.
+    ///
+    /// Structural, and it earns that: the live check for this needs a server
+    /// that redirects across hosts, and the crawler's own SSRF guard now
+    /// refuses loopback — so the obvious local harness is unavailable by
+    /// design. Meanwhile reverting the fix compiles cleanly and every other
+    /// test still passes, which was verified by doing it. A property nothing
+    /// catches is a property that comes back.
+    ///
+    /// Assembled, since this test reads the file it lives in.
+    #[test]
+    fn the_signature_covers_the_hop_not_the_original_url() {
+        let code = include_str!("search.rs");
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let signing_parse = ["reqwest", "::Url::parse(&current)"].concat();
+        assert!(
+            flat.contains(&signing_parse),
+            "the signed authority is no longer taken from the current hop",
+        );
+
+        // And the original URL must not be what gets signed. It is still used
+        // for the first request and for error messages, so this looks only at
+        // the parse that feeds the signer.
+        let wrong = ["if let Some(authority) = reqwest", "::Url::parse(url)"].concat();
+        assert!(
+            !flat.contains(&wrong),
+            "the signer is being handed the originally requested URL again, \
+             so a cross-host redirect would carry a signature for the wrong host",
+        );
     }
 }

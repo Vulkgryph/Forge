@@ -187,13 +187,6 @@ impl Default for ContextStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Path to a PKCS#8 Ed25519 private key used to sign outbound crawler
-    /// requests (Web Bot Auth, RFC 9421). Absent means requests are not
-    /// signed, which is the default and behaves exactly as before.
-    ///
-    /// Signing is only useful once the matching public key is published at
-    /// `<web_bot_auth_directory>/.well-known/http-message-signatures-directory`.
-    /// A signature nobody can look up is a header nobody can check.
     /// Whether a re-crawl may echo back the `ETag` a site issued.
     ///
     /// Off by default, and the asymmetry is the point. `Last-Modified` is a
@@ -208,6 +201,14 @@ pub struct AgentConfig {
     /// you.
     #[serde(default)]
     pub send_etag: bool,
+
+    /// Path to a PKCS#8 Ed25519 private key used to sign outbound crawler
+    /// requests (Web Bot Auth, RFC 9421). Absent means requests are not
+    /// signed, which is the default and behaves exactly as before.
+    ///
+    /// Signing is only useful once the matching public key is published at
+    /// `<web_bot_auth_directory>/.well-known/http-message-signatures-directory`.
+    /// A signature nobody can look up is a header nobody can check.
     #[serde(default)]
     pub web_bot_auth_key: Option<String>,
     /// The origin publishing that key. Required when `web_bot_auth_key` is set.

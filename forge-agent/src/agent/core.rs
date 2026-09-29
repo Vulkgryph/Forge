@@ -4057,10 +4057,10 @@ impl Agent {
             return false;
         }
 
-        while let Some(msg) = self.queued_user_messages.pop_front() {
-            let user_msg = Message::user(&msg);
-            let _ = self.log.log_message(&user_msg);
-            self.history.push(user_msg);
+        let queued: Vec<String> = self.queued_user_messages.drain(..).collect();
+        for message in interjection_messages(&queued) {
+            let _ = self.log.log_message(&message);
+            self.history.push(message);
         }
 
         true
@@ -4989,6 +4989,40 @@ fn is_known_interactive_program(name: &str) -> bool {
     )
 }
 
+/// Said after a message that arrived while the agent was working.
+///
+/// Without it a mid-turn message is just a user message in the transcript,
+/// and a user message means "someone is talking to you" — so the model
+/// answers, offers an opinion, and stops, halfway through work nobody asked
+/// it to abandon. The words are the user's; this says when they arrived and
+/// what that means, which is the part the transcript cannot show.
+///
+/// Deliberately not "always continue". An interjection is often exactly the
+/// instruction to stop, or to go somewhere else, and a note that overrode
+/// that would be worse than the problem it fixes.
+const INTERJECTION_NOTE: &str = "\
+[System: The message above was typed while you were working — it arrived \
+during this turn, not at the start of a new one.\n\
+\n\
+Take it into account and carry on. It is a correction or an addition, not a \
+request for a status report: do not summarise what you have done, do not ask \
+whether to continue, and do not stop — unless the message itself tells you to \
+stop, or changes the goal enough that the remaining work no longer makes \
+sense. If it asks a question, answer it briefly and keep going.]";
+
+/// A queued interjection, plus the note that says what it is.
+///
+/// Pure, so the shape can be tested without a live agent: the user's words
+/// verbatim, then one note however many messages arrived.
+fn interjection_messages(queued: &[String]) -> Vec<Message> {
+    if queued.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Message> = queued.iter().map(|m| Message::user(m)).collect();
+    out.push(Message::system(INTERJECTION_NOTE));
+    out
+}
+
 const PLAN_MODE_SYSTEM_ADDENDUM: &str = "\
 PLAN MODE ACTIVE — You are in planning mode.
 - You can ONLY use read tools (read_file, list_directory, search_code, glob_files) and delegate_task (read-only agents only)
@@ -5620,5 +5654,58 @@ mod plan_mode_exit_tests {
              leave_plan_mode instead, or the model keeps reading the planning \
              directive with no exit_plan_mode tool left to answer it",
         );
+    }
+}
+
+#[cfg(test)]
+mod interjection_tests {
+    use super::{interjection_messages, INTERJECTION_NOTE};
+
+    /// A message typed mid-turn must not read as the end of the turn.
+    ///
+    /// Reported from use: the agent would acknowledge an interjection, give
+    /// its opinion, and stop — halfway through work nobody had asked it to
+    /// abandon. In the transcript a queued message was indistinguishable
+    /// from someone starting a new conversation, and answering a person who
+    /// has just spoken to you means stopping. What the transcript could not
+    /// show is *when* it arrived, which is the whole difference.
+    #[test]
+    fn an_interjection_says_that_it_arrived_mid_turn() {
+        let out = interjection_messages(&["also check the tests".to_string()]);
+
+        assert_eq!(out.len(), 2, "the note is missing");
+        assert_eq!(out[0].role, "user", "the user's words must stay the user's");
+        assert_eq!(out[0].content.as_deref(), Some("also check the tests"));
+
+        let note = out[1].content.as_deref().unwrap_or_default();
+        assert_eq!(out[1].role, "system", "the framing must not be attributed to the user");
+        assert!(note.contains("while you were working"), "{note}");
+        assert!(note.contains("do not summarise"), "{note}");
+        assert!(note.contains("do not stop"), "{note}");
+    }
+
+    /// And it must not turn "stop" into "carry on".
+    ///
+    /// An interjection is very often exactly the instruction to stop, or to
+    /// go somewhere else. A note that overrode that would be worse than the
+    /// problem it fixes, so it names both exceptions rather than insisting.
+    #[test]
+    fn the_note_does_not_override_an_instruction_to_stop() {
+        assert!(INTERJECTION_NOTE.contains("unless the message itself tells you to"));
+        assert!(INTERJECTION_NOTE.contains("no longer makes"));
+    }
+
+    /// Several messages, one note — the note is about the arrival, not about
+    /// each message, and repeating it would crowd out what was said.
+    #[test]
+    fn several_queued_messages_share_one_note() {
+        let out = interjection_messages(&["one".to_string(), "two".to_string()]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].content.as_deref(), Some("one"));
+        assert_eq!(out[1].content.as_deref(), Some("two"));
+        assert_eq!(out[2].role, "system");
+
+        // And nothing at all when nothing is queued.
+        assert!(interjection_messages(&[]).is_empty());
     }
 }

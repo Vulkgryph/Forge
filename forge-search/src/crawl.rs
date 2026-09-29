@@ -427,7 +427,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                     .unwrap_or(DEFAULT_BACKOFF)
                     .clamp(1.0, MAX_BACKOFF);
                 let next = self.clock.now() + backoff;
-                self.next_allowed.insert(url.authority(), next);
+                self.defer_host(url.authority(), next);
                 report.rate_limited += 1;
                 continue;
             }
@@ -478,7 +478,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 // The destination host has now been fetched from, so it owes
                 // the same politeness gap as any other.
                 let next = self.clock.now() + self.limits.politeness;
-                self.next_allowed.insert(actual.authority(), next);
+                self.defer_host(actual.authority(), next);
             }
 
             let page = html::parse(&fetched.body);
@@ -651,7 +651,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             // first page one second after robots.txt.
             if let Some(delay) = rules.crawl_delay {
                 let next = self.clock.now() + delay.max(self.limits.politeness);
-                self.next_allowed.insert(host.clone(), next);
+                self.defer_host(host.clone(), next);
             }
             self.robots.insert(key.clone(), rules);
         }
@@ -694,6 +694,25 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         last
     }
 
+    /// Record that this host may not be contacted before `until`.
+    ///
+    /// Never earlier than it already says. `next_allowed` has four writers —
+    /// ordinary politeness, the gap a site asked for in `Crawl-delay`, the
+    /// stand-off after a 429 or 503, and the politeness owed to a redirect
+    /// destination — and one reader, which sleeps until whatever is there.
+    /// Each writer knows only its own reason to wait, so any of them
+    /// overwriting could shorten a longer wait another had set: a 429 asking
+    /// for five minutes, undone a moment later by a one-second politeness
+    /// stamp, and the crawl walks straight back into the host that had just
+    /// asked it to stop.
+    ///
+    /// The invariant was unwritten and held only by the order things happened
+    /// to run in. It is a function now.
+    fn defer_host(&mut self, host: String, until: f64) {
+        let current = self.next_allowed.get(&host).copied().unwrap_or(f64::MIN);
+        self.next_allowed.insert(host, until.max(current));
+    }
+
     /// Wait until this host may be contacted, then record the next time.
     fn wait_for_host(&mut self, url: &Url) {
         let host = url.authority();
@@ -716,7 +735,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         if let Some(&next) = self.next_allowed.get(&host) {
             self.clock.sleep_until(next);
         }
-        self.next_allowed.insert(host, self.clock.now() + delay);
+        self.defer_host(host, self.clock.now() + delay);
     }
 }
 
@@ -1660,6 +1679,43 @@ mod tests {
             paced.iter().all(|&w| w >= 4.9),
             "the site asked for 5s between requests and got {paced:?}"
         );
+    }
+
+    /// A longer wait is never shortened by a later writer.
+    ///
+    /// `next_allowed` has four writers and one reader, and each writer knows
+    /// only its own reason to wait: ordinary politeness, the gap a site asked
+    /// for, the stand-off after a 429, and the politeness owed to a redirect
+    /// destination. Any of them overwriting could undo a longer wait another
+    /// had set — a host asking for five minutes, then a redirect to that same
+    /// host stamping one second over it, and the crawl walks straight back in.
+    ///
+    /// Tested on the invariant directly. The first version of this test drove
+    /// a 429 through a whole crawl and passed with plain overwriting, because
+    /// by the time anything writes again the clock has moved past the old
+    /// value and overwriting happens to be harmless in that order. It proved
+    /// nothing, which is worse than not existing.
+    #[test]
+    fn a_longer_wait_is_never_shortened_by_a_later_writer() {
+        let fetcher = site();
+        let clock = FakeClock::default();
+        let mut crawler = Crawler::new(&fetcher, &clock, Limits::default());
+
+        crawler.defer_host("a.example".to_string(), 300.0);
+        crawler.defer_host("a.example".to_string(), 1.0);
+        assert_eq!(
+            crawler.next_allowed.get("a.example").copied(),
+            Some(300.0),
+            "a one-second stamp undid a five-minute stand-off"
+        );
+
+        // And it still moves forward when the new time is later.
+        crawler.defer_host("a.example".to_string(), 600.0);
+        assert_eq!(crawler.next_allowed.get("a.example").copied(), Some(600.0));
+
+        // A host nobody has deferred takes the value as given.
+        crawler.defer_host("b.example".to_string(), 42.0);
+        assert_eq!(crawler.next_allowed.get("b.example").copied(), Some(42.0));
     }
 
     /// The reason time is injected: politeness is the behaviour most worth

@@ -302,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the crawler's signing key, if one is configured. Set once here for
     // the same reason as the line above: the crawler is reached through
     // several paths that have no business carrying configuration.
+    tools::botauth::set_send_etag(app_config.agent.send_etag);
     tools::botauth::configure(
         app_config.agent.web_bot_auth_key.as_deref(),
         app_config.agent.web_bot_auth_directory.as_deref(),

@@ -173,7 +173,13 @@ impl Fetcher for HttpFetcher {
             }
             // Only what the server itself gave us last time. A validator we
             // invented would be a claim about a copy the server never sent.
-            if !etag.is_empty() {
+            // `Last-Modified` below is a content property — the same value for
+            // every visitor, so returning it identifies nobody. An `ETag` is
+            // server-chosen and can be minted per visitor, which is a known
+            // tracking technique, so it goes back only if the operator asked
+            // for it. Most of the bandwidth saving comes from the harmless
+            // one.
+            if !etag.is_empty() && crate::tools::botauth::send_etag() {
                 request = request.header("if-none-match", etag);
             }
             if !last_modified.is_empty() {

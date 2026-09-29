@@ -73,6 +73,10 @@ const DEFAULT_SEEDS: &[&str] = &[
 /// is why every crawl runs inside `spawn_blocking` — see [`search`].
 pub(crate) struct HttpFetcher {
     client: reqwest::Client,
+    /// Signs outbound requests when the operator has configured a key, so a
+    /// site can verify who is calling instead of taking the user agent's word
+    /// for it. `None` means unsigned, which is the default.
+    signer: Option<std::sync::Arc<crate::tools::botauth::Signer>>,
     handle: tokio::runtime::Handle,
     /// Largest body to read, so one enormous page cannot exhaust memory
     /// before the crawler's own limit has a chance to reject it.
@@ -83,6 +87,14 @@ impl HttpFetcher {
     /// One configured the way every caller wants it: identified, bounded in
     /// time, and following a sane number of redirects.
     pub(crate) fn new(handle: tokio::runtime::Handle, max_bytes: usize) -> Self {
+        Self::signed(handle, max_bytes, crate::tools::botauth::signer())
+    }
+
+    pub(crate) fn signed(
+        handle: tokio::runtime::Handle,
+        max_bytes: usize,
+        signer: Option<std::sync::Arc<crate::tools::botauth::Signer>>,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .user_agent(USER_AGENT)
@@ -109,6 +121,7 @@ impl HttpFetcher {
                 .unwrap_or_default(),
             handle,
             max_bytes,
+            signer,
         }
     }
 }
@@ -126,6 +139,38 @@ impl Fetcher for HttpFetcher {
     ) -> std::result::Result<Fetched, String> {
         self.handle.block_on(async {
             let mut request = self.client.get(url);
+
+            // Signed when a key is configured. The authority is what the
+            // signature covers, so it is taken from the URL rather than
+            // passed in — a signature over a different host than the request
+            // reaches is worse than no signature, because it looks like a
+            // forgery rather than an omission.
+            if let Some(signer) = &self.signer {
+                if let Some(authority) = reqwest::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| match u.port() {
+                        Some(p) => format!("{h}:{p}"),
+                        None => h.to_string(),
+                    }))
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut nonce = [0u8; 64];
+                    // A fresh nonce per request, so a captured signature
+                    // cannot be replayed inside its validity window.
+                    {
+                        use rand::RngCore as _;
+                        rand::thread_rng().fill_bytes(&mut nonce);
+                    }
+                    let signed = signer.sign(&authority, now, &nonce);
+                    request = request
+                        .header("signature-agent", signed.signature_agent)
+                        .header("signature-input", signed.signature_input)
+                        .header("signature", signed.signature);
+                }
+            }
             // Only what the server itself gave us last time. A validator we
             // invented would be a claim about a copy the server never sent.
             if !etag.is_empty() {

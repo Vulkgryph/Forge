@@ -1742,6 +1742,7 @@ dependencies = [
  "nix 0.29.0",
  "rand 0.8.7",
  "reqwest",
+ "ring",
  "scraper",
  "serde",
  "serde_json",

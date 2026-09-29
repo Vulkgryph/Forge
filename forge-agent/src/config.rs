@@ -187,6 +187,18 @@ impl Default for ContextStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// Path to a PKCS#8 Ed25519 private key used to sign outbound crawler
+    /// requests (Web Bot Auth, RFC 9421). Absent means requests are not
+    /// signed, which is the default and behaves exactly as before.
+    ///
+    /// Signing is only useful once the matching public key is published at
+    /// `<web_bot_auth_directory>/.well-known/http-message-signatures-directory`.
+    /// A signature nobody can look up is a header nobody can check.
+    #[serde(default)]
+    pub web_bot_auth_key: Option<String>,
+    /// The origin publishing that key. Required when `web_bot_auth_key` is set.
+    #[serde(default)]
+    pub web_bot_auth_directory: Option<String>,
     pub auto_approve_reads: bool,
     pub auto_approve_writes: bool,
     /// Legacy global switch for providers that expose thinking controls.
@@ -403,6 +415,8 @@ impl Default for AppConfig {
                 web_tool_model: None,
             },
             agent: AgentConfig {
+                web_bot_auth_key: None,
+                web_bot_auth_directory: None,
                 auto_approve_reads: true,
                 auto_approve_writes: false,
                 thinking_mode: true,

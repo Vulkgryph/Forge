@@ -121,7 +121,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      ~/.config/forge/config.toml first.\n\
                      \n\
                      Generate a key with:\n\
-                     \x20 openssl genpkey -algorithm ed25519 -out forge-bot-auth.pem"
+                     \x20 openssl genpkey -algorithm ED25519 -out forge-bot-auth.pem\n\
+                     \n\
+                     The algorithm name is case-sensitive, and macOS ships \
+                     LibreSSL as `openssl`, which has no ED25519 at all — use \
+                     an OpenSSL 3 build (`brew install openssl`) there."
                 );
                 std::process::exit(1);
             }

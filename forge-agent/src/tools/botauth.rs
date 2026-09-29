@@ -178,10 +178,19 @@ impl Signer {
     pub fn directory_json(&self) -> String {
         use ring::signature::KeyPair as _;
         let x = b64url(self.key.public_key().as_ref());
+        // `signature_agent` and `purpose` come from the architecture draft and
+        // are what Cloudflare's own reference directory serves. `purpose` is
+        // the useful one: it says what the crawler is *for*, which is the same
+        // thing Forge asks of a site when it reads Content-Signals. Declaring
+        // it is the reciprocal of expecting sites to declare theirs.
+        //
+        // No `nbf`/`exp` on the key. Those describe a validity window, and a
+        // window nothing rotates against is a date that quietly goes stale.
         format!(
             "{{\"keys\":[{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"alg\":\"Ed25519\",\
-             \"use\":\"sig\",\"kid\":\"{}\",\"x\":\"{}\"}}]}}",
-            self.keyid, x
+             \"use\":\"sig\",\"kid\":\"{}\",\"x\":\"{}\"}}],\
+             \"signature_agent\":\"{}\",\"purpose\":\"rag\"}}",
+            self.keyid, x, self.directory
         )
     }
 
@@ -382,6 +391,13 @@ mod tests {
         assert!(dir.contains(signer.keyid()), "the kid is not the thumbprint: {dir}");
         // The public half, and only the public half.
         assert!(!dir.contains("\"d\""), "a private key was about to be published");
+        // What the crawler is for, and where its key lives — both of which a
+        // site operator deciding whether to allow it will want.
+        assert!(dir.contains("\"purpose\":\"rag\""), "{dir}");
+        assert!(dir.contains("\"signature_agent\":\"https://vulkgryph.com\""), "{dir}");
+        // And it has to be valid JSON, not merely a string that looks like it.
+        let parsed: serde_json::Value = serde_json::from_str(&dir).expect("valid JSON");
+        assert_eq!(parsed["keys"][0]["crv"], "Ed25519");
     }
 
     /// The PEM reader is hand-written, so it gets its own check against the

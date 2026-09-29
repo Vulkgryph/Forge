@@ -88,6 +88,64 @@ pub fn signer() -> Option<std::sync::Arc<Signer>> {
     SIGNER.get().cloned().flatten()
 }
 
+/// Generate a signing key and write it, PEM-armoured, readable only by its
+/// owner.
+///
+/// Forge generates this itself rather than telling somebody to run `openssl`.
+/// The instruction to run `openssl genpkey -algorithm ED25519` is wrong twice
+/// over on a Mac — the algorithm name is case-sensitive, and macOS ships
+/// LibreSSL as `openssl`, which has no ED25519 at all — so the advice failed
+/// on the platform Forge shipped on first, and the reader's reasonable
+/// conclusion was that they had typed it wrong. A tool that needs a key can
+/// make a key.
+///
+/// Refuses to overwrite. A signing key is an identity: replacing one silently
+/// would orphan every signature already published against it, and the only
+/// symptom would be sites quietly ceasing to recognise the crawler.
+pub fn generate_key(path: &std::path::Path) -> Result<String, String> {
+    if path.exists() {
+        return Err(format!(
+            "{} already exists — refusing to overwrite a signing key, because \
+             replacing one silently orphans every signature published against it",
+            path.display()
+        ));
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| "could not generate a key".to_string())?;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(doc.as_ref());
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, &pem).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    restrict_to_owner(path);
+
+    let signer = Signer::new(doc.as_ref(), "https://example.invalid")?;
+    Ok(signer.keyid)
+}
+
+/// Owner-only, because this file is the crawler's identity.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) {
+    // Windows inherits the parent directory's ACL, which for a per-user
+    // config directory is already owner-only.
+}
+
 /// The DER between the PEM armour. Written here rather than pulled in,
 /// because it is base64 between two known lines.
 pub fn pkcs8_from_pem(pem: &[u8]) -> Option<Vec<u8>> {
@@ -471,6 +529,41 @@ mod tests {
             public.verify(tampered.as_bytes(), &sig).is_err(),
             "the signature verified against a different authority"
         );
+    }
+
+    /// Forge makes its own key, so nobody has to find a working openssl.
+    #[test]
+    fn a_generated_key_is_usable_private_and_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("forge-keygen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bot-auth.pem");
+
+        let keyid = generate_key(&path).expect("a key is generated");
+        assert!(!keyid.is_empty());
+
+        // It round-trips through the same reader the runtime uses.
+        let pem = std::fs::read(&path).expect("written");
+        let der = pkcs8_from_pem(&pem).expect("armoured correctly");
+        let signer = Signer::new(&der, "https://vulkgryph.com").expect("loads");
+        assert_eq!(signer.keyid(), keyid, "the reported keyid is not the key's");
+
+        // And it actually signs.
+        let out = signer.sign("docs.rs", 1_800_000_000, &[1u8; 64]);
+        assert!(out.signature.starts_with("sig1=:"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a signing key was readable by others");
+        }
+
+        // A second call must not destroy the first key.
+        let before = std::fs::read(&path).unwrap();
+        assert!(generate_key(&path).is_err(), "overwrote an existing signing key");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the key changed anyway");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

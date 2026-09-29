@@ -573,7 +573,7 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         // so an http page could be governed by the https file or the reverse.
         // Politeness stays keyed on the bare authority, because a server is
         // one server however you reach it.
-        let key = format!("{}://{}", url.scheme, url.authority());
+        let key = robots_key(url);
         let host = url.authority();
         if !self.robots.contains_key(&key) {
             let robots_url = format!("{}/robots.txt", key);
@@ -699,9 +699,17 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
         let host = url.authority();
         // A site's own figure is honoured over the configured one, never
         // undercut by it — the configured value is a floor, not a target.
+        //
+        // Looked up by the same key the rules were stored under. This read
+        // the bare authority while the cache had moved to origin keys, so it
+        // missed every time and every request silently took the 1s default —
+        // the crawl paced its first page correctly, because loading
+        // robots.txt re-stamps the clock, and then ignored the site for the
+        // rest of it. Two spellings of one key is the whole bug, so there is
+        // now one function that spells it.
         let delay = self
             .robots
-            .get(&host)
+            .get(&robots_key(url))
             .and_then(|r| r.crawl_delay)
             .map_or(self.limits.politeness, |d| d.max(self.limits.politeness));
 
@@ -716,6 +724,17 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
 ///
 /// The convenience form. Anything wanting to add to an existing index, or to
 /// control time, uses [`Crawler`] directly.
+/// The key a host's `robots.txt` is cached under: its origin.
+///
+/// RFC 9309 scopes the file to (scheme, host, port), so http and https on one
+/// host are two different files. Politeness is keyed on the bare authority
+/// instead — a server is one server however you reach it — and keeping those
+/// two distinctions straight is why this is a function rather than a format
+/// string written out wherever it is needed.
+fn robots_key(url: &Url) -> String {
+    format!("{}://{}", url.scheme, url.authority())
+}
+
 /// What a body served at `/robots.txt` actually is.
 ///
 /// Three answers, not two. Requiring a literal `user-agent:` line meant an
@@ -1607,6 +1626,39 @@ mod tests {
         assert!(
             clock.waits.borrow().iter().all(|&w| w < 86400.0),
             "waited the full day instead of declining"
+        );
+    }
+
+    /// A site's `Crawl-delay` has to pace every request, not just the first.
+    ///
+    /// Regression, and one I caused: keying the robots cache by origin —
+    /// correct, RFC 9309 scopes robots to (scheme, host, port) — while
+    /// `wait_for_host` still looked the rules up by bare authority meant the
+    /// lookup missed every time. The re-stamp after loading robots.txt hid it
+    /// for the first page, so a crawl paced its opening request correctly and
+    /// then went at the 1s default for the rest of the site, while reporting
+    /// itself as obeying. Found in review.
+    #[test]
+    fn a_crawl_delay_paces_every_request_not_only_the_first() {
+        let fetcher = site().with_response(
+            "https://a.example/robots.txt",
+            Fetched {
+                status: 200,
+                final_url: "https://a.example/robots.txt".into(),
+                content_type: "text/plain".into(),
+                body: "User-agent: *\nCrawl-delay: 5\n".into(),
+                headers: Vec::new(),
+            },
+        );
+        let (index, _, clock) = run(&fetcher, Limits::default());
+        assert!(index.len() >= 3, "too few pages to prove pacing: {}", index.len());
+
+        let waits = clock.waits.borrow();
+        let paced: Vec<f64> = waits.iter().copied().filter(|&w| w > 0.0).collect();
+        assert!(paced.len() >= 3, "expected several waits, got {paced:?}");
+        assert!(
+            paced.iter().all(|&w| w >= 4.9),
+            "the site asked for 5s between requests and got {paced:?}"
         );
     }
 

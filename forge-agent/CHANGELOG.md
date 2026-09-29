@@ -32,6 +32,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
   Group matching also used `starts_with` on the whole User-Agent string, so a group named `forge` captured `forge-search`; RFC 9309 matches the product token.
 
+  Scoping the robots cache by origin then broke `Crawl-delay` for every page after the first, because the pacing code still looked the rules up by bare authority — the same key spelled two ways, so the lookup missed and every request fell back to the one-second default. Loading `robots.txt` re-stamps the clock, which paced the opening request correctly and hid it. Caught in review before release; no shipped version is affected, and there is one function that spells the key now.
+
   Review caught an over-correction in the first pass of this: requiring a literal `user-agent:` line meant an **empty** `robots.txt` — the commonest way of all to say "no restrictions" — was indistinguishable from a login page, and both were refused. A body is now classified three ways rather than two: rules to read, nothing to obey (which is permission, and what an empty file has always meant), or content that is not this file at all.
 
 - **429 and 503 were ignored.** Both were counted as "missing" and the crawl carried on at the same rate. That is worse than ignoring a static `Crawl-delay`: it is the server saying it is struggling, while it is struggling, and under a user agent that names us it is the fastest route onto a blocklist by name. `Retry-After` is honoured in both its forms, with a default stand-off when none is sent. Europe PMC had the identical shape and got the same treatment.

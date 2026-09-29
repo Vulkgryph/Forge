@@ -79,11 +79,55 @@ struct Cli {
     /// Log in to ChatGPT Codex via OAuth (for ChatGPT subscription Codex)
     #[arg(long)]
     login_chatgpt: bool,
+
+    /// Print the JSON to publish at
+    /// `/.well-known/http-message-signatures-directory`, and exit.
+    ///
+    /// Signed crawler requests are only verifiable once this is served from
+    /// the origin named by `agent.web_bot_auth_directory`. Printed from the
+    /// key that actually signs, rather than written by hand, because a
+    /// directory that disagrees with the key produces signatures nobody can
+    /// check and nothing on this side would report it.
+    #[arg(long)]
+    print_bot_auth_directory: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    if cli.print_bot_auth_directory {
+        // Reported, not defaulted. Falling back to defaults here would print
+        // "set these keys first" at somebody who had set them and whose file
+        // failed to parse for an unrelated reason.
+        let app_config = config::AppConfig::load()
+            .map_err(|e| format!("cannot read the config: {e}"))?;
+        match (
+            app_config.agent.web_bot_auth_key.as_deref(),
+            app_config.agent.web_bot_auth_directory.as_deref(),
+        ) {
+            (Some(path), Some(dir)) => {
+                let pem = std::fs::read(path)
+                    .map_err(|e| format!("cannot read {path}: {e}"))?;
+                let der = tools::botauth::pkcs8_from_pem(&pem)
+                    .ok_or_else(|| format!("{path} is not a PEM private key"))?;
+                let signer = tools::botauth::Signer::new(&der, dir)
+                    .map_err(|e| e.to_string())?;
+                println!("{}", signer.directory_json());
+            }
+            _ => {
+                eprintln!(
+                    "Set agent.web_bot_auth_key and agent.web_bot_auth_directory in \
+                     ~/.config/forge/config.toml first.\n\
+                     \n\
+                     Generate a key with:\n\
+                     \x20 openssl genpkey -algorithm ed25519 -out forge-bot-auth.pem"
+                );
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     // Handle --login-chatgpt before anything else.
     if cli.login_chatgpt {
@@ -217,6 +261,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // version self-check is not part of a model call and has no business
     // running when the user asked for no incidental traffic.
     auth::set_offline_mode(app_config.agent.offline_mode);
+
+    // Load the crawler's signing key, if one is configured. Set once here for
+    // the same reason as the line above: the crawler is reached through
+    // several paths that have no business carrying configuration.
+    tools::botauth::configure(
+        app_config.agent.web_bot_auth_key.as_deref(),
+        app_config.agent.web_bot_auth_directory.as_deref(),
+    );
 
     // Two credential-bearing calls used to happen here for anyone with Codex
     // tokens on disk, whatever endpoint they were actually using: a token

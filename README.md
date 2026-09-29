@@ -262,6 +262,27 @@ by name. Neither pretends to be a browser and neither ignores `robots.txt`, so
 `Disallow` is enough to stop them — from one user at a page a second, which is
 the scale this runs at.
 
+A user agent is only a claim, though, and anyone can write one. If the
+operator has configured a signing key, requests also carry a **Web Bot Auth**
+signature — `draft-meunier-webbotauth-httpsig-protocol`, built on RFC 9421
+HTTP Message Signatures — so you can check the claim instead of weighing it:
+
+```
+Signature-Agent: sig1="https://example.com"
+Signature-Input: sig1=("@authority" "signature-agent";key="sig1")
+                 ;created=…;expires=…;keyid=…;alg="ed25519";nonce=…
+                 ;tag="web-bot-auth"
+Signature: sig1=:…:
+```
+
+The public key is published at
+`/.well-known/http-message-signatures-directory` on the origin named by
+`Signature-Agent`, and `keyid` is that key's JWK thumbprint. Cloudflare
+validates these at its edge as part of its Verified Bots programme, so a site
+behind it can allow or refuse this crawler by identity rather than by
+guesswork. Unsigned is the default — a signature only means something once the
+directory is published.
+
 If something is wrong anyway, **contact@vulkgryph.com**. Worth saying what
 counts as wrong: crawling you said not to, requests faster than `Crawl-delay`,
 or anything that looks like it is pretending to be something else. Those would

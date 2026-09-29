@@ -68,6 +68,10 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 
 # OAuth / crypto (PKCE + state nonce for ChatGPT Codex subscription login)
+# Ed25519 for Web Bot Auth request signing. Already linked in via rustls;
+# declared here because signature crypto is the standing exception to writing
+# it ourselves — a subtly wrong curve implementation fails open and silently.
+ring = "0.17"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"

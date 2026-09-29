@@ -80,6 +80,16 @@ pub fn is_obviously_local(host: &str) -> bool {
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return !is_public_ip(&ip);
     }
+    // The same address written so it does not look like one. `2130706433`,
+    // `127.1`, `0x7f.1` and `017700000001` are all 127.0.0.1 to the resolver
+    // a connection actually goes through, and none of them parse as an
+    // address here — Rust's parser wants four decimal octets. Forge's own URL
+    // parser does not normalise them either, so the host reached this check
+    // spelled exactly as written and walked past it, and the HTTP client
+    // normalised it afterwards and connected to loopback.
+    if let Some(ip) = parse_relaxed_ipv4(bare) {
+        return !is_public_v4(&ip);
+    }
 
     // Names, case-insensitively. `localhost` is required to be loopback;
     // `.local` is mDNS and `.internal` is the conventional private zone.
@@ -89,6 +99,71 @@ pub fn is_obviously_local(host: &str) -> bool {
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
         || lower == "broadcasthost"
+}
+
+/// The historical `inet_aton` spellings of an IPv4 address.
+///
+/// One to four parts, each decimal, octal (leading zero) or hex (`0x`), with
+/// the last part filling the remaining octets. This is what a C resolver has
+/// always accepted and what every browser still accepts, so it is what an
+/// address means in practice regardless of what the strict parser says.
+///
+/// Returns `None` for anything that is not unambiguously one of these, so an
+/// ordinary hostname is never mistaken for an address.
+fn parse_relaxed_ipv4(host: &str) -> Option<Ipv4Addr> {
+    if host.is_empty() || host.ends_with('.') {
+        return None;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let lower = part.to_ascii_lowercase();
+        let value = if let Some(hex) = lower.strip_prefix("0x") {
+            if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            u64::from_str_radix(hex, 16).ok()?
+        } else if lower.len() > 1 && lower.starts_with('0') {
+            if !lower[1..].chars().all(|c| ('0'..='7').contains(&c)) {
+                return None;
+            }
+            u64::from_str_radix(&lower[1..], 8).ok()?
+        } else {
+            if !lower.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            lower.parse::<u64>().ok()?
+        };
+        values.push(value);
+    }
+
+    // Every part but the last is one octet; the last fills what remains.
+    let last = *values.last()?;
+    let leading = &values[..values.len() - 1];
+    if leading.iter().any(|&v| v > 255) {
+        return None;
+    }
+    let remaining_octets = 4 - leading.len();
+    let max_last = match remaining_octets {
+        1 => 0xff,
+        2 => 0xffff,
+        3 => 0xff_ffff,
+        _ => 0xffff_ffff,
+    };
+    if last > max_last {
+        return None;
+    }
+
+    let mut bits: u32 = 0;
+    for (i, &v) in leading.iter().enumerate() {
+        bits |= (v as u32) << (8 * (3 - i));
+    }
+    bits |= last as u32;
+    Some(Ipv4Addr::from(bits))
 }
 
 /// Whether a host names something on the public internet.
@@ -114,6 +189,9 @@ pub fn is_routable_public(host: &str) -> bool {
     // resolver is not obliged to accept one.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return is_public_ip(&ip);
+    }
+    if let Some(ip) = parse_relaxed_ipv4(host) {
+        return is_public_v4(&ip);
     }
     // Bracketed IPv6 as it appears in a URL authority.
     let unbracketed = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
@@ -207,6 +285,60 @@ mod tests {
         assert!(!is_routable_public("[::1]"));
         assert!(!is_routable_public("[::ffff:127.0.0.1]"));
         assert!(is_routable_public("1.1.1.1"));
+    }
+
+    /// Loopback written so it does not look like loopback.
+    ///
+    /// Reported by review. None of these parse as an address with the strict
+    /// parser, and Forge's own URL parser does not normalise them — so the
+    /// host arrived at the guard spelled exactly as written, was judged "not
+    /// obviously local", and the HTTP client normalised it afterwards and
+    /// connected to 127.0.0.1. Every one of these is a working way to reach
+    /// the local machine from a browser.
+    #[test]
+    fn the_obfuscated_spellings_of_loopback_are_recognised() {
+        for spelling in [
+            "2130706433",       // decimal
+            "127.1",            // short form, last part fills two octets
+            "0x7f.1",           // hex first octet
+            "017700000001",     // octal
+            "0x7f000001",       // hex, whole address
+            "127.0x0.0x0.1",    // mixed
+        ] {
+            assert!(
+                is_obviously_local(spelling),
+                "{spelling} reaches loopback and was not recognised"
+            );
+            assert!(!is_routable_public(spelling), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_hostname_is_not_mistaken_for_an_address() {
+        // The relaxed parser must not swallow names. A false positive here
+        // refuses a legitimate site.
+        for name in [
+            "example.com",
+            "1.example.com",
+            "0x.example",
+            "999",              // out of range for one part? no — but not a name
+            "example.",         // trailing dot
+            "12.34.56.78.90",   // five parts
+            "1.2.3.4.5",
+        ] {
+            let relaxed = super::parse_relaxed_ipv4(name);
+            if let Some(ip) = relaxed {
+                // If it did parse, it must be a real address, not a name.
+                assert!(
+                    name.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'x' || c.is_ascii_hexdigit()),
+                    "{name} was parsed as {ip}"
+                );
+            }
+        }
+        // Public numeric addresses still pass.
+        assert!(!is_obviously_local("8.8.8.8"));
+        assert!(!is_obviously_local("134744072")); // 8.8.8.8 in decimal
+        assert!(is_routable_public("134744072"));
     }
 
     #[test]

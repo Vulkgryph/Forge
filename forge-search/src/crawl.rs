@@ -458,7 +458,11 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
             // public internet at all. A hostile page redirecting a legitimate
             // crawl at 127.0.0.1 put the response in the index and then in
             // front of the model, with no cooperation from the model needed.
-            if actual.host != url.host {
+            // Authority, not host. A redirect from a.example to
+            // a.example:2375 keeps the host and changes the server — it is a
+            // different origin, a different robots.txt under RFC 9309, and
+            // it was the obvious way past a check that compared hosts.
+            if actual.authority() != url.authority() {
                 if crate::net::is_obviously_local(&actual.host) {
                     report.not_public += 1;
                     continue;
@@ -585,13 +589,13 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 // the most permissive possible answer to a question that was
                 // never answered. `looks_like_robots` was already written for
                 // the challenge branch; the clean path needed it just as much.
-                Ok(r) if r.is_ok() => {
-                    if looks_like_robots(&r.body) {
-                        Robots::parse(&r.body, self.fetcher.user_agent())
-                    } else {
-                        Robots::deny_all()
-                    }
-                }
+                Ok(r) if r.is_ok() => match classify_robots(&r.body) {
+                    RobotsBody::Rules => Robots::parse(&r.body, self.fetcher.user_agent()),
+                    // An empty file is a site saying there is nothing to
+                    // obey. That is permission, and always has been.
+                    RobotsBody::NoRules => Robots::allow_all(),
+                    RobotsBody::NotRobots => Robots::deny_all(),
+                },
 
                 // A bot check on `robots.txt` is the site answering, not the
                 // site staying silent — so it is never read as permission.
@@ -610,7 +614,11 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
                 // assuming the worst about it, and here it says the same thing
                 // either way.
                 Ok(r) if r.challenge().is_some() => {
-                    if looks_like_robots(&r.body) {
+                    // Rules under a challenge are still rules — that is the
+                    // Cloudflare-418 case. But an *empty* body here is not
+                    // the permissive empty file above: the site refused, and
+                    // a refusal with nothing in it says nothing.
+                    if classify_robots(&r.body) == RobotsBody::Rules {
                         Robots::parse(&r.body, self.fetcher.user_agent())
                     } else {
                         Robots::deny_all()
@@ -708,15 +716,65 @@ impl<'a, F: Fetcher, C: Clock> Crawler<'a, F, C> {
 ///
 /// The convenience form. Anything wanting to add to an existing index, or to
 /// control time, uses [`Crawler`] directly.
-/// Whether a body looks like `robots.txt` rather than an error page.
+/// What a body served at `/robots.txt` actually is.
 ///
-/// One directive is enough, and `user-agent` is the one every group must
-/// begin with. Deliberately not a parse: this only decides whether parsing is
-/// worth attempting on a response that was not a clean 200.
-fn looks_like_robots(body: &str) -> bool {
-    body.lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim().to_ascii_lowercase())
-        .any(|l| l.starts_with("user-agent:"))
+/// Three answers, not two. Requiring a literal `user-agent:` line meant an
+/// **empty** robots.txt — the commonest way of all to say "no restrictions" —
+/// was indistinguishable from a login page, and both were refused. So were
+/// whitespace, comments alone, and a file of nothing but `Sitemap:`. Failing
+/// closed is the safe direction, but refusing most of the permissive web is
+/// not a safe outcome.
+#[derive(Debug, PartialEq)]
+enum RobotsBody {
+    /// Parseable directives. Read them.
+    Rules,
+    /// Nothing to say: empty, blank, or only comments. That is a file saying
+    /// there are no restrictions, which is what an empty one has always meant.
+    NoRules,
+    /// Content that is not this file. A login page, an SPA shell, an error
+    /// document — something was served, but not the rules that were asked for,
+    /// and "I could not hear you" is not permission.
+    NotRobots,
+}
+
+/// Every field name RFC 9309 defines, plus the widely-served extensions. An
+/// unknown line is not disqualifying on its own — real files carry junk — but
+/// a file with *no* recognised line and some other content is not this file.
+const ROBOTS_FIELDS: [&str; 10] = [
+    "user-agent",
+    "disallow",
+    "allow",
+    "crawl-delay",
+    "sitemap",
+    "host",
+    "request-rate",
+    "visit-time",
+    "noindex",
+    "clean-param",
+];
+
+fn classify_robots(body: &str) -> RobotsBody {
+    let mut saw_directive = false;
+    let mut saw_other = false;
+
+    for line in body.lines() {
+        let line = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once(':') {
+            Some((key, _)) if ROBOTS_FIELDS.contains(&key.trim()) => saw_directive = true,
+            _ => saw_other = true,
+        }
+    }
+
+    if saw_directive {
+        RobotsBody::Rules
+    } else if saw_other {
+        RobotsBody::NotRobots
+    } else {
+        RobotsBody::NoRules
+    }
 }
 
 pub fn crawl<F: Fetcher>(fetcher: &F, seeds: &[&str], limits: Limits) -> (Index, Report) {
@@ -825,15 +883,84 @@ mod tests {
         assert_eq!(index.len(), 1, "{report:?}");
     }
 
-    /// The shape check that decides whether a non-200 body is worth parsing.
+    /// Three answers, because the question has three.
+    ///
+    /// Requiring a literal `user-agent:` line collapsed "this file says
+    /// nothing" into "this is not the file", and refused both. An empty
+    /// robots.txt is the commonest way a site says it has no restrictions,
+    /// so that mistake refused most of the permissive web. Reported by
+    /// review, against a fix of mine that had over-corrected.
     #[test]
-    fn a_body_is_recognised_as_rules_or_not() {
-        assert!(looks_like_robots("User-agent: *\nDisallow: /\n"));
-        assert!(looks_like_robots("# a comment\n\nuser-agent: Googlebot\n"));
-        assert!(!looks_like_robots("<html><body>Just a moment...</body></html>"));
-        assert!(!looks_like_robots(""));
-        // A commented-out directive is not a directive.
-        assert!(!looks_like_robots("# User-agent: *\n"));
+    fn a_body_is_rules_nothing_or_not_this_file() {
+        // Rules to read.
+        assert_eq!(classify_robots("User-agent: *\nDisallow: /\n"), RobotsBody::Rules);
+        assert_eq!(classify_robots("# a comment\n\nuser-agent: Googlebot\n"), RobotsBody::Rules);
+        // A file of only Sitemap: is still this file.
+        assert_eq!(
+            classify_robots("Sitemap: https://a.example/sitemap.xml\n"),
+            RobotsBody::Rules
+        );
+
+        // Nothing to obey, which is permission.
+        assert_eq!(classify_robots(""), RobotsBody::NoRules);
+        assert_eq!(classify_robots("\n\n   \n"), RobotsBody::NoRules);
+        assert_eq!(classify_robots("# nothing to see here\n"), RobotsBody::NoRules);
+
+        // Something was served, but not this file.
+        assert_eq!(
+            classify_robots("<html><body>Just a moment...</body></html>"),
+            RobotsBody::NotRobots
+        );
+        assert_eq!(
+            classify_robots("<html><head><title>Sign in</title></head></html>"),
+            RobotsBody::NotRobots
+        );
+    }
+
+    /// The consequence of the above, at the level that matters.
+    #[test]
+    fn an_empty_robots_file_permits_the_crawl() {
+        let fetcher = site().with_response(
+            "https://a.example/robots.txt",
+            Fetched {
+                status: 200,
+                final_url: "https://a.example/robots.txt".into(),
+                content_type: "text/plain".into(),
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        let (index, _, _) = run(&fetcher, Limits::default());
+        assert_eq!(index.len(), 4, "an empty robots.txt refused a permissive site");
+    }
+
+    /// A redirect that keeps the host and changes the port is a different
+    /// server, and was the obvious way past a check that compared hosts.
+    #[test]
+    fn a_redirect_to_another_port_on_the_same_host_is_re_checked() {
+        let fetcher = site()
+            .with_page("https://a.example/", r#"<a href="/hop">next</a>"#)
+            .with_response(
+                "https://a.example:2375/robots.txt",
+                Fetched {
+                    status: 200,
+                    final_url: "https://a.example:2375/robots.txt".into(),
+                    content_type: "text/plain".into(),
+                    body: "User-agent: *\nDisallow: /\n".into(),
+                    headers: Vec::new(),
+                },
+            )
+            .with_redirect(
+                "https://a.example/hop",
+                "https://a.example:2375/admin",
+                "<p>a different server</p>",
+            );
+        let (index, report, _) = run(&fetcher, Limits { stay_on_host: false, ..Default::default() });
+        assert!(
+            !index.contains_url("https://a.example:2375/admin"),
+            "a port change skipped the destination's rules"
+        );
+        assert!(report.disallowed > 0);
     }
 
     /// A challenged page is refused, not missing, and never indexed.

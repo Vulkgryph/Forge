@@ -4,11 +4,37 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Security
+
+- **A crawl could be aimed at the machine Forge was running on.** There was no restriction on which addresses `web_search` and `web_fetch` could reach: `localhost`, `127.0.0.1`, the RFC1918 ranges, and `169.254.169.254` — where a cloud instance serves its own credentials — were all reachable. Two exposure windows, checked against the tags rather than estimated: `web_fetch` has existed and followed redirects since 0.1.0, so a single fetch could be pointed at a local address in every release there has been; the crawler arrived in 0.5.0, so the redirect-and-index route below affects 0.5.0 through 0.5.2.
+
+  The delivery route needed no cooperation from the model. `robots.txt` was checked for the URL that was *requested*; the fetcher then followed up to five redirects on its own, and whatever came back was indexed under the destination's address without the destination ever being checked. So one hostile page in an otherwise ordinary crawl could redirect to `127.0.0.1:2375`, and the contents of a local service would be indexed and then read back to the model as a page from the web. A confused deputy pointed at the user's own machine.
+
+  Now refused at two layers. The crawler rejects an address that is not on the public internet — on its seeds and on every redirect that crosses origins — using a check that does no I/O, because it runs inside a time budget and must not be stallable by a hostile nameserver. Both HTTP fetchers additionally resolve every redirect hop before following it, and `web_fetch` resolves the address it was given, which catches a *hostname* whose A record is private. This is not proof against DNS rebinding, and the code says so rather than implying more: the name is resolved once here and again by the HTTP client, and closing that gap needs the socket.
+
+  A first version of this fix was incomplete, and review caught it. The pure check recognised an address only when it was spelled as one, so `http://2130706433/`, `http://127.1/`, `http://0x7f.1/` and `http://017700000001/` — all of which reach loopback, and all of which a browser accepts — walked past it, because Forge's own URL parser does not normalise them and the HTTP client normalises them afterwards. It now understands every `inet_aton` spelling. A redirect that kept the host and changed the port (`a.example` → `a.example:2375`) also skipped the re-check, because the comparison was on host rather than origin.
+
+- **A cross-origin redirect bypassed `robots.txt`, `stay_on_host`, and per-host politeness.** The same root cause as above and fixed with it: every decision was made about the requested URL, and the destination inherited none of them. A redirect that crosses origins now reads the destination's own `robots.txt` and owes it the same politeness gap as any other host.
+
+- **Forge described a page as one a person had opened in a browser when nobody had.** When a live fetch came back behind a bot check, `web_fetch` would serve an indexed copy with the words *"this page was already opened in a browser by the user and handed over"* — inferred from nothing more than the URL being in the index and the live fetch being refused. A page the crawler collected weeks ago, on a site that has since put a challenge in front of it, satisfies both conditions and produces that sentence verbatim, which the agent then repeats to the user.
+
+  That is a statement about a human action, reconstructed from a proxy for one. It is also the strongest claim this project makes about the browser-handover route — that a person really made the request — so it is the last thing that should be guessed at. The handover now records its own attribution and the claim is read back from what was stored.
+
 ### Changed
 
 - **A re-crawl asks whether a page changed instead of asking for it again.** `Fetcher::fetch` took a URL and nothing else, so it was structurally incapable of sending `If-None-Match` or `If-Modified-Since` — a site asked about repeatedly took a full body for all 120 pages where almost every one would have answered 304 with no body. Documents now keep the `ETag` and `Last-Modified` the server sent, across a save, and a 304 leaves the indexed copy alone. A fetcher that cannot do this, or a server that does not implement it, is unaffected: the default is the unconditional fetch it was before.
 
 ### Fixed
+
+- **The crawler read "we could not tell" as "go ahead" in five places, and overrode the site in two.** A transport error on `robots.txt` returned *no restrictions* with no retry, so a host that selectively drops this crawler's connections — a cheap, standard anti-bot measure — was rewarded for it; `deny_all`'s own documentation already said it covered "a 500, or a timeout", and the code disagreed with the doc. A 200 was trusted without being looked at, so a `robots.txt` that redirects to a login page parsed to zero directives and permitted everything. There was no size bound. The cache dropped the scheme, so whichever of http/https was seen first governed both.
+
+  And two where the site was simply overruled: `User-agent: * / Disallow: /` followed by `User-agent: forge-search / Disallow:` resolved to the blanket ban rather than the exception — the standard "everyone out except you" idiom, and exactly the file a site writes after someone emails to ask for access. `Crawl-delay: 86400` was clamped to 300 seconds and the file called malformed, so a site asking for one visit a day got one every five minutes: 288 times what it asked for, from code describing itself as obeying.
+
+  Group matching also used `starts_with` on the whole User-Agent string, so a group named `forge` captured `forge-search`; RFC 9309 matches the product token.
+
+  Review caught an over-correction in the first pass of this: requiring a literal `user-agent:` line meant an **empty** `robots.txt` — the commonest way of all to say "no restrictions" — was indistinguishable from a login page, and both were refused. A body is now classified three ways rather than two: rules to read, nothing to obey (which is permission, and what an empty file has always meant), or content that is not this file at all.
+
+- **429 and 503 were ignored.** Both were counted as "missing" and the crawl carried on at the same rate. That is worse than ignoring a static `Crawl-delay`: it is the server saying it is struggling, while it is struggling, and under a user agent that names us it is the fastest route onto a blocklist by name. `Retry-After` is honoured in both its forms, with a default stand-off when none is sent. Europe PMC had the identical shape and got the same treatment.
 
 - **A compaction could end the work it interrupted.** Compaction runs mid-turn, and the model is asked for its next move immediately after. What it had just "said" was its own summary — goal, work completed, current state, next actions — and the natural continuation of a status report is another status report, so the agent would describe what it had been doing and stop, interrupted by its own summary and reading it as a handoff. Nothing about the summary was wrong; it was the wrong *last word*. A compacted history now ends with an instruction to carry on, placed after the retained recent messages so it stays the most recent thing in the window.
 

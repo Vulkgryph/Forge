@@ -409,6 +409,20 @@ fn run(
         let mut crawler = crawl::Crawler::new(&fetcher, &clock, limits);
         let mut seeded = 0;
         for seed in seeds {
+            // Resolved here, where a lookup is affordable. The crawler's own
+            // guard is deliberately pure — it runs inside a time budget and
+            // must not stall on a nameserver — so it catches an address
+            // written as an address, in any of its spellings. It cannot
+            // catch a *name* that resolves somewhere private: `router.lan`,
+            // a MagicDNS name, a corporate short name, or any hostname whose
+            // A record is 10.x. Those look like ordinary sites until
+            // something asks the resolver, and this is the layer that can.
+            let host = forge_search::url::Url::parse(seed).ok().map(|u| u.host);
+            match host {
+                Some(h) if !forge_search::net::is_routable_public(&h) => continue,
+                None => continue,
+                _ => {}
+            }
             if crawler.seed(seed).is_ok() {
                 seeded += 1;
             }

@@ -72,10 +72,8 @@ fn is_public_v6(ip: &Ipv6Addr) -> bool {
 /// address is caught one layer out, by `is_routable_public`, where a lookup is
 /// happening anyway.
 pub fn is_obviously_local(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let bare = normalise_host(host);
+    let bare = bare.as_str();
 
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return !is_public_ip(&ip);
@@ -93,12 +91,27 @@ pub fn is_obviously_local(host: &str) -> bool {
 
     // Names, case-insensitively. `localhost` is required to be loopback;
     // `.local` is mDNS and `.internal` is the conventional private zone.
-    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
+    let lower = bare.to_ascii_lowercase();
     lower == "localhost"
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
         || lower == "broadcasthost"
+}
+
+/// One spelling of a host, before anything tries to judge it.
+///
+/// Strips the brackets an IPv6 literal wears in a URL authority, and the
+/// root dot a fully-qualified name may end with. `127.0.0.1.` is the same
+/// machine as `127.0.0.1` to every resolver, and bailing on the dot rather
+/// than removing it left the canonical form walking past the check — which
+/// is the sort of thing a guard is for.
+fn normalise_host(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.trim_end_matches('.').to_string()
 }
 
 /// The historical `inet_aton` spellings of an IPv4 address.
@@ -111,7 +124,7 @@ pub fn is_obviously_local(host: &str) -> bool {
 /// Returns `None` for anything that is not unambiguously one of these, so an
 /// ordinary hostname is never mistaken for an address.
 fn parse_relaxed_ipv4(host: &str) -> Option<Ipv4Addr> {
-    if host.is_empty() || host.ends_with('.') {
+    if host.is_empty() {
         return None;
     }
     let parts: Vec<&str> = host.split('.').collect();
@@ -185,6 +198,7 @@ fn parse_relaxed_ipv4(host: &str) -> Option<Ipv4Addr> {
 /// stronger half of this defence; this one stops a crawl being pointed at a
 /// private address in the first place.
 pub fn is_routable_public(host: &str) -> bool {
+    let host = &normalise_host(host);
     // A literal address answers without a resolver, and must, because a
     // resolver is not obliged to accept one.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -193,17 +207,9 @@ pub fn is_routable_public(host: &str) -> bool {
     if let Some(ip) = parse_relaxed_ipv4(host) {
         return is_public_v4(&ip);
     }
-    // Bracketed IPv6 as it appears in a URL authority.
-    let unbracketed = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
-    if let Some(inner) = unbracketed {
-        return match inner.parse::<IpAddr>() {
-            Ok(ip) => is_public_ip(&ip),
-            Err(_) => false,
-        };
-    }
     // Port 80 is arbitrary: `to_socket_addrs` needs one and only the address
     // is being judged.
-    match (host, 80u16).to_socket_addrs() {
+    match (host.as_str(), 80u16).to_socket_addrs() {
         // An empty answer is not an endorsement.
         Ok(addrs) => {
             let mut saw_one = false;
@@ -311,6 +317,23 @@ mod tests {
             );
             assert!(!is_routable_public(spelling), "{spelling}");
         }
+    }
+
+    /// The fully-qualified form of a name is the same machine.
+    ///
+    /// `127.0.0.1.` with the root dot is what a resolver is handed for an
+    /// absolute name, and the relaxed parser bailed on the dot rather than
+    /// removing it — so the canonical spelling of loopback walked past the
+    /// guard. Reported by review.
+    #[test]
+    fn a_trailing_root_dot_does_not_hide_an_address() {
+        for spelling in ["127.0.0.1.", "169.254.169.254.", "2130706433.", "localhost.", "10.0.0.1."] {
+            assert!(is_obviously_local(spelling), "{spelling} walked past the guard");
+            assert!(!is_routable_public(spelling), "{spelling}");
+        }
+        // And a public name with a root dot is still public.
+        assert!(!is_obviously_local("8.8.8.8."));
+        assert!(is_routable_public("8.8.8.8."));
     }
 
     #[test]

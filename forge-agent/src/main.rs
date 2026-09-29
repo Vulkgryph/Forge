@@ -90,11 +90,48 @@ struct Cli {
     /// check and nothing on this side would report it.
     #[arg(long)]
     print_bot_auth_directory: bool,
+
+    /// Generate an Ed25519 signing key for Web Bot Auth, and exit.
+    ///
+    /// Written here rather than delegated to `openssl`, which is not present
+    /// everywhere and on macOS is LibreSSL, which cannot generate this kind
+    /// of key at all. A tool that needs a key can make a key.
+    #[arg(long, value_name = "PATH")]
+    generate_bot_auth_key: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    if let Some(path) = &cli.generate_bot_auth_key {
+        let path = std::path::PathBuf::from(path);
+        match tools::botauth::generate_key(&path) {
+            Ok(keyid) => {
+                println!("Wrote {} (owner-only).", path.display());
+                println!("Key id: {keyid}");
+                println!();
+                println!("Add to ~/.config/forge/config.toml:");
+                println!();
+                println!("  [agent]");
+                println!("  web_bot_auth_key = \"{}\"", path.display());
+                println!("  web_bot_auth_directory = \"https://your-domain.example\"");
+                println!();
+                println!(
+                    "Then `forge-agent --print-bot-auth-directory` gives the JSON to \
+                     publish at\n  \
+                     https://your-domain.example/.well-known/http-message-signatures-directory"
+                );
+                println!();
+                println!("Keep the key file. Replacing it orphans every signature published against it.");
+            }
+            Err(e) => {
+                eprintln!("forge: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     if cli.print_bot_auth_directory {
         // Reported, not defaulted. Falling back to defaults here would print
@@ -121,11 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      ~/.config/forge/config.toml first.\n\
                      \n\
                      Generate a key with:\n\
-                     \x20 openssl genpkey -algorithm ED25519 -out forge-bot-auth.pem\n\
-                     \n\
-                     The algorithm name is case-sensitive, and macOS ships \
-                     LibreSSL as `openssl`, which has no ED25519 at all — use \
-                     an OpenSSL 3 build (`brew install openssl`) there."
+                     \x20 forge-agent --generate-bot-auth-key ~/.config/forge/bot-auth.pem"
                 );
                 std::process::exit(1);
             }

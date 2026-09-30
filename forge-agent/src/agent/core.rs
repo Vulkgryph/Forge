@@ -889,23 +889,28 @@ impl Agent {
                     output,
                     exit_code,
                 } => {
-                    // A background command finished. Inject as a user message so the model
-                    // sees it as new information — not as a tool result (which would require
-                    // a matching tool call and confuse the conversation structure).
-                    let truncated: String = output.chars().take(4000).collect();
-                    let more = if output.len() > 4000 {
-                        "\n... (truncated)"
-                    } else {
-                        ""
-                    };
-                    let code_str = exit_code
-                        .map(|c| format!("exit code {}", c))
-                        .unwrap_or_else(|| "unknown exit".into());
-                    let notification = format!(
-                        "[Background command '{}' finished ({})]\n$ {}\n{}{}",
-                        id, code_str, command, truncated, more
-                    );
-                    self.history.push(Message::user(&notification));
+                    // A background command finished. Injected as a user message so
+                    // the model sees it as new information — not as a tool result,
+                    // which would need a matching tool call and would misdescribe
+                    // the conversation's shape.
+                    //
+                    // Every other one already waiting comes with it, and they share
+                    // a single turn. One turn each was what a long stretch of
+                    // parallel work turned into afterwards: a full history read per
+                    // completion to acknowledge one line, back to back, which is
+                    // what it looked like from outside — the agent stopping, then
+                    // being pinged over and over until the queue was empty.
+                    let mut notices =
+                        vec![background_notice(&id, &command, &output, exit_code)];
+                    notices.extend(self.take_background_completions());
+                    let batched = notices.len();
+                    for notice in &notices {
+                        self.history.push(Message::user(notice));
+                    }
+                    if batched > 1 {
+                        self.history.push(Message::system(BACKGROUND_NOTE));
+                    }
+                    let notification = notices.join("\n");
                     let _ = self.log.log_run_state(RunState::Running);
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     let turn_preview = preview_text(&notification);
@@ -4046,12 +4051,63 @@ impl Agent {
         )));
     }
 
+    /// Take every finished background command out of the parked queue,
+    /// leaving everything else in the order it arrived.
+    ///
+    /// `deferred_actions` is drained only by the main loop, which runs after
+    /// the turn ends — so a completion that arrived while the model was
+    /// working sat there until the turn finished, and then got a whole turn of
+    /// its own. Twenty-three commands finishing during one long turn meant
+    /// twenty-three turns afterwards, each re-reading the entire history to
+    /// acknowledge one line, in immediate succession. The parking fixed the
+    /// older bug of losing them; it did not make them timely.
+    fn take_background_completions(&mut self) -> Vec<String> {
+        if !self
+            .deferred_actions
+            .iter()
+            .any(|a| matches!(a, UserAction::BgDone { .. }))
+        {
+            return Vec::new();
+        }
+        let mut notices = Vec::new();
+        let mut keep = VecDeque::with_capacity(self.deferred_actions.len());
+        while let Some(action) = self.deferred_actions.pop_front() {
+            match action {
+                UserAction::BgDone { id, command, output, exit_code } => {
+                    notices.push(background_notice(&id, &command, &output, exit_code));
+                }
+                other => keep.push_back(other),
+            }
+        }
+        self.deferred_actions = keep;
+        notices
+    }
+
     fn drain_queued_user_messages_into_history(&mut self) -> bool {
-        if self.queued_user_messages.is_empty() {
+        // Background results first: they are older than anything the user has
+        // typed since, and reading them before an interjection that may be
+        // about them is the right order.
+        let finished = self.take_background_completions();
+        let queued: Vec<String> = self.queued_user_messages.drain(..).collect();
+        if finished.is_empty() && queued.is_empty() {
             return false;
         }
 
-        let queued: Vec<String> = self.queued_user_messages.drain(..).collect();
+        if !finished.is_empty() {
+            // All of them, then one note. Not a note each: five commands
+            // finishing at once is one event to the person watching, and five
+            // copies of the same explanation is what made the old behaviour
+            // read as the agent being interrupted repeatedly.
+            for notice in &finished {
+                let message = Message::user(notice);
+                let _ = self.log.log_message(&message);
+                self.history.push(message);
+            }
+            let note = Message::system(BACKGROUND_NOTE);
+            let _ = self.log.log_message(&note);
+            self.history.push(note);
+        }
+
         for message in interjection_messages(&queued) {
             let _ = self.log.log_message(&message);
             self.history.push(message);
@@ -5004,6 +5060,31 @@ whether to continue, and do not stop — unless the message itself tells you to 
 stop, or changes the goal enough that the remaining work no longer makes \
 sense. If it asks a question, answer it briefly and keep going.]";
 
+/// What the model is told when a background command finishes.
+///
+/// Shared by both delivery paths — at a tool boundary while the turn runs, and
+/// from the main loop when one finishes while nothing else is happening — so
+/// the two cannot describe the same event differently.
+fn background_notice(id: &str, command: &str, output: &str, exit_code: Option<i32>) -> String {
+    let truncated: String = output.chars().take(4000).collect();
+    let more = if output.len() > 4000 { "\n... (truncated)" } else { "" };
+    let code = exit_code
+        .map(|c| format!("exit code {c}"))
+        .unwrap_or_else(|| "unknown exit".into());
+    format!("[Background command '{id}' finished ({code})]\n$ {command}\n{truncated}{more}")
+}
+
+/// Said once when background results arrive in the middle of a turn.
+///
+/// Without it the results read as though the model had just asked for them,
+/// and it would re-plan around output it did not request. The same reasoning
+/// as `INTERJECTION_NOTE`, for the other thing that can arrive mid-turn.
+const BACKGROUND_NOTE: &str = "\
+The background command results above finished while you were working and have \
+been delivered now rather than at the end of the turn. You did not ask for \
+them just now. Fold them into what you are doing if they matter, and carry on \
+if they do not.";
+
 /// A queued interjection, plus the note that says what it is.
 ///
 /// Pure, so the shape can be tested without a live agent: the user's words
@@ -5703,3 +5784,116 @@ mod interjection_tests {
         assert!(interjection_messages(&[]).is_empty());
     }
 }
+#[cfg(test)]
+mod background_delivery_tests {
+    use super::{background_notice, BACKGROUND_NOTE};
+
+    /// A completion says which command, how it exited, and what it printed.
+    #[test]
+    fn a_notice_names_the_command_and_its_exit() {
+        let n = background_notice("bg-7", "cargo test --workspace", "ok\n", Some(0));
+        assert!(n.contains("bg-7"), "{n}");
+        assert!(n.contains("exit code 0"), "{n}");
+        assert!(n.contains("cargo test --workspace"), "{n}");
+        assert!(n.contains("ok"), "{n}");
+    }
+
+    /// A command killed by a signal has no exit code, and that is said rather
+    /// than shown as a zero.
+    #[test]
+    fn a_missing_exit_code_is_not_reported_as_success() {
+        let n = background_notice("bg-1", "sleep 100", "", None);
+        assert!(n.contains("unknown exit"), "{n}");
+        assert!(!n.contains("exit code 0"), "a signal death read as success: {n}");
+    }
+
+    /// Long output is cut, and says it was.
+    #[test]
+    fn long_output_is_truncated_and_marked() {
+        let big = "x".repeat(10_000);
+        let n = background_notice("bg-2", "yes", &big, Some(0));
+        assert!(n.contains("(truncated)"), "{n}");
+        assert!(n.len() < 5_000, "the whole 10k of output went into history");
+    }
+
+    /// The note tells the model the results were not something it just asked
+    /// for. Without it, output arriving mid-turn reads as a tool result and
+    /// gets re-planned around.
+    #[test]
+    fn the_note_says_the_results_were_not_requested_now() {
+        assert!(BACKGROUND_NOTE.contains("while you were working"));
+        assert!(BACKGROUND_NOTE.contains("did not ask for"));
+        assert!(BACKGROUND_NOTE.contains("carry on"));
+    }
+
+    /// Finished commands are taken out of the parked queue at a tool
+    /// boundary, and everything else parked stays parked.
+    ///
+    /// This is the fix for the observed behaviour: 23 commands finishing
+    /// during one long turn were invisible until it ended, and then got 23
+    /// consecutive turns of their own — each a full history read to
+    /// acknowledge one line. `deferred_actions` is drained only by the main
+    /// loop, which runs after the turn; the tool-boundary drain now takes the
+    /// completions out of it first.
+    ///
+    /// Assembled, since this test reads the file it lives in.
+    #[test]
+    fn completions_are_taken_at_the_tool_boundary_and_batched() {
+        let src = include_str!("core.rs");
+
+        // The mid-turn drain must consult the parked queue for completions.
+        let drain_at = src
+            .find("fn drain_queued_user_messages_into_history")
+            .expect("the tool-boundary drain");
+        let drain_body = &src[drain_at..drain_at + 1800];
+        assert!(
+            drain_body.contains(&["take_background", "_completions()"].concat()),
+            "the tool-boundary drain no longer delivers finished background \
+             commands, so they wait for the turn to end again",
+        );
+
+        // And it must emit one note for the batch, not one per completion.
+        let note_uses = drain_body.matches("BACKGROUND_NOTE").count();
+        assert_eq!(
+            note_uses, 1,
+            "the mid-turn drain pushes the explanation {note_uses} times; five \
+             commands finishing at once is one event, and repeating the note is \
+             what made this read as the agent being interrupted over and over",
+        );
+
+        // The main loop must batch whatever else is waiting into the same turn.
+        let loop_at = src.find("pub async fn run(&mut self)").expect("the main loop");
+        let arm_at = src[loop_at..].find("UserAction::BgDone").expect("the BgDone arm") + loop_at;
+        let arm = &src[arm_at..arm_at + 1400];
+        assert!(
+            arm.contains(&["take_background", "_completions()"].concat()),
+            "the main loop handles one completion per turn again",
+        );
+        let turns = arm.matches("self.process_turn()").count();
+        assert!(
+            turns <= 1,
+            "the BgDone arm runs {turns} turns; a batch of completions must share one",
+        );
+    }
+
+    /// Non-completion actions must not be eaten by the completion drain —
+    /// they belong to the main loop, which is the only place with an arm for
+    /// every kind.
+    ///
+    /// Assembled.
+    #[test]
+    fn other_parked_actions_are_put_back() {
+        let src = include_str!("core.rs");
+        let at = src.find("fn take_background_completions").expect("the extractor");
+        let body = &src[at..at + 1200];
+        assert!(
+            body.contains("other => keep.push_back(other)"),
+            "the extractor drops parked actions that are not completions",
+        );
+        assert!(
+            body.contains("self.deferred_actions = keep"),
+            "the extractor does not restore the actions it kept",
+        );
+    }
+}
+

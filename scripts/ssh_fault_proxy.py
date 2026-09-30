@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-"""Local test-only SSH relay. A marker interrupts only this relay's sockets."""
+"""Local test-only SSH relay. A marker interrupts only this relay's sockets.
+
+Also serves the mock model endpoint the relayed agent talks to, on :22284.
+
+That fixture used to be imported from `scripts/test_resilience.py`. The Python
+resilience harness was ported to Rust in 955e562 and the file went with it,
+which left this script importing something that no longer existed — it raised
+FileNotFoundError before either listener was created, so the reproduction path
+FAILURE-TESTING.md documents could not run at all. The provider is inlined
+here now, covering the one mode this script drives.
+"""
 import argparse
-import importlib.util
+import http.server
+import json
 import socket
 import threading
 import time
@@ -53,16 +64,57 @@ def monitor():
         time.sleep(.02)
 
 
-spec = importlib.util.spec_from_file_location('fixture', Path(__file__).with_name('test_resilience.py'))
-fixture = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fixture)
+class Provider(http.server.BaseHTTPRequestHandler):
+    """An OpenAI-compatible endpoint that truncates its first response.
 
+    Only what this script needs: `output_limit` on the first request, `ok`
+    after, over the OpenAI streaming protocol. The Rust harness at
+    forge-agent/tests/resilience.rs covers the other modes and protocols.
+    """
 
-class Provider(fixture.Provider):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *_):
+        pass
+
     def do_GET(self):
         if self.path == '/reset':
+            # Clears the recorded requests. It deliberately does not reset
+            # `mode`, which stays pinned to output_limit for this script's
+            # lifetime — the first request after a reset truncates again.
             self.server.requests.clear()
-        super().do_GET()
+        data = json.dumps(
+            {'data': [{'id': 'failure-fixture', 'context_length': 131072}]}
+        ).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        length = int(self.headers['Content-Length'])
+        self.server.requests.append(json.loads(self.rfile.read(length)))
+        truncate = len(self.server.requests) == 1
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+
+        def delta(body, finish=None):
+            payload = 'data: ' + json.dumps(
+                {'choices': [{'index': 0, 'delta': body, 'finish_reason': finish}]}
+            ) + '\n\n'
+            self.wfile.write(payload.encode())
+            self.wfile.flush()
+
+        try:
+            delta({'content': 'PARTIAL-FIXTURE' if truncate else 'RECOVERED'})
+            delta({}, finish='length' if truncate else 'stop')
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
 
 provider = ThreadingHTTPServer(('127.0.0.1', 22284), Provider)
@@ -79,7 +131,17 @@ with socket.socket() as listener:
         if time.monotonic() < pause_until:
             client.close()
             continue
-        upstream = socket.create_connection(('127.0.0.1', 22282))
+        try:
+            upstream = socket.create_connection(('127.0.0.1', 22282))
+        except OSError as e:
+            # The relay outlives its upstream. sshd on :22282 not being there
+            # is the ordinary case at startup and between test runs, and an
+            # unhandled refusal here took the whole script down — including
+            # the model fixture on :22284, which has nothing to do with ssh.
+            print(f'upstream :22282 refused ({e}); dropping this connection',
+                  flush=True)
+            client.close()
+            continue
         with lock:
             active.update((client, upstream))
         threading.Thread(target=copy, args=(client, upstream), daemon=True).start()

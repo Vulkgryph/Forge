@@ -287,9 +287,12 @@ the scale this runs at.
 
 **What a site learns about the person running Forge: nothing that
 distinguishes them from anyone else running it.** The complete set of headers
-sent is `Host`, `Accept`, and the user agent above — measured, not assumed.
-No cookies, no `Referer`, no `Accept-Language`, no client hints, no machine or
-session identifier. The agent's own session id travels only to the model
+sent is `Host`, `Accept`, and the user agent above — measured against a local
+listener, not read off the source, and asserted in the test suite so a fourth
+header cannot appear without the claim failing. The crawler's `Accept` is
+reqwest's default `*/*`; `web_fetch` asks for HTML, because it is fetching a
+page somebody named. No cookies, no `Referer`, no `Accept-Language`, no
+`Accept-Encoding`, no client hints, no machine or session identifier. The agent's own session id travels only to the model
 endpoint the user configured, never to a crawled site.
 
 Two things do vary. The **IP address**, which is true of any HTTP client and

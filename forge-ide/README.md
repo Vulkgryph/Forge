@@ -10,7 +10,7 @@ A fast, native code editor built in Rust on Vulkan and [egui](https://github.com
 
 ## Philosophy
 
-Forge IDE is built for engineers who want to see and understand the tool they use all day. It draws on the GPU through the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux — with a hand-written Vulkan backend available as an opt-in build. There's no browser, no Electron, no JavaScript runtime underneath. What you see in the source is what runs on your GPU.
+Forge IDE is built for engineers who want to see and understand the tool they use all day. It draws on the GPU through the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux — with a hand-written Vulkan backend available as an opt-in build. The interface is not a browser: no Electron, no HTML layout engine, no JavaScript runtime drawing what you see. What you see in the source is what runs on your GPU. One feature is the exception and is deliberate — the bot-check handoff embeds the system's own `WKWebView` on macOS (`src/webview.rs`), because the whole point of that panel is to be a real browser passing a real check.
 
 **Dependencies are kept deliberately low.** Every crate in `Cargo.toml` is there because it does real, hard-to-replace work — a graphics binding, a windowing layer, an SSH implementation. Where a dependency was only doing something trivial (tilde expansion, an unused trait), it has been replaced with a few lines of our own code instead.
 
@@ -136,7 +136,7 @@ cargo build -p forge-server --release --target x86_64-unknown-linux-musl
 cargo build -p forge-server --release --target aarch64-unknown-linux-musl
 ```
 
-The linker paths for these targets are already configured in `.cargo/config.toml`. Forge IDE looks for these binaries under `target/<triple>/release/forge-server` and uploads whichever one matches the remote machine's architecture the first time you connect. If forge-server's version changes, bump both `forge-server/Cargo.toml`'s `version` and the matching `SERVER_VERSION` constant in `src/ssh.rs` — that's what tells the client to re-upload instead of reusing what's already on the remote.
+The linker paths for these targets are already configured in the workspace root's `.cargo/config.toml` — there is no `forge-ide/.cargo/config.toml`; the builds work from this directory because Cargo walks up to find it. Forge IDE looks for these binaries under `target/<triple>/release/forge-server` and uploads whichever one matches the remote machine's architecture the first time you connect. If forge-server's version changes, bump both `forge-server/Cargo.toml`'s `version` and the matching `SERVER_VERSION` constant in `src/ssh.rs` — that's what tells the client to re-upload instead of reusing what's already on the remote.
 
 ## SSH Remote
 

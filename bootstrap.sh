@@ -104,7 +104,7 @@ cd "$DEST"
 # the bootstrap before the installer ever ran. The root also has its own
 # install.sh — the Linux-only desktop one, with no provider wizard — so a bare
 # `install.sh` would have been the wrong script even had the chmod passed.
-chmod +x forge-agent/install.sh forge-agent/update.sh forge-agent/forge
+chmod +x forge-agent/install.sh forge-agent/update.sh
 
 info "Running forge-agent/install.sh"
 echo

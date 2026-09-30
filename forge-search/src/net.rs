@@ -25,7 +25,7 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
 }
 
 fn is_public_v4(ip: &Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     !(ip.is_loopback()            // 127/8
         || ip.is_private()        // 10/8, 172.16/12, 192.168/16
         || ip.is_link_local()     // 169.254/16 — cloud instance metadata
@@ -34,7 +34,12 @@ fn is_public_v4(ip: &Ipv4Addr) -> bool {
         || ip.is_unspecified()    // 0.0.0.0, which many stacks route to local
         || a == 0                 // 0/8 "this network"
         || (a == 100 && (64..128).contains(&b)) // 100.64/10 carrier NAT
-        || (a == 192 && b == 0)   // 192.0.0/24 protocol assignments
+        // 192.0.0/24 IETF protocol assignments. The third octet matters: the
+        // test was `a == 192 && b == 0`, which is 192.0.0/16 — refusing about
+        // 253 globally routable /24s, 192.0.1/24 through 192.0.255/24, as if
+        // they were reserved. 192.0.2/24 is documentation and is caught by
+        // `is_documentation` above.
+        || (a == 192 && b == 0 && c == 0)
         || (a == 198 && (18..20).contains(&b)) // 198.18/15 benchmarking
         || ip.is_multicast()
         || a >= 240)              // 240/4 reserved, includes 255.255.255.255
@@ -372,3 +377,52 @@ mod tests {
         assert!(!is_routable_public(""));
     }
 }
+#[cfg(test)]
+mod reserved_range_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn public(a: u8, b: u8, c: u8, d: u8) -> bool {
+        is_public_ip(&std::net::IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
+    }
+
+    /// 192.0.0/24 is reserved; the rest of 192.0/16 is not.
+    ///
+    /// The guard tested only the first two octets, so every address from
+    /// 192.0.1.0 to 192.0.255.255 was refused as reserved. That is roughly 253
+    /// routable /24s a crawl could not reach, for a range whose own comment
+    /// said /24.
+    #[test]
+    fn only_the_first_slash_24_of_192_0_is_reserved() {
+        assert!(!public(192, 0, 0, 1), "192.0.0/24 is IETF protocol assignments");
+        assert!(!public(192, 0, 0, 170), "192.0.0/24, DNS64 discovery");
+        // 192.0.2/24 is TEST-NET-1, caught as documentation.
+        assert!(!public(192, 0, 2, 1), "192.0.2/24 is documentation");
+
+        assert!(public(192, 0, 1, 1), "192.0.1/24 is globally routable");
+        assert!(public(192, 0, 3, 1), "192.0.3/24 is globally routable");
+        assert!(public(192, 0, 255, 1), "192.0.255/24 is globally routable");
+    }
+
+    /// The neighbouring ranges the same guard covers, so narrowing one did not
+    /// widen another.
+    #[test]
+    fn the_other_reserved_ranges_still_refuse() {
+        assert!(!public(127, 0, 0, 1));
+        assert!(!public(10, 0, 0, 1));
+        assert!(!public(172, 16, 0, 1));
+        assert!(!public(192, 168, 0, 1));
+        assert!(!public(169, 254, 169, 254), "cloud instance metadata");
+        assert!(!public(100, 64, 0, 1), "carrier NAT");
+        assert!(!public(198, 18, 0, 1), "benchmarking");
+        assert!(!public(0, 0, 0, 0));
+        assert!(!public(255, 255, 255, 255));
+        assert!(!public(240, 0, 0, 1));
+
+        assert!(public(8, 8, 8, 8));
+        assert!(public(1, 1, 1, 1));
+        assert!(public(192, 167, 0, 1), "one below the private range");
+        assert!(public(192, 169, 0, 1), "one above the private range");
+    }
+}
+

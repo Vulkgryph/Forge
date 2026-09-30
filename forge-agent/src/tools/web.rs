@@ -726,3 +726,187 @@ mod user_agent_tests {
         }
     }
 }
+#[cfg(test)]
+mod outbound_header_tests {
+    //! What a crawled site actually learns from the request line.
+    //!
+    //! The README states the complete set of headers Forge sends and calls it
+    //! "measured, not assumed". This is the measurement, so the sentence has
+    //! something behind it and a header added later has to be reflected in the
+    //! docs rather than shipping quietly.
+    //!
+    //! Worth doing rather than reading the source: neither client sets
+    //! `Accept` on the crawler path, and a review concluded from that that no
+    //! `Accept` is sent. reqwest sends `accept: */*` of its own accord, so the
+    //! documented set was right and the source reading was wrong. The values
+    //! differ between the two clients, which is the part only a measurement
+    //! tells you.
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// Serve one request and hand back the headers it arrived with, lowercased
+    /// and sorted.
+    fn headers_of(send: impl FnOnce(&str) + Send + 'static) -> Vec<(String, String)> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/probe");
+
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(&stream);
+            let mut headers = Vec::new();
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request line");
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).expect("header") == 0 {
+                    break;
+                }
+                let header = header.trim_end().to_string();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                }
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+            );
+            headers.sort();
+            headers
+        });
+
+        send(&url);
+        handle.join().expect("join")
+    }
+
+    fn names(headers: &[(String, String)]) -> Vec<&str> {
+        headers.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    fn value<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("<absent>")
+    }
+
+    /// `web_fetch` sends exactly Host, Accept and the user agent.
+    ///
+    /// Notably no `accept-encoding`: reqwest is built without its compression
+    /// features, so it does not negotiate one. And no cookies, no `Referer`,
+    /// no `Accept-Language`, no client hints — the README's claim, enforced.
+    #[test]
+    fn web_fetch_sends_host_accept_and_the_user_agent() {
+        let got = headers_of(|url| {
+            let url = url.to_string();
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            rt.block_on(async move {
+                let client = super::build_http_client();
+                let _ = client
+                    .get(&url)
+                    .header(
+                        "Accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    )
+                    .send()
+                    .await;
+            });
+        });
+
+        assert_eq!(
+            names(&got),
+            vec!["accept", "host", "user-agent"],
+            "the documented header set for web_fetch has changed: {got:?}"
+        );
+        assert!(
+            value(&got, "user-agent").starts_with("forge-agent/"),
+            "{got:?}"
+        );
+        assert_eq!(
+            value(&got, "accept"),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        );
+    }
+
+    /// The crawler sends the same three, with reqwest's default `Accept`.
+    ///
+    /// Built with the crawler's own client options rather than its
+    /// `HttpFetcher`, because that type refuses a non-public address before it
+    /// sends anything — the SSRF fix — so it cannot be aimed at a loopback
+    /// listener.
+    #[test]
+    fn the_crawler_sends_host_a_default_accept_and_the_user_agent() {
+        let got = headers_of(|url| {
+            let url = url.to_string();
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            rt.block_on(async move {
+                let client = reqwest::Client::builder()
+                    .user_agent(crate::tools::search::USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(20))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("client");
+                let _ = client.get(&url).send().await;
+            });
+        });
+
+        assert_eq!(
+            names(&got),
+            vec!["accept", "host", "user-agent"],
+            "the crawler's header set has changed: {got:?}"
+        );
+        // reqwest's own default, not something Forge sets. Recorded because
+        // the README distinguishes the two clients' Accept values.
+        assert_eq!(value(&got, "accept"), "*/*", "{got:?}");
+        assert!(
+            value(&got, "user-agent").starts_with("forge-search/"),
+            "{got:?}"
+        );
+    }
+
+    /// Nothing that identifies the person or the session goes to a site.
+    #[test]
+    fn no_header_identifies_the_user_or_the_session() {
+        for got in [
+            headers_of(|url| {
+                let url = url.to_string();
+                let rt = tokio::runtime::Runtime::new().expect("rt");
+                rt.block_on(async move {
+                    let _ = super::build_http_client().get(&url).send().await;
+                });
+            }),
+            headers_of(|url| {
+                let url = url.to_string();
+                let rt = tokio::runtime::Runtime::new().expect("rt");
+                rt.block_on(async move {
+                    let client = reqwest::Client::builder()
+                        .user_agent(crate::tools::search::USER_AGENT)
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .expect("client");
+                    let _ = client.get(&url).send().await;
+                });
+            }),
+        ] {
+            for forbidden in [
+                "cookie",
+                "referer",
+                "accept-language",
+                "authorization",
+                "sec-ch-ua",
+                "x-session-id",
+                "from",
+            ] {
+                assert!(
+                    !names(&got).contains(&forbidden),
+                    "{forbidden} reached a crawled site: {got:?}"
+                );
+            }
+        }
+    }
+}

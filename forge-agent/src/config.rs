@@ -214,7 +214,13 @@ pub struct AgentConfig {
     /// The origin publishing that key. Required when `web_bot_auth_key` is set.
     #[serde(default)]
     pub web_bot_auth_directory: Option<String>,
+    /// Defaulted because `[agent]` is a table a user writes by hand. Without
+    /// one, naming the table at all made this mandatory, so a snippet that set
+    /// only `disabled_tools` failed to parse — which is what the offline setup
+    /// in the README told people to write.
+    #[serde(default = "default_auto_approve_reads")]
     pub auto_approve_reads: bool,
+    #[serde(default)]
     pub auto_approve_writes: bool,
     /// Legacy global switch for providers that expose thinking controls.
     /// false maps OpenAI-compatible endpoints to enable_thinking=false unless
@@ -223,9 +229,14 @@ pub struct AgentConfig {
     pub thinking_mode: bool,
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
     /// Dead since the trigger became token-based; kept only so existing config
     /// files that name it still parse. `compact_at_percent` is the live knob.
+    ///
+    /// Defaulted for the same reason as the fields above, and more sharply: a
+    /// key that does nothing has no business being mandatory.
+    #[serde(default = "default_compaction_threshold")]
     pub compaction_threshold: usize,
     /// Fraction of the context window at which the conversation is compacted,
     /// as a percentage. The trigger used to be `>= 100`, which is not a
@@ -300,6 +311,18 @@ pub struct AgentConfig {
 
 fn default_forced_shell_background_secs() -> u64 {
     300
+}
+
+fn default_auto_approve_reads() -> bool {
+    true
+}
+
+fn default_max_history_messages() -> usize {
+    200
+}
+
+fn default_compaction_threshold() -> usize {
+    150
 }
 
 fn default_compact_at_percent() -> u8 {
@@ -1041,4 +1064,76 @@ mod offline_tool_tests {
         );
     }
 }
+#[cfg(test)]
+mod documented_config_parses {
+    use super::*;
+
+    /// Every complete `toml` block in the README that looks like a Forge
+    /// config must actually load.
+    ///
+    /// Two of them did not. `[agent]` had four members with no serde default,
+    /// so naming the table at all made all four mandatory: the "Multiple
+    /// endpoints" example failed with `missing field max_history_messages`,
+    /// and the offline-setup snippet — two lines, `[agent]` and
+    /// `disabled_tools` — failed with `missing field auto_approve_reads`.
+    /// Both were presented as things to copy.
+    ///
+    /// Reads the README rather than restating its examples, so the two cannot
+    /// drift apart.
+    #[test]
+    fn every_config_example_in_the_readme_loads() {
+        let readme = include_str!("../README.md");
+        let mut checked = 0;
+        let mut failures = Vec::new();
+
+        for block in readme.split("```toml").skip(1) {
+            let Some(body) = block.split("```").next() else { continue };
+
+            // Only whole-file examples. A fragment showing one key under a
+            // header it does not include is prose, not a file.
+            if !body.contains("[[models.endpoints]]") && !body.contains("[agent]") {
+                continue;
+            }
+            // Snippets written as an edit to an existing table are explicitly
+            // not standalone files; the README says so where it shows them.
+            let standalone = body.contains("[models]") || body.contains("[[models.endpoints]]");
+            if !standalone {
+                continue;
+            }
+
+            checked += 1;
+            if let Err(e) = toml::from_str::<AppConfig>(body) {
+                failures.push(format!("{e}\n--- block ---\n{body}"));
+            }
+        }
+
+        assert!(checked >= 2, "expected to find the README's config examples, found {checked}");
+        assert!(
+            failures.is_empty(),
+            "{} of {checked} documented config examples do not parse:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+
+    /// The offline setup the README tells people to write.
+    ///
+    /// Presented as an edit to an existing `[agent]` table, but it has to work
+    /// on its own too — a reader who creates the file from it should get a
+    /// working config, not a parse error naming a field they were never shown.
+    #[test]
+    fn the_offline_snippet_loads_on_its_own() {
+        let c: AgentConfig = toml::from_str(
+            "disabled_tools = [\"web_search\", \"web_fetch\", \"search_papers\"]",
+        )
+        .expect("the documented offline snippet should load on its own");
+        assert_eq!(c.disabled_tools.len(), 3);
+        // And the defaults that filled in are the ones the table documents.
+        assert!(c.auto_approve_reads);
+        assert!(!c.auto_approve_writes);
+        assert_eq!(c.max_history_messages, 200);
+        assert_eq!(c.compact_at_percent, 80);
+    }
+}
+
 

@@ -319,12 +319,14 @@ Forge can use your existing **ChatGPT Codex** subscription via OAuth — no API 
 From the command line:
 
 ```bash
-forge --login chatgpt           # OAuth for ChatGPT Codex
-forge --login-chatgpt           # shortcut form
+forge --login-chatgpt           # OAuth for ChatGPT Codex
 
 # Lower-level equivalent (skip the wrapper):
 forge-agent --login-chatgpt
 ```
+
+It is one token: `--login` on its own is not an option and `forge` will reject
+it with a usage message.
 
 Or from inside the TUI:
 
@@ -336,7 +338,7 @@ After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.jso
 
 > **Remote / firewall users:** the OAuth flow listens on `localhost:1455` (ChatGPT Codex). If your browser can't reach it (SSH session without port forwarding, corporate firewall, etc.), forge prints both the URL to visit AND a prompt to paste the callback code. After approving in your browser, the redirect page will fail to load — just copy the URL from your browser's address bar after it fails to load, and paste it into forge.
 
-> **Claude (Anthropic):** subscription (Pro/Max) login via Forge is **not supported** — there is no Claude OAuth code path in Forge, and `forge --login claude` exits with an error. Anthropic's terms restrict subscription OAuth credentials to its own applications and prohibit routing requests through Pro/Max credentials in third-party tools, so we don't. Use an **Anthropic API key** instead — add it to an `endpoint_type = "anthropic"` endpoint in `~/.config/forge/config.toml` (or pick **Claude** in the installer wizard). See the [CHANGELOG](CHANGELOG.md) for details.
+> **Claude (Anthropic):** subscription (Pro/Max) login via Forge is **not supported** — there is no Claude OAuth code path in Forge, and no flag that would reach one: `--login` is not an option at all, so `forge --login claude` fails with a usage message rather than a refusal specific to Claude. Anthropic's terms restrict subscription OAuth credentials to its own applications and prohibit routing requests through Pro/Max credentials in third-party tools, so we don't. Use an **Anthropic API key** instead — add it to an `endpoint_type = "anthropic"` endpoint in `~/.config/forge/config.toml` (or pick **Claude** in the installer wizard). See the [CHANGELOG](CHANGELOG.md) for details.
 
 ### Config reference
 
@@ -346,13 +348,14 @@ After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.jso
 | `models.web_tool_model` | same as default | Endpoint for `web_fetch` summarization |
 | `agent.auto_approve_reads` | `true` | Skip approval prompts for read-only tools |
 | `agent.auto_approve_writes` | `false` | Skip approval prompts for file writes |
-| `agent.permission_mode` | `"default"` | Stored permission preference. Related approval behavior is surfaced through multiple mechanisms: the TUI mode selector (`normal` / `auto_accept` / `plan`), per-session “approve always” tool memory, and the startup flag `--dangerously-allow-all`. The serialized enum supports `default`, `accept_edits`, `bypass_permissions`, `dont_ask`, `plan` |
+| `agent.permission_mode` | `"default"` | Stored permission preference. Related approval behavior is surfaced through multiple mechanisms: the TUI mode selector (`normal` / `auto_accept` / `plan`), per-session “approve always” tool memory, and the startup flag `--dangerously-allow-all`. The serialized enum is camelCase: `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`, `plan`. Snake-case spellings do not parse |
 | `agent.disabled_tools` | `[]` | Tool names to exclude from normal turns |
 | `agent.context_strategy` | `"compaction"` | `"compaction"` or `"rolling_window"` |
 | `agent.max_history_messages` | `200` | Hard cap on conversation history length |
-| `agent.compaction_threshold` | `150` | Message count that triggers context compaction |
+| `agent.compact_at_percent` | `80` | Percent of the endpoint's context window at which compaction runs. This is the live trigger |
+| `agent.compaction_threshold` | `150` | **Legacy, and does nothing.** Kept only so existing config files that name it still parse; the trigger became token-based. Tuning this changes nothing |
 | `agent.subagents.enabled` | `true` | Enable/disable parallel subagents |
-| `agent.subagents.max_concurrent` | `4` | Max subagents running at once (1, 2, or 4) |
+| `agent.subagents.max_concurrent` | `4` | Max subagents running at once. Any positive integer; not restricted to 1, 2 or 4 |
 | `agent.subagents.max_depth` | `4` | Max subagent nesting depth |
 | `agent.subagents.default_model` | same as default | Model endpoint subagents use |
 

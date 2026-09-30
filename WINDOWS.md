@@ -97,9 +97,14 @@ $env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"
 cargo test --locked -p forge-ide
 ```
 
-The full agent test suite still contains Unix-specific process tests (including
-an unguarded `is_zombie` test), so it does not yet compile on Windows. Agent
-compilation and installed CLI checks are separate from that outstanding test work.
+The named cause of this is fixed: the `is_zombie` test and the
+`process_exists`/`is_zombie` helpers it exercises are `#[cfg(unix)]`-guarded
+now (`forge-agent/src/agent/rewind.rs`). Whether the *whole* agent suite
+compiles on Windows is still unverified, because nothing checks it: CI builds
+`forge-agent` there and runs only its `resilience` target, not its unit tests.
+So treat this as open until somebody runs `cargo test -p forge-agent` on a
+Windows box — the remaining risk is another Unix-only test, not the one this
+paragraph used to name.
 
 Validated locally on 2026-09-25: the release installer and all three installed
 `--version` commands passed; the combined IDE/TUI/protocol/search run passed

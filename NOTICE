@@ -65,8 +65,7 @@ workspace member and pinned in Cargo.lock, which together are the authoritative
 dependency list. They are predominantly MIT and Apache-2.0. Worth naming
 specifically, because their terms are not those two:
 
-  Mozilla Public License 2.0 — cssparser, cssparser-macros, dtoa-short and
-    selectors (reached through `scraper`), and option-ext (through `dirs`).
+  Mozilla Public License 2.0 — option-ext, reached through `dirs`.
     MPL-2.0 section 3.3 permits distributing the larger work under other terms;
     section 3.2 asks that recipients of the executable be told how to obtain
     the source form of those files, which is: from crates.io at the versions

@@ -36,6 +36,27 @@ pub struct Page {
 /// definition, and `svg` holds path data that tokenises into nonsense.
 const SKIPPED: &[&str] = &["script", "style", "noscript", "template", "svg", "math"];
 
+/// Site furniture: present on every page, about none of them.
+///
+/// Their text is dropped rather than indexed. A navigation bar repeated
+/// across two hundred pages makes every page look like it is about the
+/// navigation bar — BM25 sees the same terms everywhere and ranks on
+/// furniture. `looks_like_template` already handles template *URLs*; this is
+/// the same problem in the text.
+///
+/// Depth-counted rather than skipped to the closing tag, because unlike
+/// `script` these contain real markup and a `<nav>` left unclosed must not
+/// swallow the rest of the document.
+/// Below this, a `<main>` is a wrapper rather than the content.
+const MAIN_MINIMUM: usize = 100;
+
+const CHROME: &[&str] = &["nav", "header", "footer", "aside", "form"];
+
+/// Where a page keeps what it is actually about, when it says so.
+///
+/// Preferred over the whole body when it holds enough to be worth having.
+const MAIN: &[&str] = &["article", "main"];
+
 /// Elements that end a line of text.
 ///
 /// Without these, a list or a table of links runs together into one long line
@@ -66,6 +87,13 @@ pub fn parse(html: &str) -> Page {
     let mut at = 0;
     let mut in_title = false;
     let mut text = String::with_capacity(html.len() / 4);
+    // How deep inside furniture we are. Counted, not a flag: a `<footer>`
+    // inside an `<aside>` must not reopen the text when the inner one closes.
+    let mut chrome_depth = 0usize;
+    // Text from `<article>`/`<main>` alone, kept alongside the rest so the
+    // choice between them can be made once the page has been read.
+    let mut main_depth = 0usize;
+    let mut main_text = String::new();
 
     while at < bytes.len() {
         match bytes[at] {
@@ -139,6 +167,23 @@ pub fn parse(html: &str) -> Page {
                     continue;
                 }
 
+                if CHROME.contains(&name.as_str()) {
+                    if closing {
+                        chrome_depth = chrome_depth.saturating_sub(1);
+                    } else if !raw.ends_with('/') {
+                        chrome_depth += 1;
+                    }
+                    continue;
+                }
+
+                if MAIN.contains(&name.as_str()) {
+                    if closing {
+                        main_depth = main_depth.saturating_sub(1);
+                    } else if !raw.ends_with('/') {
+                        main_depth += 1;
+                    }
+                }
+
                 if !closing {
                     if name == "a" {
                         if let Some(href) = attribute(raw, "href") {
@@ -162,11 +207,14 @@ pub fn parse(html: &str) -> Page {
                     }
                 }
 
-                if BLOCK.contains(&name.as_str()) && !in_title {
+                if BLOCK.contains(&name.as_str()) && !in_title && chrome_depth == 0 {
                     // A newline rather than a space, so a snippet taken from
                     // here does not read as one run-on sentence.
                     if !text.ends_with('\n') && !text.is_empty() {
                         text.push('\n');
+                    }
+                    if main_depth > 0 && !main_text.ends_with('\n') && !main_text.is_empty() {
+                        main_text.push('\n');
                     }
                 }
                 let _ = VOID; // documented above; the stack is depth-counted instead
@@ -186,8 +234,11 @@ pub fn parse(html: &str) -> Page {
                 let chunk = &html[at..end];
                 if in_title {
                     page.title.push_str(chunk);
-                } else {
+                } else if chrome_depth == 0 {
                     push_text(&mut text, chunk);
+                    if main_depth > 0 {
+                        push_text(&mut main_text, chunk);
+                    }
                 }
                 at = end;
             }
@@ -195,7 +246,12 @@ pub fn parse(html: &str) -> Page {
     }
 
     page.title = collapse(&decode_entities(&page.title));
-    page.text = tidy_lines(&decode_entities(&text));
+    let main = tidy_lines(&decode_entities(&main_text));
+    let whole = tidy_lines(&decode_entities(&text));
+    // The marked-up main content when there is enough of it to be the page,
+    // otherwise everything. The threshold is there because plenty of pages
+    // carry an empty `<main>` wrapper around the real content.
+    page.text = if main.len() > MAIN_MINIMUM { main } else { whole };
     page
 }
 
@@ -687,3 +743,73 @@ mod tests {
         assert_eq!(page.links, vec!["/a", "/b", "/c"]);
     }
 }
+#[cfg(test)]
+mod chrome_tests {
+    use super::parse;
+
+    /// Site furniture is not what a page is about.
+    ///
+    /// A navigation bar repeated across two hundred pages makes every page
+    /// look like it is about the navigation bar: BM25 sees the same terms
+    /// everywhere and ranks on furniture. `looks_like_template` already
+    /// handles template URLs; this is the same problem in the text.
+    #[test]
+    fn navigation_and_footers_are_not_indexed_as_content() {
+        let page = parse(
+            "<html><body>\
+             <nav><a href=/>Home</a><a href=/docs>Documentation</a>Sign in</nav>\
+             <p>Allocators reuse freed blocks to avoid syscalls.</p>\
+             <footer>Copyright 2026 Example Incorporated. All rights reserved.</footer>\
+             </body></html>",
+        );
+        assert!(page.text.contains("Allocators"), "the content went missing: {:?}", page.text);
+        for furniture in ["Home", "Documentation", "Sign in", "Copyright", "reserved"] {
+            assert!(
+                !page.text.contains(furniture),
+                "{furniture:?} was indexed as content: {:?}",
+                page.text
+            );
+        }
+        // Links are still collected — the crawler needs them to move, and
+        // dropping a nav's *text* is not the same as refusing to follow it.
+        assert!(page.links.iter().any(|l| l == "/docs"), "{:?}", page.links);
+    }
+
+    /// Unclosed furniture must not swallow the document.
+    #[test]
+    fn an_unclosed_nav_does_not_eat_the_page() {
+        let page = parse("<body><nav><a href=/>Home</a><p>Real content here.</p></body>");
+        // The nav never closes, so everything after it is inside furniture.
+        // That is the correct reading of the markup, and the important part
+        // is that it terminates rather than mis-nesting.
+        assert!(!page.text.contains("Home"));
+
+        // Nested furniture closes once, not twice.
+        let nested = parse(
+            "<body><aside><footer>x</footer>still aside</aside><p>Content.</p></body>",
+        );
+        assert!(nested.text.contains("Content"), "{:?}", nested.text);
+        assert!(!nested.text.contains("still aside"), "{:?}", nested.text);
+    }
+
+    /// When a page says where its content is, believe it.
+    #[test]
+    fn main_content_is_preferred_when_there_is_enough_of_it() {
+        let page = parse(
+            "<body><div>Cookie banner and sidebar chatter that is not the point.</div>\
+             <main><p>The page is about lock-free queues and their memory ordering \
+             requirements, at some length, so that this passes the threshold.</p></main>\
+             <div>More unrelated marginalia down here.</div></body>",
+        );
+        assert!(page.text.contains("lock-free queues"), "{:?}", page.text);
+        assert!(!page.text.contains("Cookie banner"), "{:?}", page.text);
+    }
+
+    /// And an empty wrapper is not the content.
+    #[test]
+    fn an_empty_main_wrapper_falls_back_to_the_whole_page() {
+        let page = parse("<body><main></main><p>All of the actual content is here.</p></body>");
+        assert!(page.text.contains("actual content"), "{:?}", page.text);
+    }
+}
+

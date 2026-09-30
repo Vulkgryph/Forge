@@ -48,6 +48,19 @@ fn dim_color(c: egui::Color32) -> egui::Color32 {
 #[derive(Clone, Copy)]
 struct Cell {
     ch: char,
+    /// The right half of a double-width character, holding no character of
+    /// its own.
+    ///
+    /// The grid used to advance one column per `char`, so a CJK ideograph or
+    /// an emoji occupied one column where the program writing to the terminal
+    /// had assumed two — and since applications compute their own padding from
+    /// those widths, everything after it on the row was already misaligned by
+    /// the time it was drawn. A wide character now writes its glyph in the
+    /// lead cell and claims the next one with a spacer.
+    ///
+    /// Spacers are skipped everywhere a row becomes text: they are grid
+    /// bookkeeping, not content, and a copied line must not contain them.
+    spacer: bool,
     fg: egui::Color32,
     /// `None` = transparent (the terminal's own background shows through).
     /// Used for SGR 40-49/100-107 (background color) — e.g. Claude Code
@@ -58,10 +71,17 @@ struct Cell {
 }
 
 impl Cell {
-    fn blank() -> Self { Self { ch: ' ', fg: default_fg(), bg: None } }
+    fn blank() -> Self { Self { ch: ' ', fg: default_fg(), bg: None, spacer: false } }
     /// A character with no style of its own — used when a saved row's runs do
     /// not cover its text, so the character survives even if its colour cannot.
-    fn blank_with(ch: char) -> Self { Self { ch, fg: default_fg(), bg: None } }
+    fn blank_with(ch: char) -> Self { Self { ch, fg: default_fg(), bg: None, spacer: false } }
+
+    /// The right half of the wide character in the cell before this one. Takes
+    /// that cell's background so a highlighted band stays continuous across
+    /// both halves.
+    fn spacer_with(bg: Option<egui::Color32>) -> Self {
+        Self { ch: ' ', fg: default_fg(), bg, spacer: true }
+    }
 }
 
 /// Nothing printed on this row. A background colour counts as something: a shell
@@ -93,6 +113,7 @@ impl CellSnap {
             ch: self.ch,
             fg: egui::Color32::from_rgba_premultiplied(r, g, b, a),
             bg: self.bg.map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a)),
+            spacer: false,
         }
     }
 }
@@ -132,6 +153,14 @@ impl RowSnap {
         let mut t = String::with_capacity(row.len());
         let mut r: Vec<RunSnap> = Vec::new();
         for cell in row {
+            // Not written: a spacer is the second half of the character
+            // before it, and `to_cells` puts it back from that character's
+            // width. Skipping it keeps this format exactly what it was before
+            // wide characters were tracked, so old sessions still load and new
+            // ones stay readable by older builds.
+            if cell.spacer {
+                continue;
+            }
             t.push(cell.ch);
             let fg = cell.fg.to_array();
             let bg = cell.bg.map(|b| b.to_array());
@@ -155,11 +184,11 @@ impl RowSnap {
             loop {
                 match current {
                     Some((run, used)) if used < run.n => {
-                        out.push(Cell {
-                            ch,
-                            fg: colour(run.fg),
-                            bg: run.bg.map(colour),
-                        });
+                        let bg = run.bg.map(colour);
+                        out.push(Cell { ch, fg: colour(run.fg), bg, spacer: false });
+                        if crate::charwidth::char_width(ch) == 2 {
+                            out.push(Cell::spacer_with(bg));
+                        }
                         current = Some((run, used + 1));
                         break;
                     }
@@ -169,6 +198,9 @@ impl RowSnap {
                         // take the default rather than dropping the row.
                         None => {
                             out.push(Cell::blank_with(ch));
+                            if crate::charwidth::char_width(ch) == 2 {
+                                out.push(Cell::spacer_with(None));
+                            }
                             break;
                         }
                     },
@@ -715,9 +747,45 @@ impl Grid {
                 self.cur_col = self.cols.saturating_sub(1);
             }
         }
+        let width = crate::charwidth::char_width(c);
+
+        // Zero-width: a combining mark or a variation selector. A cell holds
+        // one `char`, so there is nowhere to attach it — dropping it keeps the
+        // rest of the row aligned, which is what giving it a column would
+        // destroy. The cost is that `e` + combining-acute renders as `e`
+        // rather than `é`; the alternative is every following column wrong.
+        if width == 0 {
+            return;
+        }
+
+        // A wide character needs both halves on the same row. Wrapping here
+        // rather than letting it straddle the edge is what real terminals do,
+        // and the alternative puts half a glyph in the last column.
+        if width == 2 && self.cur_col + 2 > self.cols {
+            if self.autowrap {
+                self.cur_col = 0;
+                self.line_feed();
+                if let Some(flag) = self.wrapped.get_mut(self.cur_row) {
+                    *flag = true;
+                }
+            } else {
+                // DECAWM off and no room for both halves: the character is
+                // dropped rather than drawn as half of itself.
+                return;
+            }
+        }
+
         let fg = if self.dim { dim_color(self.current_fg) } else { self.current_fg };
-        self.viewport[self.cur_row][self.cur_col] = Cell { ch: c, fg, bg: self.current_bg };
+        self.viewport[self.cur_row][self.cur_col] =
+            Cell { ch: c, fg, bg: self.current_bg, spacer: false };
         self.cur_col += 1;
+        if width == 2 {
+            if self.cur_col < self.cols {
+                self.viewport[self.cur_row][self.cur_col] =
+                    Cell::spacer_with(self.current_bg);
+            }
+            self.cur_col += 1;
+        }
     }
 
     fn erase_line(&mut self, mode: usize) {
@@ -969,13 +1037,13 @@ impl Grid {
     fn row_text(&self, row: usize) -> String {
         self.viewport
             .get(row)
-            .map(|cells| cells.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .map(|cells| cells.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>().trim_end().to_string())
             .unwrap_or_default()
     }
 
     pub fn all_text(&self) -> String {
         self.scrollback.iter().chain(self.viewport.iter())
-            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .map(|r| r.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>().join("\n")
     }
 
@@ -1017,7 +1085,7 @@ impl Grid {
                 let bg  = row[si].bg;
                 let mut ei = si + 1;
                 while ei < end && row[ei].fg == fg && row[ei].bg == bg { ei += 1; }
-                let text: String = row[si..ei].iter().map(|c| c.ch).collect();
+                let text: String = row[si..ei].iter().filter(|c| !c.spacer).map(|c| c.ch).collect();
                 job.append(&text, 0.0, fmt(fg, bg));
                 si = ei;
             }
@@ -2591,13 +2659,13 @@ mod shrink_tests {
     /// What the viewport says, top to bottom, trailing blanks trimmed.
     fn viewport(g: &Grid) -> Vec<String> {
         g.viewport.iter()
-            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .map(|r| r.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>().trim_end().to_string())
             .collect()
     }
 
     fn scrollback(g: &Grid) -> Vec<String> {
         g.scrollback.iter()
-            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .map(|r| r.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>().trim_end().to_string())
             .collect()
     }
 
@@ -2860,7 +2928,7 @@ mod row_encoding_tests {
     use super::*;
 
     fn cell(ch: char, fg: egui::Color32, bg: Option<egui::Color32>) -> Cell {
-        Cell { ch, fg, bg }
+        Cell { ch, fg, bg, spacer: false }
     }
 
     /// The encoding is a change of representation, not of content: every
@@ -2900,9 +2968,23 @@ mod row_encoding_tests {
             cell('✔', b, None), cell('❯', b, None),
         ];
         let back = Row::from_cells(&row).to_cells();
-        assert_eq!(back.iter().map(|c| c.ch).collect::<String>(), "日本✔❯");
-        assert_eq!(back[0].fg, a);
-        assert_eq!(back[2].fg, b);
+        assert_eq!(back.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>(), "日本✔❯");
+
+        // Indexed past the spacers: 日 and 本 are two columns each, so the
+        // restored row is six cells and the character positions are not the
+        // run positions. The property under test is that a run covers the
+        // characters it was given, whatever width they turned out to be.
+        let chars: Vec<&Cell> = back.iter().filter(|c| !c.spacer).collect();
+        assert_eq!(chars[0].ch, '日');
+        assert_eq!(chars[0].fg, a);
+        assert_eq!(chars[1].fg, a, "本 is in the same run as 日");
+        assert_eq!(chars[2].ch, '✔');
+        assert_eq!(chars[2].fg, b);
+        assert_eq!(chars[3].fg, b);
+
+        // And the spacer lands where the wide character put it.
+        assert!(back[1].spacer, "日 should claim the column after it");
+        assert!(back[3].spacer, "本 should claim the column after it");
     }
 
     #[test]
@@ -2934,7 +3016,7 @@ mod row_encoding_tests {
     fn runs_that_fall_short_still_yield_the_text() {
         let snap = RowSnap { t: "hello".into(), r: vec![RunSnap { n: 2, fg: [1, 2, 3, 4], bg: None }] };
         let cells = snap.to_cells();
-        assert_eq!(cells.iter().map(|c| c.ch).collect::<String>(), "hello");
+        assert_eq!(cells.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>(), "hello");
         assert_eq!(cells[0].fg, egui::Color32::from_rgba_premultiplied(1, 2, 3, 4));
     }
 
@@ -3010,3 +3092,124 @@ mod drop_paste_tests {
         assert_eq!(s.matches("\x1b[201~").count(), 1, "more than one paste ended");
     }
 }
+#[cfg(test)]
+mod wide_char_grid_tests {
+    use super::*;
+
+    fn row_text(g: &Grid, row: usize) -> String {
+        g.viewport[row].iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>()
+            .trim_end().to_string()
+    }
+
+    /// A CJK character takes two columns, which is what the program writing to
+    /// the terminal already assumed.
+    ///
+    /// The grid advanced one column per `char`, so every cell after a wide one
+    /// was off by one for the rest of the row — the reported symptom being
+    /// `git log` on a repository with Chinese commit messages coming apart.
+    #[test]
+    fn a_wide_character_claims_two_columns() {
+        let mut g = Grid::with_size(4, 20);
+        g.process("日本");
+
+        assert_eq!(g.cur_col, 4, "two wide characters should occupy four columns");
+        assert_eq!(g.viewport[0][0].ch, '日');
+        assert!(g.viewport[0][1].spacer, "the column after 日 belongs to it");
+        assert_eq!(g.viewport[0][2].ch, '本');
+        assert!(g.viewport[0][3].spacer);
+        assert_eq!(row_text(&g, 0), "日本", "the spacers are not content");
+    }
+
+    /// The alignment case, stated as a program would produce it: a table whose
+    /// columns are padded using display width.
+    #[test]
+    fn a_padded_table_lines_up() {
+        let mut g = Grid::with_size(4, 20);
+        // "日本" is four columns, so a program padding to eight adds four
+        // spaces. "abcd" is four columns and gets four too.
+        g.process("日本    |\r\nabcd    |\r\n");
+
+        // The separator must land in the same column on both rows. That is the
+        // whole property: before this, the first row's `|` sat two columns to
+        // the left of the second's.
+        let bar_row0 = g.viewport[0].iter().position(|c| c.ch == '|');
+        let bar_row1 = g.viewport[1].iter().position(|c| c.ch == '|');
+        assert_eq!(
+            bar_row0, bar_row1,
+            "the separator is in different columns on the two rows: {bar_row0:?} vs {bar_row1:?}"
+        );
+        assert_eq!(bar_row0, Some(8));
+    }
+
+    /// A wide character with one column left wraps rather than being split in
+    /// half across the edge.
+    #[test]
+    fn a_wide_character_wraps_rather_than_straddling_the_edge() {
+        let mut g = Grid::with_size(4, 5);
+        g.process("abcd日");
+
+        assert_eq!(row_text(&g, 0), "abcd", "the wide character should not start at column 4 of 5");
+        assert_eq!(row_text(&g, 1), "日");
+        assert_eq!(g.cur_row, 1);
+        assert_eq!(g.cur_col, 2);
+    }
+
+    /// Emoji are wide too, and shells print them.
+    #[test]
+    fn emoji_claim_two_columns() {
+        let mut g = Grid::with_size(4, 20);
+        g.process("✅ ok");
+        assert_eq!(g.viewport[0][0].ch, '✅');
+        assert!(g.viewport[0][1].spacer);
+        assert_eq!(g.viewport[0][2].ch, ' ');
+        assert_eq!(g.viewport[0][3].ch, 'o');
+        assert_eq!(row_text(&g, 0), "✅ ok");
+    }
+
+    /// Box drawing must stay single width, or every framed TUI breaks the
+    /// other way — the regression this change could most easily have caused.
+    #[test]
+    fn box_drawing_still_takes_one_column() {
+        let mut g = Grid::with_size(4, 20);
+        g.process("┌───┐");
+        assert_eq!(g.cur_col, 5, "five box-drawing characters, five columns");
+        assert!(g.viewport[0].iter().take(5).all(|c| !c.spacer));
+    }
+
+    /// A copied line contains the characters and not the bookkeeping.
+    #[test]
+    fn selected_text_has_no_spacers_in_it() {
+        let mut g = Grid::with_size(4, 20);
+        g.process("日本語");
+        let text = g.all_text();
+        assert!(text.starts_with("日本語"), "{text:?}");
+        assert!(!text.starts_with("日 本"), "a spacer reached the copied text: {text:?}");
+    }
+
+    /// A row with a wide character survives being saved and restored, and the
+    /// saved form is still the pre-spacer format so old sessions keep working.
+    #[test]
+    fn a_wide_character_survives_a_session_round_trip() {
+        let mut g = Grid::with_size(4, 20);
+        g.process("日本 ok");
+        let row = g.viewport[0].clone();
+
+        let snap = Row::from_cells(&row);
+        let saved = match &snap {
+            Row::Runs(r) => r.t.clone(),
+            Row::Cells(_) => panic!("from_cells should produce the run form"),
+        };
+        assert!(
+            saved.trim_end().ends_with("日本 ok"),
+            "the saved text is not the pre-spacer form: {saved:?}"
+        );
+
+        let back = snap.to_cells();
+        assert_eq!(
+            back.iter().filter(|c| !c.spacer).map(|c| c.ch).collect::<String>().trim_end(),
+            "日本 ok"
+        );
+        assert!(back[1].spacer, "the spacer should be reconstructed from the width");
+    }
+}
+

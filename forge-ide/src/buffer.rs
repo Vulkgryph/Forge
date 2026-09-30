@@ -99,6 +99,16 @@ pub struct Buffer {
     /// process — so this records only which page the tab wants and what the
     /// agent is waiting for. See `crate::webview`.
     pub browser: Option<BrowserTab>,
+    /// How this file's bytes became text, so `save` can reverse it exactly.
+    ///
+    /// Without it, `save` wrote UTF-8 unconditionally: a UTF-16 file came back
+    /// re-encoded with its byte-order mark rendered as mojibake, and a latin-1
+    /// file came back as UTF-8. Both silently, and to the whole file rather
+    /// than the part that was edited.
+    pub encoding: crate::encoding::Encoding,
+    /// The newline the file used. `str::lines()` strips `\r` and the old save
+    /// path wrote `\n`, so every CRLF file the editor touched was converted.
+    pub line_ending: crate::encoding::LineEnding,
 }
 
 /// A tab showing a web page.
@@ -164,7 +174,9 @@ impl Buffer {
     pub fn new() -> Self {
         Self { path: None, lines: vec![String::new()], cursor: (0, 0), modified: false, diff: None,
                undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
-               image_bytes: None, image_view: None, browser: None }
+               image_bytes: None, image_view: None, browser: None,
+               encoding: crate::encoding::Encoding::Utf8,
+               line_ending: crate::encoding::LineEnding::Lf }
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, String> {
@@ -177,6 +189,8 @@ impl Buffer {
                 path: Some(path), lines: vec![String::new()], cursor: (0, 0), modified: false,
                 diff: None, undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
                 image_bytes: Some(bytes), image_view: None, browser: None,
+                encoding: crate::encoding::Encoding::Utf8,
+                line_ending: crate::encoding::LineEnding::Lf,
             });
         }
         // A `.gz` is decompressed rather than refused. Opening one used to
@@ -184,26 +198,22 @@ impl Buffer {
         // outside the tab simply never appeared. The DEFLATE decoder this uses
         // is the one already written for PNG — gzip is the same payload with a
         // different header, so this costs a header parse and no dependency.
-        let text = if ext.eq_ignore_ascii_case("gz") {
-            let raw = std::fs::read(&path)
+        let raw = if ext.eq_ignore_ascii_case("gz") {
+            let compressed = std::fs::read(&path)
                 .map_err(|e| format!("read {}: {e}", path.display()))?;
-            let out = crate::img::inflate::gzip_decompress(&raw)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            String::from_utf8(out).map_err(|_| {
-                format!("{}: decompresses to something that is not text", path.display())
-            })?
+            crate::img::inflate::gzip_decompress(&compressed)
+                .map_err(|e| format!("{}: {e}", path.display()))?
         } else {
-            std::fs::read_to_string(&path).map_err(|e| {
-                // `read_to_string` says "stream did not contain valid UTF-8",
-                // which names the cause without saying what it means for the
-                // file you just tried to open.
-                if e.kind() == std::io::ErrorKind::InvalidData {
-                    format!("{} is not a text file", path.display())
-                } else {
-                    format!("read {}: {e}", path.display())
-                }
-            })?
+            std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?
         };
+        // Not `read_to_string`: that refuses anything but UTF-8 and the
+        // message said "is not a text file", which was wrong about latin-1
+        // and UTF-16 files and right only about binaries. `decode` keeps the
+        // refusal for those and remembers what it found for the rest, because
+        // `save` has to put the file back the way it came.
+        let crate::encoding::Decoded { text, encoding, line_ending } =
+            crate::encoding::decode(&raw)
+                .map_err(|why| format!("{} {why}", path.display()))?;
         let trailing_newline = text.ends_with('\n');
         let lines = if text.is_empty() {
             vec![String::new()]
@@ -212,7 +222,7 @@ impl Buffer {
         };
         Ok(Self { path: Some(path), lines, cursor: (0, 0), modified: false, diff: None,
                   undo_stack: Vec::new(), redo_stack: Vec::new(), trailing_newline, last_edit_at: None,
-                  image_bytes: None, image_view: None, browser: None })
+                  image_bytes: None, image_view: None, browser: None, encoding, line_ending })
     }
 
     /// A read-only diff tab for `path`, holding precomputed diff rows.
@@ -220,7 +230,7 @@ impl Buffer {
         Self { path: Some(path), lines: vec![String::new()], cursor: (0, 0),
                modified: false, diff: Some(rows), undo_stack: Vec::new(),
                redo_stack: Vec::new(), trailing_newline: true, last_edit_at: None,
-               image_bytes: None, image_view: None, browser: None }
+               image_bytes: None, image_view: None, browser: None , encoding: crate::encoding::Encoding::Utf8, line_ending: crate::encoding::LineEnding::Lf }
     }
 
     /// A tab showing a web page.
@@ -249,6 +259,8 @@ impl Buffer {
                 can_back: false,
                 can_forward: false,
             }),
+            encoding: crate::encoding::Encoding::Utf8,
+            line_ending: crate::encoding::LineEnding::Lf,
         }
     }
 
@@ -263,16 +275,71 @@ impl Buffer {
 
     /// Full buffer text, plus the trailing newline the file had on disk when
     /// loaded (if any) — use this, not `text()`, whenever writing to disk.
+    ///
+    /// Always LF, because that is what the buffer holds. `bytes_for_disk`
+    /// applies the file's own line ending.
     pub fn text_for_disk(&self) -> String {
         let mut t = self.text();
         if self.trailing_newline { t.push('\n'); }
         t
     }
 
+    /// Exactly what should be written to the file: the buffer's text, in the
+    /// encoding and with the line ending it was read with.
+    pub fn bytes_for_disk(&self) -> Vec<u8> {
+        let text = self.text_for_disk();
+        let text = match self.line_ending {
+            crate::encoding::LineEnding::Lf => text,
+            crate::encoding::LineEnding::Crlf => text.replace('\n', "\r\n"),
+        };
+        crate::encoding::encode(&text, self.encoding)
+    }
+
+    /// Text for the remote `fs/write` RPC, which carries a JSON string.
+    ///
+    /// The line ending is applied here the same as for a local save. The
+    /// encoding cannot be: that call is a `&str` on the wire, so a latin-1 or
+    /// UTF-16 file has no faithful representation to send and would arrive
+    /// re-encoded as UTF-8 — the same silent conversion a local save used to
+    /// do. Refused instead, with the reason, until `fs/write` can carry bytes.
+    pub fn text_for_remote_write(&self) -> Result<String, String> {
+        match self.encoding {
+            crate::encoding::Encoding::Utf8 => {}
+            other => {
+                let label = other.label().unwrap_or("a non-UTF-8 encoding");
+                return Err(format!(
+                    "not saved: this file is {label}, and the remote write path can only \
+                     carry UTF-8 — saving would convert it. Edit it locally, or convert \
+                     it to UTF-8 first."
+                ));
+            }
+        }
+        let text = self.text_for_disk();
+        Ok(match self.line_ending {
+            crate::encoding::LineEnding::Lf => text,
+            crate::encoding::LineEnding::Crlf => text.replace('\n', "\r\n"),
+        })
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
         if self.is_read_only_view() { return Ok(()); }
+
+        // Refuse rather than mangle. A latin-1 file cannot hold a character
+        // above U+00FF, so saving one would replace it with `?` — and the
+        // person who pasted it would have no way to know until they reopened
+        // the file. Saying so costs them a decision; the alternative costs
+        // them the character.
+        if crate::encoding::is_lossy(&self.text_for_disk(), self.encoding) {
+            let label = self.encoding.label().unwrap_or("this file's encoding");
+            return Err(format!(
+                "not saved: this file is {label}, which cannot represent some of the \
+                 characters now in it. Saving would replace them. Convert the file to \
+                 UTF-8 first, or remove them."
+            ));
+        }
+
         let path = self.path.as_ref().ok_or("no path")?;
-        std::fs::write(path, self.text_for_disk()).map_err(|e| format!("write: {e}"))?;
+        std::fs::write(path, self.bytes_for_disk()).map_err(|e| format!("write: {e}"))?;
         self.modified = false;
         Ok(())
     }
@@ -938,6 +1005,12 @@ mod gz_open_tests {
 
     /// A binary file that is not gzip says what is wrong in those terms,
     /// rather than reporting a UTF-8 decoding fault.
+    ///
+    /// The wording moved from "is not a text file" to "is a binary file" when
+    /// non-UTF-8 text became openable: the old message was being used for two
+    /// different situations, and only one of them was this one. A latin-1 file
+    /// is not UTF-8 and *is* a text file, so the message that covers both
+    /// tells the reader nothing about which they have.
     #[test]
     fn a_binary_file_says_it_is_not_text() {
         let dir = std::env::temp_dir().join(format!("forge-bin-{}", std::process::id()));
@@ -949,7 +1022,7 @@ mod gz_open_tests {
             Err(e) => e,
             Ok(_) => panic!("a binary file was opened as text"),
         };
-        assert!(err.contains("not a text file"), "unhelpful error: {err}");
+        assert!(err.contains("binary"), "unhelpful error: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -972,3 +1045,121 @@ mod gz_open_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+#[cfg(test)]
+mod non_utf8_file_tests {
+    use super::*;
+
+    fn temp(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join("forge-encoding-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).expect("write fixture");
+        p
+    }
+
+    /// A latin-1 file opens, and saving it back leaves the bytes alone.
+    ///
+    /// It used to be refused outright with "is not a text file", which was
+    /// wrong: it is text, just not UTF-8. And decoding it without this
+    /// round-trip would have been worse — `save` wrote UTF-8, so one keystroke
+    /// would have re-encoded the whole file.
+    #[test]
+    fn a_latin1_file_opens_and_saves_byte_identical() {
+        let original: Vec<u8> = vec![b'c', b'a', b'f', 0xE9, b'\n'];
+        let path = temp("latin1.txt", &original);
+
+        let mut b = Buffer::from_file(path.clone()).expect("a latin-1 file is text");
+        assert_eq!(b.encoding, crate::encoding::Encoding::Latin1);
+        assert_eq!(b.lines[0], "café");
+
+        b.save().expect("saves");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the file was re-encoded");
+    }
+
+    /// A UTF-16 file with a byte-order mark, likewise.
+    #[test]
+    fn a_utf16_file_opens_and_keeps_its_mark() {
+        let mut original = vec![0xFF, 0xFE];
+        for u in "hello\n".encode_utf16() {
+            original.extend_from_slice(&u.to_le_bytes());
+        }
+        let path = temp("utf16.txt", &original);
+
+        let mut b = Buffer::from_file(path.clone()).expect("a UTF-16 file is text");
+        assert_eq!(b.encoding, crate::encoding::Encoding::Utf16Le);
+        assert_eq!(b.lines[0], "hello");
+
+        b.save().expect("saves");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the mark or encoding changed");
+    }
+
+    /// CRLF survives. This was broken for every file, not just unusual ones:
+    /// `lines()` strips the `\r` and the old save wrote `\n`, so opening and
+    /// saving any CRLF file rewrote every line in it.
+    #[test]
+    fn crlf_is_not_converted_to_lf() {
+        let original = b"one\r\ntwo\r\n".to_vec();
+        let path = temp("crlf.txt", &original);
+
+        let mut b = Buffer::from_file(path.clone()).expect("opens");
+        assert_eq!(b.line_ending, crate::encoding::LineEnding::Crlf);
+        assert_eq!(b.lines, vec!["one", "two"], "the \\r should not be in the buffer");
+
+        b.save().expect("saves");
+        assert_eq!(
+            std::fs::read(&path).unwrap(), original,
+            "a CRLF file came back with LF endings"
+        );
+    }
+
+    /// An edit to a CRLF file keeps CRLF on the new line too.
+    #[test]
+    fn a_line_added_to_a_crlf_file_is_also_crlf() {
+        let path = temp("crlf-edit.txt", b"one\r\n");
+        let mut b = Buffer::from_file(path.clone()).expect("opens");
+        b.lines.push("two".to_string());
+        b.save().expect("saves");
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\r\ntwo\r\n".to_vec());
+    }
+
+    /// Typing something latin-1 cannot hold is refused, not silently replaced.
+    #[test]
+    fn a_save_that_would_lose_characters_is_refused() {
+        let original: Vec<u8> = vec![b'h', b'i', 0xE9, b'\n'];
+        let path = temp("lossy.txt", &original);
+
+        let mut b = Buffer::from_file(path.clone()).expect("opens");
+        b.lines[0] = "日本語".to_string();
+
+        let err = b.save().expect_err("saving should refuse rather than write `?`");
+        assert!(err.contains("Latin-1"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(), original,
+            "the file was written despite the refusal"
+        );
+    }
+
+    /// Binaries are still refused — the check that made the old behaviour
+    /// right for them has to keep working.
+    #[test]
+    fn a_binary_file_is_still_refused() {
+        let path = temp("binary.bin", &[0x7F, b'E', b'L', b'F', 0x00, 0x01, 0xFF, 0xFE, 0x00]);
+        let err = match Buffer::from_file(path) {
+            Err(e) => e,
+            Ok(_) => panic!("an ELF binary should not open as text"),
+        };
+        assert!(err.contains("binary"), "{err}");
+    }
+
+    /// And a plain UTF-8 file is untouched by any of this.
+    #[test]
+    fn a_utf8_file_round_trips_unchanged() {
+        let original = "héllo — wörld\n".as_bytes().to_vec();
+        let path = temp("utf8.txt", &original);
+        let mut b = Buffer::from_file(path.clone()).expect("opens");
+        assert_eq!(b.encoding, crate::encoding::Encoding::Utf8);
+        b.save().expect("saves");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+

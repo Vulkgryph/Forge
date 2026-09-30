@@ -7292,6 +7292,19 @@ impl IdeApp {
                             ui.label(egui::RichText::new(
                                 format!("Ln {}, Col {}", row + 1, col + 1))
                                 .size(11.0).color(w));
+                            // Only when it is not the ordinary case. A file
+                            // that is latin-1 or CRLF will be written back
+                            // that way, and a save can be refused because of
+                            // it, so the one thing worse than not showing it
+                            // is showing it on every file and making it
+                            // invisible.
+                            for note in [buf.encoding.label(), buf.line_ending.label()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                ui.label(egui::RichText::new("·").size(11.0).color(dim));
+                                ui.label(egui::RichText::new(note).size(11.0).color(dim));
+                            }
                             if let Some(ext) = buf.path.as_ref()
                                 .and_then(|p| p.extension())
                                 .and_then(|e| e.to_str())
@@ -15654,7 +15667,10 @@ impl IdeApp {
             // Remote save via SFTP when connected.
             if let Some(ssh) = &self.ssh {
                 if let Some(path) = buf.path.clone() {
-                    let text = buf.text_for_disk();
+                    let text = match buf.text_for_remote_write() {
+                        Ok(t) => t,
+                        Err(why) => { self.status = why; return; }
+                    };
                     match ssh.fs_write(&path.to_string_lossy(), &text) {
                         Ok(()) => { buf.modified = false; self.status = "Saved (remote)".into(); }
                         Err(e) => self.ssh_error = Some(e),

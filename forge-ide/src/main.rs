@@ -10,6 +10,8 @@ mod dock_install;
 mod dock_menu;
 #[cfg(target_os = "macos")]
 mod webview;
+mod charwidth;
+mod encoding;
 mod filetree;
 mod filewatch;
 mod gfx_wgpu;

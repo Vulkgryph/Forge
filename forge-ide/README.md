@@ -2,7 +2,7 @@
 
 Created by **Vulkgryph LLC**.
 
-A fast, native code editor built in Rust on [wgpu](https://github.com/gfx-rs/wgpu) and [egui](https://github.com/emilk/egui). Forge IDE aims to cover the same daily workflow as VS Code — editing, git, language servers, a terminal, and remote development over SSH — in a smaller, more inspectable codebase. Its integrated agent panel spawns [`forge-agent`](../forge-agent/) directly — the same binary [`forge-tui-rs`](../forge-tui-rs/) drives independently. See the [top-level README](../README.md) for how the three projects in this monorepo fit together.
+A fast, native code editor built in Rust on [wgpu](https://github.com/gfx-rs/wgpu) and [egui](https://github.com/emilk/egui). Forge IDE covers editing, git, language servers, a terminal, and remote development over SSH in a smaller, more inspectable codebase than VS Code's. It is not a replacement for it: syntax highlighting covers seven languages and local LSP covers one, both listed below, and there is no extension ecosystem. Its integrated agent panel spawns [`forge-agent`](../forge-agent/) directly — the same binary [`forge-tui-rs`](../forge-tui-rs/) drives independently. See the [top-level README](../README.md) for how the three projects in this monorepo fit together.
 
 ![Forge IDE editing forge-agent, with the agent panel showing tool calls, a diffstat and a rewind checkpoint](assets/forge-ide.png)
 
@@ -23,7 +23,9 @@ Forge IDE is built for engineers who want to see and understand the tool they us
 ## Features
 
 - **Editor** — multi-tab, syntax highlighting, line numbers, undo, find/replace, multi-file search, split editors, multi-cursor editing, bracket matching + pair colorization, minimap, indent guides, auto-close brackets, word wrap, go-to-line
-- **LSP** — full language server support (diagnostics, completions, hover, go-to-definition, find references, rename, code actions, signature help, formatting, symbol outline). Ships wired up for `rust-analyzer`; any LSP-compliant server works.
+- **LSP** — diagnostics, completions, hover, go-to-definition, find references, rename, code actions, signature help, formatting and symbol outline, all implemented against the protocol. **Local editing drives `rust-analyzer` and nothing else:** the server command is a literal in `src/lsp.rs`, there is no setting for it, and `lsp_open` returns early for any extension but `.rs`. Other servers are not yet configurable — if you write Python or TypeScript locally, you get an editor with no diagnostics and no completions.
+
+  Remote development is further along: `forge-server/src/lsp.rs` picks a server per language (`rust-analyzer`, `typescript-language-server`, `pylsp`, `clangd`, `gopls`), so an SSH workspace supports five languages where the local path supports one. Lifting that table to both sides is the intended fix.
 - **Git** — status-colored file tree, staged/unstaged source control panel, inline diff gutter, unified diff view, commit/push/pull/fetch, inline blame, `gh`-backed "Publish to GitHub," and a `~/.ssh/config`-integrated remote picker
 - **SSH Remote** — a small Rust daemon (`forge-server`) uploads itself to the remote machine over SFTP, runs there, and speaks JSON-RPC back over the SSH channel. Remote file tree, remote terminal, and remote file editing all route through it — no VS Code Server–style background install step, and it works fully offline on the remote end (nothing is downloaded there).
 - **Debugging** — DAP client (breakpoints, step over/in/out, call stack, variables) against `lldb-dap`, `debugpy`, or any DAP-compliant adapter
@@ -32,7 +34,8 @@ Forge IDE is built for engineers who want to see and understand the tool they us
 - **Forge Agent** — an optional AI coding assistant panel with multi-tab conversations and persistent history
 - **Multi-window** — open more than one workspace or remote host at once
 - **Themes & settings** — font size, tab width, word wrap, and a theme picker (Dark+, Light+, Monokai, One Dark), all in `~/.config/forge-ide/settings.toml`
-- **Plugins** — a minimal C ABI for dynamically loaded `.so`/`.dylib`/`.dll` plugins, surfaced in the command palette
+- **Languages** — syntax highlighting covers Rust, TOML, GLSL, JSON, YAML, shell and Markdown: seven, hardcoded in `app.rs`, not a grammar system. The file tree shows icons for languages the editor cannot highlight, which is worth knowing before you open a `.py` file and find grey text. Local language-server support is Rust only; see the LSP bullet.
+- **Plugins** — a 122-line C ABI: a dynamic library exports `forge_plugin_run(id, text) -> char*` and gets the buffer's text, returning a replacement. That is the whole surface — no editor API, no events, no UI, no way to register a highlighter or a language server, and no list of what is loaded. It is a text-transform hook, not an extension system, and it is not a route to the VS Code ecosystem.
 
 ## Shell history
 

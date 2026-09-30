@@ -65,10 +65,34 @@ for script in bootstrap.sh bootstrap.ps1; do
     check "$rel" "$script advertised URL"
 done
 
+# The preflight must cover what the installer it hands off to refuses to run
+# without. It did not: `forge-agent/install.sh` exits when ripgrep is absent
+# and shells out to python3 to write the config, and the bootstrap checked
+# neither — so the advertised one-liner cloned the repo and then died inside
+# the installer on a fresh machine. Both scripts parse fine; the gap is
+# between them, which is why neither `bash -n` nor a path check finds it.
+echo
+echo "bootstrap preflight covers the installer's hard requirements:"
+required="$(grep -oE 'command -v [a-z0-9_]+ +&>/dev/null \|\| MISSING' forge-agent/install.sh \
+            | awk '{print $3}' | sort -u)"
+# python3 is invoked directly rather than probed, so it is named here.
+required="$required
+python3"
+checked="$(grep -oE 'command -v [a-z0-9_]+' bootstrap.sh | awk '{print $3}' | sort -u)"
+for tool in $required; do
+    if echo "$checked" | grep -qx "$tool"; then
+        echo "  ok       $tool"
+    else
+        echo "  MISSING  $tool  (forge-agent/install.sh needs it; bootstrap.sh does not check for it)" >&2
+        status=1
+    fi
+done
+
 echo
 if [[ $status -eq 0 ]]; then
     echo "All bootstrap paths resolve."
 else
-    echo "Bootstrap references a path that does not exist — the one-command install is broken." >&2
+    echo "The one-command install is broken: a path does not exist, or the preflight" >&2
+    echo "does not cover what the installer it calls requires." >&2
 fi
 exit $status

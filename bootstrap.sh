@@ -39,10 +39,18 @@ info "Detected $OS $(uname -m)"
 # 2. Preflight system packages
 # -------------------------------------------------------------------
 if [[ "$OS" == "Linux" ]]; then
+    # This list must cover what forge-agent/install.sh hard-requires, because
+    # that is what runs next. It did not: install.sh exits if ripgrep is
+    # missing and shells out to python3 to write the config, and neither was
+    # checked here — so the advertised one-liner cloned the repo and then died
+    # in the installer on a fresh Ubuntu box. `unzip` was here for Bun, which
+    # was retired (see forge-agent/install.sh's note about it).
     MISSING=()
-    command -v git    >/dev/null 2>&1 || MISSING+=(git)
-    command -v unzip  >/dev/null 2>&1 || MISSING+=(unzip)        # bun installer
-    command -v cc     >/dev/null 2>&1 || MISSING+=(build-essential)  # cargo
+    command -v git     >/dev/null 2>&1 || MISSING+=(git)
+    command -v curl    >/dev/null 2>&1 || MISSING+=(curl)             # rustup download, and web_search shells out to it
+    command -v cc      >/dev/null 2>&1 || MISSING+=(build-essential)  # cargo
+    command -v rg      >/dev/null 2>&1 || MISSING+=(ripgrep)          # search_code, and install.sh refuses without it
+    command -v python3 >/dev/null 2>&1 || MISSING+=(python3)           # install.sh writes the config with it
 
     if [[ ${#MISSING[@]} -gt 0 ]]; then
         if command -v apt-get >/dev/null 2>&1; then

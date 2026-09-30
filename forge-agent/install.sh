@@ -560,13 +560,17 @@ CONFIG
 [agent]
 auto_approve_reads = true
 auto_approve_writes = false
-permission_mode = "default"
 max_history_messages = 200
-compaction_threshold = 150
+# compact_at_percent is the live compaction trigger. compaction_threshold and
+# permission_mode used to be written here and are not: the first is dead (the
+# trigger became token-based) and the second is read by nothing, so a
+# generated config that set them was handing the reader two dials attached to
+# nothing.
+compact_at_percent = 80
 
 [agent.subagents]
 enabled = true
-max_depth = 2
+max_depth = 4
 max_concurrent = 4
 default_model = "$DEFAULT_MODEL"
 CONFIG

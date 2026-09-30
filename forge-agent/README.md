@@ -152,12 +152,20 @@ Intel Macs are untested. See the [platform table](../README.md#platforms).
 - **macOS, Linux, or Windows**
 - **Rust** (installed automatically by the installer if missing)
 - **An LLM endpoint** — OpenAI-compatible, Anthropic, or ChatGPT Codex
+- **`git`, `curl`, a C compiler, `ripgrep` and `python3`** — the installer
+  refuses to continue without the first four and writes your config with the
+  last. On macOS, `ripgrep` is not part of the Xcode command-line tools and
+  needs its own install (`brew install ripgrep`, or a prebuilt binary from its
+  releases page); the rest are usually already there.
 
-**Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `forge-agent/install.sh`:
+**Linux preflight** — on a minimal Ubuntu/Debian image, install these before running `forge-agent/install.sh`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git build-essential unzip
+sudo apt-get update && sudo apt-get install -y git curl build-essential ripgrep python3
 ```
+
+The one-command bootstrap installs them for you on Debian/Ubuntu; this is for
+the manual path, or for any other distribution.
 
 `forge-agent/install.sh` will detect these and tell you exactly what to install if any are missing.
 

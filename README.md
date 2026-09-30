@@ -30,7 +30,9 @@ client is a protocol away rather than a fork.
 using egui — not a VS Code fork and not Electron. That has costs, and they are
 listed honestly in [Platforms](#platforms): one supported platform, and a
 smaller feature surface than an editor with a decade of extensions behind it.
-What it buys is no upstream to track, and an agent panel that is part of the
+What it buys is no *editor* upstream to track — egui, wgpu and winit are still
+upstreams, and winit is a patched fork vendored in-tree, itemised in
+[`NOTICE`](NOTICE) — and an agent panel that is part of the
 editor rather than an extension in a sandbox — checkpoints, diffs and rewind
 reach the buffers directly.
 
@@ -41,6 +43,16 @@ its rendering, wrapping, markdown and diffing is in this repository. The editor
 decodes PNG and GIF with decoders written for it, which replaced the `image`
 crate and three of its transitive dependencies. No
 third-party binary ships in this repository at all.
+
+That figure is the terminal client's, and it does not generalise. On this
+machine — `cargo tree -e normal -p <crate> --target aarch64-apple-darwin`,
+deduped by name, workspace crates excluded — the agent pulls **171** and the
+editor **286**, because one makes HTTP requests with TLS and the other drives a
+GPU, git and SSH. Nobody should write their own rustls. The claim is that a
+dependency is a decision rather than a reflex, and the terminal client is where
+that shows most clearly — not that the whole project is thirteen crates. The
+command is given because the number moves with the platform you resolve for,
+and a figure nobody can reproduce is not worth quoting.
 
 **Permission is the design, not a setting.** Every tool call is approvable;
 plan mode is read-only until you approve a plan; auto-accept is a mode the
@@ -57,8 +69,10 @@ configured endpoint, a model-catalog fetch and a GitHub lookup of the Codex
 client version. `agent.offline_mode` turns all of them off.
 
 **It tells you what does not work.** The changelog says when a fix of ours was
-incomplete and review caught it, and the security section names the releases an
-SSRF was shipped in rather than the ones it was fixed in. Platform support is a
+incomplete and review caught it, and its Security sections name the releases an
+SSRF was shipped in rather than the ones it was fixed in — in
+[`forge-agent/CHANGELOG.md`](forge-agent/CHANGELOG.md), which is where the
+affected ranges live; [`SECURITY.md`](SECURITY.md) is the reporting policy. Platform support is a
 table of what has and has not been run by a person, not a list of logos. That is
 the standard the rest of the documentation is held to as well.
 

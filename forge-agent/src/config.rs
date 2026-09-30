@@ -1135,5 +1135,107 @@ mod documented_config_parses {
         assert_eq!(c.compact_at_percent, 80);
     }
 }
+#[cfg(test)]
+mod installer_config_tests {
+    use super::*;
+
+    /// The config the installer writes must load in the agent that reads it.
+    ///
+    /// Two things had gone wrong that this catches. The wizard wrote
+    /// `compaction_threshold`, a key whose own doc comment says it does
+    /// nothing, and `permission_mode`, which no code reads — so a first-time
+    /// user got a generated file with two dials attached to nothing. It also
+    /// wrote `max_depth = 2` where the code default and the documentation both
+    /// say 4, so the installed default silently disagreed with the documented
+    /// one.
+    ///
+    /// What this does not catch: a misspelled key. Serde ignores unknown
+    /// fields here on purpose, so an old config naming a retired option still
+    /// loads — which means a typo in the installer's template would parse
+    /// clean. `the_installer_writes_no_dead_keys` below covers the named
+    /// cases; a typo would need a deny-unknown-fields pass the rest of the
+    /// config deliberately does not have.
+    ///
+    /// Reads `install.sh` rather than restating its template, so the two
+    /// cannot drift. The installer builds the file in two parts — an endpoint
+    /// block per provider choice, then a shared `[agent]` tail appended — so
+    /// each `<< CONFIG` heredoc is reassembled with the tail and parsed.
+    #[test]
+    fn every_config_the_installer_writes_loads() {
+        let sh = include_str!("../install.sh");
+
+        // The heredocs, in order. The last one is appended (`>>`) to whichever
+        // endpoint block ran, so it is the shared tail rather than a file.
+        let mut blocks: Vec<String> = Vec::new();
+        let mut rest = sh;
+        while let Some(at) = rest.find("<< CONFIG\n") {
+            rest = &rest[at + "<< CONFIG\n".len()..];
+            let end = rest.find("\nCONFIG\n").expect("an unterminated heredoc in install.sh");
+            blocks.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        assert!(
+            blocks.len() >= 2,
+            "expected the installer's config heredocs, found {}",
+            blocks.len()
+        );
+
+        let tail = blocks.pop().expect("the shared [agent] tail");
+        assert!(
+            tail.contains("[agent]"),
+            "the last heredoc should be the shared [agent] tail, got: {tail}"
+        );
+
+        // Shell variables the installer interpolates. Values only have to be
+        // type-plausible; this is a parse check, not a semantic one.
+        let fill = |t: &str| -> String {
+            t.replace("$DEFAULT_MODEL", "main")
+                .replace("$EP_NAME", "main")
+                .replace("$EP_URL", "http://127.0.0.1:1234/v1")
+                .replace("$EP_MODEL", "a-model")
+                .replace("$EP_KEY", "sk-placeholder")
+                .replace("$EP_CONTEXT", "131072")
+                .replace("$EP_TYPE", "open_ai")
+        };
+
+        for (n, block) in blocks.iter().enumerate() {
+            let whole = format!("{}\n{}", fill(block), fill(&tail));
+            // Any `$VAR` left means this test does not know about a variable
+            // the installer uses, and would be parsing something a user never
+            // gets. Fail loudly rather than quietly checking the wrong text.
+            let leftover: Vec<&str> = whole
+                .split_whitespace()
+                .filter(|w| w.starts_with('$') && w.len() > 1)
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "heredoc {n} uses shell variables this test does not fill: {leftover:?}"
+            );
+
+            let parsed = toml::from_str::<AppConfig>(&whole);
+            assert!(
+                parsed.is_ok(),
+                "the config installer heredoc {n} writes does not load: {}\n--- config ---\n{whole}",
+                parsed.unwrap_err()
+            );
+        }
+    }
+
+    /// The installer must not write keys that do nothing.
+    #[test]
+    fn the_installer_writes_no_dead_keys() {
+        let sh = include_str!("../install.sh");
+        // Both are still accepted for backwards compatibility; neither should
+        // be produced fresh. `compaction_threshold` is superseded by
+        // `compact_at_percent`; nothing reads `permission_mode`.
+        for dead in ["compaction_threshold =", "permission_mode ="] {
+            assert!(
+                !sh.contains(dead),
+                "install.sh writes `{dead}` into new configs, and it does nothing",
+            );
+        }
+    }
+}
+
 
 

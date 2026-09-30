@@ -99,8 +99,11 @@ their published licences: everything compiled into the binaries Forge
 distributes, and every source tree vendored into this repository.
 
 Cargo.lock also resolves crates for targets Forge does not currently build —
-Windows, Android, WebAssembly, Redox, and other platform-specific graphs. Those
-have not been checked one by one. None of them is linked into anything
+Android, WebAssembly, Redox, and other platform-specific graphs. Those have not
+been checked one by one. Windows is no longer among them: the agent, protocol,
+search engine and terminal client build and pass their tests there on every
+push, and the editor builds, so its graph is linked into something a person can
+run even though no signed Windows artifact is published here. None of them is linked into anything
 distributed here, and they are conventionally MIT or Apache-2.0, but this
 notice does not assert that, because nobody has confirmed it yet. Checking the
 remainder is outstanding work, and the intention is that this section

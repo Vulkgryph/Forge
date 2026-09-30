@@ -214,6 +214,13 @@ jobs:
           sys.exit(1 if dead else 0)
           EOF
 
+      # NOTICE claimed to name every crate whose terms are not MIT or
+      # Apache-2.0, and had missed every ISC one — including `ring`, a direct
+      # dependency — plus every BSD-3-Clause one and MIT-0. It was written
+      # once against the graph of the day; the graph kept moving.
+      - name: NOTICE attributes every licence in the shipped graph
+        run: python3 scripts/check_notice_licences.py
+
       - name: Installer parses
         run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh && bash -n bootstrap.sh
 

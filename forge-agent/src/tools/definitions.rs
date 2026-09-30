@@ -293,7 +293,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     and search the full text of what it returns. Use this for a measured value, a \
                     method, or a result that would be stated in a paper — recording temperatures, \
                     concentrations, cell types, assay conditions — none of which are on pages \
-                    web_search can crawl, because PubMed Central forbids crawling. \
+                    web_search can crawl: this uses Europe PMC's published API, which is \
+                    better than crawling even where crawling is allowed. \
                     Only open-access articles have their text indexed; anything else comes back as a \
                     citation and a link, and the result says so. Every result reports the licence its \
                     text is held under: quote it with that attribution, and note that cc by-nc \

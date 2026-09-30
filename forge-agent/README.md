@@ -65,7 +65,7 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
 | Component | When it talks to the network |
 |---|---|
 | LLM endpoint | Always — but if it's local (`127.0.0.1:1234`, etc.) that traffic stays on your machine |
-| `web_search` / `web_fetch` tools | Only when the model invokes them. Disable both via `agent.disabled_tools = ["web_search", "web_fetch"]` if you want them off the table |
+| `web_search` / `web_fetch` / `search_papers` tools | Only when the model invokes them. `search_papers` reaches Europe PMC at `www.ebi.ac.uk`; the other two reach whatever the model asks for. Disable all three via `agent.disabled_tools = ["web_search", "web_fetch", "search_papers"]` if you want them off the table, or set `offline_mode = true`, which forces exactly these three off |
 | Codex subscription auth | Login, and a token refresh when the stored one is near expiry. Only when ChatGPT Codex is the endpoint in use — having logged in once does not make this happen on other endpoints |
 | Codex model catalog | Once at startup, only when Codex is the endpoint in use. On any other endpoint the list `/model` offers comes from a local cache and nothing is sent |
 | Codex version self-check | Background, at most once a week, only if you're actively using Codex; if GitHub is unreachable forge falls back to a cached value. `offline_mode` or `FORGE_NO_AUTO_VERSION_CHECK=1` stops it |
@@ -73,11 +73,14 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
 **Minimum offline setup**:
 
 1. Local LLM running (LM Studio / Ollama / llama.cpp / vLLM)
-2. Wizard option 1 (Local LLM server) when running `install.sh`
-3. Disable network tools in `~/.config/forge/config.toml`:
+2. Wizard option 1 (Local LLM server) when running `forge-agent/install.sh`
+3. Disable network tools in `~/.config/forge/config.toml`. Add the line to the
+   `[agent]` table the wizard already wrote — this is an edit, not a file you
+   can create from these two lines, because `[agent]` has members with no
+   default and dropping the rest is a parse error:
    ```toml
    [agent]
-   disabled_tools = ["web_search", "web_fetch"]
+   disabled_tools = ["web_search", "web_fetch", "search_papers"]
    ```
 4. Set `FORGE_NO_AUTO_VERSION_CHECK=1` to suppress the once-a-week GitHub poll Forge uses to keep its Codex `client_version` current (only relevant if you'd ever use the ChatGPT Codex provider anyway):
    ```bash
@@ -85,8 +88,14 @@ Forge runs with no internet when paired with a local LLM. Useful for airgapped e
    ```
 
 Simplest route, instead of the four steps above: set `offline_mode = true` under
-`[agent]`, or toggle it from the tools menu. It forces off the web tools, the
-weekly version self-check, and the Codex model-catalog fetch in one move.
+`[agent]`, or toggle it from the tools menu. It forces off all three network
+tools, the weekly version self-check, and the Codex model-catalog fetch in one
+move — including for any subagent the agent delegates to.
+
+One wrinkle in the reporting: the `init` frame a client receives still lists the
+network tools as enabled under `offline_mode`, because the force-off is applied
+when the tool list is handed to the model, later than that frame is sent. The
+tools menu will show them on; the model cannot call them.
 
 After that, Forge makes no outgoing request except to the endpoint you
 configured — which, for a local model, means nothing leaves the machine.
@@ -116,7 +125,7 @@ Forge respects a small set of environment variables for users who want to overri
 | `FORGE_SHOW_INTERNAL_MODELS=1` | Show ChatGPT Codex models marked as internal (e.g. `codex-auto-review`). These aren't general chat targets — selecting one will likely fail at the API. Hidden by default. |
 | `FORGE_SKIP_DANGEROUS_CONFIRM=1` | Skip the confirmation prompt that fires when launching with `--dangerously-allow-all`. Intended for scripted / CI usage; never set in interactive shells. |
 | `FORGE_AGENT_PATH` | Override the path the wrapper uses to find `forge-agent`. Useful for testing local builds. |
-| `FORGE_RUSTUP_SHA256` | Pin the expected SHA-256 of the rustup installer when `install.sh` fetches it. If unset, the script prints the hash so you can pin it on a future run. |
+| `FORGE_RUSTUP_SHA256` | Pin the expected SHA-256 of the rustup installer when `forge-agent/install.sh` fetches it. If unset, the script prints the hash so you can pin it on a future run. |
 | `FORGE_REPO` / `FORGE_DEST` / `FORGE_BRANCH` | Override defaults in `bootstrap.sh` / `bootstrap.ps1`. |
 
 ## Platforms
@@ -144,13 +153,13 @@ Intel Macs are untested. See the [platform table](../README.md#platforms).
 - **Rust** (installed automatically by the installer if missing)
 - **An LLM endpoint** — OpenAI-compatible, Anthropic, or ChatGPT Codex
 
-**Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `install.sh`:
+**Linux preflight** — on a minimal Ubuntu/Debian image you may need to install a C toolchain and `unzip` before running `forge-agent/install.sh`:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git build-essential unzip
 ```
 
-`install.sh` will detect these and tell you exactly what to install if any are missing.
+`forge-agent/install.sh` will detect these and tell you exactly what to install if any are missing.
 
 **Windows preflight** — `install.ps1` uses `winget` to install missing prerequisites (Git, and Rust via rustup). It assumes Visual Studio Build Tools 2022 (or higher) is already installed for the MSVC linker — install from [aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the "Desktop development with C++" workload if missing.
 
@@ -184,7 +193,7 @@ Override defaults via environment variables:
 ```bash
 git clone https://github.com/Vulkgryph/Forge.git forge
 cd forge
-./install.sh
+./forge-agent/install.sh
 ```
 
 **Windows (PowerShell):**
@@ -210,7 +219,7 @@ The installer's first question is how you want Forge to reach an LLM:
 - **ChatGPT Codex subscription (3):** writes a minimal config and offers to run the OAuth login inline. On a local machine, just say yes and a browser opens. On a remote VM over SSH, the installer detects this and tells you to first re-connect with port forwarding so the OAuth callback can reach the listener on the remote host:
   - ChatGPT Codex OAuth uses port **1455**: `ssh -L 1455:localhost:1455 <user>@<host>`
 - **Direct API key (4):** you'll pick a provider, paste your key, choose a model. The key is stored in `~/.config/forge/config.toml` (so file permissions matter — `chmod 600` it if you're paranoid).
-- **Skip (5):** writes a placeholder config you can edit by hand at `~/.config/forge/config.toml`. The file is annotated with examples for every endpoint type. Re-run `./install.sh` later if you want the interactive wizard.
+- **Skip (5):** writes a placeholder config you can edit by hand at `~/.config/forge/config.toml`. The file is annotated with examples for every endpoint type. Re-run `./forge-agent/install.sh` later if you want the interactive wizard.
 
 When the wizard finishes:
 
@@ -231,10 +240,10 @@ forge-update
 Or from the repo:
 
 ```bash
-./update.sh
+./forge-agent/update.sh
 ```
 
-The updater uses `git pull --ff-only`, rebuilds `forge-agent` and the UI, reinstalls the local wrappers, and preserves your config in `~/.config/forge`. If you have local source changes, it skips pulling and rebuilds the current checkout. Use `./update.sh --no-pull` to rebuild/reinstall without touching git.
+The updater uses `git pull --ff-only`, rebuilds `forge-agent` and the UI, reinstalls the local wrappers, and preserves your config in `~/.config/forge`. If you have local source changes, it skips pulling and rebuilds the current checkout. Use `./forge-agent/update.sh --no-pull` to rebuild/reinstall without touching git.
 
 ## Configuration
 
@@ -428,9 +437,9 @@ Forge runs the script from the project root. Tool arguments are passed as JSON o
 
 **"No endpoint 'X' found in config"** — `models.default` in your config doesn't match any endpoint name. Open `~/.config/forge/config.toml` and make sure `models.default` matches the `name` field of one of your `[[models.endpoints]]` entries.
 
-**Forge hangs on startup** — your LLM server isn't running or the endpoint URL is wrong. Check that your server is up at the URL in your config, or re-run `./install.sh` to reconfigure.
+**Forge hangs on startup** — your LLM server isn't running or the endpoint URL is wrong. Check that your server is up at the URL in your config, or re-run `./forge-agent/install.sh` to reconfigure.
 
-**Config reset** — delete `~/.config/forge/config.toml` and re-run `./install.sh` to go through the setup wizard again.
+**Config reset** — delete `~/.config/forge/config.toml` and re-run `./forge-agent/install.sh` to go through the setup wizard again.
 
 ## Known Issues
 

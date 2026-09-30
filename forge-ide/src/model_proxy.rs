@@ -23,9 +23,13 @@
 //! authorises this tunnel and nothing else, it is marked ephemeral so the agent
 //! does not write it to that machine's config, and it dies with the session.
 //!
-//! This half is the rewriting: what arrives, what is sent on, and what must
-//! never be passed through. It performs no I/O so it can be tested against the
-//! exact bytes a client sends.
+//! Most of this module is the rewriting — what arrives, what is sent on, and
+//! what must never be passed through — and those functions perform no I/O, so
+//! they can be tested against the exact bytes a client sends. `serve_one` is
+//! the exception and does the actual forwarding: it reads the request off the
+//! socket and issues the upstream call with the credential attached. This file
+//! is therefore credential- and LLM-facing surface, not a pure rewriter; the
+//! module doc claimed otherwise until the serving code landed beside it.
 
 /// How an endpoint expects to be authenticated.
 ///

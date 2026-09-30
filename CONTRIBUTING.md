@@ -17,31 +17,44 @@ repository, not general advice about writing Rust.
 
 | Crate | What it is |
 |---|---|
-| [`forge-agent/`](forge-agent/) | The agent. The only component that talks to an LLM or executes tools. |
+| [`forge-agent/`](forge-agent/) | The agent. The only component that executes tools. |
 | [`forge-tui-rs/`](forge-tui-rs/) | The terminal client, installed as `forge`. |
-| [`forge-ide/`](forge-ide/) | The editor, plus its terminal emulator and `forge-server` pty host. |
+| [`forge-ide/`](forge-ide/) | The editor, plus its terminal emulator, its `forge-server` pty host, and the model proxy that lends a credentialled endpoint to a remote agent. |
 | [`forge-agent-proto/`](forge-agent-proto/) | The wire protocol shared by the agent and the terminal client. |
-| [`forge-search/`](forge-search/) | The crawler and index behind `web_search` and `search_documents`. |
+| [`forge-search/`](forge-search/) | The crawler and index behind `web_search` and `search_documents`, and the Europe PMC client behind `search_papers`. |
+| [`forge-ide/forge-proto/`](forge-ide/forge-proto/) | The JSON-RPC protocol shared by `forge-ide` and the `forge-server` pty host. |
 
 The three that people install — `forge-agent`, `forge-tui-rs`, `forge-ide` — are
-versioned together and each keeps a `CHANGELOG.md`. The rest are internal: they
-are not released or versioned on their own, so a change to one is described in
-the changelog of whatever it changed for. `forge-search` has no changelog of its
-own for that reason, and its user-visible behaviour is recorded under
-`forge-agent`, where the tools that expose it live.
+versioned together and each keeps a `CHANGELOG.md`. The rest are internal and
+keep none: a change to one is described in the changelog of whatever it changed
+for. `forge-search` has no changelog of its own for that reason, and its
+user-visible behaviour is recorded under `forge-agent`, where the tools that
+expose it live.
+
+Internal does not mean the version never moves. `forge-server` is at `0.1.7` and
+is bumped when its wire behaviour changes, because `forge-ide` compiles the
+number into `SERVER_VERSION` and a remote running an older daemon has to be
+recognised as older. It is simply not bumped *with* a release.
 
 `default-members` is `forge-agent` alone, so a bare `cargo build` does not pull in the editor's GPU stack. Build the others explicitly:
 
 ```bash
-cargo test -p forge-agent -p forge-agent-proto -p forge-tui-rs
-cargo test -p forge-ide            # needs a GPU-capable toolchain
+cargo test -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
+cargo test -p forge-ide -p forge-proto -p forge-server   # needs a GPU-capable toolchain
 ```
+
+That is all seven workspace members. `cargo test --workspace` also works and is
+what CI's macOS job runs.
 
 ## What CI enforces
 
-- Those tests, on every push
+- Those tests, on pushes to `main` and on pull requests
 - `RUSTFLAGS=-D warnings` — the crates are at zero warnings and should stay there
-- That `install.sh` and `update.sh` still parse, and that the macOS app bundle still builds and contains both binaries
+- That `forge-agent/install.sh`, `forge-agent/update.sh` and `bootstrap.sh` still parse, and that every repo path the bootstrap installers name actually exists — `bash -n` passes on a bootstrap whose filenames have gone stale, which is how the one-command install broke once
+- That the macOS app bundle still builds and contains both binaries
+- That no documented version literal is pinned to a number that drifts — a version printed in the docs or sent as a user agent has to be derived, not typed
+- That `NOTICE` names every licence in the shipped dependency graph that is not MIT or Apache-2.0 — a new dependency with unusual terms fails the build rather than waiting for an audit
+- That documentation links resolve to a file that exists (vendored trees excluded; the checker strips `#fragments`, so anchors are not machine-verified)
 - On Windows: the agent, the protocol, search and the terminal client build and pass their tests, including the provider fault matrix. This gates. The editor is **not** built there, so a Windows regression in `forge-ide` will not be caught by CI.
 - That no documentation or installer script contains a home directory. `%USERPROFILE%`, `$HOME` or a relative path instead — an absolute path through someone's home publishes their username and only works on their machine.
 

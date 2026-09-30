@@ -34,10 +34,12 @@ What it buys is no upstream to track, and an agent panel that is part of the
 editor rather than an extension in a sandbox — checkpoints, diffs and rewind
 reach the buffers directly.
 
-**Dependencies are decisions here.** The terminal client has two third-party
-crates, both Unicode tables: every part of its rendering, wrapping, markdown
-and diffing is in this repository. The editor decodes PNG and GIF with decoders
-written for it, which replaced the `image` crate and six transitive crates. No
+**Dependencies are decisions here.** The terminal client declares two
+third-party crates directly, both Unicode tables — serde and serde_json reach
+it through the shared protocol crate, thirteen in the built graph. Every part of
+its rendering, wrapping, markdown and diffing is in this repository. The editor
+decodes PNG and GIF with decoders written for it, which replaced the `image`
+crate and three of its transitive dependencies. No
 third-party binary ships in this repository at all — even MoltenVK, for the
 optional Vulkan renderer, you install yourself.
 
@@ -50,8 +52,10 @@ against is an agent that has already done something you would not have allowed.
 
 **Your keys, your machine.** Any OpenAI-compatible endpoint works, nothing is
 routed through a Vulkgryph service, and offline mode turns off the tools that
-reach the network. The only first-party network call in the whole system is a
-GitHub releases check for updates.
+reach the network. The first-party network calls are a weekly GitHub releases
+check for updates — one in each client — and, only when ChatGPT Codex is the
+configured endpoint, a model-catalog fetch and a GitHub lookup of the Codex
+client version. `agent.offline_mode` turns all of them off.
 
 **It tells you what does not work.** The changelog says when a fix of ours was
 incomplete and review caught it, and the security section names the releases an
@@ -78,7 +82,7 @@ terminal client are more portable than the editor; the table in
 
 ## How they fit together
 
-`forge-agent` is the only piece that talks to an LLM or touches tools directly. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui-rs` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other, and neither reimplements any agent logic. This means the agent's actual behavior (tool execution, model calls, safety gating) can never diverge between the two clients, since it's the literal same compiled binary in both cases.
+`forge-agent` is the only piece that runs the model loop or touches tools directly. One exception, in the other direction: in remote development `forge-ide` proxies the model endpoint so the credential never leaves your machine ([`forge-ide/src/model_proxy.rs`](forge-ide/src/model_proxy.rs)) — the outbound request to the provider is made by the editor, and the agent holds no provider credential at all. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui-rs` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other, and neither reimplements any agent logic. This means the agent's actual behavior (tool execution, model calls, safety gating) can never diverge between the two clients, since it's the literal same compiled binary in both cases.
 
 What *can* diverge is each client's own view of the wire protocol's shape. The terminal client shares [`forge-agent-proto`](forge-agent-proto/) with the agent, so those two cannot drift; `forge-ide` keeps its own hand-maintained Rust structs, so a protocol change has to be applied there by hand.
 
@@ -125,13 +129,13 @@ The older terminal-only installer above installs:
 | Command | Points at |
 |---|---|
 | `forge` | `forge-tui-rs`, built from this workspace and installed as `~/.local/share/forge/bin/forge` |
-| `forge-agent` | `target/release/forge-agent` from this workspace |
+| `forge-agent` | built from this workspace and installed as `~/.local/share/forge/bin/forge-agent` |
 | `forge-update` | `forge-agent/update.sh` in this repo |
 
 With that terminal-only installer, `forge-ide` is built separately. The root Linux
 and Windows installers include it by default.
 
-On macOS there is also a notarized `.dmg` on the [releases page](https://github.com/Vulkgryph/Forge/releases) if you would rather not build the editor yourself. It is signed with Vulkgryph LLC's Developer ID and notarized by Apple, so it opens without the unidentified-developer warning. The terminal client is not distributed that way — `install.sh` builds it from this checkout.
+On macOS there is also a notarized `.dmg` on the [releases page](https://github.com/Vulkgryph/Forge/releases) if you would rather not build the editor yourself. It is signed with Vulkgryph LLC's Developer ID and notarized by Apple, so it opens without the unidentified-developer warning. The terminal client is not distributed that way — `forge-agent/install.sh` builds it from this checkout.
 
 ## Platforms
 
@@ -146,16 +150,16 @@ this is actually used against is ARM64.
 
 | | macOS (Apple Silicon) | Linux x86-64 | Linux ARM64 | Windows x86-64 |
 |---|---|---|---|---|
-| `forge-agent` | supported | builds and passes tests in CI | runs headless on a remote | builds and passes tests in CI, including the provider fault matrix |
+| `forge-agent` | supported | builds and passes tests in CI | runs headless on a remote | builds in CI; the provider fault matrix passes there, the unit suite is not run |
 | `forge-search` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
 | `forge-agent-proto` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
 | `forge-tui-rs` (`forge`) | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
-| `forge-ide` | supported | untested | untested | builds in CI; nobody has watched it draw a frame |
-| `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | builds in CI, never run |
+| `forge-ide` | supported | untested | untested | attempted in CI as a non-gating step; nobody has watched it draw a frame |
+| `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | attempted in CI as a non-gating step, never run |
 
 "Builds and passes tests in CI" means exactly that and no more: a machine
 compiled it and its tests passed. It does not mean a person has used it. Where
-a person has, the word is "supported". CI runs every push — see
+a person has, the word is "supported". CI runs on every push to `main` and on every pull request — see
 [`ci.yml`](.github/workflows/ci.yml) for which crates each platform covers.
 
 One feature is narrower than its component. When a bot check refuses the
@@ -171,12 +175,16 @@ its own web view before that feature came with it.
 evidence behind the word. CI coverage is not what it rests on, and differs by
 component: `forge-ide` is built and its tests run on a macOS runner on every
 push; `forge-agent` is built on macOS by the packaging job but its test suite
-runs on Linux; `forge-tui-rs` is built and tested on Linux only.
+runs on Linux; `forge-tui-rs` is built and tested on Linux and Windows.
 
-**compiles and passes tests** — CI builds it on x86-64 Linux and the test suite
-passes there on every push. Nobody has sat in front of it on a Linux desktop. A
-build that works and a program that behaves are different claims, and only the
-first one is being made.
+**builds and passes tests in CI** — a machine compiled it and its tests passed.
+Nobody has sat in front of it there. A build that works and a program that
+behaves are different claims, and only the first one is being made.
+
+**attempted in CI as a non-gating step** — the build runs but is
+`continue-on-error`, so it reports rather than gates: a regression there will not
+fail the workflow. Used for the editor on Windows, where nothing had ever built
+it on a runner and the point was to find out.
 
 **runs headless on a remote** — the agent and the file/pty server are uploaded to
 a Linux machine and driven over SSH by remote development, exercised regularly
@@ -195,9 +203,10 @@ Intel Macs are untested. Rosetta is not a substitute for having tried it.
 "builds and passes tests in CI", which means a machine compiled it and its tests
 passed and nothing more. The editor renders through wgpu — D3D12 on Windows,
 Vulkan on Linux — and takes its window from winit, so there is no known reason
-it cannot work; it builds on Windows in CI, and that job is how a `cfg` bug
-making `forge-server` uncompilable there was found. Nobody has watched it draw a
-frame off macOS. A report that it does not run is worth filing.
+it cannot work; it is built on Windows in CI as a non-gating
+step — which is how a `cfg` bug making `forge-server` uncompilable there was
+found, and which also means a Windows regression in the editor will not fail the
+build. Nobody has watched it draw a frame off macOS. A report that it does not run is worth filing.
 
 The macOS app bundle, its signing, and the "add to Dock" option are macOS-only by
 nature. Remote development is exercised from a macOS host to a Linux remote; the
@@ -243,8 +252,9 @@ saying "off until there is a real search behind it".
 There is one now, in `forge-search` — a crawler, an inverted index, BM25
 ranking and snippets, with no dependencies. It answers from pages Forge has
 actually read. The cost is that it only knows what it has crawled, so a query
-the index cannot answer crawls first, which takes up to 25 seconds once and
-milliseconds afterwards. Pass `sites` to aim the crawl somewhere specific
+the index cannot answer crawls first, which takes up to about two and a half
+minutes on a first crawl at the default of 120 pages — the budget scales with
+`max_pages` and is capped at 300 seconds — and milliseconds afterwards. Pass `sites` to aim the crawl somewhere specific
 rather than rephrasing the query.
 
 It is **on by default** now. Anyone who ran an earlier version has
@@ -254,7 +264,11 @@ in either client turns it back on.
 
 Crawling has limits that are not bugs. `robots.txt` is obeyed, including
 `Crawl-delay`, and requests to one host are spaced a second apart by default.
-Sites that refuse crawlers are refused, and PubMed Central refuses everyone:
+Sites that refuse crawlers are refused. PubMed Central disallows most of its
+site but explicitly allows `/articles/` and `/api/` with a one-second
+`Crawl-delay`, so its full text is crawlable — `search_papers` uses the Europe
+PMC API anyway, because a published API beats crawling even where crawling is
+permitted. The point stands where it actually applies:
 its `robots.txt` is `User-agent: *` and `Disallow: /`.
 
 ### If Forge has been at your site

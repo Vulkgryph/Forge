@@ -56,6 +56,21 @@ C libraries compiled from source
     scanner will report the GPL and the exception is the answer.
   OpenSSL 3.6.3 — vendored and compiled in via git2's `vendored-openssl`
     feature, licensed under the Apache License 2.0.
+  libssh2 — compiled from source by `libssh2-sys`, reached through git2's `ssh`
+    feature, licensed under the BSD 3-Clause License. The `libssh2-sys` crate
+    itself is MIT or Apache-2.0; the C it builds is not.
+  AWS-LC — compiled from C and per-architecture assembly by `aws-lc-sys`,
+    reached through `russh`'s default `aws-lc-rs` cryptographic backend. Its
+    terms are a conjunction: ISC, Apache-2.0, MIT, BSD-3-Clause, and
+    third-party components offered under Apache-2.0, ISC or MIT-0. It also
+    carries code derived from OpenSSL and BoringSSL.
+  ring — compiles C and assembly for its cryptographic primitives (see the ISC
+    entry below for its terms). Forge uses it directly for Ed25519 request
+    signing.
+
+  Not in a default build: the optional `vulkan-renderer` feature compiles
+  shaderc and SPIRV-Tools from source. They are not embedded in the binaries
+  distributed here, which do not enable that feature.
 
 Rust crates
 -----------
@@ -74,6 +89,19 @@ specifically, because their terms are not those two:
   Unicode-3.0 — the ICU crates (icu_*, zerovec and related), whose data files
     carry Unicode, Inc.'s attribution terms.
   CC0-1.0 — notify, hexf-parse.
+  ISC — untrusted, rustls-webpki, libloading. ISC is a permissive licence
+    requiring attribution only; this entry is that attribution.
+  Apache-2.0 AND ISC — ring, a direct dependency, used for Ed25519 request
+    signing. The conjunction means both sets of terms apply, not a choice
+    between them.
+  ISC AND (Apache-2.0 OR ISC) — aws-lc-rs, reached through `russh`. Its
+    `aws-lc-sys` companion additionally carries Apache-2.0, MIT,
+    BSD-3-Clause and MIT-0 components; see the C libraries section above.
+  BSD 3-Clause — curve25519-dalek, ed25519-dalek, subtle, reached through
+    `russh`, and the vendored libssh2 C source. The clause prohibiting use of
+    the authors' names for endorsement applies; Forge makes no such claim.
+  Unicode-3.0 also applies to unicode-ident, in conjunction with its MIT or
+    Apache-2.0 grant.
 
 
 Trademarks
@@ -100,10 +128,15 @@ distributes, and every source tree vendored into this repository.
 
 Cargo.lock also resolves crates for targets Forge does not currently build —
 Android, WebAssembly, Redox, and other platform-specific graphs. Those have not
-been checked one by one. Windows is no longer among them: the agent, protocol,
-search engine and terminal client build and pass their tests there on every
-push, and the editor builds, so its graph is linked into something a person can
-run even though no signed Windows artifact is published here. None of them is linked into anything
+been checked one by one. Windows is no longer among them, though what CI
+establishes there is narrower than the rest: the protocol, search engine and
+terminal client run their full suites on every push to main and on pull
+requests; the agent builds and runs its provider-fault matrix, not its unit
+tests; and the editor's Windows build is marked informational and does not gate,
+because no runner had ever attempted it. The editor has been built and tested
+there by hand — see FAILURE-TESTING.md. So the Windows graph is linked into
+something a person can run, even though no signed Windows artifact is published
+here and CI alone would not prove it. None of them is linked into anything
 distributed here, and they are conventionally MIT or Apache-2.0, but this
 notice does not assert that, because nobody has confirmed it yet. Checking the
 remainder is outstanding work, and the intention is that this section

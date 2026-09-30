@@ -25,7 +25,7 @@ Forge is intentionally not chasing the newest agent architecture every month. If
 ## Features
 
 - **Fully offline-capable** — runs with no internet when paired with a local LLM (LM Studio, Ollama, llama.cpp, vLLM, etc.). See [Offline use](#offline-use) below.
-- **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, fetch a URL (`web_fetch`). `web_search` ships disabled and does not work in practice — see [Web search does not really work](../README.md#web-search-does-not-really-work)
+- **Full coding toolkit** — read/write files, apply unified diffs, search code, run shell commands, fetch a URL (`web_fetch`), and crawl and search the web (`web_search`) with an index that stays on your disk
 - **Parallel subagents** — delegate subtasks to specialized agents running concurrently
 - **Planning mode** — agent drafts a plan for your approval before making changes
 - **Session persistence** — resume prior sessions with full context
@@ -130,8 +130,13 @@ different evidence behind them, and neither has been used interactively:
   this binary to an aarch64 machine and drives it over SSH, with no terminal of
   its own. Nothing on that architecture goes through CI.
 
-Windows and Intel Macs are untested. See the
-[platform table](../README.md#platforms).
+- **Windows x86-64** — CI builds it and runs its tests on every push, including
+  the provider fault matrix: eleven failure cases against two streaming
+  formats, exercising what the agent does when a stream truncates, a tool
+  call arrives incomplete, a provider returns 429, or the process is killed
+  mid-turn. Nobody has used it interactively there either.
+
+Intel Macs are untested. See the [platform table](../README.md#platforms).
 
 ## Requirements
 

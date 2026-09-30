@@ -10,7 +10,7 @@ A fast, native code editor built in Rust on Vulkan and [egui](https://github.com
 
 ## Philosophy
 
-Forge IDE is built for engineers who want to see and understand the tool they use all day. The rendering pipeline is Vulkan because almost everything runs Vulkan — there's no browser, no Electron, no JavaScript runtime underneath. What you see in the source is what runs on your GPU.
+Forge IDE is built for engineers who want to see and understand the tool they use all day. It draws on the GPU through the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux — with a hand-written Vulkan backend available as an opt-in build. There's no browser, no Electron, no JavaScript runtime underneath. What you see in the source is what runs on your GPU.
 
 **Dependencies are kept deliberately low.** Every crate in `Cargo.toml` is there because it does real, hard-to-replace work — a graphics binding, a windowing layer, an SSH implementation. Where a dependency was only doing something trivial (tilde expansion, an unused trait), it has been replaced with a few lines of our own code instead.
 
@@ -81,12 +81,15 @@ Forge IDE is a Cargo workspace with three crates:
 
 ### Requirements
 
-- **macOS on Apple Silicon.** It is the only platform this has been run on, and
-  the binary built here is arm64 — Intel Macs are untested too. Linux (either
-  architecture) and Windows are unverified: the renderer goes through wgpu and
-  the window through winit, so there is no known reason it cannot work, but
-  nobody has tried it and a report that it does not build is expected rather than
-  surprising. See the [platform table](../README.md#platforms).
+- **macOS on Apple Silicon.** It is the only platform this has been *run* on,
+  and the binary built here is arm64 — Intel Macs are untested too. Windows
+  x86-64 builds on every push in CI, which is how a `cfg` bug that had made
+  `forge-server` uncompilable there was found; but building is not running, and
+  nobody has watched the editor draw a frame anywhere but macOS. Linux is not
+  built in CI at all. The renderer goes through wgpu and the window through
+  winit, so there is no known reason either cannot work — a report that one does
+  not is worth filing rather than surprising. See the
+  [platform table](../README.md#platforms).
 - **Rust** (stable, 2024 edition)
 - **Vulkan** — only for the optional `vulkan-renderer` build; the default renderer is wgpu and needs none of this. On macOS Vulkan means [MoltenVK](https://github.com/KhronosGroup/MoltenVK), which is **not bundled** — this repository ships no third-party binaries. Install it with `brew install molten-vk`, or drop your own `libMoltenVK.dylib` at `runtime/macos/`. Linux and Windows use their native Vulkan drivers.
 - **A GLSL compiler toolchain** for `shaderc` (used at build time to compile the egui shaders) — this typically means `cmake` and a C++ compiler are available.

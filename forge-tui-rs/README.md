@@ -24,11 +24,13 @@ cargo run -p forge-tui-rs
 
 ## Platforms
 
-Developed and used on macOS (Apple Silicon). CI builds it on **x86-64** Linux and
-the tests pass there on every push, but nobody has sat in front of it in a Linux
-terminal — a build that works and a program that behaves are different claims.
-ARM64 Linux, Windows and Intel Macs are untested. See the
-[platform table](../README.md#platforms).
+Developed and used on macOS (Apple Silicon). CI builds it and runs its tests on
+**x86-64 Linux** and **x86-64 Windows** on every push — the Windows console
+layer was written for this release, since `sys.rs` had been `#![cfg(unix)]` in
+its entirety and the crate did not compile there at all. But nobody has sat in
+front of it in a Linux or Windows terminal, and a build that works and a program
+that behaves are different claims. ARM64 Linux and Intel Macs are untested. See
+the [platform table](../README.md#platforms).
 
 ## What it is, and what it isn't
 

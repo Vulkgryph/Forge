@@ -53,11 +53,11 @@ routed through a Vulkgryph service, and offline mode turns off the tools that
 reach the network. The only first-party network call in the whole system is a
 GitHub releases check for updates.
 
-**It tells you what does not work.** There is a section below titled
-[Web search does not really work](#web-search-does-not-really-work), about a
-tool shipped in this repository. Platform support is a table of what has and
-has not been run by a person, not a list of logos. That is the standard the
-rest of the documentation is held to as well.
+**It tells you what does not work.** The changelog says when a fix of ours was
+incomplete and review caught it, and the security section names the releases an
+SSRF was shipped in rather than the ones it was fixed in. Platform support is a
+table of what has and has not been run by a person, not a list of logos. That is
+the standard the rest of the documentation is held to as well.
 
 ### Where it is the wrong choice
 
@@ -144,12 +144,19 @@ Architecture matters here as much as the operating system, and the two Linux
 columns have never been the same machine: CI runs on x86-64, and the Linux box
 this is actually used against is ARM64.
 
-| | macOS (Apple Silicon) | Linux x86-64 | Linux ARM64 | Windows |
+| | macOS (Apple Silicon) | Linux x86-64 | Linux ARM64 | Windows x86-64 |
 |---|---|---|---|---|
-| `forge-agent` | supported | compiles and passes tests | runs headless on a remote | untested |
-| `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | untested |
-| `forge-tui-rs` (`forge`) | supported | compiles and passes tests | untested | untested |
-| `forge-ide` | supported | untested | untested | untested |
+| `forge-agent` | supported | builds and passes tests in CI | runs headless on a remote | builds and passes tests in CI, including the provider fault matrix |
+| `forge-search` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
+| `forge-agent-proto` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
+| `forge-tui-rs` (`forge`) | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
+| `forge-ide` | supported | untested | untested | builds in CI; nobody has watched it draw a frame |
+| `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | builds in CI, never run |
+
+"Builds and passes tests in CI" means exactly that and no more: a machine
+compiled it and its tests passed. It does not mean a person has used it. Where
+a person has, the word is "supported". CI runs every push — see
+[`ci.yml`](.github/workflows/ci.yml) for which crates each platform covers.
 
 One feature is narrower than its component. When a bot check refuses the
 crawler, the agent can offer the page to a person, who opens it in a real
@@ -184,11 +191,13 @@ no such remote has ever been connected to.
 On macOS, only Apple Silicon: the binary this repository builds is arm64, and
 Intel Macs are untested. Rosetta is not a substitute for having tried it.
 
-**untested** means literally that. The editor renders through wgpu, which targets
-D3D12 on Windows and Vulkan on Linux, and takes its window from winit, so there
-is no known reason it cannot work — nobody has tried. Until someone runs it, a
-report that it does not build is expected rather than surprising, and worth
-filing.
+**untested** means literally that: nobody has run it. It is kept distinct from
+"builds and passes tests in CI", which means a machine compiled it and its tests
+passed and nothing more. The editor renders through wgpu — D3D12 on Windows,
+Vulkan on Linux — and takes its window from winit, so there is no known reason
+it cannot work; it builds on Windows in CI, and that job is how a `cfg` bug
+making `forge-server` uncompilable there was found. Nobody has watched it draw a
+frame off macOS. A report that it does not run is worth filing.
 
 The macOS app bundle, its signing, and the "add to Dock" option are macOS-only by
 nature. Remote development is exercised from a macOS host to a Linux remote; the

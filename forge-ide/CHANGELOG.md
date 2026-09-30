@@ -2,6 +2,16 @@
 
 All notable changes to Forge IDE are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge IDE adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-09-29
+
+### Security
+
+- **The agent panel could be used to read this machine.** Forge IDE spawns `forge-agent`, and the crawler behind its `web_search` and `web_fetch` tools had no restriction on which addresses it could reach — `localhost`, the private ranges, and `169.254.169.254` were all reachable, and a hostile page could redirect a crawl at any of them. Nothing in the editor was at fault and nothing in the editor changes, but the exposure was reachable from the agent panel, so an editor user should hear it from here. Fixed in `forge-agent` 0.6.0; see [`../forge-agent/CHANGELOG.md`](../forge-agent/CHANGELOG.md) for the full account, including which releases were affected.
+
+### Changed
+
+- **Version-matched to the release.** No changes to the editor itself this time. The agent it spawns gained signed crawler requests, stopped contacting a provider it was not using at startup, and no longer drops a message typed while it is working — all of which an editor user experiences through the agent panel. See [`../forge-agent/CHANGELOG.md`](../forge-agent/CHANGELOG.md).
+
 ## [0.5.2] — 2026-09-27
 
 ### Added

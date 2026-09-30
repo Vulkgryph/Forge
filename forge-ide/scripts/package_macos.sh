@@ -107,10 +107,8 @@ for target in $REMOTE_TARGETS; do
     fi
   done
 done
-# No third-party runtime is bundled. The default renderer uses wgpu, which
-# targets Apple's own Metal framework — already present on every Mac. The
-# optional `vulkan-renderer` build needs MoltenVK installed on the host
-# instead; it is deliberately not redistributed here.
+# No third-party runtime is bundled. The renderer is wgpu, which targets
+# Apple's own Metal framework — already present on every Mac.
 
 echo "==> Generating icon"
 ICONSET="$OUT_DIR/AppIcon.iconset"

@@ -58,17 +58,18 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp -R "$SRC_APP" "$APP"
 
-# No third-party library is bundled: the default renderer is wgpu, which goes
-# through Apple's own Metal framework. The optional `vulkan-renderer` build
-# needs MoltenVK installed on the host, and a packager who chooses to embed
-# their own copy still needs it signed — hence the existence check rather than
-# an unconditional sign, which failed outright once the bundled copy was gone.
-if [ -f "$APP/Contents/Frameworks/libMoltenVK.dylib" ]; then
-  echo "==> Signing embedded libraries"
-  codesign --force --options runtime --timestamp \
-    --sign "$SIGN_ID" \
-    "$APP/Contents/Frameworks/libMoltenVK.dylib"
-fi
+# No third-party library is bundled: the renderer is wgpu, which goes through
+# Apple's own Metal framework.
+#
+# This used to sign `libMoltenVK.dylib` by name, for the Vulkan renderer that
+# has since been removed. Kept as a find over whatever is actually in
+# Frameworks/ so an embedded dylib still gets signed without this script
+# naming a dependency — an unconditional sign of one path failed outright once
+# that file stopped being bundled, and naming the next one would repeat it.
+while IFS= read -r -d '' lib; do
+  echo "==> Signing embedded library: $(basename "$lib")"
+  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$lib"
+done < <(find "$APP/Contents/Frameworks" -type f -name '*.dylib' -print0 2>/dev/null)
 
 # Every nested executable, found rather than listed. The bundle carries
 # forge-agent and forge-server beside the main binary, and this script used to

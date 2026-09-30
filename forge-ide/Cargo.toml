@@ -3,7 +3,7 @@ name        = "forge-ide"
 version     = "0.6.0"
 edition     = "2024"
 license     = "Apache-2.0"
-description = "A fast, Rust/Vulkan-based code editor with built-in Git, LSP, and SSH remote development"
+description = "A fast, native Rust code editor with built-in Git, LSP, and SSH remote development"
 repository  = "https://github.com/Vulkgryph/Forge"
 
 [[bin]]
@@ -11,29 +11,24 @@ name = "forge-ide"
 path = "src/main.rs"
 
 [features]
-# Default renderer is wgpu (gfx_wgpu.rs): native Metal on macOS, D3D12 on
-# Windows, Vulkan on Linux. Chosen over the hand-written Vulkan backend because
-# Vulkan does not exist on macOS — that path needs MoltenVK, a 10 MB
-# third-party dylib redistributed inside the .app. Metal ships with the OS, so
-# the default build now bundles no third-party runtime at all.
+# The renderer is wgpu (gfx_wgpu.rs), which selects the platform's own API:
+# Metal on macOS, D3D12 on Windows, Vulkan on Linux.
+#
+# There used to be a second, hand-written Vulkan backend behind a
+# `vulkan-renderer` feature. It is gone. Vulkan does not exist on macOS, so
+# that path needed MoltenVK — a third-party dylib this repository does not
+# redistribute — and it was never built in CI, so it was 1,421 lines that
+# nothing compiled and nobody ran. wgpu had already shipped a notarized macOS
+# release and drawn frames on Windows D3D12 by the time it was removed, which
+# is the bar its comment said it was waiting on.
 default = []
 
-# Opt-in: the original hand-written Vulkan renderer (gfx.rs + egui_pass.rs).
-# Kept while wgpu proves itself in real use. Requires MoltenVK to be present at
-# runtime on macOS — it is no longer bundled — and pulls in shaderc at build
-# time to compile the SPIR-V shaders.
-vulkan-renderer = ["dep:ash", "dep:ash-window", "dep:shaderc"]
 
 [dependencies]
 forge-proto       = { path = "forge-proto" }
-# The search engine, for the browser tab's own results page. A workspace
-# crate, not a third-party one — and it is the whole point of having written
-# it that Forge's browser searches Forge's index rather than somebody else's.
 egui-wgpu         = { version = "0.29", default-features = false }
 wgpu              = "22"
 pollster          = "0.3"
-ash               = { version = "0.38", optional = true }
-ash-window        = { version = "0.13", optional = true }
 winit             = "0.30"
 egui              = "0.29.1"
 egui-winit        = "0.29.1"
@@ -75,7 +70,6 @@ version = "0.2.2"
 features = ["NSString", "NSThread", "NSURL", "NSURLRequest", "NSGeometry", "NSDictionary", "NSValue"]
 
 [build-dependencies]
-shaderc = { version = "0.10", optional = true }
 toml    = "0.8"
 
 # winit patch (vendor/winit-0.30.13) is declared in the workspace root

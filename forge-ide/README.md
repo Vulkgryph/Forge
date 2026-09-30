@@ -2,7 +2,7 @@
 
 Created by **Vulkgryph LLC**.
 
-A fast, native code editor built in Rust on Vulkan and [egui](https://github.com/emilk/egui). Forge IDE aims to cover the same daily workflow as VS Code — editing, git, language servers, a terminal, and remote development over SSH — in a smaller, more inspectable codebase. Its integrated agent panel spawns [`forge-agent`](../forge-agent/) directly — the same binary [`forge-tui-rs`](../forge-tui-rs/) drives independently. See the [top-level README](../README.md) for how the three projects in this monorepo fit together.
+A fast, native code editor built in Rust on [wgpu](https://github.com/gfx-rs/wgpu) and [egui](https://github.com/emilk/egui). Forge IDE aims to cover the same daily workflow as VS Code — editing, git, language servers, a terminal, and remote development over SSH — in a smaller, more inspectable codebase. Its integrated agent panel spawns [`forge-agent`](../forge-agent/) directly — the same binary [`forge-tui-rs`](../forge-tui-rs/) drives independently. See the [top-level README](../README.md) for how the three projects in this monorepo fit together.
 
 ![Forge IDE editing forge-agent, with the agent panel showing tool calls, a diffstat and a rewind checkpoint](assets/forge-ide.png)
 
@@ -10,7 +10,7 @@ A fast, native code editor built in Rust on Vulkan and [egui](https://github.com
 
 ## Philosophy
 
-Forge IDE is built for engineers who want to see and understand the tool they use all day. It draws on the GPU through the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux — with a hand-written Vulkan backend available as an opt-in build. The interface is not a browser: no Electron, no HTML layout engine, no JavaScript runtime drawing what you see. What you see in the source is what runs on your GPU. One feature is the exception and is deliberate — the bot-check handoff embeds the system's own `WKWebView` on macOS (`src/webview.rs`), because the whole point of that panel is to be a real browser passing a real check.
+Forge IDE is built for engineers who want to see and understand the tool they use all day. It draws on the GPU through the platform's own API, chosen by wgpu — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux. The interface is not a browser: no Electron, no HTML layout engine, no JavaScript runtime drawing what you see. What you see in the source is what runs on your GPU. One feature is the exception and is deliberate — the bot-check handoff embeds the system's own `WKWebView` on macOS (`src/webview.rs`), because the whole point of that panel is to be a real browser passing a real check.
 
 **Dependencies are kept deliberately low.** Every crate in `Cargo.toml` is there because it does real, hard-to-replace work — a graphics binding, a windowing layer, an SSH implementation. Where a dependency was only doing something trivial (tilde expansion, an unused trait), it has been replaced with a few lines of our own code instead.
 
@@ -91,8 +91,6 @@ Forge IDE is a Cargo workspace with three crates:
   not is worth filing rather than surprising. See the
   [platform table](../README.md#platforms).
 - **Rust** (stable, 2024 edition)
-- **Vulkan** — only for the optional `vulkan-renderer` build; the default renderer is wgpu and needs none of this. On macOS Vulkan means [MoltenVK](https://github.com/KhronosGroup/MoltenVK), which is **not bundled** — this repository ships no third-party binaries. Install it with `brew install molten-vk`, or drop your own `libMoltenVK.dylib` at `runtime/macos/`. Linux and Windows use their native Vulkan drivers.
-- **A GLSL compiler toolchain** for `shaderc` (used at build time to compile the egui shaders) — this typically means `cmake` and a C++ compiler are available.
 
 ### Build the IDE
 

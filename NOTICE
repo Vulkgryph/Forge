@@ -68,10 +68,6 @@ C libraries compiled from source
     entry below for its terms). Forge uses it directly for Ed25519 request
     signing.
 
-  Not in a default build: the optional `vulkan-renderer` feature compiles
-  shaderc and SPIRV-Tools from source. They are not embedded in the binaries
-  distributed here, which do not enable that feature.
-
 Rust crates
 -----------
 
@@ -108,10 +104,11 @@ Trademarks
 ----------
 
 Vulkan and the Vulkan logo are registered trademarks of The Khronos Group
-Inc. Forge's optional `vulkan-renderer` build uses the Vulkan API; it is not
-an implementation of the Vulkan specification, and it is neither produced by
-nor endorsed by The Khronos Group. Vulkgryph LLC and Forge are not
-affiliated with The Khronos Group Inc.
+Inc. Forge contains no Vulkan code of its own; on Linux its renderer, wgpu,
+selects a Vulkan backend and calls the platform's driver. Forge is not an
+implementation of the Vulkan specification, and it is neither produced by nor
+endorsed by The Khronos Group. Vulkgryph LLC and Forge are not affiliated
+with The Khronos Group Inc.
 
 Metal and macOS are trademarks of Apple Inc.
 

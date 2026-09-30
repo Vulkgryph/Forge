@@ -2,6 +2,28 @@
 
 All notable changes to Forge IDE are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge IDE adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- **The hand-written Vulkan renderer is gone.** `gfx.rs` and `egui_pass.rs` — 1,421 lines — plus the SPIR-V shaders, the `vulkan-renderer` feature, and the `ash`, `ash-window` and `shaderc` dependencies.
+
+  It was opt-in, and nothing built it. No CI job ever enabled the feature, so it had not been compiled by a machine since it stopped being the default, and on macOS it could not run at all without MoltenVK — a third-party dylib this repository deliberately does not redistribute. Its own comment said it was "kept while wgpu proves itself in real use"; by now wgpu has shipped a notarized macOS release and drawn frames on Windows under D3D12, which is the bar that sentence set.
+
+  What it also removes: a documented build requirement nobody needed. `forge-ide/README.md` listed a GLSL toolchain — `cmake` and a C++ compiler — as a prerequisite for every build, thirteen lines after the bullet explaining that Vulkan was optional. New contributors were installing a toolchain to compile shaders that were never compiled.
+
+  Renderer selection is now unconditional: wgpu, which picks the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux. The 25 `#[cfg(feature = "vulkan-renderer")]` switch points in `main.rs` are gone with it.
+
+### Fixed
+
+- **The web view was positioned twice per frame.** `place_webview()` was called once after each renderer's draw block, and since only one block was ever compiled, the surviving pair meant the wgpu build called it twice — the first time *before* the frame it was meant to follow, under a comment reading "After the frame rather than during." Visible once the Vulkan branch was removed and the two calls sat next to each other.
+
+- `forge-ide`'s package description advertised a renderer the default build did not use ("A fast, Rust/Vulkan-based code editor"). That string is what `cargo metadata` reports and what any listing scraping the manifest shows.
+
+- Removed an orphaned comment in `forge-ide/Cargo.toml` explaining a `forge-search` dependency the manifest does not have — it had come to annotate `egui-wgpu` instead. The editor does not depend on `forge-search`.
+
+- `sign_notarize_dmg.sh` signed `libMoltenVK.dylib` by name. Nothing produces that file now; it signs whatever dylibs are actually in `Contents/Frameworks/` instead, so the next embedded library does not need this script edited.
+
 ## [0.6.0] — 2026-09-29
 
 ### Security

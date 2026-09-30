@@ -40,8 +40,7 @@ it through the shared protocol crate, thirteen in the built graph. Every part of
 its rendering, wrapping, markdown and diffing is in this repository. The editor
 decodes PNG and GIF with decoders written for it, which replaced the `image`
 crate and three of its transitive dependencies. No
-third-party binary ships in this repository at all — even MoltenVK, for the
-optional Vulkan renderer, you install yourself.
+third-party binary ships in this repository at all.
 
 **Permission is the design, not a setting.** Every tool call is approvable;
 plan mode is read-only until you approve a plan; auto-accept is a mode the

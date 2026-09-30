@@ -81,7 +81,9 @@ terminal client are more portable than the editor; the table in
 
 ## How they fit together
 
-`forge-agent` is the only piece that runs the model loop or touches tools directly. One exception, in the other direction: in remote development `forge-ide` proxies the model endpoint so the credential never leaves your machine ([`forge-ide/src/model_proxy.rs`](forge-ide/src/model_proxy.rs)) — the outbound request to the provider is made by the editor, and the agent holds no provider credential at all. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui-rs` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other, and neither reimplements any agent logic. This means the agent's actual behavior (tool execution, model calls, safety gating) can never diverge between the two clients, since it's the literal same compiled binary in both cases.
+`forge-agent` is the only piece that runs the model loop or touches tools directly. One exception, in the other direction: in remote development `forge-ide` proxies the model endpoint so the credential never leaves your machine ([`forge-ide/src/model_proxy.rs`](forge-ide/src/model_proxy.rs)) — the outbound request to the provider is made by the editor, and the agent holds no provider credential at all. It exposes one thing: a JSON-newline protocol over stdin/stdout (`forge-agent --headless`), documented in [`forge-agent/ARCHITECTURE.md`](forge-agent/ARCHITECTURE.md). `forge-tui-rs` and `forge-ide` are two separate, independent implementations of a client against that same protocol — neither depends on the other. Tool execution and model calls therefore cannot diverge between them: it is the literal same compiled binary doing both.
+
+**Approval is the exception, and it is worth being exact about.** The agent decides whether a tool needs approval and says so on the wire, but a client may answer that question itself rather than asking you. The terminal client does: its permission mode is a client-side gate, so Allow-all answers on your behalf and Auto-accept answers for writes, while the agent goes on marking every tool as needing approval. The editor instead toggles the agent's own auto-approve flag. Two consequences follow. The middle mode does not mean the same thing in both — the editor's Auto-Approve covers shell commands and the terminal client's Auto-accept does not. And a session log records an approval for each tool either way, so it cannot distinguish a run where you approved each command from one where a client mode approved them for you.
 
 What *can* diverge is each client's own view of the wire protocol's shape. The terminal client shares [`forge-agent-proto`](forge-agent-proto/) with the agent, so those two cannot drift; `forge-ide` keeps its own hand-maintained Rust structs, so a protocol change has to be applied there by hand.
 
@@ -153,7 +155,7 @@ this is actually used against is ARM64.
 | `forge-search` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
 | `forge-agent-proto` | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
 | `forge-tui-rs` (`forge`) | supported | builds and passes tests in CI | untested | builds and passes tests in CI |
-| `forge-ide` | supported | untested | untested | attempted in CI as a non-gating step; nobody has watched it draw a frame |
+| `forge-ide` | supported | run by hand once | untested | Windows: built in CI as a non-gating step, and its suite plus a real window checked by hand on 2026-09-25 (see [WINDOWS.md](WINDOWS.md)). Linux: nobody has watched it draw a frame |
 | `forge-server` | n/a — runs on the remote | cross-compiled, never run | runs headless on a remote | attempted in CI as a non-gating step, never run |
 
 "Builds and passes tests in CI" means exactly that and no more: a machine
@@ -180,6 +182,12 @@ runs on Linux; `forge-tui-rs` is built and tested on Linux and Windows.
 Nobody has sat in front of it there. A build that works and a program that
 behaves are different claims, and only the first one is being made.
 
+**run by hand once** — a person installed it, launched it, and watched it work
+on a real machine, on a stated date, recorded in a file you can read. Once. It
+is not in a gating CI job and nobody uses it there daily, so it sits between
+"builds and passes tests in CI" and "supported": stronger evidence than a
+machine compiling it, weaker than somebody's working day depending on it.
+
 **attempted in CI as a non-gating step** — the build runs but is
 `continue-on-error`, so it reports rather than gates: a regression there will not
 fail the workflow. Used for the editor on Windows, where nothing had ever built
@@ -205,7 +213,7 @@ Vulkan on Linux — and takes its window from winit, so there is no known reason
 it cannot work; it is built on Windows in CI as a non-gating
 step — which is how a `cfg` bug making `forge-server` uncompilable there was
 found, and which also means a Windows regression in the editor will not fail the
-build. Nobody has watched it draw a frame off macOS. A report that it does not run is worth filing.
+build. On Windows a person has: the installed editor opened a responsive window on D3D12 on 2026-09-25, recorded in [WINDOWS.md](WINDOWS.md). On Linux nobody has. A report that it does not run is worth filing.
 
 The macOS app bundle, its signing, and the "add to Dock" option are macOS-only by
 nature. Remote development is exercised from a macOS host to a Linux remote; the
@@ -286,12 +294,20 @@ the scale this runs at.
 
 **What a site learns about the person running Forge: nothing that
 distinguishes them from anyone else running it.** The complete set of headers
-sent is `Host`, `Accept`, and the user agent above — measured against a local
-listener, not read off the source, and asserted in the test suite so a fourth
-header cannot appear without the claim failing. The crawler's `Accept` is
-reqwest's default `*/*`; `web_fetch` asks for HTML, because it is fetching a
-page somebody named. No cookies, no `Referer`, no `Accept-Language`, no
-`Accept-Encoding`, no client hints, no machine or session identifier. The agent's own session id travels only to the model
+sent on a first, unsigned request is `Host`, `Accept`, and the user agent
+above — measured against a local listener rather than read off the source. The
+crawler's `Accept` is reqwest's default `*/*`; `web_fetch` asks for HTML,
+because it is fetching a page somebody named. No cookies, no `Referer`, no
+`Accept-Language`, no `Accept-Encoding`, no client hints, no machine or session
+identifier.
+
+Two paths add to that, both described below and neither of them an identifier:
+a re-crawl may send `If-Modified-Since`, and a signed request carries the three
+Web Bot Auth headers. Those are produced by one function, and a test asserts
+that everything it can ever add is on that list — so a new header cannot reach
+a site without the list, and this paragraph, failing first. The earlier version
+of that test rebuilt the HTTP client instead of calling the fetcher, which left
+those five headers outside the claim it was making. The agent's own session id travels only to the model
 endpoint the user configured, never to a crawled site.
 
 Two things do vary. The **IP address**, which is true of any HTTP client and

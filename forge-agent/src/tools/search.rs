@@ -71,6 +71,65 @@ const DEFAULT_SEEDS: &[&str] = &[
 /// The trait is synchronous and `reqwest` here is not, so each fetch blocks on
 /// the runtime handle. That is only sound off a runtime worker thread, which
 /// is why every crawl runs inside `spawn_blocking` — see [`search`].
+/// Every header this fetcher adds to a request, in one place.
+///
+/// Extracted so the documented set can be asserted against the code that
+/// actually produces it. The README states the complete set of headers a
+/// crawled site sees and says tests enforce it; the test measured a client
+/// built with the same builder options rather than this fetcher, so the
+/// three signature headers and the two conditional ones sat outside the
+/// assertion it claimed to make. A pure function taking `now` and `nonce`
+/// is testable exhaustively, which a request builder is not.
+///
+/// `Host`, `Accept` and `User-Agent` are not here: reqwest derives them
+/// from the URL and the client's `user_agent`, and the listener test in
+/// `web.rs` measures those.
+pub(crate) fn added_headers(
+    signer: Option<&crate::tools::botauth::Signer>,
+    url: &str,
+    etag: &str,
+    last_modified: &str,
+    now: u64,
+    nonce: &[u8],
+) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+
+    // Signed when a key is configured. The authority is what the signature
+    // covers, so it is taken from the URL rather than passed in — a
+    // signature over a different host than the request reaches is worse
+    // than no signature, because it looks like a forgery rather than an
+    // omission.
+    if let Some(signer) = signer {
+        if let Some(authority) = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{h}:{p}"),
+                None => h.to_string(),
+            }))
+        {
+            let signed = signer.sign(&authority, now, nonce);
+            headers.push(("signature-agent", signed.signature_agent));
+            headers.push(("signature-input", signed.signature_input));
+            headers.push(("signature", signed.signature));
+        }
+    }
+
+    // Only what the server itself gave us last time. A validator we
+    // invented would be a claim about a copy the server never sent.
+    // `Last-Modified` is a content property — the same value for every
+    // visitor, so returning it identifies nobody. An `ETag` is
+    // server-chosen and can be minted per visitor, which is a known
+    // tracking technique, so it goes back only if the operator asked for
+    // it. Most of the bandwidth saving comes from the harmless one.
+    if !etag.is_empty() && crate::tools::botauth::send_etag() {
+        headers.push(("if-none-match", etag.to_string()));
+    }
+    if !last_modified.is_empty() {
+        headers.push(("if-modified-since", last_modified.to_string()));
+    }
+    headers
+}
+
 pub(crate) struct HttpFetcher {
     client: reqwest::Client,
     /// Signs outbound requests when the operator has configured a key, so a
@@ -137,50 +196,21 @@ impl Fetcher for HttpFetcher {
             let response = loop {
             let mut request = self.client.get(&current);
 
-            // Signed when a key is configured. The authority is what the
-            // signature covers, so it is taken from the URL rather than
-            // passed in — a signature over a different host than the request
-            // reaches is worse than no signature, because it looks like a
-            // forgery rather than an omission.
-            if let Some(signer) = &self.signer {
-                if let Some(authority) = reqwest::Url::parse(&current)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| match u.port() {
-                        Some(p) => format!("{h}:{p}"),
-                        None => h.to_string(),
-                    }))
-                {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut nonce = [0u8; 64];
-                    // A fresh nonce per request, so a captured signature
-                    // cannot be replayed inside its validity window.
-                    {
-                        use rand::RngCore as _;
-                        rand::thread_rng().fill_bytes(&mut nonce);
-                    }
-                    let signed = signer.sign(&authority, now, &nonce);
-                    request = request
-                        .header("signature-agent", signed.signature_agent)
-                        .header("signature-input", signed.signature_input)
-                        .header("signature", signed.signature);
-                }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut nonce = [0u8; 64];
+            // A fresh nonce per request, so a captured signature cannot be
+            // replayed inside its validity window.
+            {
+                use rand::RngCore as _;
+                rand::thread_rng().fill_bytes(&mut nonce);
             }
-            // Only what the server itself gave us last time. A validator we
-            // invented would be a claim about a copy the server never sent.
-            // `Last-Modified` below is a content property — the same value for
-            // every visitor, so returning it identifies nobody. An `ETag` is
-            // server-chosen and can be minted per visitor, which is a known
-            // tracking technique, so it goes back only if the operator asked
-            // for it. Most of the bandwidth saving comes from the harmless
-            // one.
-            if !etag.is_empty() && crate::tools::botauth::send_etag() {
-                request = request.header("if-none-match", etag);
-            }
-            if !last_modified.is_empty() {
-                request = request.header("if-modified-since", last_modified);
+            for (name, value) in added_headers(
+                self.signer.as_deref(), &current, etag, last_modified, now, &nonce,
+            ) {
+                request = request.header(name, value);
             }
             let response = request
                 .send()
@@ -1364,36 +1394,183 @@ mod tests {
 
 #[cfg(test)]
 mod redirect_signing_tests {
-    /// The fetcher must sign the hop it is about to make, not the URL it was
-    /// originally handed.
+    use super::added_headers;
+    use crate::tools::botauth::Signer;
+    use base64::Engine as _;
+
+    /// The Ed25519 key from RFC 9421 Appendix B.1.4, as used by botauth's own
+    /// tests.
+    fn test_signer() -> Signer {
+        let pkcs8 = base64::engine::general_purpose::STANDARD
+            .decode("MC4CAQAwBQYDK2VwBCIEIJ+DYvh6SEqVTm50DFtMDoQikTmiCqirVv9mWG9qfSnF")
+            .expect("the RFC's key decodes");
+        Signer::new(&pkcs8, "https://example.invalid").expect("and loads")
+    }
+
+    /// The signature must cover the host the request is about to reach.
     ///
-    /// Structural, and it earns that: the live check for this needs a server
-    /// that redirects across hosts, and the crawler's own SSRF guard now
-    /// refuses loopback — so the obvious local harness is unavailable by
-    /// design. Meanwhile reverting the fix compiles cleanly and every other
-    /// test still passes, which was verified by doing it. A property nothing
-    /// catches is a property that comes back.
+    /// A signature over a different authority than the request arrives at is
+    /// worse than sending none: it looks like a forgery rather than an
+    /// omission, and `example.com` → `www.example.com` is the most common
+    /// redirect on the web. The caller passes the current hop; this asserts the
+    /// signature is actually derived from the URL it is given.
+    ///
+    /// This replaced a structural test that grepped this file for
+    /// `Url::parse(&current)`. That test was correct about the property and
+    /// pinned to one spelling of it: extracting the header assembly into
+    /// `added_headers` — behaviour unchanged, the hop still what gets signed —
+    /// tripped it, because the parse moved to a parameter named `url`. Now
+    /// that the assembly is a pure function, the property can be checked
+    /// directly instead of guessed at from source text.
+    #[test]
+    fn the_signature_covers_the_hop_it_is_given() {
+        let signer = test_signer();
+        let now = 1_700_000_000u64;
+        let nonce = [7u8; 64];
+
+        let sig_for = |url: &str| -> String {
+            added_headers(Some(&signer), url, "", "", now, &nonce)
+                .into_iter()
+                .find(|(n, _)| *n == "signature")
+                .map(|(_, v)| v)
+                .expect("a signed request carries a signature")
+        };
+
+        // Same inputs, same signature — so any difference below is the URL.
+        assert_eq!(sig_for("https://example.com/a"), sig_for("https://example.com/a"));
+
+        // The redirect that matters: only the authority differs.
+        assert_ne!(
+            sig_for("https://example.com/a"),
+            sig_for("https://www.example.com/a"),
+            "example.com and www.example.com produced the same signature, so the \
+             authority is not coming from the URL being signed — a cross-host \
+             redirect would carry the previous host's signature",
+        );
+
+        // And the port is part of the authority, so a port-only change counts.
+        assert_ne!(
+            sig_for("https://example.com/a"),
+            sig_for("https://example.com:8443/a"),
+            "a port change left the signature identical",
+        );
+    }
+
+    /// No host, no signature — rather than a signature over something guessed.
+    #[test]
+    fn an_unparseable_url_is_not_signed() {
+        let signer = test_signer();
+        let got = added_headers(Some(&signer), "not a url", "", "", 0, &[0u8; 64]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// The fetcher must hand the current hop to the header builder, not the
+    /// URL it was originally called with.
+    ///
+    /// The one part that stays structural: `fetch_conditional` follows
+    /// redirects in a loop, and reaching the hop-signing path for real needs a
+    /// server that redirects across hosts — which the crawler's own SSRF guard
+    /// now refuses to follow to loopback, by design.
     ///
     /// Assembled, since this test reads the file it lives in.
     #[test]
-    fn the_signature_covers_the_hop_not_the_original_url() {
+    fn the_fetcher_passes_the_current_hop() {
         let code = include_str!("search.rs");
         let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        let signing_parse = ["reqwest", "::Url::parse(&current)"].concat();
+        let right = ["added_headers( self.signer.as_deref(), &current,"].concat();
         assert!(
-            flat.contains(&signing_parse),
-            "the signed authority is no longer taken from the current hop",
-        );
-
-        // And the original URL must not be what gets signed. It is still used
-        // for the first request and for error messages, so this looks only at
-        // the parse that feeds the signer.
-        let wrong = ["if let Some(authority) = reqwest", "::Url::parse(url)"].concat();
-        assert!(
-            !flat.contains(&wrong),
-            "the signer is being handed the originally requested URL again, \
-             so a cross-host redirect would carry a signature for the wrong host",
+            flat.contains(&right),
+            "the fetcher is no longer passing the current hop to added_headers",
         );
     }
 }
+
+#[cfg(test)]
+mod added_header_tests {
+    use super::added_headers;
+
+    /// Unsigned, unconditional: the crawler adds nothing of its own.
+    ///
+    /// Which is what makes the README's three-header claim true for a first
+    /// request — `Host`, `Accept` and `User-Agent` all come from reqwest and
+    /// the client's `user_agent`, and are measured against a real listener in
+    /// `tools::web::outbound_header_tests`. This is the other half: that
+    /// nothing is added here.
+    #[test]
+    fn a_first_unsigned_request_adds_no_headers() {
+        let got = added_headers(None, "https://example.com/a", "", "", 0, &[0u8; 64]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// A re-crawl sends back only the validator the server itself supplied,
+    /// and only the one that cannot carry per-visitor entropy.
+    #[test]
+    fn a_recrawl_adds_if_modified_since_and_not_if_none_match() {
+        let got = added_headers(
+            None,
+            "https://example.com/a",
+            "\"abc\"",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            0,
+            &[0u8; 64],
+        );
+        let names: Vec<&str> = got.iter().map(|(n, _)| *n).collect();
+
+        assert!(
+            names.contains(&"if-modified-since"),
+            "Last-Modified is a content property and should go back: {got:?}"
+        );
+        // `send_etag` is off unless the operator turned it on, and an ETag can
+        // be minted per visitor. Default must not return it.
+        assert!(
+            !names.contains(&"if-none-match"),
+            "an ETag went back without the operator asking: {got:?}"
+        );
+    }
+
+    /// The full set, with every optional part on at once.
+    ///
+    /// This is the assertion the README's "complete set" sentence rests on. It
+    /// previously rested on a test that rebuilt a `reqwest::Client` with the
+    /// same options and never called this code, so the signature and
+    /// conditional headers were outside it — three headers could appear, and
+    /// did, while the test stayed green.
+    #[test]
+    fn nothing_is_sent_that_is_not_documented() {
+        // Every header this function can ever add, by construction.
+        const DOCUMENTED: [&str; 5] = [
+            "signature-agent",
+            "signature-input",
+            "signature",
+            "if-none-match",
+            "if-modified-since",
+        ];
+
+        for (etag, last_mod) in [
+            ("", ""),
+            ("\"abc\"", ""),
+            ("", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("\"abc\"", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        ] {
+            let got = added_headers(
+                None, "https://example.com/a", etag, last_mod, 1_700_000_000, &[7u8; 64],
+            );
+            for (name, _) in &got {
+                assert!(
+                    DOCUMENTED.contains(name),
+                    "{name} is sent to crawled sites and is not in the documented set",
+                );
+            }
+        }
+    }
+
+    /// An unparseable URL must not produce a signature over a guessed
+    /// authority — it produces none.
+    #[test]
+    fn a_url_with_no_host_is_not_signed() {
+        let got = added_headers(None, "not a url", "", "", 0, &[0u8; 64]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+}
+

@@ -342,6 +342,20 @@ After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.jso
 
 ### Config reference
 
+**Where permission actually gets decided.** Not here. Each client owns its own
+gate, and they are not the same gate:
+
+- The **terminal client** keeps a per-session mode (Ask / Auto-accept / Plan /
+  Allow-all) that starts at Ask every run and is never written to or read from
+  this file. Auto-accept there approves writes only — a command still stops.
+- The **editor** has its own `settings.toml` with
+  `default_agent_permission_mode`, which is the only persisted default of the
+  three and is genuinely safety-relevant. Its Auto-Approve covers reads,
+  writes **and** shell commands, which is not what the terminal client's
+  similarly-named mode does.
+- `--dangerously-allow-all` and the agent's own `auto_approve_reads` /
+  `auto_approve_writes` are what the agent itself enforces.
+
 **Forge rewrites this file on every startup, and your comments do not
 survive it.** After it resolves endpoints it writes the whole config back
 serialized from its own structures, so a hand-written 27-line file with two
@@ -355,7 +369,7 @@ somewhere else, or keep a copy of the file you wrote.
 | `models.web_tool_model` | same as default | Endpoint for `web_fetch` summarization |
 | `agent.auto_approve_reads` | `true` | Skip approval prompts for read-only tools |
 | `agent.auto_approve_writes` | `false` | Skip approval prompts for file writes |
-| `agent.permission_mode` | `"default"` | Stored permission preference. Related approval behavior is surfaced through multiple mechanisms: the TUI mode selector (`normal` / `auto_accept` / `plan`), per-session “approve always” tool memory, and the startup flag `--dangerously-allow-all`. The serialized enum is camelCase: `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`, `plan`. Snake-case spellings do not parse |
+| `agent.permission_mode` | `"default"` | **Legacy, and does nothing.** Parsed and written back, read by nothing: `grep permission_mode forge-agent/src` finds only its own definition and default. Approval is decided by `approval_needed`, which consults `dangerously_allow_all`, `auto_approve_reads`, `auto_approve_writes`, the scratchpad exemption, and the session's auto-approve flag — never this key. Setting it changes no behaviour. If you write it anyway, the enum is camelCase (`default`, `acceptEdits`, `bypassPermissions`, `dontAsk`, `plan`); snake-case does not parse |
 | `agent.disabled_tools` | `[]` | Tool names to exclude from normal turns |
 | `agent.context_strategy` | `"compaction"` | `"compaction"` or `"rolling_window"` |
 | `agent.max_history_messages` | `200` | Hard cap on conversation history length |

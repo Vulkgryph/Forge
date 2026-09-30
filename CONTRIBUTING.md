@@ -43,8 +43,10 @@ cargo test -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
 cargo test -p forge-ide -p forge-proto -p forge-server   # needs a GPU-capable toolchain
 ```
 
-That is all seven workspace members. `cargo test --workspace` also works and is
-what CI's macOS job runs.
+That is all seven workspace members. No CI job runs `cargo test --workspace`:
+the macOS job runs `-p forge-ide -p forge-proto -p forge-server`, and the Linux
+job runs the other four. Running it locally is still the way to cover
+everything at once.
 
 ## What CI enforces
 
@@ -55,7 +57,7 @@ what CI's macOS job runs.
 - That no documented version literal is pinned to a number that drifts — a version printed in the docs or sent as a user agent has to be derived, not typed
 - That `NOTICE` names every licence in the shipped dependency graph that is not MIT or Apache-2.0 — a new dependency with unusual terms fails the build rather than waiting for an audit
 - That documentation links resolve to a file that exists (vendored trees excluded; the checker strips `#fragments`, so anchors are not machine-verified)
-- On Windows: the agent, the protocol, search and the terminal client build and pass their tests, including the provider fault matrix. This gates. The editor is **not** built there, so a Windows regression in `forge-ide` will not be caught by CI.
+- On Windows: the protocol, search and the terminal client run their full suites, and the agent builds and runs its provider fault matrix — not its unit tests. That much gates. The editor **is** built there, but as a `continue-on-error` step that cannot fail the build, so a Windows regression in `forge-ide` will still not be caught by CI.
 - That no documentation or installer script contains a home directory. `%USERPROFILE%`, `$HOME` or a relative path instead — an absolute path through someone's home publishes their username and only works on their machine.
 
 ## House rules

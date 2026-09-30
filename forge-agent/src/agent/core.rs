@@ -1321,15 +1321,9 @@ impl Agent {
             let _ = self.event_tx.send(AgentEvent::Thinking);
 
             // Build tool list — filtered by plan mode and disabled_tools config
-            let mut disabled = self.app_config.agent.disabled_tools.clone();
-            if self.app_config.agent.offline_mode {
-                // web_search/web_fetch are the only normal tools that reach
-                // the network — force them off in offline mode regardless of
-                // the user's own disabled_tools list.
-                for t in ["web_search", "web_fetch"] {
-                    if !disabled.iter().any(|d| d == t) { disabled.push(t.to_string()); }
-                }
-            }
+            // One rule, shared with subagents. See
+            // `AgentConfig::effective_disabled_tools`.
+            let disabled = self.app_config.agent.effective_disabled_tools();
             let disabled = &disabled;
             let tools = if self.plan_mode {
                 let mut plan_tools = self.executor.plan_mode_tools();

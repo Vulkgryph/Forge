@@ -153,8 +153,23 @@ impl SubagentRunner {
         let mut executor = ToolExecutor::new(self.project_root.clone());
         executor.set_scratchpad(self.scratchpad.clone());
 
-        // Build filtered tool list
-        let mut tools = executor.tool_definitions_filtered(&self.agent_def.tools);
+        // Build filtered tool list.
+        //
+        // Filtered twice: by what this agent definition offers, and by what
+        // the session forbids. The second was missing — a delegated `general`
+        // agent lists `web_search` and `web_fetch`, so it kept live web tools
+        // under `offline_mode = true`, and ignored the operator's own
+        // `disabled_tools` too. "Offline" that only holds for the agent you
+        // can see is not offline.
+        let forbidden = self.app_config.agent.effective_disabled_tools();
+        let allowed: Vec<String> = self
+            .agent_def
+            .tools
+            .iter()
+            .filter(|t| !forbidden.iter().any(|d| d == *t))
+            .cloned()
+            .collect();
+        let mut tools = executor.tool_definitions_filtered(&allowed);
 
         // Include delegate_task if nesting depth allows
         if self.depth < self.max_depth {
@@ -951,3 +966,39 @@ fn summarize_args(args_json: &str) -> String {
         display
     }
 }
+#[cfg(test)]
+mod subagent_offline_tests {
+    /// A subagent's tool list must be filtered by what the session forbids,
+    /// not only by what its own definition offers.
+    ///
+    /// It was not: the executor was handed the agent definition's list
+    /// directly, and the built-in `general` agent lists
+    /// `web_search` and `web_fetch` — so `offline_mode = true` left a
+    /// delegated agent with live web tools, and `disabled_tools` was ignored
+    /// for subagents entirely. Structural because constructing a live
+    /// subagent needs a model endpoint; the property is that the session's
+    /// forbidden list is consulted at all.
+    ///
+    /// Assembled, since this test reads the file it lives in.
+    #[test]
+    fn a_subagent_is_filtered_by_what_the_session_forbids() {
+        let code = include_str!("subagent.rs");
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let consulted = ["effective_disabled", "_tools()"].concat();
+        assert!(
+            flat.contains(&consulted),
+            "the session's forbidden-tool list is no longer consulted when \
+             building a subagent's tools",
+        );
+
+        // And the unfiltered form must not be what reaches the executor.
+        let unfiltered = ["tool_definitions_filtered(&self.agent_def", ".tools)"].concat();
+        assert!(
+            !flat.contains(&unfiltered),
+            "the agent definition's tool list is passed through unfiltered, so \
+             offline_mode and disabled_tools do not reach subagents",
+        );
+    }
+}
+

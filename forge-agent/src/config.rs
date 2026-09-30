@@ -307,6 +307,37 @@ fn default_compact_at_percent() -> u8 {
 }
 
 /// Tools off unless asked for. See `AgentConfig::disabled_tools`.
+/// Tools that reach the network and are not part of making a model call.
+///
+/// `offline_mode` forces these off. `search_papers` belongs here and was
+/// missing: it is enabled by default and reaches Europe PMC at
+/// `www.ebi.ac.uk`, so "no outgoing request except to the endpoint you
+/// configured" was false for anyone who left it on.
+pub const NETWORK_TOOLS: [&str; 3] = ["web_search", "web_fetch", "search_papers"];
+
+impl AgentConfig {
+    /// Every tool this session may not use: the operator's own list, plus
+    /// the network tools when offline.
+    ///
+    /// Centralised because it was applied in one place and needed in two. The
+    /// top-level agent filtered its own tool list and subagents did not, so a
+    /// delegated `general` agent — whose definition lists `web_search` and
+    /// `web_fetch` — kept live web tools with `offline_mode = true`, and
+    /// ignored `disabled_tools` as well. A guarantee that holds for the agent
+    /// you can see and not the ones it spawns is not a guarantee.
+    pub fn effective_disabled_tools(&self) -> Vec<String> {
+        let mut disabled = self.disabled_tools.clone();
+        if self.offline_mode {
+            for t in NETWORK_TOOLS {
+                if !disabled.iter().any(|d| d == t) {
+                    disabled.push(t.to_string());
+                }
+            }
+        }
+        disabled
+    }
+}
+
 fn default_disabled_tools() -> Vec<String> {
     Vec::new()
 }
@@ -960,3 +991,54 @@ compaction_threshold = 100
         assert_eq!(c.scratchpad.keep_days, 7);
     }
 }
+#[cfg(test)]
+mod offline_tool_tests {
+    use super::*;
+
+    fn cfg(offline: bool, disabled: &[&str]) -> AgentConfig {
+        let mut a = AppConfig::default().agent;
+        a.offline_mode = offline;
+        a.disabled_tools = disabled.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    /// Every tool that reaches the network goes off when offline.
+    ///
+    /// `search_papers` was missing from this list. It is enabled by default
+    /// and reaches Europe PMC at `www.ebi.ac.uk`, so the README's "no
+    /// outgoing request except to the endpoint you configured" was false for
+    /// anyone who left it on — which is everyone, since the default disabled
+    /// list is empty.
+    #[test]
+    fn offline_mode_stops_every_tool_that_leaves_the_machine() {
+        let disabled = cfg(true, &[]).effective_disabled_tools();
+        for tool in ["web_search", "web_fetch", "search_papers"] {
+            assert!(
+                disabled.iter().any(|d| d == tool),
+                "{tool} reaches the network and survives offline mode: {disabled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn online_is_left_alone() {
+        assert!(cfg(false, &[]).effective_disabled_tools().is_empty());
+        // And the operator's own list is preserved either way.
+        assert_eq!(cfg(false, &["shell_exec"]).effective_disabled_tools(), vec!["shell_exec"]);
+        let both = cfg(true, &["shell_exec"]).effective_disabled_tools();
+        assert!(both.iter().any(|d| d == "shell_exec"));
+        assert!(both.iter().any(|d| d == "web_search"));
+    }
+
+    /// A tool named twice is disabled once.
+    #[test]
+    fn an_explicitly_disabled_network_tool_is_not_listed_twice() {
+        let disabled = cfg(true, &["web_search"]).effective_disabled_tools();
+        assert_eq!(
+            disabled.iter().filter(|d| *d == "web_search").count(),
+            1,
+            "{disabled:?}"
+        );
+    }
+}
+

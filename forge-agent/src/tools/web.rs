@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 use anyhow::{Context, Result};
-use scraper::{Html, Selector};
 
 use crate::api::{ApiClient, Message};
 
@@ -341,22 +340,20 @@ pub async fn web_fetch(
         return Ok(refused(url, vendor, None));
     }
 
-    // Parse HTML and extract text in a block so `document` (non-Send) is dropped
-    // before any subsequent .await points.
+    // Forge's own parser, the same one the crawler uses. This used to be
+    // `scraper`, which brought twenty-three crates for one file's worth of
+    // tag lookups — and meant `web_fetch` and `web_search` read the same page
+    // two different ways, so the two tools could disagree about what it said.
+    //
+    // Nothing is lost by the swap: the selectors in use were `title`,
+    // `article`, `main`, `[role=main]` and `body`, and the skip list and
+    // main-content preference now live in `html.rs` where both callers get
+    // them.
     let (title, truncated, text_len) = {
-        let document = Html::parse_document(&html);
-
-        let title = Selector::parse("title")
-            .ok()
-            .and_then(|sel| document.select(&sel).next())
-            .map(|el| el.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-
-        let text = extract_readable_text(&document);
-        let text_len = text.len();
-        let truncated: String = text.chars().take(max_length).collect();
-
-        (title, truncated, text_len)
+        let page = forge_search::html::parse(&html);
+        let text_len = page.text.len();
+        let truncated: String = page.text.chars().take(max_length).collect();
+        (page.title, truncated, text_len)
     };
 
     // If we have a summarizer, route through LLM
@@ -428,118 +425,6 @@ pub async fn web_fetch(
             final_url, output
         ))
     }
-}
-
-/// Extract readable text from HTML, preferring <article> or <main> content,
-/// and stripping navigation, scripts, styles, etc.
-fn extract_readable_text(document: &Html) -> String {
-    // Tags to skip entirely
-    let skip_tags = [
-        "script", "style", "nav", "header", "footer", "aside", "noscript", "svg", "form",
-    ];
-
-    // Try to find main content area first
-    let content_selectors = ["article", "main", "[role=\"main\"]"];
-    for sel_str in &content_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(element) = document.select(&sel).next() {
-                let text = extract_text_from_element(element, &skip_tags);
-                let cleaned = collapse_whitespace(&text);
-                if cleaned.len() > 100 {
-                    return cleaned;
-                }
-            }
-        }
-    }
-
-    // Fallback to body
-    if let Ok(sel) = Selector::parse("body") {
-        if let Some(element) = document.select(&sel).next() {
-            let text = extract_text_from_element(element, &skip_tags);
-            return collapse_whitespace(&text);
-        }
-    }
-
-    // Last resort: all text
-    collapse_whitespace(&document.root_element().text().collect::<String>())
-}
-
-/// Recursively extract text from an element, skipping specified tags.
-fn extract_text_from_element(element: scraper::ElementRef, skip_tags: &[&str]) -> String {
-    let mut text = String::new();
-
-    for node in element.children() {
-        match node.value() {
-            scraper::node::Node::Text(t) => {
-                text.push_str(t);
-            }
-            scraper::node::Node::Element(el) => {
-                let tag = el.name();
-                if skip_tags.contains(&tag) {
-                    continue;
-                }
-                // Add newlines for block elements
-                let is_block = matches!(
-                    tag,
-                    "p" | "div"
-                        | "br"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "li"
-                        | "tr"
-                        | "blockquote"
-                        | "pre"
-                        | "section"
-                        | "dd"
-                        | "dt"
-                );
-                if is_block {
-                    text.push('\n');
-                }
-                if let Some(child_ref) = scraper::ElementRef::wrap(node) {
-                    text.push_str(&extract_text_from_element(child_ref, skip_tags));
-                }
-                if is_block {
-                    text.push('\n');
-                }
-            }
-            _ => {}
-        }
-    }
-
-    text
-}
-
-/// Collapse multiple whitespace/newlines into single spaces/newlines.
-fn collapse_whitespace(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_newline = false;
-    let mut prev_space = false;
-
-    for ch in s.chars() {
-        if ch == '\n' {
-            if !prev_newline {
-                result.push('\n');
-            }
-            prev_newline = true;
-            prev_space = false;
-        } else if ch.is_whitespace() {
-            if !prev_space && !prev_newline {
-                result.push(' ');
-            }
-            prev_space = true;
-        } else {
-            prev_newline = false;
-            prev_space = false;
-            result.push(ch);
-        }
-    }
-
-    result.trim().to_string()
 }
 
 #[cfg(test)]

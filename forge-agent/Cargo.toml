@@ -60,7 +60,6 @@ clap = { version = "4", features = ["derive"] }
 shell-words = "1"
 
 # HTML parsing
-scraper = "0.22"
 forge-search = { path = "../forge-search" }
 
 # Timestamps and IDs for conversation log

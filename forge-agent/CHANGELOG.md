@@ -26,6 +26,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Changed
 
+- **`scraper` is gone — 27 packages out of the tree.** It was used in one file, for five selectors, four of which were bare tag names (`title`, `article`, `main`, `body`; the fifth was `[role=main]`). Forge has had its own HTML parser since 0.5.0, so `web_fetch` and `web_search` were reading the same page two different ways and could disagree about what it said. They now share one parser.
+
+  The skip list and main-content preference that lived in `web_fetch` moved into `forge-search/src/html.rs`, which means the crawler gets them too — and that is the better half of this change. Navigation and footers are no longer indexed as content: a nav bar repeated across two hundred pages made every page look like it was about the nav bar, because BM25 sees the same terms everywhere and ranks on furniture. Links are still collected from it; dropping a nav's *text* is not the same as refusing to follow it.
+
+  Four of the five MPL-2.0 crates in the tree went with it — `cssparser`, `cssparser-macros`, `dtoa-short` and `selectors` — leaving only `option-ext` via `dirs`. `NOTICE` said those were "reached through `scraper`" and now says what is actually there.
+
 - **A re-crawl no longer hands a site a token it minted for you.** Conditional requests were added this release to stop re-downloading unchanged pages, and they returned both validators the server had issued. Those are not equivalent: `Last-Modified` is a property of the content, identical for every visitor, so echoing it identifies nobody — while an `ETag` is server-chosen and can be minted per visitor, which is a documented tracking technique. Forge now returns the harmless one always and the correlatable one only if `agent.send_etag` is set, which is off by default. Most of the saving comes from `Last-Modified` anyway; the opt-in exists for sites that issue no `Last-Modified` at all, which tend to be the CDN-fronted ones where the risk is highest.
 
   The README now states what a site can learn, measured rather than asserted: the complete header set is `Host`, `Accept` and the user agent. No cookies, no `Referer`, no `Accept-Language`, no client hints, no session identifier — the agent's own session id travels only to the configured model endpoint. What remains is the IP address, which Forge will not hide because routing around it is the kind of evasion this project declines, and which pages were asked for, which is inherent.

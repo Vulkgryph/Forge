@@ -61,6 +61,29 @@ throwaway work does not land in your project; and a rewind checkpoint lets you
 put a file back after the agent has edited it. The failure mode being designed
 against is an agent that has already done something you would not have allowed.
 
+**What it does to your project without being asked.** Two things, both
+deliberate and neither obvious:
+
+- **It runs `git init` in your project directory** the first time it needs a
+  rewind checkpoint and there is no repository there. Checkpoints are commits,
+  so it needs one. It refuses to do this to your home directory, a filesystem
+  root, or the containers homes and volumes are mounted under — `git init` on
+  `$HOME` is silent, sticky, and stops Forge working on every project inside
+  it, which is why the guard exists rather than being assumed
+  (`forge-agent/src/agent/rewind.rs`).
+- **It rewrites `~/.config/forge/config.toml` on every startup**, and comments
+  do not survive it. Your values do. Keep notes elsewhere.
+
+**What it costs, and where you can see it.** Forge never sees your bill — the
+key is yours and the requests go to your endpoint — so it reports tokens, not
+money. Both clients show how full the model's context window is as a live
+`NN% ctx` figure, and hovering it in the editor gives the last request's exact
+prompt and completion token counts. Running totals for the session are tracked
+separately and sent to the client every turn, so a client can show them. There is no currency estimate anywhere, and no
+per-tool accounting: `delegate_task` runs up to four subagents at once by
+default and compaction fires at 80% of the window, so a turn can cost several
+model calls that the percentage alone does not break down.
+
 **Your keys, your machine.** Any OpenAI-compatible endpoint works, nothing is
 routed through a Vulkgryph service, and offline mode turns off the tools that
 reach the network. The first-party network calls are a weekly GitHub releases
@@ -121,23 +144,43 @@ What *can* diverge is each client's own view of the wire protocol's shape. The t
 
 ## Install / defaults
 
-On **Ubuntu/Debian x86-64**, run `bash install.sh` from the source directory.
-It installs missing build tools, both interfaces, and branded application-menu
-entries. See [Linux installation](LINUX.md) for options and tested scope.
+This monorepo is the **canonical** Forge source. The standalone `forge` and
+`Forge-IDE` checkouts are retired.
 
-For the local native Windows development installer, see [Windows installation](WINDOWS.md).
-From an existing checkout, double-click `install.cmd` to build and install both
-interfaces and the shared agent. Windows support is under development; the
-Windows guide records its current limitations.
+macOS first, because it is the only platform the editor is *supported* on —
+see the [platform table](#platforms) for what that word means here and what
+the others get.
 
-This monorepo is the **canonical** Forge source. The standalone `forge` and `Forge-IDE` checkouts are retired.
+**macOS** — the editor comes as a notarized `.dmg` on the
+[releases page](https://github.com/Vulkgryph/Forge/releases), signed with
+Vulkgryph LLC's Developer ID, so it opens without the unidentified-developer
+warning. For the agent and the terminal client, from a checkout:
 
 ```bash
-# from a checkout of this repo:
-./forge-agent/install.sh
-# or later:
-forge-update
+./forge-agent/install.sh    # interactive: picks a provider and writes a config
+forge-update                # later, to rebuild from a newer checkout
 ```
+
+Or in one command, which clones to `~/forge` and runs that installer for you:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Vulkgryph/Forge/main/bootstrap.sh | bash
+```
+
+**Linux (Ubuntu/Debian x86-64)** — `bash install.sh` from the source directory
+installs missing build tools, both interfaces, and application-menu entries.
+See [Linux installation](LINUX.md) for options and tested scope. The same
+`bootstrap.sh` one-liner above works here.
+
+**Windows** — see [Windows installation](WINDOWS.md); from a checkout,
+double-click `install.cmd`. In PowerShell the one-command form is:
+
+```powershell
+irm https://raw.githubusercontent.com/Vulkgryph/Forge/main/bootstrap.ps1 | iex
+```
+
+Windows support is under development and the Windows guide records its current
+limitations.
 
 The older terminal-only installer above installs:
 
@@ -150,7 +193,7 @@ The older terminal-only installer above installs:
 With that terminal-only installer, `forge-ide` is built separately. The root Linux
 and Windows installers include it by default.
 
-On macOS there is also a notarized `.dmg` on the [releases page](https://github.com/Vulkgryph/Forge/releases) if you would rather not build the editor yourself. It is signed with Vulkgryph LLC's Developer ID and notarized by Apple, so it opens without the unidentified-developer warning. The terminal client is not distributed that way — `forge-agent/install.sh` builds it from this checkout.
+The terminal client is not distributed as a signed artifact — `forge-agent/install.sh` builds it from this checkout. The `.dmg` covers the editor only; see [Install](#install--defaults).
 
 ## Platforms
 
@@ -261,6 +304,15 @@ xAI has OAuth of the same shape for SuperGrok and X Premium+ subscriptions, and
 Forge deliberately does **not** implement it: xAI's consumer terms prohibit
 programmatic access and reverse engineering, and route developer use to their
 Enterprise terms with an API key. Grok works here through an API key.
+
+**GitHub Copilot: no**, and it is worth saying because it is the subscription
+most readers already have. Copilot's completions and chat go through endpoints
+tied to the editor extensions that are licensed to use them; there is no
+API-key form of a Copilot subscription to point Forge at, and driving those
+endpoints from something that is not one of those clients is the same
+unsanctioned shape as the Anthropic path that was removed. If Copilot is what
+you pay for, that subscription does not carry over — Forge needs an API key or
+a Codex subscription instead.
 
 ## Search is ours now
 

@@ -14,6 +14,20 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
   Renderer selection is now unconditional: wgpu, which picks the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux. The 25 `#[cfg(feature = "vulkan-renderer")]` switch points in `main.rs` are gone with it.
 
+### Added
+
+- **Files that are not UTF-8 open, and are written back the way they came.** A latin-1 source file, a UTF-16 file off a Windows box, or one stray byte all used to be refused with "is not a text file" — a message that was right about binaries and wrong about everything else. The encoding is remembered on the buffer and reversed on save, so `encode(decode(bytes)) == bytes`; without that, decoding would have been *worse* than refusing, since saving wrote UTF-8 and would have rewritten a UTF-16 file with its byte-order mark left as mojibake. Detection stops at a byte-order mark and a UTF-8 check — guessing between latin-1, Windows-1252 and Shift-JIS is what `encoding_rs` is for — and latin-1 is the fallback because it is total and exactly reversible. Binaries are still refused, now saying so specifically. A save that would drop characters the encoding cannot hold is refused rather than performed.
+
+- **CRLF files keep their line endings.** This was broken for every file, not just unusual ones: `str::lines()` strips the `\r` and saving wrote `\n`, so opening and saving any CRLF file rewrote every line in it.
+
+- **Composed input reaches the terminal.** The input loop matched `Event::Text` and `Event::Key` and nothing else, so `Event::Ime` was dropped — Japanese, Chinese and Korean could not be typed into the built-in terminal at all. The editor was unaffected because `TextEdit` handles IME itself, which is why it was broken only where nobody would look. Both the local and SSH terminals now route it through one function, since they had the same omission.
+
+### Changed
+
+- **Wide characters take two terminal columns.** Every CJK ideograph, fullwidth form and most emoji occupied one column where the program writing to the terminal had assumed two — and since applications compute their own padding from those widths, the alignment was wrong before it was drawn. `git log` on a repository with Chinese commit messages came apart. Wide characters now claim the column after them with a spacer, which is skipped wherever a row becomes text and is not written to the session file (reconstructed from the character's width instead, so the saved format is unchanged and old sessions still load). Box drawing, powerline separators and the arrows Forge's own TUI prints stay single-width — the regression this could most easily have caused, and tested for. Combining marks are dropped rather than given a column: a cell holds one `char`, so `e` + combining-acute renders as `e`, and the alternative puts every following column wrong.
+
+- **The language server is told what changed, not sent the whole file.** `didChange` shipped the entire document, JSON-encoded, on every keystroke — and being called from the frame loop, on frames with no edit at all. Identical text now sends nothing, and an edit sends one range computed from a common prefix and suffix. Deliberately not a minimal diff: a change at both ends of a file sends the middle too, because a wrong minimal diff silently desynchronises the server's copy and every diagnostic after it points at the wrong line. Gated on the server's declared `textDocumentSync`, read from the initialize result rather than assumed — the response used to be read and discarded.
+
 ### Fixed
 
 - **The web view was positioned twice per frame.** `place_webview()` was called once after each renderer's draw block, and since only one block was ever compiled, the surviving pair meant the wgpu build called it twice — the first time *before* the frame it was meant to follow, under a comment reading "After the frame rather than during." Visible once the Vulkan branch was removed and the two calls sat next to each other.

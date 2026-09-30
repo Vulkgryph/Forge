@@ -11459,6 +11459,10 @@ impl IdeApp {
                     egui::Event::Text(t) => Some(t.as_bytes().to_vec()),
                     egui::Event::Key { key, pressed: true, modifiers, .. } =>
                         crate::terminal::key_to_pty(*key, *modifiers),
+                    // Composed input — Japanese, Chinese, Korean. Same
+                    // omission as the local terminal had, and the same fix, so
+                    // the two agree about what reaches the pty.
+                    egui::Event::Ime(ime) => crate::terminal::ime_to_pty(ime),
                     _ => None,
                 };
                 if let Some(b) = bytes {

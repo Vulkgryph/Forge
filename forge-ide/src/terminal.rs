@@ -1955,10 +1955,39 @@ impl Terminal {
                             self.write_bytes(&b);
                         }
                     }
+                    egui::Event::Ime(ime) => {
+                        if let Some(b) = ime_to_pty(ime) {
+                            self.pending_input.push(b.clone());
+                            self.write_bytes(&b);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+/// The bytes an IME composition sends, if any.
+///
+/// The terminal's input loop matched `Event::Text` and `Event::Key` and
+/// nothing else, so `Event::Ime` — which is how every composed script
+/// arrives — was dropped on the floor. Japanese, Chinese and Korean could not
+/// be typed into the built-in terminal at all; not badly, but not at all. The
+/// editor got this for free because `TextEdit` handles IME itself, which is
+/// why it was only broken here.
+///
+/// Only `Commit` produces bytes. `Preedit` is the candidate being composed and
+/// belongs on screen, not in the pty: sending it would type every intermediate
+/// guess and then the final one. Rendering it inline needs a preedit overlay
+/// the grid does not have, so the composition is invisible until it commits —
+/// the platform's own candidate window is still shown by the OS, which is
+/// where the person is looking while they choose.
+pub fn ime_to_pty(event: &egui::ImeEvent) -> Option<Vec<u8>> {
+    match event {
+        egui::ImeEvent::Commit(text) if !text.is_empty() => Some(text.as_bytes().to_vec()),
+        // Enabled/Disabled are notifications, and Preedit is not input yet.
+        _ => None,
     }
 }
 
@@ -3212,4 +3241,54 @@ mod wide_char_grid_tests {
         assert!(back[1].spacer, "the spacer should be reconstructed from the width");
     }
 }
+#[cfg(test)]
+mod ime_input_tests {
+    use super::ime_to_pty;
+
+    /// A committed composition reaches the pty.
+    ///
+    /// Nothing did before: the input loop matched `Event::Text` and
+    /// `Event::Key`, so `Event::Ime` — the only way composed script arrives —
+    /// was dropped. CJK could not be typed into the terminal at all.
+    #[test]
+    fn a_committed_composition_is_sent() {
+        let got = ime_to_pty(&egui::ImeEvent::Commit("日本語".to_string()));
+        assert_eq!(got, Some("日本語".as_bytes().to_vec()));
+    }
+
+    /// The candidate being composed is not input yet.
+    ///
+    /// Sending preedit would type every intermediate guess and then the final
+    /// text — "にほん" followed by "日本" — which is worse than the silence it
+    /// replaced.
+    #[test]
+    fn a_composition_in_progress_is_not_sent() {
+        assert_eq!(ime_to_pty(&egui::ImeEvent::Preedit("にほん".to_string())), None);
+        assert_eq!(ime_to_pty(&egui::ImeEvent::Enabled), None);
+        assert_eq!(ime_to_pty(&egui::ImeEvent::Disabled), None);
+    }
+
+    /// An empty commit is what cancelling a composition produces. It must not
+    /// send a zero-length write to the pty.
+    #[test]
+    fn a_cancelled_composition_sends_nothing() {
+        assert_eq!(ime_to_pty(&egui::ImeEvent::Commit(String::new())), None);
+    }
+
+    /// Both terminals route IME through this one function, so they cannot
+    /// disagree about what reaches the pty — the local one handled neither and
+    /// the SSH one handled neither, and fixing only one would have been worse
+    /// than fixing neither.
+    ///
+    /// Assembled, since this test reads the files it checks.
+    #[test]
+    fn both_terminals_consult_it() {
+        let local = include_str!("terminal.rs");
+        let ssh = include_str!("app.rs");
+        let needle = ["ime_to_pty", "(ime)"].concat();
+        assert!(local.contains(&needle), "the local terminal no longer routes IME");
+        assert!(ssh.contains(&needle), "the SSH terminal no longer routes IME");
+    }
+}
+
 

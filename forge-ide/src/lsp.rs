@@ -53,7 +53,83 @@ pub struct LspClient {
     rx:               mpsc::Receiver<Value>,
     next_id:          i64,
     versions:         HashMap<PathBuf, i64>,
+    /// The text the server was last told about, per document.
+    ///
+    /// Needed to say what changed. `did_change` used to send the whole file as
+    /// a single full-document change on every keystroke, which meant
+    /// JSON-encoding the buffer and writing it down a pipe per character — the
+    /// third of four O(file-size) costs per keypress, and the only one that
+    /// also cost the server a full reparse.
+    texts:            HashMap<PathBuf, String>,
+    /// Set when the server declared it accepts ranged changes.
+    incremental:      bool,
     pending_requests: HashMap<i64, Value>, // id → response (once arrived)
+}
+
+/// The LSP position (line, UTF-16 column) of a character offset in `text`.
+///
+/// `character` is UTF-16 code units, not chars and not bytes — the one part of
+/// LSP positions that is easy to get wrong and silently wrong when you do: an
+/// off-by-one here means the server applies an edit at the position next to
+/// the real one and its copy of the file drifts from yours with nothing to
+/// report it.
+fn position_at(text: &str, char_offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut col = 0u32;
+    for (i, ch) in text.chars().enumerate() {
+        if i == char_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += ch.len_utf16() as u32;
+        }
+    }
+    (line, col)
+}
+
+/// One replacement covering everything that differs between `old` and `new`.
+///
+/// `None` when they are identical, so an unchanged buffer sends no
+/// notification at all.
+///
+/// Computed as a common prefix and a common suffix, which makes the result
+/// provably correct for any edit: replacing `old[prefix .. len-suffix]` with
+/// `new[prefix .. len-suffix]` reconstructs `new` exactly, whatever the edit
+/// was. It is not a minimal diff — a change at both ends of a file sends the
+/// middle too — but a wrong minimal diff is far worse than a correct
+/// conservative one, because the server's copy silently stops matching the
+/// buffer and every diagnostic after that points at the wrong line.
+fn single_change(old: &str, new: &str) -> Option<((u32, u32), (u32, u32), String)> {
+    if old == new {
+        return None;
+    }
+    let old_chars: Vec<char> = old.chars().collect();
+    let new_chars: Vec<char> = new.chars().collect();
+
+    let prefix = old_chars
+        .iter()
+        .zip(new_chars.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // The suffix must not reach back past the prefix on either side, or the
+    // two would overlap and describe a region that does not exist.
+    let max_suffix = old_chars.len().min(new_chars.len()) - prefix;
+    let suffix = old_chars
+        .iter()
+        .rev()
+        .zip(new_chars.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(max_suffix);
+
+    let start = position_at(old, prefix);
+    let end = position_at(old, old_chars.len() - suffix);
+    let replacement: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+    Some((start, end, replacement))
 }
 
 impl LspClient {
@@ -81,6 +157,10 @@ impl LspClient {
                     "workspace": { "configuration": true, "workspaceFolders": true },
                     "textDocument": {
                         "synchronization": { "didSave": true },
+                        // Ranged changes are only legal if the client says it
+                        // supports them; `did_change` checks what the server
+                        // answers with before sending any.
+                        "textDocumentSync": { "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false },
                         "hover": { "contentFormat": ["plaintext", "markdown"] },
                         "completion": {
@@ -103,10 +183,22 @@ impl LspClient {
             }
         });
         write_msg(&mut *stdin.lock().ok()?, &init).ok()?;
+        // Whether the server takes ranged changes. Asked rather than assumed:
+        // sending incremental changes to a server that declared Full means it
+        // treats each range as the entire document, and its copy becomes the
+        // last edit alone. `TextDocumentSyncKind` is 0 none, 1 full, 2
+        // incremental, and may be either a bare number or an options object.
+        let mut incremental = false;
         loop {
             let msg = read_msg(&mut reader)?;
             let id_matches = msg.get("id").and_then(|v| v.as_i64()) == Some(1);
             if id_matches && (msg.get("result").is_some() || msg.get("error").is_some()) {
+                if let Some(sync) = msg.pointer("/result/capabilities/textDocumentSync") {
+                    let kind = sync
+                        .as_i64()
+                        .or_else(|| sync.get("change").and_then(|c| c.as_i64()));
+                    incremental = kind == Some(2);
+                }
                 break;
             }
         }
@@ -141,7 +233,8 @@ impl LspClient {
         });
 
         Some(Self { child, stdin, rx, next_id: 2,
-                    versions: HashMap::new(), pending_requests: HashMap::new() })
+                    versions: HashMap::new(), texts: HashMap::new(), incremental,
+                    pending_requests: HashMap::new() })
     }
 
     // ── Document sync ───────────────────────────────────────────────────────
@@ -155,16 +248,53 @@ impl LspClient {
                 "version": 1, "text": text,
             }
         }));
+        // What the server now holds, so the next change can be described
+        // rather than resent.
+        self.texts.insert(path.to_path_buf(), text.to_string());
     }
 
+    /// Tell the server what changed.
+    ///
+    /// A ranged change when the server accepts one, and nothing at all when
+    /// the text is identical — the editor calls this from the frame loop, so
+    /// the common case is a redraw with no edit behind it, and that used to
+    /// ship the whole file anyway.
     pub fn did_change(&mut self, path: &Path, text: &str) {
+        let previous = self.texts.get(path).cloned();
+
+        // An unchanged buffer is not a change. Worth checking first: without
+        // it, every frame with the editor focused sent a full-document sync.
+        if previous.as_deref() == Some(text) {
+            return;
+        }
+
         let Some(v) = self.versions.get_mut(path) else { return };
         *v += 1;
         let ver = *v;
+
+        let changes = match (self.incremental, previous.as_deref()) {
+            (true, Some(old)) => match single_change(old, text) {
+                Some(((sl, sc), (el, ec), replacement)) => json!([{
+                    "range": {
+                        "start": { "line": sl, "character": sc },
+                        "end":   { "line": el, "character": ec },
+                    },
+                    "text": replacement,
+                }]),
+                // Identical was handled above, so this is unreachable; sending
+                // the whole document is the safe answer if it ever is not.
+                None => json!([{ "text": text }]),
+            },
+            // No prior text (a change before did_open) or a server that only
+            // takes full documents.
+            _ => json!([{ "text": text }]),
+        };
+
         self.notify("textDocument/didChange", json!({
             "textDocument": { "uri": path_to_uri(path), "version": ver },
-            "contentChanges": [{ "text": text }],
+            "contentChanges": changes,
         }));
+        self.texts.insert(path.to_path_buf(), text.to_string());
     }
 
     // ── Requests (fire-and-forget; result arrives via poll + take_response) ──
@@ -713,3 +843,127 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     }
     Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
 }
+#[cfg(test)]
+mod incremental_sync_tests {
+    use super::{position_at, single_change};
+
+    /// Apply a change the way a language server would, so the test checks the
+    /// thing the server will actually do rather than the shape of the JSON.
+    fn apply(old: &str, change: &((u32, u32), (u32, u32), String)) -> String {
+        let ((sl, sc), (el, ec), text) = change;
+        // Resolve (line, utf16 column) back to a char offset.
+        let offset_of = |line: u32, col: u32| -> usize {
+            let mut l = 0u32;
+            let mut c = 0u32;
+            for (i, ch) in old.chars().enumerate() {
+                if l == line && c == col {
+                    return i;
+                }
+                if ch == '\n' {
+                    l += 1;
+                    c = 0;
+                } else {
+                    c += ch.len_utf16() as u32;
+                }
+            }
+            old.chars().count()
+        };
+        let start = offset_of(*sl, *sc);
+        let end = offset_of(*el, *ec);
+        let chars: Vec<char> = old.chars().collect();
+        let mut out: String = chars[..start].iter().collect();
+        out.push_str(text);
+        out.extend(&chars[end..]);
+        out
+    }
+
+    /// The property the whole thing rests on: the edit reconstructs the new
+    /// text exactly. A wrong range does not error — the server's copy simply
+    /// stops matching the buffer, and every diagnostic after that points
+    /// somewhere else.
+    #[test]
+    fn the_change_reconstructs_the_new_text() {
+        let cases = [
+            // (old, new, what it is)
+            ("fn main() {}", "fn main() { }", "insert in the middle of a line"),
+            ("hello", "hello world", "append"),
+            ("hello world", "hello", "truncate"),
+            ("abc", "xbc", "replace the first character"),
+            ("abc", "abx", "replace the last character"),
+            ("a\nb\nc", "a\nB\nc", "replace on the second line"),
+            ("a\nb\nc", "a\nb\nc\nd", "append a line"),
+            ("a\nb\nc\nd", "a\nb\nc", "remove the last line"),
+            ("a\nb\nc", "a\nc", "remove a middle line"),
+            ("", "x", "insert into an empty file"),
+            ("x", "", "empty the file"),
+            ("let x = 1;", "let x = 12;", "type a digit"),
+            // Non-ASCII, where UTF-16 columns stop matching char counts.
+            ("日本語", "日本", "delete a wide character"),
+            ("日本", "日本語", "add a wide character"),
+            ("a日b", "aXb", "replace a wide character with a narrow one"),
+            ("// 🎉\nx", "// 🎉\ny", "edit after an astral-plane character"),
+            ("🎉x", "🎉y", "edit after a surrogate pair"),
+            ("a\nb", "a\r\nb", "introduce a carriage return"),
+            ("same", "same", "no change at all"),
+            ("aaa", "aa", "ambiguous prefix and suffix overlap"),
+            ("aa", "aaa", "the same, growing"),
+            ("abab", "ab", "repeated content"),
+        ];
+
+        for (old, new, what) in cases {
+            match single_change(old, new) {
+                None => assert_eq!(old, new, "{what}: reported no change but they differ"),
+                Some(change) => {
+                    assert_eq!(
+                        apply(old, &change), new,
+                        "{what}: applying the change to {old:?} did not produce {new:?} \
+                         (change was {change:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Identical text produces no notification, because the editor calls
+    /// `did_change` from the frame loop and most frames have no edit in them.
+    #[test]
+    fn an_unchanged_buffer_is_not_a_change() {
+        assert!(single_change("same", "same").is_none());
+        assert!(single_change("", "").is_none());
+    }
+
+    /// The change covers only what differs, which is the point of the
+    /// exercise — otherwise this is full sync with extra steps.
+    #[test]
+    fn a_one_character_edit_sends_one_character() {
+        let old = "line one\nline two\nline three\n";
+        let new = "line one\nline TWO\nline three\n";
+        let ((sl, sc), (el, ec), text) = single_change(old, new).expect("differs");
+        assert_eq!((sl, el), (1, 1), "the edit is on line 1 only");
+        assert_eq!(text, "TWO", "sent {text:?} rather than the changed word");
+        assert_eq!((sc, ec), (5, 8));
+    }
+
+    /// UTF-16 columns, which is what LSP means by `character`.
+    #[test]
+    fn positions_are_utf16_code_units() {
+        // An emoji is one char and two UTF-16 units.
+        assert_eq!(position_at("🎉x", 1), (0, 2), "after the emoji");
+        assert_eq!(position_at("🎉x", 2), (0, 3), "after the x");
+        // A BMP wide character is one unit.
+        assert_eq!(position_at("日x", 1), (0, 1));
+        // Newlines reset the column.
+        assert_eq!(position_at("ab\ncd", 4), (1, 1));
+        assert_eq!(position_at("ab\ncd", 3), (1, 0));
+    }
+
+    /// An edit after an astral-plane character must be positioned past both of
+    /// its UTF-16 units, or the server applies it one unit early — inside the
+    /// surrogate pair.
+    #[test]
+    fn an_edit_after_an_emoji_is_positioned_past_both_units() {
+        let ((_, sc), _, _) = single_change("🎉a", "🎉b").expect("differs");
+        assert_eq!(sc, 2, "the edit should start at UTF-16 offset 2, not 1");
+    }
+}
+

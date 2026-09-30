@@ -98,9 +98,15 @@ fi
 # 4. Hand off to install.sh
 # -------------------------------------------------------------------
 cd "$DEST"
-chmod +x install.sh update.sh forge
+# These live under forge-agent/ in the monorepo. They were at the root in the
+# standalone checkout this script was written for, and the move was not carried
+# through here: `chmod` on a missing path exits non-zero, and `set -e` killed
+# the bootstrap before the installer ever ran. The root also has its own
+# install.sh — the Linux-only desktop one, with no provider wizard — so a bare
+# `install.sh` would have been the wrong script even had the chmod passed.
+chmod +x forge-agent/install.sh forge-agent/update.sh forge-agent/forge
 
-info "Running install.sh"
+info "Running forge-agent/install.sh"
 echo
 
 # When this bootstrap is invoked via `curl ... | bash`, our stdin is the curl
@@ -110,12 +116,12 @@ echo
 # `[[ -e /dev/tty ]]` only checks that the device file exists, which is always
 # true even when no controlling terminal is attached.
 if (true </dev/tty) 2>/dev/null; then
-    bash install.sh </dev/tty
+    bash forge-agent/install.sh </dev/tty
 else
     echo
     warn "No interactive terminal detected (running without a controlling TTY)."
     warn "Source is ready at $DEST, but the config wizard requires a terminal."
     warn "To finish the install, run from a real shell:"
-    warn "  cd $DEST && ./install.sh"
+    warn "  cd $DEST && ./forge-agent/install.sh"
     exit 0
 fi

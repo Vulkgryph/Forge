@@ -32,7 +32,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils shellcheck
       - name: Shell and packaging checks
         run: |
-          shellcheck install.sh scripts/test_linux_installer.sh
+          shellcheck install.sh scripts/test_linux_installer.sh scripts/test_bootstrap_paths.sh
           bash scripts/test_linux_installer.sh
 
   agent:
@@ -215,7 +215,13 @@ jobs:
           EOF
 
       - name: Installer parses
-        run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh
+        run: bash -n forge-agent/install.sh && bash -n forge-agent/update.sh && bash -n bootstrap.sh
+
+      # `bash -n` passed on a bootstrap that could not run: the syntax was
+      # fine and the filenames were stale. Nothing else in CI executes these
+      # scripts, since running them installs Forge onto the runner.
+      - name: Bootstrap references paths that exist
+        run: bash scripts/test_bootstrap_paths.sh
 
       - name: Package the app bundle
         run: bash forge-ide/scripts/package_macos.sh

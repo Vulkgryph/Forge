@@ -136,7 +136,7 @@ cargo build -p forge-server --release --target x86_64-unknown-linux-musl
 cargo build -p forge-server --release --target aarch64-unknown-linux-musl
 ```
 
-The linker paths for these targets are already configured in the workspace root's `.cargo/config.toml` — there is no `forge-ide/.cargo/config.toml`; the builds work from this directory because Cargo walks up to find it. Forge IDE looks for these binaries under `target/<triple>/release/forge-server` and uploads whichever one matches the remote machine's architecture the first time you connect. If forge-server's version changes, bump both `forge-server/Cargo.toml`'s `version` and the matching `SERVER_VERSION` constant in `src/ssh.rs` — that's what tells the client to re-upload instead of reusing what's already on the remote.
+The linker paths for these targets are already configured in the workspace root's `.cargo/config.toml` — there is no `forge-ide/.cargo/config.toml`; the builds work from this directory because Cargo walks up to find it. Forge IDE looks for these binaries under `target/<triple>/release/forge-server` and uploads whichever one matches the remote machine's architecture the first time you connect. If forge-server's version changes, bump `forge-server/Cargo.toml`'s `version` and nothing else: `build.rs` reads that file and emits `FORGE_SERVER_VERSION`, which `SERVER_VERSION` in `src/ssh.rs` is built from. That is what tells the client to re-upload instead of reusing what is already on the remote.
 
 ## SSH Remote
 

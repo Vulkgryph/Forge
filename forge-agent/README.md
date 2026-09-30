@@ -342,6 +342,13 @@ After login, Forge stores OAuth credentials at `~/.config/forge/chatgpt_auth.jso
 
 ### Config reference
 
+**Forge rewrites this file on every startup, and your comments do not
+survive it.** After it resolves endpoints it writes the whole config back
+serialized from its own structures, so a hand-written 27-line file with two
+comments comes back as 50 lines with none, every default spelled out. The
+values you set are preserved; the comments and the layout are not. Keep notes
+somewhere else, or keep a copy of the file you wrote.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `models.default` | — | Endpoint name used for the main agent |

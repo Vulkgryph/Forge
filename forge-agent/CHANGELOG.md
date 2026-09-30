@@ -2,6 +2,38 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Offline mode did not cover everything that leaves the machine, and did not reach subagents.** Two separate holes behind one documented promise — "no outgoing request except to the endpoint you configured" — with different ranges, checked against the tags. `offline_mode` arrived in 0.3.0; `disabled_tools` has existed since 0.1.0; `search_papers` arrived in 0.5.0.
+
+  `search_papers` was never in the force-off set — affects 0.5.0 through 0.6.0. It is enabled by default and calls Europe PMC at `www.ebi.ac.uk`, so the promise was false for anyone who had not disabled it by hand, which is the default state. The comment in the code asserted that `web_search` and `web_fetch` "are the only normal tools that reach the network" and was the reason nobody looked again.
+
+  Subagents honoured neither `offline_mode` nor the operator's own `disabled_tools` — affects 0.3.0 through 0.6.0 for `offline_mode`, and every release for `disabled_tools`. A subagent's tools were filtered against its agent definition alone, and the built-in `general` agent lists `web_search` and `web_fetch` — so with `offline_mode = true`, `delegate_task` handed a subagent live web tools. The switch held for the agent you could see and not for the ones it started.
+
+  Both paths now derive the disabled set from one function. What it returns is tested, and the subagent path has a guard that fails if the session's list stops being consulted.
+
+- **`search_documents` could not be turned off from the UI.** Affects 0.5.0 through 0.6.0, the releases it has existed in. The model was offered it and the tools menu never listed it, because it was missing from the toggle list — so the only way to stop it was editing `disabled_tools` by hand. It reads and indexes whatever prose files it is pointed at, which is the kind of tool a switch is for. A test now requires every tool the model is offered to be one the user can disable.
+
+### Fixed
+
+- **The one-command install was dead, both ways it could be.** The published `curl … | bash` and `irm … | iex` URLs pointed at the repository root and the scripts were under `forge-agent/`, so both 404'd. Fetched from the right path, `bootstrap.sh` then aborted anyway: it was written for the standalone checkout and still ran `chmod +x install.sh update.sh forge` at the repo root, where none of those exist, and `set -euo pipefail` ended the run before the installer was reached. The root `install.sh` it would have called is the Linux-only desktop one with no provider wizard, so it was the wrong script regardless. Scripts moved to the root, handoff corrected, and CI now resolves every repo path they name — `bash -n` was already running and cannot see a stale filename.
+
+- **`forge-search` refused about 253 routable `/24`s as reserved.** The guard for IETF protocol assignments tested two octets rather than three, so all of `192.0.0.0/16` was treated as `192.0.0.0/24` — 64,516 addresses a crawl could not reach.
+
+- **Neither documented `[agent]` config example parsed.** Four members of the table had no default, so naming `[agent]` at all made all four mandatory: the offline-setup snippet failed on `auto_approve_reads` and the multiple-endpoints example on `max_history_messages`. They default now, and a test loads every complete config example out of the README.
+
+- `scripts/ssh_fault_proxy.py` could not start. It imported a fixture deleted when the resilience harness was ported to Rust, so it raised before either listener existed and the SSH reproduction path in `FAILURE-TESTING.md` had been unusable since. The provider is inlined, and a refused upstream no longer takes the whole script down with it.
+
+- Removed `forge-agent/forge`, a Bun wrapper for the TypeScript client retired in 0.3.0. Its target directory had been gone for releases; running it could only print a Bun error.
+
+### Changed
+
+- Documented that Forge rewrites `config.toml` on every startup and does not preserve comments or layout — measured, not inferred: a hand-written 27-line file with two comments comes back as 50 lines with none. Values are preserved.
+
+- `search_papers` now appears in the offline documentation and in the "what requires network" table, which had listed two tools when there were three.
+
 ## [0.6.0] — 2026-09-29
 
 ### Security

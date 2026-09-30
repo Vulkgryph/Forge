@@ -606,6 +606,11 @@ pub fn get_toggleable_tool_names() -> Vec<&'static str> {
         "web_search",
         "web_fetch",
         "search_papers",
+        // Was missing, so it could not be turned off from either client's
+        // tools menu while the model could still call it. It reads and indexes
+        // whatever prose files it is pointed at, which is exactly the kind of
+        // tool someone wants a switch for.
+        "search_documents",
         "shell_exec",
         "delegate_task",
     ]
@@ -717,3 +722,50 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod toggleable_coverage_tests {
+    use super::*;
+
+    /// Every tool the model is given must be one the user can turn off.
+    ///
+    /// The opposite direction — every toggleable name has a definition — is
+    /// already covered by `every_toggleable_tool_is_actually_defined` above,
+    /// including its `delegate_task` exception. This is the half that was
+    /// missing.
+    ///
+    /// `search_documents` was not. It has a full definition and the executor
+    /// dispatches it, so the model could call it, but it was absent from the
+    /// toggle list — so it never appeared in `available_tools`, never showed in
+    /// either client's tools menu, and the README's "disable selected tools
+    /// from the UI/settings" did not hold for it. Only an edit to
+    /// `disabled_tools` in the config file could stop it.
+    #[test]
+    fn every_model_facing_tool_can_be_toggled() {
+        // Tools the model never sees: the plan-mode machinery and the
+        // question channel, which are protocol rather than capability.
+        const INTERNAL: [&str; 4] = [
+            "enter_plan_mode",
+            "write_plan",
+            "exit_plan_mode",
+            "ask_question",
+        ];
+
+        let toggleable = get_toggleable_tool_names();
+        let mut missing = Vec::new();
+        for def in get_tool_definitions() {
+            let name = def.function.name.as_str();
+            if INTERNAL.contains(&name) {
+                continue;
+            }
+            if !toggleable.contains(&name) {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the model is offered tools the user cannot disable: {missing:?}"
+        );
+    }
+
+}
+

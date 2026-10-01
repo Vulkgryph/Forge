@@ -19,6 +19,7 @@ pub mod compaction;
 pub mod conversation_log;
 mod core;
 pub mod log_types;
+pub mod memory;
 pub mod rewind;
 pub mod subagent;
 

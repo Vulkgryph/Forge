@@ -675,11 +675,26 @@ impl Agent {
         let mut client = client;
         client.apply_agent_reasoning_defaults(&app_config.agent);
 
+        // Loaded here so expiry happens once per process start rather than
+        // per request, and so a note written this session is picked up by the
+        // next prompt rebuild rather than immediately — the prefix has to stay
+        // stable within a turn for caching to be worth anything.
+        let memory_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let memory_dir = ToolExecutor::memory_dir(executor.project_root());
+        let notes = crate::agent::memory::render(
+            &crate::agent::memory::load(&memory_dir, memory_now),
+            memory_now,
+        );
+
         let system_prompt = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
+            notes.as_deref(),
         );
 
         let mut history = Vec::new();
@@ -755,11 +770,26 @@ impl Agent {
         workspace_root: PathBuf,
         existing_meta: &SessionMeta,
     ) -> Result<Self> {
+        // Loaded here so expiry happens once per process start rather than
+        // per request, and so a note written this session is picked up by the
+        // next prompt rebuild rather than immediately — the prefix has to stay
+        // stable within a turn for caching to be worth anything.
+        let memory_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let memory_dir = ToolExecutor::memory_dir(executor.project_root());
+        let notes = crate::agent::memory::render(
+            &crate::agent::memory::load(&memory_dir, memory_now),
+            memory_now,
+        );
+
         let system_prompt = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
+            notes.as_deref(),
         );
         let loaded = log.load_from_last_compaction()?;
         let rewind_checkpoints = log
@@ -5163,6 +5193,7 @@ fn build_system_prompt(
     max_concurrent: usize,
     max_depth: usize,
     scratchpad: Option<&std::path::Path>,
+    notes: Option<&str>,
 ) -> String {
     let base = format!(
         r#"You are an autonomous codebase agent. Your primary workspace is: {}
@@ -5236,13 +5267,21 @@ Be concise and direct in your responses. Focus on actionable feedback."#,
 
     // Only described when there is one, so an agent running without a lab is
     // never told about a directory that does not exist.
-    match scratchpad {
+    let mut prompt = match scratchpad {
         None => base,
         Some(lab) => format!(
             "{base}\n\n{}",
             scratchpad_section(&lab.to_string_lossy())
         ),
+    };
+    // Last, and only when there is something to say. Appended rather than
+    // interleaved so the stable part of the prompt stays byte-identical
+    // between requests — prompt caching keys on a prefix, and a note written
+    // mid-session must not invalidate everything before it.
+    if let Some(notes) = notes {
+        prompt.push_str(notes);
     }
+    prompt
 }
 
 /// Everything the approval decision depends on besides the tool's kind.
@@ -5416,7 +5455,7 @@ mod scratchpad_prompt_tests {
     #[test]
     fn the_agent_is_told_where_its_working_area_is() {
         let lab = Path::new("/tmp/forge-lab/session-123");
-        let prompt = build_system_prompt("/work", 4, 4, Some(lab));
+        let prompt = build_system_prompt("/work", 4, 4, Some(lab), None);
         assert!(
             prompt.contains("/tmp/forge-lab/session-123"),
             "the path is the one thing it cannot infer"
@@ -5430,11 +5469,35 @@ mod scratchpad_prompt_tests {
     /// exist — it would write there and the writes would prompt like any other.
     #[test]
     fn without_a_working_area_it_is_not_mentioned() {
-        let prompt = build_system_prompt("/work", 4, 4, None);
+        let prompt = build_system_prompt("/work", 4, 4, None, None);
         assert!(!prompt.to_lowercase().contains("scratchpad"), "{prompt}");
         assert!(!prompt.contains("forge-lab"));
         // The rest of the prompt is unaffected.
         assert!(prompt.contains("You are an autonomous codebase agent"));
+    }
+
+    /// Notes reach the prompt, and land after everything stable.
+    ///
+    /// Appended rather than interleaved so the prefix stays byte-identical
+    /// between requests: prompt caching keys on a prefix, and a note written
+    /// mid-session must not invalidate the system prompt and tool definitions
+    /// ahead of it.
+    #[test]
+    fn recorded_notes_are_appended_to_the_prompt() {
+        let without = build_system_prompt("/work", 4, 4, None, None);
+        let with = build_system_prompt("/work", 4, 4, None, Some("\n\n## Your notes\n\n- x\n"));
+
+        assert!(with.contains("## Your notes"), "the notes are missing");
+        assert!(
+            with.starts_with(&without),
+            "the notes were not appended — everything before them moved, which \
+             invalidates the cached prefix on every write"
+        );
+        assert_eq!(
+            without,
+            build_system_prompt("/work", 4, 4, None, None),
+            "the prompt is not stable across calls with the same inputs"
+        );
     }
 }
 

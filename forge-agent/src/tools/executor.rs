@@ -248,6 +248,8 @@ impl ToolExecutor {
             }
             "glob_files" => self.glob_files(args).await,
             "todo_write" => self.todo_write(args).await,
+            "remember" => self.remember(args),
+            "forget" => self.forget(args),
             // The engine in `forge-search`, not a scrape of someone else's
             // results page. Indexed per workspace, so the pages an agent has
             // read for this project stay with the project.
@@ -1077,6 +1079,66 @@ impl ToolExecutor {
                 ));
             }
             Ok(output)
+        }
+    }
+
+    /// Where this workspace's notes live.
+    ///
+    /// Project-scoped, beside the session logs: a note about this codebase is
+    /// not a note about the next one, and keeping them here means deleting the
+    /// project deletes its memory rather than leaving it in the user's home.
+    pub fn memory_dir(project_root: &std::path::Path) -> std::path::PathBuf {
+        project_root.join(".forge").join("memory")
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn remember(&self, args: &serde_json::Value) -> Result<String> {
+        use crate::agent::memory;
+
+        let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if note.trim().is_empty() {
+            return Ok("Refused: a note with no text is not a note.".to_string());
+        }
+        // Hours rather than seconds in the tool's shape: the useful range is
+        // an hour to a few weeks, and seconds invites a number nobody checks.
+        let hours = args.get("hours").and_then(|v| v.as_f64());
+        let ttl = match hours {
+            Some(h) if h > 0.0 => std::time::Duration::from_secs((h * 3600.0) as u64),
+            _ => memory::DEFAULT_TTL,
+        };
+
+        let dir = Self::memory_dir(&self.project_root);
+        match memory::remember(&dir, &key, &note, ttl, Self::now_secs()) {
+            Ok(entry) => {
+                let left = entry.expires_at.saturating_sub(Self::now_secs());
+                Ok(format!(
+                    "Remembered '{}' for {} hours. It will be in your notes until then, \
+                     and gone afterwards.",
+                    entry.key,
+                    (left / 3600).max(1),
+                ))
+            }
+            // Returned as text rather than an error: a refused note is
+            // information the model can act on, and failing the tool call
+            // would make it look like a fault in the agent.
+            Err(why) => Ok(format!("Not remembered: {why}")),
+        }
+    }
+
+    fn forget(&self, args: &serde_json::Value) -> Result<String> {
+        let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let dir = Self::memory_dir(&self.project_root);
+        if crate::agent::memory::forget(&dir, key) {
+            Ok(format!("Forgot '{key}'."))
+        } else {
+            Ok(format!("There was no note called '{key}'."))
         }
     }
 

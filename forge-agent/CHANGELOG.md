@@ -4,6 +4,16 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **A memory that expires.** `remember` records a short note that survives into later requests, with a lifetime the agent chooses; `forget` drops one. Everything expires, and that is the design rather than a limitation — the failure mode of a memory system is not forgetting, it is asserting something that stopped being true, read with the same confidence as a correct note and with nothing to prompt a recheck. An entry that expires is wrong for a bounded time.
+
+  Lifetime is the interface. An hour carries a decision across a compaction, because compaction rewrites the transcript and the system prompt is not part of what it trims. A day covers something true of this task but not of the project. Weeks suit a fact about the codebase that cost real work to establish. The ceiling is 90 days and the agent cannot raise it; re-affirming a note writes a new one with a fresh clock, so the fact gets looked at again rather than inherited.
+
+  Bounded by construction, so there is no retrieval: 32 entries, 512 bytes each, 8 KB total — small enough to load in full on every request, which costs about two thousand tokens and removes a whole class of problem. Ranked recall would let the store grow, and `forge-search` already has the machinery, but a ranked store is present only when it ranks for the current query — so a note written to survive the next few minutes of work would be missing exactly when the work needed it. When the cap is reached, the entry that expires soonest is evicted; a note more transient than everything already stored is refused rather than displacing something durable, since evicting by age would shed the facts that were expensive to establish in order to keep whatever was written last.
+
+  Notes are project-scoped, under `.forge/memory/`, so deleting a project deletes its memory. They are injected at the end of the system prompt rather than interleaved, so a note written mid-session does not invalidate the cached prefix ahead of it. They are rendered as notes with their age and remaining life, framed explicitly as claims to check rather than instructions to follow — the same reasoning as the `<web_content>` wrapper, because this text lands in the most trusted part of the request. The agent is the only writer, a key is sanitised to `[A-Za-z0-9_-]` before it becomes a filename, and anything in that directory that is not a parseable entry is deleted rather than served.
+
 ### Security
 
 - **Offline mode did not cover everything that leaves the machine, and did not reach subagents.** Two separate holes behind one documented promise — "no outgoing request except to the endpoint you configured" — with different ranges, checked against the tags. `offline_mode` arrived in 0.3.0; `disabled_tools` has existed since 0.1.0; `search_papers` arrived in 0.5.0.

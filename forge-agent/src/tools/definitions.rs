@@ -171,6 +171,45 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
+                name: "remember".to_string(),
+                description: "Record a short note that survives into later requests, with a                     lifetime you choose. Everything you record expires — that is deliberate,                     because a note that outlives the thing it describes is worse than no note.                     Pick the shortest lifetime that covers the need: an hour to carry a decision                     across a context compaction, a day for something true of this task, weeks                     for a fact about the codebase that cost real work to establish. The store is                     small and capped, so a note is one sentence that would change a decision, not                     a place to put findings — put those in a file and remember where it is.                     Writing the same name again replaces that note and restarts its clock, which                     is how you re-affirm something after checking it is still true.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Short name for this note, letters/digits/-/_ only. Reusing a name replaces that note."
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "The note itself. One or two sentences; there is a hard size limit."
+                        },
+                        "hours": {
+                            "type": "number",
+                            "description": "How many hours it should live. Defaults to a week; the ceiling is 90 days. Use 1 for something that only needs to survive compaction."
+                        }
+                    },
+                    "required": ["key", "note"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "forget".to_string(),
+                description: "Drop a note you recorded, by name. Use this when you find out a                     note is wrong — leaving it to expire on its own means acting on something                     false until it does.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "The note's name." }
+                    },
+                    "required": ["key"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
                 name: "todo_write".to_string(),
                 description: "Manage your task list. Use to track progress on multi-step work. \
                     Mark an item done as soon as it is done, and call clear_done once a batch of \
@@ -611,6 +650,8 @@ pub fn get_toggleable_tool_names() -> Vec<&'static str> {
         // whatever prose files it is pointed at, which is exactly the kind of
         // tool someone wants a switch for.
         "search_documents",
+        "remember",
+        "forget",
         "shell_exec",
         "delegate_task",
     ]

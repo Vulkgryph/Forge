@@ -1636,7 +1636,15 @@ impl App {
             } else {
                 0
             };
-            parts.push(format!("{pct}% ctx"));
+            // Over 100% is a real state — a resumed conversation can be larger
+            // than the window before anything has trimmed it. It used to render
+            // as a bare "114% ctx", indistinguishable from a broken number, so
+            // the figure now says that it is over and that nothing is lost yet.
+            if pct > 100 {
+                parts.push(format!("{pct}% ctx — over, trims next turn"));
+            } else {
+                parts.push(format!("{pct}% ctx"));
+            }
         }
         if self.session.plan_mode {
             parts.push("PLAN".into());
@@ -3298,6 +3306,58 @@ mod tests {
         assert!(grid.contains("50% ctx"), "the figure is shown: {grid:?}");
         assert!(grid.contains("Model"), "alongside the model name");
         assert!(!grid.contains('█'), "no gauge — that was not in the original");
+    }
+
+    /// A conversation larger than the window says so, rather than showing a
+    /// bare figure over 100%.
+    ///
+    /// Reported from use: resuming a long session showed "114% ctx" in the
+    /// same style as any other figure. The number was right — a restored
+    /// transcript can exceed the window before anything has trimmed it,
+    /// because the figure on resume is an estimate of what was loaded rather
+    /// than a measured request — but nothing said whether that meant work had
+    /// been lost, was about to be, or neither.
+    #[test]
+    fn over_the_window_the_context_bar_says_it_is_over() {
+        use forge_agent_proto::UsageSnapshot;
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::UsageUpdate {
+            snapshot: UsageSnapshot {
+                last_prompt_tokens: 1140,
+                last_completion_tokens: 0,
+                max_context_tokens: 1000,
+                ..Default::default()
+            },
+        });
+        let grid = live_text(&mut app);
+        assert!(grid.contains("114% ctx"), "the figure is gone: {grid:?}");
+        assert!(
+            grid.contains("over"),
+            "a figure past 100% reads as a broken number with no word for it: {grid:?}"
+        );
+        assert!(
+            grid.contains("next turn"),
+            "nothing says when it will be trimmed: {grid:?}"
+        );
+    }
+
+    /// And an ordinary figure stays short: the explanation must not sit in the
+    /// bar at every size.
+    #[test]
+    fn inside_the_window_the_context_bar_is_just_the_figure() {
+        use forge_agent_proto::UsageSnapshot;
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::UsageUpdate {
+            snapshot: UsageSnapshot {
+                last_prompt_tokens: 400,
+                last_completion_tokens: 0,
+                max_context_tokens: 1000,
+                ..Default::default()
+            },
+        });
+        let grid = live_text(&mut app);
+        assert!(grid.contains("40% ctx"), "{grid:?}");
+        assert!(!grid.contains("over,"), "the warning shows inside the window: {grid:?}");
     }
 
     /// The prompt is `❯ ` with a placeholder, and no separator rule above it.

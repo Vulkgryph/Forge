@@ -793,6 +793,18 @@ impl Agent {
         }
 
         let estimated_prompt_tokens = estimate_prompt_tokens_from_history(&history);
+        // A resumed conversation can already be past the window. Said here
+        // rather than left to the percentage: clients show
+        // `last_prompt_tokens / max_context_tokens`, which on resume is an
+        // estimate of the restored transcript, so a long session comes back
+        // reading well over 100% with nothing to explain it.
+        if let Some(notice) = over_window_notice(
+            estimated_prompt_tokens,
+            max_context_tokens,
+            app_config.agent.context_strategy.clone(),
+        ) {
+            let _ = event_tx.send(AgentEvent::AssistantMessage(notice));
+        }
         let mut client = client;
         client.apply_agent_reasoning_defaults(&app_config.agent);
 
@@ -5060,6 +5072,45 @@ whether to continue, and do not stop — unless the message itself tells you to 
 stop, or changes the goal enough that the remaining work no longer makes \
 sense. If it asks a question, answer it briefly and keep going.]";
 
+/// What a resumed session is told when its history already exceeds the window.
+///
+/// The context figure clients show is `last_prompt_tokens / max_context_tokens`,
+/// and on resume that numerator is an estimate of the restored transcript
+/// rather than a measured request — so a long conversation comes back reading
+/// "114% ctx" with nothing to say what that means. Over 100% is a real state,
+/// not a glitch, and it is about to be corrected: the first turn trims. Saying
+/// so is the difference between a number that looks broken and one that
+/// explains itself.
+fn over_window_notice(
+    estimated: u32,
+    max_context_tokens: usize,
+    strategy: crate::config::ContextStrategy,
+) -> Option<String> {
+    if max_context_tokens == 0 || (estimated as usize) <= max_context_tokens {
+        return None;
+    }
+    let pct = (estimated as f64 / max_context_tokens as f64 * 100.0).round() as u32;
+    let what_happens = match strategy {
+        crate::config::ContextStrategy::RollingWindow =>
+            "the oldest messages will be dropped until it fits — they are gone from              this conversation, though the session log on disk keeps them",
+        crate::config::ContextStrategy::Compaction =>
+            "it will be summarised: the older messages are replaced by a summary of              them, and the recent ones are kept verbatim",
+    };
+    Some(format!(
+        concat!(
+            "[Resumed conversation is larger than the context window: about ",
+            "{estimated} tokens against a {max_context_tokens} limit, which is ",
+            "roughly {pct}%. Nothing has been discarded yet. On the next turn ",
+            "{what_happens}. To keep all of it instead, raise ",
+            "`max_context_tokens` for this endpoint if the model supports more.]",
+        ),
+        estimated = estimated,
+        max_context_tokens = max_context_tokens,
+        pct = pct,
+        what_happens = what_happens,
+    ))
+}
+
 /// What the model is told when a background command finishes.
 ///
 /// Shared by both delivery paths — at a tool boundary while the turn runs, and
@@ -5896,4 +5947,76 @@ mod background_delivery_tests {
         );
     }
 }
+#[cfg(test)]
+mod over_window_tests {
+    use super::over_window_notice;
+    use crate::config::ContextStrategy;
+
+    /// A resumed conversation inside the window says nothing.
+    #[test]
+    fn a_conversation_that_fits_is_not_announced() {
+        assert!(over_window_notice(40_000, 100_000, ContextStrategy::Compaction).is_none());
+        // Exactly at the limit is not over it.
+        assert!(over_window_notice(100_000, 100_000, ContextStrategy::Compaction).is_none());
+        // An unconfigured window cannot be exceeded.
+        assert!(over_window_notice(500_000, 0, ContextStrategy::Compaction).is_none());
+    }
+
+    /// The reported case: 114% on resume, with nothing to say what it meant.
+    ///
+    /// The percentage clients show is `last_prompt_tokens / max_context_tokens`,
+    /// and on resume the numerator is an estimate of the restored transcript
+    /// rather than a measured request — so a long conversation comes back over
+    /// 100% before anything has been trimmed. The number was accurate and
+    /// unexplained, which reads as a defect or as lost work.
+    #[test]
+    fn being_over_the_window_says_so_and_says_nothing_is_lost_yet() {
+        let n = over_window_notice(114_000, 100_000, ContextStrategy::RollingWindow)
+            .expect("over the window");
+        assert!(n.contains("114%"), "the figure is not in the notice: {n}");
+        assert!(n.contains("Nothing has been discarded yet"), "{n}");
+        assert!(n.contains("114000") && n.contains("100000"), "the raw counts are missing: {n}");
+    }
+
+    /// Each strategy says what it will actually do, because they differ in the
+    /// way that matters: one loses the oldest messages, the other keeps a
+    /// summary of them.
+    #[test]
+    fn the_notice_describes_the_configured_strategy() {
+        let rolling = over_window_notice(120_000, 100_000, ContextStrategy::RollingWindow)
+            .expect("over");
+        assert!(rolling.contains("oldest messages will be dropped"), "{rolling}");
+        assert!(
+            rolling.contains("session log on disk keeps them"),
+            "a user told their conversation is being trimmed should be told what \
+             survives it: {rolling}"
+        );
+
+        let compaction = over_window_notice(120_000, 100_000, ContextStrategy::Compaction)
+            .expect("over");
+        assert!(compaction.contains("summarised"), "{compaction}");
+        assert!(
+            !compaction.contains("will be dropped"),
+            "compaction does not drop messages, and saying so would be wrong: {compaction}"
+        );
+    }
+
+    /// It offers the way out, since the trim is avoidable if the model's window
+    /// is actually larger than the configured one.
+    #[test]
+    fn the_notice_names_the_setting_that_avoids_the_trim() {
+        let n = over_window_notice(200_000, 100_000, ContextStrategy::Compaction).expect("over");
+        assert!(n.contains("max_context_tokens"), "{n}");
+    }
+
+    /// The percentage is rounded, not truncated — 1,149 against 1,000 is 115%,
+    /// and a reader comparing it against the raw counts in the same sentence
+    /// would notice the difference.
+    #[test]
+    fn the_percentage_matches_the_counts_it_is_shown_with() {
+        let n = over_window_notice(1_149, 1_000, ContextStrategy::Compaction).expect("over");
+        assert!(n.contains("115%"), "{n}");
+    }
+}
+
 

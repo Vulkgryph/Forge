@@ -8596,10 +8596,34 @@ impl IdeApp {
                     .round() as i64;
                 let dot = if detail.separators { "· " } else { "" };
                 let unit = if detail.compact { "" } else { " ctx" };
+                // Over the window is a real state, and it was rendered in the
+                // same grey as 40% — so a resumed conversation reading "114%"
+                // looked like a broken number rather than something about to
+                // be trimmed. Coloured, and the tooltip says what happens.
+                let over = pct > 100;
+                let colour = if over {
+                    egui::Color32::from_rgb(220, 160, 60)
+                } else {
+                    egui::Color32::from_gray(120)
+                };
+                // `last_prompt_tokens` is a measurement only once a request
+                // has been made. On resume it is an estimate of the restored
+                // transcript, and calling that "last request" was simply
+                // wrong — no request had happened.
+                let measured = usage.total_requests > 0;
+                let basis = if measured { "last request" } else { "estimated from the resumed conversation" };
+                let mut hover = format!("{} / {} tokens ({basis})",
+                    usage.last_prompt_tokens, usage.max_context_tokens);
+                if over {
+                    hover.push_str(
+                        "\n\nLarger than the window. Nothing has been dropped yet — \
+                         the next turn trims it, by summarising or by dropping the \
+                         oldest messages depending on the context strategy.",
+                    );
+                }
                 ui.label(egui::RichText::new(format!("{dot}{pct}%{unit}")).size(10.5)
-                    .color(egui::Color32::from_gray(120)))
-                    .on_hover_text(format!("{} / {} tokens (last request)",
-                        usage.last_prompt_tokens, usage.max_context_tokens));
+                    .color(colour))
+                    .on_hover_text(hover);
             }
             // Offline is not a setting you glance at, it is a state that changes
             // what the agent can do — so it stays in the row, while its normal

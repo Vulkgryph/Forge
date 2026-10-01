@@ -586,6 +586,12 @@ pub struct Agent {
     auto_mode: bool,
     compaction_pending: bool,
     max_context_tokens: usize,
+    /// The system prompt without notes.
+    ///
+    /// Kept apart because notes change during a session and the prompt has to
+    /// be rebuilt from something stable. `system_prompt` is this plus whatever
+    /// is currently remembered.
+    system_prompt_base: String,
     last_prompt_tokens: u32,
     last_completion_tokens: u32,
     total_prompt_tokens: u64,
@@ -689,13 +695,17 @@ impl Agent {
             memory_now,
         );
 
-        let system_prompt = build_system_prompt(
+        let system_prompt_base = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
-            notes.as_deref(),
+            None,
         );
+        let system_prompt = match notes.as_deref() {
+            Some(notes) => format!("{system_prompt_base}{notes}"),
+            None => system_prompt_base.clone(),
+        };
 
         let mut history = Vec::new();
         history.push(Message::system(&system_prompt));
@@ -714,6 +724,7 @@ impl Agent {
             auto_mode: false,
             compaction_pending: false,
             max_context_tokens,
+            system_prompt_base,
             last_prompt_tokens: 0,
             last_completion_tokens: 0,
             total_prompt_tokens: 0,
@@ -784,13 +795,17 @@ impl Agent {
             memory_now,
         );
 
-        let system_prompt = build_system_prompt(
+        let system_prompt_base = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
-            notes.as_deref(),
+            None,
         );
+        let system_prompt = match notes.as_deref() {
+            Some(notes) => format!("{system_prompt_base}{notes}"),
+            None => system_prompt_base.clone(),
+        };
         let loaded = log.load_from_last_compaction()?;
         let rewind_checkpoints = log
             .rewind_checkpoints_for_resume()?
@@ -852,6 +867,7 @@ impl Agent {
             auto_mode: false,
             compaction_pending: false,
             max_context_tokens,
+            system_prompt_base,
             last_prompt_tokens: estimated_prompt_tokens,
             last_completion_tokens: 0,
             total_prompt_tokens: 0,
@@ -1330,7 +1346,42 @@ impl Agent {
         turn_result
     }
 
+    /// Re-read the notes and put them back on the system message.
+    ///
+    /// Called at the start of every turn because a note written during one
+    /// turn has to be visible in the next. The prompt was built once in the
+    /// constructor and stored as `history[0]`, so `remember` wrote a file that
+    /// nothing would ever read again in that session — the module's unit tests
+    /// could not see it, and the first live test caught it immediately.
+    ///
+    /// Only rewritten when the text actually differs. Changing the system
+    /// message invalidates a cached prefix, so paying that on every turn
+    /// rather than only when the notes change would be a real cost once
+    /// prompt caching is in.
+    fn refresh_notes(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = ToolExecutor::memory_dir(self.executor.project_root());
+        let notes = crate::agent::memory::render(&crate::agent::memory::load(&dir, now), now);
+        let wanted = match notes.as_deref() {
+            Some(notes) => format!("{}{}", self.system_prompt_base, notes),
+            None => self.system_prompt_base.clone(),
+        };
+        if wanted == self.system_prompt {
+            return;
+        }
+        self.system_prompt = wanted;
+        if let Some(first) = self.history.first_mut() {
+            if first.role == "system" {
+                first.content = Some(self.system_prompt.clone());
+            }
+        }
+    }
+
     async fn process_turn(&mut self) -> Result<()> {
+        self.refresh_notes();
         const MAX_CONSECUTIVE_SAME_TOOL: usize = 100;
         const MAX_TOOLLESS_INTENT_RETRIES: usize = 1;
         const NETWORK_RETRY_DELAYS_SECS: [u64; 10] = [1, 1, 1, 2, 4, 10, 20, 20, 45, 60];
@@ -5274,10 +5325,12 @@ Be concise and direct in your responses. Focus on actionable feedback."#,
             scratchpad_section(&lab.to_string_lossy())
         ),
     };
-    // Last, and only when there is something to say. Appended rather than
-    // interleaved so the stable part of the prompt stays byte-identical
-    // between requests — prompt caching keys on a prefix, and a note written
-    // mid-session must not invalidate everything before it.
+    // Last, and only when there is something to say. Appending puts the
+    // volatile part at the end, so everything a reader needs to understand the
+    // agent's instructions is in a fixed prefix — but note that this does not
+    // make the *system message* stable: writing a note does change it, and
+    // does invalidate a cached prefix once. That is why `refresh_notes` only
+    // rewrites it when the text actually differs, rather than every turn.
     if let Some(notes) = notes {
         prompt.push_str(notes);
     }

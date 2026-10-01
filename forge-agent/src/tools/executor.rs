@@ -143,8 +143,14 @@ impl ToolExecutor {
 
     pub fn classify_tool(name: &str) -> ToolKind {
         match name {
+            // `remember`/`forget` sit with `todo_write`: the agent's own
+            // bookkeeping, a few hundred bytes inside `.forge/`, not the
+            // user's files. Unclassified they fell to `Unknown`, which demands
+            // approval on every call even in auto-accept — a prompt per note
+            // is not a memory anyone would use.
             "read_file" | "list_directory" | "search_code" | "glob_files" | "todo_write"
-            | "write_plan" | "exit_plan_mode" | "ask_question" => ToolKind::Read,
+            | "write_plan" | "exit_plan_mode" | "ask_question" | "remember" | "forget"
+                => ToolKind::Read,
             "enter_plan_mode" => ToolKind::Execute,
             "apply_patch" => ToolKind::Write, // <-- FIX: Added apply_patch
             "write_file" | "edit_file" => ToolKind::Write,
@@ -1962,3 +1968,34 @@ mod scratchpad_approval_tests {
         ));
     }
 }
+#[cfg(test)]
+mod tool_classification_coverage {
+    use super::*;
+
+    /// Every tool offered to the model must be classified.
+    ///
+    /// `ToolKind::Unknown` requires approval on every call, even in
+    /// auto-accept — a correct default for a tool nobody has thought about,
+    /// and a trap for one that was just added. `remember` and `forget` landed
+    /// in it, which would have meant an approval prompt per note.
+    #[test]
+    fn no_model_facing_tool_is_unclassified() {
+        let internal = ["enter_plan_mode", "write_plan", "exit_plan_mode", "ask_question"];
+        let mut unclassified = Vec::new();
+        for def in crate::tools::definitions::get_tool_definitions() {
+            let name = def.function.name.as_str();
+            if internal.contains(&name) {
+                continue;
+            }
+            if ToolExecutor::classify_tool(name) == ToolKind::Unknown {
+                unclassified.push(name.to_string());
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "these tools are offered to the model and fall to ToolKind::Unknown, \
+             so they ask for approval on every call even in auto-accept: {unclassified:?}"
+        );
+    }
+}
+

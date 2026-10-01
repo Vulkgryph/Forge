@@ -41,6 +41,16 @@
 //! fresh clock, which forces the fact to be looked at again rather than
 //! inherited — the re-check is the feature.
 //!
+//! ## What the live test found
+//!
+//! Two things the unit tests here could not. `remember` fell to
+//! `ToolKind::Unknown`, which demands approval on every call even in
+//! auto-accept — a prompt per note, which nobody would use. And the system
+//! prompt was built once in the constructor and stored as `history[0]`, so a
+//! note written during a session was a file nothing read again. Both needed
+//! the real binary driven against a provider to see. See
+//! `tests/memory_live.rs`.
+//!
 //! ## Who may write
 //!
 //! The agent, and nothing else. These entries are injected into the system

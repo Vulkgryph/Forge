@@ -591,6 +591,20 @@ pub fn estimate_history_tokens(history: &[Message]) -> usize {
 /// at 14x the window it read as comfortably under budget and shed nothing at
 /// all, so the turn failed and the oversized message stayed in history, and
 /// every turn after it failed the same way.
+/// What `CompactionSummary::to_context_string` opens with.
+///
+/// Recognised here so the recovery trim does not throw the summary away.
+/// Matching on text is not elegant; the alternative is a flag on `Message`,
+/// which is a wire type shared with both clients.
+pub(crate) const COMPACTION_SUMMARY_MARKER: &str = "[Compaction Summary]";
+
+fn is_compaction_summary(message: &Message) -> bool {
+    message
+        .content
+        .as_deref()
+        .is_some_and(|c| c.starts_with(COMPACTION_SUMMARY_MARKER))
+}
+
 pub fn fit_history_to_window(history: &mut Vec<Message>, budget_tokens: usize) -> FitReport {
     let mut report = FitReport::default();
     if budget_tokens == 0 {
@@ -598,8 +612,23 @@ pub fn fit_history_to_window(history: &mut Vec<Message>, budget_tokens: usize) -
     }
 
     // Drop oldest whole units while there is something droppable left.
+    //
+    // The compaction summary is not droppable. It sits immediately after the
+    // system prompt, which made it the oldest non-system message and therefore
+    // the *first* thing this loop threw away — so a compaction whose rolling
+    // window was itself over budget paid for the summariser call and then
+    // discarded its result, keeping raw recent messages instead. The agent was
+    // left with the note saying the conversation had been condensed and none of
+    // the condensation, which is strictly worse than not having compacted.
+    //
+    // It is also the wrong trade on its own terms: the summary is the
+    // compressed form of everything this loop is about to delete, so of all
+    // the messages here it is the one carrying the most per token.
     while estimate_history_tokens(history) > budget_tokens {
-        let Some(idx) = history.iter().position(|m| m.role != "system") else {
+        let Some(idx) = history
+            .iter()
+            .position(|m| m.role != "system" && !is_compaction_summary(m))
+        else {
             break;
         };
         // Keep the last user turn: an agent that cannot see what it was asked
@@ -1462,5 +1491,87 @@ mod continuation_tests {
         );
     }
 }
+#[cfg(test)]
+mod summary_survives_the_trim {
+    use super::*;
+
+    fn msg(role: &str, body: &str) -> Message {
+        match role {
+            "system" => Message::system(body),
+            "assistant" => Message::assistant(body),
+            _ => Message::user(body),
+        }
+    }
+
+    /// The recovery trim must not discard the compaction summary.
+    ///
+    /// It used to. The summary is pushed immediately after the system prompt,
+    /// so it was the oldest non-system message and the first thing dropped —
+    /// which meant a compaction whose rolling window was still over budget
+    /// paid for the summariser call and threw the result away, leaving the
+    /// agent the note saying its context had been condensed and nothing of the
+    /// condensation. Caught by driving the real binary; see
+    /// `tests/compaction_over_window.rs`.
+    #[test]
+    fn the_compaction_summary_is_not_dropped_to_make_room() {
+        let big = "x".repeat(8_000);
+        let mut history = vec![
+            msg("system", "the system prompt"),
+            msg("assistant", "[Compaction Summary]\nGoal: finish the loader\nDecisions: little-endian only"),
+            msg("user", &big),
+            msg("assistant", &big),
+            msg("user", &big),
+            msg("user", "the newest thing asked"),
+        ];
+
+        // A budget that cannot hold the raw messages, so something must go.
+        let report = fit_history_to_window(&mut history, 600);
+        assert!(report.changed(), "nothing was trimmed, so this proves nothing");
+
+        let kept: String = history
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            kept.contains(COMPACTION_SUMMARY_MARKER),
+            "the summary was dropped to make room for raw messages"
+        );
+        assert!(
+            kept.contains("little-endian only"),
+            "the summary survived as a header with its content shortened away"
+        );
+        assert!(
+            kept.contains("the newest thing asked"),
+            "the most recent turn was dropped"
+        );
+    }
+
+    /// And it is still the oldest *ordinary* messages that go.
+    #[test]
+    fn the_oldest_ordinary_messages_are_still_what_goes() {
+        let big = "y".repeat(8_000);
+        let mut history = vec![
+            msg("system", "prompt"),
+            msg("assistant", "[Compaction Summary]\nsummary body"),
+            msg("user", &format!("OLDEST {big}")),
+            msg("assistant", &format!("MIDDLE {big}")),
+            msg("user", "NEWEST"),
+        ];
+        fit_history_to_window(&mut history, 600);
+        let kept: String = history
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(kept.contains("NEWEST"), "the newest turn went");
+        assert!(
+            !kept.contains("OLDEST"),
+            "the oldest ordinary message survived, so protecting the summary \
+             stopped the trim working at all"
+        );
+    }
+}
+
 
 

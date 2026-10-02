@@ -411,9 +411,27 @@ fn merge_summaries(parts: Vec<CompactionSummary>) -> CompactionSummary {
 }
 
 /// Build a condensed text transcript from the message history.
+/// The conversation, rendered for a summariser that cannot see the real
+/// messages.
+///
+/// Nothing is truncated here any more. Every message used to be cut to 500
+/// characters, tool results to 300 and tool-call arguments to 200 — which
+/// meant the summariser could not see most of what it was summarising, and
+/// hit hardest exactly where the information lives in a coding session. A
+/// compiler error, a file's contents, a test's output: all three are longer
+/// than 300 characters and all three were arriving as their first sentence.
+///
+/// Those limits predate chunking. They come from the initial release, when
+/// this was one call with one prompt and the only way to bound it was to cut
+/// each message. `split_transcript` bounds it properly now, by splitting
+/// across calls and *growing* the chunks rather than dropping material — so
+/// the per-message cut stopped being the thing holding the prompt down and
+/// became a second, invisible lossy step underneath the fix that was supposed
+/// to have removed the first. The commit that added chunking is called
+/// "summarize the whole conversation, not 12,000 characters of it"; this is
+/// the rest of that.
 fn build_transcript(history: &[Message]) -> String {
     let mut transcript = String::new();
-    let max_content_len = 500;
 
     for msg in history {
         let role = &msg.role;
@@ -425,28 +443,24 @@ fn build_transcript(history: &[Message]) -> String {
                 continue;
             }
             "user" => {
-                let truncated: String = content.chars().take(max_content_len).collect();
-                transcript.push_str(&format!("[USER]: {}\n", truncated));
+                transcript.push_str(&format!("[USER]: {content}\n"));
             }
             "assistant" => {
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
-                        let args: String = tc.function.arguments.chars().take(200).collect();
                         transcript.push_str(&format!(
                             "[ASSISTANT calls {}]: {}\n",
-                            tc.function.name, args
+                            tc.function.name, tc.function.arguments
                         ));
                     }
                 }
                 if !content.is_empty() {
-                    let truncated: String = content.chars().take(max_content_len).collect();
-                    transcript.push_str(&format!("[ASSISTANT]: {}\n", truncated));
+                    transcript.push_str(&format!("[ASSISTANT]: {content}\n"));
                 }
             }
             "tool" => {
                 let name = msg.name.as_deref().unwrap_or("unknown");
-                let truncated: String = content.chars().take(300).collect();
-                transcript.push_str(&format!("[TOOL {}]: {}\n", name, truncated));
+                transcript.push_str(&format!("[TOOL {name}]: {content}\n"));
             }
             _ => {}
         }
@@ -2039,6 +2053,82 @@ mod schema_echo_tests {
         assert!(!is_placeholder("what should happen next is the oracle work"));
     }
 }
+#[cfg(test)]
+mod transcript_truncation_tests {
+    use super::*;
+
+    /// The summariser sees whole messages.
+    ///
+    /// Every message used to be cut to 500 characters, tool results to 300,
+    /// tool-call arguments to 200 — so a compiler error, a file's contents or
+    /// a test's output all arrived as their first sentence, which is the
+    /// material a coding session actually turns on. Those limits predate
+    /// chunking and were a second lossy step underneath the fix that removed
+    /// the first.
+    #[test]
+    fn nothing_in_the_transcript_is_truncated() {
+        let long_user = "U".repeat(4_000);
+        let long_tool = format!("error[E0599]: {}", "T".repeat(4_000));
+        let long_args = format!("{{\"path\": \"{}\"}}", "A".repeat(2_000));
+
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![crate::api::types::ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: crate::api::types::FunctionCall {
+                name: "read_file".into(),
+                arguments: long_args.clone(),
+            },
+        }]);
+
+        let mut tool = Message::user(&long_tool);
+        tool.role = "tool".into();
+        tool.name = Some("read_file".into());
+
+        let history = vec![
+            Message::system("the system prompt, which is skipped"),
+            Message::user(&long_user),
+            assistant,
+            tool,
+        ];
+
+        let transcript = build_transcript(&history);
+
+        assert!(
+            transcript.contains(&long_user),
+            "a {}-character user message was cut",
+            long_user.len()
+        );
+        assert!(
+            transcript.contains(&long_tool),
+            "a tool result was cut — this is where a compiler error lives"
+        );
+        assert!(
+            transcript.contains(&long_args),
+            "tool-call arguments were cut"
+        );
+        // The system prompt is still skipped: it is static and the agent's
+        // own, not part of what happened.
+        assert!(!transcript.contains("the system prompt, which is skipped"));
+    }
+
+    /// Size is bounded by chunking, which is what replaced the per-message
+    /// cut — and it grows the chunks rather than dropping material.
+    #[test]
+    fn a_huge_transcript_is_split_rather_than_shortened() {
+        let transcript = "a line of some length\n".repeat(200_000);
+        let chunks = split_transcript(&transcript, CHUNK_CHARS, MAX_CHUNKS);
+        assert!(chunks.len() > 1, "a transcript this size should be split");
+        assert!(chunks.len() <= MAX_CHUNKS, "more chunks than the call budget allows");
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert!(
+            total >= transcript.len() - chunks.len(),
+            "splitting lost {} characters; it is supposed to grow chunks, not drop text",
+            transcript.len() - total
+        );
+    }
+}
+
 
 
 

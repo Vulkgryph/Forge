@@ -3007,7 +3007,21 @@ impl Agent {
                     "[Compacting context...]".to_string(),
                 ));
 
-                let compaction_client = self.client.clone().without_forge_session();
+                // Room to write a document rather than a reply. The summary
+                // is the only record of everything it replaces, and the
+                // endpoint's ordinary per-reply budget was cutting the JSON
+                // off mid-field on long sessions — which does not error, it
+                // degrades to a stub while still reporting success.
+                //
+                // Bounded, because it has to fit in the history it is joining:
+                // an eighth of the window, held between 4k and 32k.
+                let summary_budget =
+                    ((self.max_context_tokens / 8) as u32).clamp(4096, 32_768);
+                let compaction_client = self
+                    .client
+                    .clone()
+                    .without_forge_session()
+                    .with_output_budget(summary_budget);
                 match perform_compaction(
                     &compaction_client,
                     &self.model_id,
@@ -3018,7 +3032,9 @@ impl Agent {
                 )
                 .await
                 {
-                    Ok(mut new_history) => {
+                    Ok(outcome) => {
+                        let degraded = outcome.degraded;
+                        let mut new_history = outcome.history;
                         // The summary is small, but the rolling window kept
                         // alongside it is whatever the recent messages were —
                         // and if one of those is the oversized tool result that
@@ -3040,7 +3056,14 @@ impl Agent {
                         self.rewind_checkpoints.clear();
                         self.update_meta();
                         let _ = self.event_tx.send(AgentEvent::AssistantMessage(
-                            "[Context compacted to save tokens]".to_string(),
+                            if degraded {
+                                "[Context compacted, but the summary could not be read as \
+                                 structured data — its text was kept as-is. Expect the \
+                                 record of earlier work to be less precise than usual.]"
+                                    .to_string()
+                            } else {
+                                "[Context compacted to save tokens]".to_string()
+                            },
                         ));
                     }
                     Err(e) => {

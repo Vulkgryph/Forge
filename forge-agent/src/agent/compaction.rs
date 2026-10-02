@@ -31,6 +31,15 @@ const ROLLING_PLAN_MARKER: &str = "[Forge rolling-window approved plan]";
 /// last ROLLING_WINDOW_SIZE messages are appended after the summary. When false
 /// (used when switching to a small-context model), only the system prompt and
 /// compaction summary are kept so the result fits tight context budgets.
+/// What a compaction produced, and whether its summary is trustworthy.
+pub struct CompactionOutcome {
+    pub history: Vec<Message>,
+    /// The summary could not be parsed, so what it holds is the model's prose
+    /// rather than a structured record. Carried out so the caller does not
+    /// report a clean compaction over a degraded one.
+    pub degraded: bool,
+}
+
 pub async fn perform_compaction(
     client: &ApiClient,
     model_id: &str,
@@ -38,7 +47,7 @@ pub async fn perform_compaction(
     system_prompt: &str,
     log: &mut ConversationLog,
     keep_rolling_window: bool,
-) -> Result<Vec<Message>> {
+) -> Result<CompactionOutcome> {
     let messages_before = history.len();
 
     // Write compaction_start marker
@@ -50,6 +59,7 @@ pub async fn perform_compaction(
     // Write the summary to the log
     log.log_compaction_summary(summary.clone())?;
 
+    let degraded = summary_is_degraded(&summary);
     let new_history = rebuild_history(system_prompt, &summary, history, keep_rolling_window);
 
     let messages_after = new_history.len();
@@ -59,7 +69,7 @@ pub async fn perform_compaction(
     // Write compaction_commit marker
     log.log_compaction_commit(messages_after, rolling_window)?;
 
-    Ok(new_history)
+    Ok(CompactionOutcome { history: new_history, degraded })
 }
 
 /// Assemble what the model sees after a compaction.
@@ -402,23 +412,48 @@ fn parse_summary_response(response: &str) -> Result<CompactionSummary> {
     match serde_json::from_str::<CompactionSummary>(json_str) {
         Ok(summary) => Ok(summary),
         Err(e) => {
-            // Fallback: create a minimal summary from the raw text
+            // The summary is the only record of everything it replaces, so a
+            // parse failure must not quietly become an empty one.
+            //
+            // It used to: the fallback kept 500 characters of the raw reply in
+            // `current_state`, emptied every other field, and returned `Ok` —
+            // so the caller reported "[Context compacted to save tokens]" over
+            // a summary that had thrown the session away. The usual cause is
+            // the reply being cut off by the output budget, which is why the
+            // budget is now raised for these calls, but a model can also
+            // simply not produce the JSON asked for.
+            //
+            // So: keep the whole reply rather than a fragment. Unparsed prose
+            // describing the session is worth far more than a well-formed
+            // record of having lost it, and `fit_history_to_window` will
+            // shorten it if it is genuinely too large.
             Ok(CompactionSummary {
-                goal: "Unable to parse structured summary".to_string(),
+                goal: "A summary was produced but could not be read as structured JSON. \
+                       Its text is under `current_state`; treat that as the record of \
+                       the conversation so far."
+                    .to_string(),
                 repo_map: Vec::new(),
                 work_completed: Vec::new(),
-                current_state: format!(
-                    "Summary parse error: {}. Raw: {}",
-                    e,
-                    &json_str[..json_str.len().min(500)]
-                ),
+                current_state: format!("(unstructured summary, parse error: {e})\n\n{json_str}"),
                 commands_run: Vec::new(),
                 decisions: Vec::new(),
                 next_actions: Vec::new(),
-                pitfalls: vec!["Previous compaction summary failed to parse".to_string()],
+                pitfalls: vec![
+                    "The previous compaction summary could not be parsed. What is in \
+                     `current_state` is the model's own prose, not a structured record, \
+                     so treat gaps in it as unknown rather than as nothing having \
+                     happened."
+                        .to_string(),
+                ],
             })
         }
     }
+}
+
+/// Whether a summary is the degraded form produced when the reply could not be
+/// parsed, so the caller can say so instead of reporting a clean compaction.
+pub(crate) fn summary_is_degraded(summary: &CompactionSummary) -> bool {
+    summary.current_state.starts_with("(unstructured summary")
 }
 
 /// Check if compaction should be triggered based on context saturation.
@@ -1572,6 +1607,78 @@ mod summary_survives_the_trim {
         );
     }
 }
+#[cfg(test)]
+mod degraded_summary_tests {
+    use super::*;
+
+    /// A summary cut off mid-JSON keeps the text it did produce.
+    ///
+    /// The old fallback kept 500 characters of it in `current_state`, emptied
+    /// every other field, and returned `Ok` — so a long session was replaced
+    /// by a well-formed record of having lost it, and the caller reported a
+    /// clean compaction. The usual cause is the output budget cutting the
+    /// reply off, which is why compaction now asks for a larger one, but a
+    /// model can also just not produce the JSON.
+    #[test]
+    fn a_truncated_summary_keeps_what_it_managed_to_say() {
+        // A reply that starts well and stops mid-field, as a budget cut-off
+        // produces.
+        let truncated = r#"{"goal": "port the loader to the new ABI",
+          "repo_map": ["src/loader.rs — header parsing", "src/abi.rs — the new layout"],
+          "work_completed": ["moved the header parse", "fixed the endianness assumption"],
+          "decisions": ["little-endian only, agreed with the user"],
+          "current_state": "the segment walk is half conv"#;
+
+        let summary = parse_summary_response(truncated).expect("degrades rather than failing");
+        assert!(summary_is_degraded(&summary), "not flagged as degraded");
+
+        let text = summary.to_context_string();
+        for kept in [
+            "port the loader to the new ABI",
+            "src/loader.rs",
+            "fixed the endianness assumption",
+            "little-endian only",
+            "the segment walk is half conv",
+        ] {
+            assert!(
+                text.contains(kept),
+                "{kept:?} was in the reply and is not in the summary — the \
+                 conversation was thrown away rather than kept unparsed"
+            );
+        }
+        assert!(
+            !text.contains("Unable to parse structured summary"),
+            "the summary still reports only that it failed: {text}"
+        );
+    }
+
+    /// A summary that parses is not flagged, so the caller reports normally.
+    #[test]
+    fn a_clean_summary_is_not_flagged() {
+        let good = r#"{"goal":"g","repo_map":[],"work_completed":[],
+          "current_state":"s","commands_run":[],"decisions":[],
+          "next_actions":[],"pitfalls":[]}"#;
+        let summary = parse_summary_response(good).expect("parses");
+        assert!(!summary_is_degraded(&summary));
+        assert_eq!(summary.goal, "g");
+    }
+
+    /// The degraded summary says what it is, so the agent reads the prose as
+    /// an imprecise record rather than as the whole truth.
+    #[test]
+    fn the_degraded_summary_says_what_it_is() {
+        let summary = parse_summary_response("not json at all, just prose about the session")
+            .expect("degrades");
+        let text = summary.to_context_string();
+        assert!(text.contains("could not be read as structured"), "{text}");
+        assert!(
+            text.contains("treat gaps in it as unknown"),
+            "nothing warns the agent not to read absence as nothing having happened: {text}"
+        );
+        assert!(text.contains("just prose about the session"), "the prose was dropped");
+    }
+}
+
 
 
 

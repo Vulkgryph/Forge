@@ -415,6 +415,19 @@ impl ApiClient {
         }
     }
 
+    /// A client that may write a longer reply than a turn normally would.
+    ///
+    /// For compaction. Summarising a whole session is writing a document, not
+    /// answering a question, and it was being given the endpoint's ordinary
+    /// per-reply budget — so on a long conversation the JSON was cut off
+    /// mid-field. That did not surface as an error: the parse falls back to a
+    /// stub summary, and the user was told the context had been compacted
+    /// while almost all of it had in fact been discarded.
+    pub fn with_output_budget(mut self, tokens: u32) -> Self {
+        self.max_output_tokens = tokens.max(self.max_output_tokens);
+        self
+    }
+
     pub fn without_forge_session(mut self) -> Self {
         self.forge_session_id = None;
         self

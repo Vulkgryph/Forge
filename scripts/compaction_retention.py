@@ -154,7 +154,7 @@ def read_endpoint_from_config(name):
     sys.exit(f"no endpoint called {name!r}. Configured: {names}")
 
 
-def write_config(home, base_url, model, api_key, window):
+def write_config(home, base_url, model, api_key, window, endpoint_type):
     (home / ".config" / "forge").mkdir(parents=True, exist_ok=True)
     (home / ".config" / "forge" / "config.toml").write_text(
         f"""
@@ -167,7 +167,7 @@ model_id = "{model}"
 max_context_tokens = {window}
 max_output_tokens = 4096
 request_timeout_secs = 180
-endpoint_type = "open_ai"
+endpoint_type = "{endpoint_type}"
 api_key = "{api_key}"
 [agent]
 thinking_mode = false
@@ -302,13 +302,12 @@ def main():
         base_url = args.base_url or found.get("base_url")
         model = args.model or found.get("model_id")
         api_key = found.get("api_key", args.api_key)
-        if found.get("endpoint_type", "open_ai") != "open_ai":
-            sys.exit(f"{args.endpoint!r} is {found.get('endpoint_type')}; this harness "
-                     "speaks the OpenAI-compatible protocol only")
+        endpoint_type = found.get("endpoint_type", "open_ai")
     else:
         if not (args.base_url and args.model):
             sys.exit("give --endpoint, or both --base-url and --model")
         base_url, model, api_key = args.base_url, args.model, args.api_key
+        endpoint_type = "open_ai"
 
     binary = REPO / "target" / "debug" / "forge-agent"
     if not binary.exists():
@@ -317,8 +316,21 @@ def main():
         sys.exit("no forge-agent binary built; run `cargo build -p forge-agent`")
 
     home = Path(tempfile.mkdtemp(prefix="forge-retention-"))
-    write_config(home, base_url, model, api_key, args.window)
-    print(f"  endpoint : {base_url}")
+    # ChatGPT Codex authenticates from a token file beside the config, not
+    # from an api_key — so an isolated HOME has no credential and the run
+    # would fail on auth rather than on anything being measured. Copied in,
+    # and removed with the fixture unless --keep is given.
+    if endpoint_type == "chatgpt_codex":
+        token = Path(os.path.expanduser("~/.config/forge/chatgpt_auth.json"))
+        if not token.exists():
+            sys.exit("that endpoint is chatgpt_codex and ~/.config/forge/chatgpt_auth.json "
+                     "does not exist — run `forge --login-chatgpt` first")
+        (home / ".config" / "forge").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(token, home / ".config" / "forge" / "chatgpt_auth.json")
+        os.chmod(home / ".config" / "forge" / "chatgpt_auth.json", 0o600)
+        print("  auth     : copied chatgpt_auth.json into the fixture (0600, removed with it)")
+    write_config(home, base_url, model, api_key, args.window, endpoint_type)
+    print(f"  endpoint : {base_url}  [{endpoint_type}]")
     print(f"  model    : {model}")
     print(f"  window   : {args.window} tokens, compacting at 80%")
     print(f"  fixture  : {home}\n")

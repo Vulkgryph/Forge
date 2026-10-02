@@ -1,7 +1,7 @@
 // Minimal markdown renderer for the agent chat panel.
 // Handles: headings (#, ##, ###), bullet/numbered lists, fenced code blocks,
-// GFM pipe tables, inline **bold** and `code`. Anything fancier (images,
-// links) renders as plain text — we'll grow this as needed.
+// GFM pipe tables, inline **bold**, `code` and [links](target). Anything
+// fancier (images) renders as plain text — we'll grow this as needed.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText};
@@ -11,6 +11,7 @@ struct Theme {
     bold:     Color32,
     code_fg:  Color32,
     code_bg:  Color32,
+    link:     Color32,
     heading:  Color32,
     bullet:   Color32,
 }
@@ -20,6 +21,7 @@ const T: Theme = Theme {
     bold:    Color32::WHITE,
     code_fg: Color32::from_rgb(206, 145, 120),
     code_bg: Color32::from_rgb(38, 38, 38),
+    link:    Color32::from_rgb(106, 162, 222),
     heading: Color32::from_rgb(86, 156, 214),
     bullet:  Color32::from_rgb(160, 160, 160),
 };
@@ -373,6 +375,58 @@ fn parse_numbered_prefix(line: &str) -> Option<(usize, &str)> {
     if rest.is_empty() { None } else { Some((n, rest)) }
 }
 
+/// `[label](target)` at the start of `text`: the label, and how many bytes the
+/// whole construct took.
+///
+/// `None` when it is not a link, so `[` keeps its ordinary meaning —
+/// `vec[0]`, `[WARN]` and an unclosed bracket all have to survive untouched.
+/// Nested brackets inside the label are counted rather than ended on, so
+/// `[see [note]](x)` takes the whole label.
+fn parse_link(text: &str) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut close = None;
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(idx);
+                    break;
+                }
+            }
+            // A newline inside the brackets means this was never a link.
+            b'\n' => return None,
+            _ => {}
+        }
+    }
+    let close = close?;
+    if bytes.get(close + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut end = None;
+    for (idx, b) in bytes.iter().enumerate().skip(close + 2) {
+        match b {
+            b')' => {
+                end = Some(idx);
+                break;
+            }
+            b'\n' => return None,
+            _ => {}
+        }
+    }
+    let end = end?;
+    let label = &text[1..close];
+    if label.is_empty() {
+        return None;
+    }
+    Some((label, end + 1))
+}
+
 fn parse_inline(text: &str, size: f32) -> LayoutJob {
     let mut job  = LayoutJob::default();
     let prop = FontId::proportional(size);
@@ -406,6 +460,38 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
     };
 
     while i < len {
+        // [text](target)
+        //
+        // Rendered as its text, in the link colour and underlined, with the
+        // target dropped. It used to fall through to the literal-text branch,
+        // so a link to a file came out as the whole of
+        // `[language design directive](path/to/some/long/file.md)` mid-sentence
+        // — reported from the agent panel, where a sentence naming three files
+        // becomes unreadable.
+        //
+        // The target is not shown. For a file path that is a real loss, and
+        // the honest fix is making these clickable so it does not have to be
+        // shown; that needs hit-testing a galley range rather than a colour,
+        // and is not this change. Dropping it is still better than printing it
+        // inline, because the agent names the file in prose when it matters.
+        if !code && bytes[i] == b'[' {
+            if let Some((label, target_len)) = parse_link(&text[i..]) {
+                flush(&mut job, &mut buf, bold, code);
+                job.append(
+                    label,
+                    0.0,
+                    TextFormat {
+                        font_id: prop.clone(),
+                        color: T.link,
+                        background: Color32::TRANSPARENT,
+                        underline: egui::Stroke::new(1.0_f32, T.link),
+                        ..Default::default()
+                    },
+                );
+                i += target_len;
+                continue;
+            }
+        }
         // **bold**
         if !code && i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
             flush(&mut job, &mut buf, bold, code);
@@ -429,4 +515,88 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
 
     job
 }
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    /// The reported case, verbatim from the agent panel.
+    ///
+    /// A link to a file rendered as the whole of
+    /// `[language design directive](CascadeProjects/.../vulkgryph-design-directive.md)`
+    /// in the middle of a sentence, because the inline parser knew only bold
+    /// and code and everything else fell through to literal text.
+    #[test]
+    fn a_link_renders_as_its_text() {
+        let (label, took) = parse_link(
+            "[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md) says",
+        )
+        .expect("that is a link");
+        assert_eq!(label, "language design directive");
+        // Everything up to and including the closing paren.
+        assert_eq!(
+            took,
+            "[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md)".len()
+        );
+    }
+
+    /// `[` has an ordinary meaning and most of its uses are not links.
+    #[test]
+    fn brackets_that_are_not_links_are_left_alone() {
+        for not_a_link in [
+            "[WARN] something happened",
+            "vec[0] is the first",
+            "[unclosed",
+            "[label] followed by prose",
+            "[label]  (space before the paren)",
+            "[](empty label)",
+            "[spans\na newline](x)",
+            "[label](unclosed",
+        ] {
+            assert!(
+                parse_link(not_a_link).is_none(),
+                "{not_a_link:?} was taken for a link"
+            );
+        }
+    }
+
+    /// Brackets inside the label are counted, not ended on.
+    #[test]
+    fn a_nested_bracket_does_not_end_the_label() {
+        let (label, _) = parse_link("[see [note] here](x.md)").expect("a link");
+        assert_eq!(label, "see [note] here");
+    }
+
+    /// The whole construct disappears from the rendered text, leaving the
+    /// label — which is the thing the report was about.
+    #[test]
+    fn the_target_is_not_in_the_rendered_output() {
+        let job = parse_inline(
+            "see the [design directive](specs/vulkgryph-design-directive.md) for why",
+            14.0,
+        );
+        let rendered = job.text.clone();
+        assert!(rendered.contains("design directive"), "{rendered:?}");
+        assert!(
+            !rendered.contains("specs/vulkgryph-design-directive.md"),
+            "the target is still being printed: {rendered:?}"
+        );
+        assert!(!rendered.contains('['), "a bracket survived: {rendered:?}");
+        assert!(!rendered.contains("]("), "the markdown survived: {rendered:?}");
+        assert!(rendered.starts_with("see the "), "{rendered:?}");
+        assert!(rendered.ends_with(" for why"), "{rendered:?}");
+    }
+
+    /// Code spans still win: a link inside backticks is literal text, because
+    /// that is someone showing the markdown rather than using it.
+    #[test]
+    fn a_link_inside_code_stays_literal() {
+        let job = parse_inline("write `[a](b)` to link", 14.0);
+        assert!(
+            job.text.contains("[a](b)"),
+            "a link inside a code span was rendered: {:?}",
+            job.text
+        );
+    }
+}
+
 

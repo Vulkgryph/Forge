@@ -30,6 +30,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **Markdown links in the agent panel rendered as their source.** Reported from use: a sentence came out carrying the whole of `[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md)` inline. The inline parser knew `**bold**` and `` `code` `` and nothing else, so everything it did not recognise fell through to literal text — which the file's own comment said in as many words, and which is easy to miss until an agent writes a paragraph naming three files.
+
+  Links now render as their text, in a link colour and underlined. The target is dropped rather than printed. For a file path that is a real loss, and the honest fix is making them clickable so the path does not need showing — that needs hit-testing a galley range rather than setting a colour, and is not this change. `[` keeps its ordinary meaning: `[WARN]`, `vec[0]`, an unclosed bracket and a link inside backticks are all left alone, and nested brackets in a label are counted rather than ended on.
+
 - **The web view was positioned twice per frame.** `place_webview()` was called once after each renderer's draw block, and since only one block was ever compiled, the surviving pair meant the wgpu build called it twice — the first time *before* the frame it was meant to follow, under a comment reading "After the frame rather than during." Visible once the Vulkan branch was removed and the two calls sat next to each other.
 
 - `forge-ide`'s package description advertised a renderer the default build did not use ("A fast, Rust/Vulkan-based code editor"). That string is what `cargo metadata` reports and what any listing scraping the manifest shows.

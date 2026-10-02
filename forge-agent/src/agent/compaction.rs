@@ -12,16 +12,33 @@ const ROLLING_WINDOW_SIZE: usize = 20;
 ///
 /// Addressed to the specific way compaction used to end a turn: the summary
 /// reads as a report, and a report invites another report.
-const CONTINUE_AFTER_COMPACTION: &str = "\
-[System: The conversation above was condensed to free up context. This is the \
-middle of your work, not the end of it, and nobody has asked you for a status \
-update.\n\
-\n\
-Carry on from \"Current state\" toward \"Next actions\" by calling the tools you \
-need. Do not restate the summary, do not describe what you were doing, and do \
-not ask whether to continue — the summary exists so that you can continue \
-without being told again. Reply to the user only when the work is finished or \
-you are genuinely blocked.]";
+/// Said after a compaction, with the path to the full record filled in.
+///
+/// The path is the part that was missing. A summary is lossy by construction,
+/// and the thing it replaced is still sitting on disk — so an agent that needs
+/// an exact error message, a command's output, or something the user said
+/// three hours ago can go and read it instead of guessing or asking. Nothing
+/// told it that, and nothing told it where. The log has always known its own
+/// path; it was simply never passed on.
+fn continue_after_compaction(log_path: &str) -> String {
+    format!(
+        "[System: The conversation above was condensed to free up context. This is the \
+         middle of your work, not the end of it, and nobody has asked you for a status \
+         update.\n\
+         \n\
+         Carry on from \"Current state\" toward \"Next actions\" by calling the tools you \
+         need. Do not restate the summary, do not describe what you were doing, and do \
+         not ask whether to continue — the summary exists so that you can continue \
+         without being told again. Reply to the user only when the work is finished or \
+         you are genuinely blocked.\n\
+         \n\
+         The summary is lossy; the conversation it replaced is not gone. The full \
+         record of this session, every message and every tool result verbatim, is at \
+         {log_path} — one JSON object per line. If you need an exact error, a command's \
+         output, or something the user said earlier, read that file rather than \
+         reconstructing it from the summary or asking them to repeat it.]"
+    )
+}
 const ROLLING_PLAN_MARKER: &str = "[Forge rolling-window approved plan]";
 
 /// Perform compaction: call the LLM to summarize messages, write JSONL markers,
@@ -60,7 +77,9 @@ pub async fn perform_compaction(
     log.log_compaction_summary(summary.clone())?;
 
     let degraded = summary_is_degraded(&summary);
-    let new_history = rebuild_history(system_prompt, &summary, history, keep_rolling_window);
+    let log_path = log.path().to_string_lossy().to_string();
+    let new_history =
+        rebuild_history(system_prompt, &summary, history, keep_rolling_window, &log_path);
 
     let messages_after = new_history.len();
     // The window is whatever came after the system prompt and the summary.
@@ -81,6 +100,7 @@ pub(crate) fn rebuild_history(
     summary: &crate::agent::log_types::CompactionSummary,
     history: &[Message],
     keep_rolling_window: bool,
+    log_path: &str,
 ) -> Vec<Message> {
     let mut new_history = Vec::new();
 
@@ -109,7 +129,7 @@ pub(crate) fn rebuild_history(
     //
     //    Nothing about the summary is wrong; it is the wrong *last word*.
     //    This is the last word instead.
-    new_history.push(Message::system(CONTINUE_AFTER_COMPACTION));
+    new_history.push(Message::system(&continue_after_compaction(log_path)));
 
     new_history
 }
@@ -1489,7 +1509,7 @@ mod continuation_tests {
     /// handoff. Reported from a live session.
     #[test]
     fn a_compacted_history_ends_by_saying_to_carry_on() {
-        let rebuilt = rebuild_history("sys", &summary(), &[], false);
+        let rebuilt = rebuild_history("sys", &summary(), &[], false, "/tmp/fixture/conversation.jsonl");
 
         let last = rebuilt.last().expect("a rebuilt history is never empty");
         assert_eq!(last.role, "system", "the last word came from the model, not the harness");
@@ -1511,7 +1531,7 @@ mod continuation_tests {
             Message::user("do the thing"),
             Message::assistant("part way through"),
         ];
-        let rebuilt = rebuild_history("sys", &summary(), &history, true);
+        let rebuilt = rebuild_history("sys", &summary(), &history, true, "/tmp/fixture/conversation.jsonl");
 
         assert!(
             rebuilt.len() > 3,
@@ -1678,6 +1698,64 @@ mod degraded_summary_tests {
         assert!(text.contains("just prose about the session"), "the prose was dropped");
     }
 }
+#[cfg(test)]
+mod transcript_pointer_tests {
+    use super::*;
+
+    fn summary() -> crate::agent::log_types::CompactionSummary {
+        crate::agent::log_types::CompactionSummary {
+            goal: "g".into(),
+            repo_map: vec![],
+            work_completed: vec![],
+            current_state: "s".into(),
+            commands_run: vec![],
+            decisions: vec![],
+            next_actions: vec![],
+            pitfalls: vec![],
+        }
+    }
+
+    /// After compacting, the agent is told where the full record is.
+    ///
+    /// A summary is lossy by construction and the conversation it replaced is
+    /// still on disk, so an agent needing an exact error or something the user
+    /// said earlier can read it rather than guess or ask again. Nothing told
+    /// it that and nothing told it where — the log has always known its own
+    /// path and it was simply never passed on.
+    #[test]
+    fn the_rebuilt_history_says_where_the_transcript_is() {
+        let path = "/work/.forge/sessions/20260101_000000_000/conversation.jsonl";
+        let rebuilt = rebuild_history("sys", &summary(), &[], false, path);
+        let text: String = rebuilt
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains(path), "the transcript path is not in the rebuilt history");
+        assert!(
+            text.contains("one JSON object per line"),
+            "nothing says what the file is, so the agent has to guess how to read it"
+        );
+        assert!(
+            text.contains("rather than reconstructing it"),
+            "nothing tells the agent to prefer reading it over guessing: {text}"
+        );
+    }
+
+    /// And the instruction not to stop is still the last word, since that was
+    /// the reason this message exists at all.
+    #[test]
+    fn the_carry_on_instruction_is_still_last() {
+        let rebuilt = rebuild_history("sys", &summary(), &[], false, "/tmp/x.jsonl");
+        let last = rebuilt.last().and_then(|m| m.content.as_deref()).unwrap_or_default();
+        assert!(
+            last.contains("middle of your work"),
+            "the carry-on instruction is no longer the last message: {last}"
+        );
+    }
+}
+
 
 
 

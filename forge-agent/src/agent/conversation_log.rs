@@ -247,6 +247,15 @@ impl ConversationLog {
 
     /// Load conversation context using reverse-seek from end of file.
     /// Only reads from the last compaction_commit forward, avoiding OOM on large logs.
+    /// Where this session's full record lives.
+    ///
+    /// Needed by compaction so the agent can be told that everything it just
+    /// lost is still on disk and readable. The log has always known; nothing
+    /// asked it.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn load_from_last_compaction(&self) -> Result<LoadedContext> {
         let mut file = std::fs::File::open(&self.path)
             .with_context(|| format!("Failed to open log for reading: {}", self.path.display()))?;

@@ -220,22 +220,43 @@ class Agent:
             with self.lock:
                 self.frames.append(frame)
 
-    def wait_for(self, kinds, timeout):
+    def wait_for(self, kinds, timeout, after=0):
+        """First frame of one of `kinds` at index >= `after`.
+
+        `after` matters and its absence was a real defect in this harness: the
+        scan used to start at zero every call, so once any `done` had arrived
+        it returned that same frame instantly for every later turn. Twenty
+        messages went out without waiting for any of them, and the context
+        figure this script reported was turn one's, read twenty times — which
+        looked exactly like a conversation that would not accumulate.
+        """
         deadline = time.time() + timeout
-        seen = 0
         while time.time() < deadline:
             with self.lock:
-                for frame in self.frames[seen:]:
+                for frame in self.frames[after:]:
                     if frame.get("type") in kinds:
                         return frame
-                seen = len(self.frames)
             time.sleep(0.05)
         return None
 
+    def mark(self):
+        """The current end of the frame list, to wait from."""
+        with self.lock:
+            return len(self.frames)
+
     def say(self, text, timeout):
+        after = self.mark()
         self.proc.stdin.write(json.dumps({"type": "send_message", "content": text}) + "\n")
         self.proc.stdin.flush()
-        return self.wait_for(["done", "error", "cancelled"], timeout)
+        return self.wait_for(["done", "error", "cancelled"], timeout, after=after)
+
+    def usage(self):
+        """The latest usage snapshot the agent reported, if any."""
+        with self.lock:
+            for frame in reversed(self.frames):
+                if frame.get("type") == "usage_update":
+                    return frame.get("snapshot", {})
+        return {}
 
     def transcript(self):
         with self.lock:
@@ -309,9 +330,13 @@ def main():
 
     # Plant the facts, one per turn, each padded so the window fills.
     for i, fact in enumerate(FACTS, 1):
-        print(f"  [{i}/{len(FACTS)}] planting {fact['id']}…", flush=True)
+        print(f"  [{i}/{len(FACTS)}] planting {fact['id']}…", end="", flush=True)
         end = agent.say(f"{fact['say']}\n\n{FILLER * 6}\nJust acknowledge, briefly.",
                         args.turn_timeout)
+        u = agent.usage()
+        pct = (100 * u.get("last_prompt_tokens", 0) / max(u.get("max_context_tokens", 1), 1))
+        print(f"  ctx {u.get('last_prompt_tokens', 0)}/{u.get('max_context_tokens', 0)}"
+              f" ({pct:.0f}%), {u.get('history_messages', 0)} msgs", flush=True)
         if end is None or end.get("type") != "done":
             agent.stop()
             sys.exit(f"turn {i} did not complete: {end}\n"
@@ -331,21 +356,32 @@ def main():
     for i in range(12):
         if compacted:
             break
-        print(f"  pushing for compaction ({i + 1})…", flush=True)
+        print(f"  pushing for compaction ({i + 1})…", end="", flush=True)
         end = agent.say(f"Keep going.\n\n{FILLER * 14}", args.turn_timeout)
+        u = agent.usage()
+        pct = (100 * u.get("last_prompt_tokens", 0) / max(u.get("max_context_tokens", 1), 1))
+        print(f"  ctx {u.get('last_prompt_tokens', 0)}/{u.get('max_context_tokens', 0)}"
+              f" ({pct:.0f}%), {u.get('history_messages', 0)} msgs", flush=True)
         if end is None or end.get("type") != "done":
             print(f"  a push turn ended as {end.get('type') if end else 'timeout'}; stopping")
             break
         compacted = has_compacted()
 
     transcript = agent.transcript()
+    agent_usage_final = agent.usage()
     agent.stop()
 
     summary = summary_from_log(home)
     if summary is None:
         print("\n  No compaction summary was written.")
         if not compacted:
-            print("  Compaction never fired — try a smaller --window or more pushes.")
+            u = agent_usage_final
+            print(f"  Compaction never fired. Last reported context: "
+                  f"{u.get('last_prompt_tokens', 0)}/{u.get('max_context_tokens', 0)} tokens "
+                  f"across {u.get('history_messages', 0)} messages, and the threshold is "
+                  f"{args.window * 80 // 100}.")
+            print("  If the message count is not climbing, the history is not growing — "
+                  "check stderr below rather than lowering the window.")
         print(f"\n  stderr tail:\n{(home / 'stderr.log').read_text()[-1500:]}")
         if not args.keep:
             shutil.rmtree(home, ignore_errors=True)

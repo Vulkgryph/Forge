@@ -413,6 +413,69 @@ fn split_transcript(transcript: &str, chunk_chars: usize, max_chunks: usize) -> 
 
 /// Parse the LLM's JSON response into a CompactionSummary.
 /// Handles cases where the model wraps JSON in markdown fences.
+/// The placeholder text in the summariser prompts.
+///
+/// A model that does not understand the instruction sometimes echoes the
+/// schema back instead of filling it in — and because the schema shown in the
+/// prompt is itself valid JSON, that parses cleanly and is accepted as the
+/// session's record. Observed against a local 16B model, which produced
+/// exactly this and had it committed to the log:
+///
+///   decisions:      ["architectural or implementation decisions made"]
+///   next_actions:   ["what should happen next"]
+///   work_completed: ["list of completed work items"]
+///
+/// Nothing caught it, because a parroted schema is well-formed. These are the
+/// strings to recognise, trimmed and lowercased at the comparison.
+const PLACEHOLDERS: [&str; 12] = [
+    "what the user is trying to accomplish",
+    "what the user is trying to accomplish, as far as this part shows",
+    "key files and what they do",
+    "list of completed work items",
+    "what's working, what's failing, what's next",
+    "what is working, what is failing",
+    "commands and their outcomes",
+    "architectural or implementation decisions made",
+    "what should happen next",
+    "things to avoid or known issues",
+    "completed work items",
+    "decisions made",
+];
+
+fn is_placeholder(value: &str) -> bool {
+    let v = value.trim().trim_matches('"').to_lowercase();
+    PLACEHOLDERS.iter().any(|p| v == *p)
+}
+
+/// Strip echoed schema text, and say whether anything of substance was left.
+///
+/// Returns `false` when the summary was *only* the schema — at which point it
+/// is not a thin summary, it is no summary, and treating it as one puts a
+/// conversation's record beyond recovery while reporting success.
+fn strip_placeholders(summary: &mut CompactionSummary) -> bool {
+    if is_placeholder(&summary.goal) {
+        summary.goal.clear();
+    }
+    if is_placeholder(&summary.current_state) {
+        summary.current_state.clear();
+    }
+    for list in [
+        &mut summary.repo_map,
+        &mut summary.work_completed,
+        &mut summary.commands_run,
+        &mut summary.decisions,
+        &mut summary.next_actions,
+        &mut summary.pitfalls,
+    ] {
+        list.retain(|item| !is_placeholder(item));
+    }
+    !summary.goal.trim().is_empty()
+        || !summary.current_state.trim().is_empty()
+        || !summary.work_completed.is_empty()
+        || !summary.decisions.is_empty()
+        || !summary.next_actions.is_empty()
+}
+
 fn parse_summary_response(response: &str) -> Result<CompactionSummary> {
     let cleaned = response.trim();
 
@@ -430,7 +493,41 @@ fn parse_summary_response(response: &str) -> Result<CompactionSummary> {
 
     // Try to parse as CompactionSummary
     match serde_json::from_str::<CompactionSummary>(json_str) {
-        Ok(summary) => Ok(summary),
+        Ok(mut summary) => {
+            // Well-formed is not the same as useful. The schema in the prompt
+            // is valid JSON, so a model that echoes it back parses perfectly
+            // and would be stored as the conversation's record.
+            if strip_placeholders(&mut summary) {
+                Ok(summary)
+            } else {
+                Ok(CompactionSummary {
+                    goal: "The summariser returned the requested schema rather than a \
+                           summary of the conversation, so there is no usable record of \
+                           what came before this point."
+                        .to_string(),
+                    repo_map: Vec::new(),
+                    work_completed: Vec::new(),
+                    // The raw reply is deliberately *not* kept here, unlike the
+                    // unparseable case below. There it is prose about the
+                    // session and worth everything; here it is the schema, so
+                    // embedding it would put "architectural or implementation
+                    // decisions made" in front of the agent as though it were
+                    // a decision someone took.
+                    current_state: "(unstructured summary, the model echoed the schema \
+                                     back instead of summarising; nothing was recorded)"
+                        .to_string(),
+                    commands_run: Vec::new(),
+                    decisions: Vec::new(),
+                    next_actions: Vec::new(),
+                    pitfalls: vec![
+                        "The previous compaction produced no summary. Treat everything \
+                         before this point as unknown rather than as not having happened, \
+                         and read the session log if you need it."
+                            .to_string(),
+                    ],
+                })
+            }
+        }
         Err(e) => {
             // The summary is the only record of everything it replaces, so a
             // parse failure must not quietly become an empty one.
@@ -1755,6 +1852,91 @@ mod transcript_pointer_tests {
         );
     }
 }
+#[cfg(test)]
+mod schema_echo_tests {
+    use super::*;
+
+    /// The exact reply a local 16B model produced, which was committed to a
+    /// session log as that conversation's permanent record.
+    ///
+    /// The schema in the summariser prompt is valid JSON, so echoing it back
+    /// parses cleanly — well-formed and completely empty of the conversation.
+    /// Found by the retention harness in `scripts/compaction_retention.py`,
+    /// not by any test, because nothing had ever looked at whether a summary
+    /// was *about* anything.
+    #[test]
+    fn a_parroted_schema_is_not_accepted_as_a_summary() {
+        let echoed = r#"{
+          "goal": "what the user is trying to accomplish",
+          "repo_map": ["key files and what they do"],
+          "work_completed": ["list of completed work items"],
+          "current_state": "what's working, what's failing, what's next",
+          "commands_run": ["commands and their outcomes"],
+          "decisions": ["architectural or implementation decisions made"],
+          "next_actions": ["what should happen next"],
+          "pitfalls": ["things to avoid or known issues"]
+        }"#;
+        let summary = parse_summary_response(echoed).expect("parses");
+        assert!(
+            summary_is_degraded(&summary),
+            "an echoed schema was accepted as a real summary"
+        );
+        let text = summary.to_context_string();
+        assert!(
+            !text.contains("architectural or implementation decisions made"),
+            "the placeholder text is still being presented as a decision: {text}"
+        );
+        assert!(
+            text.contains("echoed the schema") || text.contains("rather than a summary"),
+            "nothing says why there is no summary: {text}"
+        );
+        assert!(
+            text.contains("unknown rather than as not having happened"),
+            "the agent is not warned to treat the gap as unknown: {text}"
+        );
+    }
+
+    /// A real summary that happens to contain one placeholder-looking line
+    /// keeps everything else.
+    #[test]
+    fn a_real_summary_with_one_echoed_line_keeps_the_rest() {
+        let mixed = r#"{
+          "goal": "port the loader to the new ABI",
+          "repo_map": ["src/loader/header.rs — header parsing"],
+          "work_completed": ["list of completed work items"],
+          "current_state": "the segment walk is half converted",
+          "commands_run": ["cargo test -p loader"],
+          "decisions": ["little-endian only"],
+          "next_actions": ["wire it into the ELF oracle"],
+          "pitfalls": []
+        }"#;
+        let summary = parse_summary_response(mixed).expect("parses");
+        assert!(!summary_is_degraded(&summary), "a real summary was rejected");
+        assert_eq!(summary.goal, "port the loader to the new ABI");
+        assert!(
+            summary.work_completed.is_empty(),
+            "the echoed line survived: {:?}",
+            summary.work_completed
+        );
+        assert_eq!(summary.decisions, vec!["little-endian only"]);
+        assert!(summary.next_actions.iter().any(|n| n.contains("oracle")));
+    }
+
+    /// Case and surrounding whitespace must not let an echo through.
+    #[test]
+    fn an_echo_is_caught_regardless_of_case_or_padding() {
+        for variant in [
+            "  What Should Happen Next  ",
+            "WHAT SHOULD HAPPEN NEXT",
+            " what should happen next",
+        ] {
+            assert!(is_placeholder(variant), "{variant:?} was not recognised");
+        }
+        assert!(!is_placeholder("wire it into the ELF oracle"));
+        assert!(!is_placeholder("what should happen next is the oracle work"));
+    }
+}
+
 
 
 

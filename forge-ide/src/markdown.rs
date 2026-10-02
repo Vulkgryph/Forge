@@ -26,6 +26,18 @@ const T: Theme = Theme {
     bullet:  Color32::from_rgb(160, 160, 160),
 };
 
+/// Where a link sits in a rendered job, and what it points at.
+///
+/// Char indices into `LayoutJob::text`, so a click can be mapped back to a
+/// target: `Galley::cursor_from_pos` gives a char index and this says which
+/// link, if any, contains it. Carried beside the job rather than inside it
+/// because `LayoutJob` has nowhere to put it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub range: std::ops::Range<usize>,
+    pub target: String,
+}
+
 /// One parsed markdown block, ready to emit into a `Ui` with no further
 /// string parsing or `LayoutJob` construction. This is the cached
 /// intermediate: parsing the raw text and building the inline `LayoutJob`s
@@ -42,14 +54,14 @@ enum Block {
     /// A `#`/`##`/`###` heading — text already soft-wrapped for `max_run`.
     Heading { text: String, size: f32, space_before: f32 },
     /// A `-`/`*`/`N.` list row: marker glyph plus its wrapped content.
-    Bullet { marker: String, job: LayoutJob },
+    Bullet { marker: String, job: LayoutJob, links: Vec<Link> },
     /// A fenced ``` code block (raw text, rendered monospace).
     Code(String),
     /// A GFM pipe table — kept as raw cells; column widths are measured
     /// against the live `Ui` width at emit time (can't be precomputed).
     Table { header: Vec<String>, rows: Vec<Vec<String>> },
     /// A plain paragraph (consecutive non-special lines merged).
-    Paragraph(LayoutJob),
+    Paragraph(LayoutJob, Vec<Link>),
 }
 
 /// Frame-cache computer: raw `(text, max_run)` → parsed block list. egui
@@ -91,11 +103,74 @@ type MdBlockCache<'a> = egui::util::cache::FrameCache<std::sync::Arc<Vec<Block>>
 /// whose text actually changed this frame re-parses; every stable message is
 /// a cache hit, and emit-time work is just widget layout over the already-built
 /// jobs (whose shaped `Galley`s egui caches on its own).
+/// Where a clicked link target is left for the application to collect.
+///
+/// Stashed in egui memory rather than returned, because `render` is called
+/// from inside nested closures that already borrow the app — threading a
+/// value back out of those would mean a local and an `if let` at every call
+/// site, and a new one would be easy to forget. One well-known slot, read
+/// once a frame by `take_clicked_link`, cannot be forgotten at a call site
+/// that does not know about it.
+fn clicked_link_slot() -> egui::Id {
+    egui::Id::new("forge_markdown_clicked_link")
+}
+
+/// The link target clicked since this was last called, if any.
+///
+/// Taken rather than read: a click is an event, and leaving it in memory
+/// would reopen the file on every frame after.
+pub fn take_clicked_link(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| d.remove_temp::<String>(clicked_link_slot()))
+}
+
 pub fn render(ui: &mut egui::Ui, text: &str, max_run: usize) {
     let blocks = ui.memory_mut(|mem| {
         mem.caches.cache::<MdBlockCache<'_>>().get((text, max_run))
     });
-    emit(ui, &blocks, max_run);
+    if let Some(target) = emit(ui, &blocks, max_run) {
+        ui.data_mut(|d| d.insert_temp(clicked_link_slot(), target));
+    }
+}
+
+/// Draw one job, and report a link target if one was clicked.
+///
+/// `Label::layout_in_ui` rather than `ui.add(Label)`, because it hands back
+/// the galley — and the galley is what turns a click position into a
+/// character index, which `links` turns into a target. Laying the paragraph
+/// out as one job keeps the text wrapping identical to before; splitting it
+/// into a widget per span would have made every link a wrap opportunity.
+fn label_with_links(
+    ui: &mut egui::Ui,
+    job: &LayoutJob,
+    links: &[Link],
+) -> Option<String> {
+    let label = egui::Label::new(job.clone()).wrap();
+    if links.is_empty() {
+        ui.add(label);
+        return None;
+    }
+
+    let (pos, galley, response) = label.sense(egui::Sense::click()).layout_in_ui(ui);
+    ui.painter().galley(pos, galley.clone(), T.plain);
+
+    let at = |p: egui::Pos2| -> Option<&Link> {
+        let idx = galley.cursor_from_pos(p - pos).ccursor.index;
+        links.iter().find(|l| l.range.contains(&idx))
+    };
+
+    // Hover shows where it goes, which is the half of this that matters even
+    // when nobody clicks: the target is no longer printed inline, so hover is
+    // the only way to see it.
+    if let Some(hovered) = response.hover_pos().and_then(at) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        response.clone().on_hover_text(hovered.target.clone());
+    }
+    if response.clicked() {
+        if let Some(clicked) = response.interact_pointer_pos().and_then(at) {
+            return Some(clicked.target.clone());
+        }
+    }
+    None
 }
 
 /// Parses raw markdown into the cacheable block list. Kept free of any `Ui`
@@ -151,15 +226,15 @@ fn parse_blocks(text: &str, max_run: usize) -> Vec<Block> {
 
         // ── Bullet list ──
         if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            let job = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
-            out.push(Block::Bullet { marker: "•".to_string(), job });
+            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
+            out.push(Block::Bullet { marker: "•".to_string(), job, links });
             i += 1; continue;
         }
 
         // ── Numbered list ──
         if let Some((num, rest)) = parse_numbered_prefix(line) {
-            let job = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
-            out.push(Block::Bullet { marker: format!("{}.", num), job });
+            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
+            out.push(Block::Bullet { marker: format!("{}.", num), job, links });
             i += 1; continue;
         }
 
@@ -176,7 +251,8 @@ fn parse_blocks(text: &str, max_run: usize) -> Vec<Block> {
             para.push_str(lines[i].trim());
             i += 1;
         }
-        out.push(Block::Paragraph(parse_inline(&crate::app::soft_wrap(&para, max_run), 12.5)));
+        let (job, links) = parse_inline(&crate::app::soft_wrap(&para, max_run), 12.5);
+            out.push(Block::Paragraph(job, links));
     }
     out
 }
@@ -184,7 +260,8 @@ fn parse_blocks(text: &str, max_run: usize) -> Vec<Block> {
 /// Emits already-parsed blocks into `ui`. Cheap relative to `parse_blocks`:
 /// no string parsing or job construction, just widget layout (egui caches the
 /// shaped `Galley` for each unchanged `LayoutJob` on its own).
-fn emit(ui: &mut egui::Ui, blocks: &[Block], max_run: usize) {
+fn emit(ui: &mut egui::Ui, blocks: &[Block], max_run: usize) -> Option<String> {
+    let mut clicked = None;
     for block in blocks {
         match block {
             Block::Space(h) => { ui.add_space(*h); }
@@ -192,19 +269,22 @@ fn emit(ui: &mut egui::Ui, blocks: &[Block], max_run: usize) {
                 ui.add_space(*space_before);
                 ui.label(RichText::new(text).size(*size).strong().color(T.heading));
             }
-            Block::Bullet { marker, job } => {
+            Block::Bullet { marker, job, links } => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0);
                     ui.label(RichText::new(marker).size(12.5).color(T.bullet));
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(job.clone()).wrap());
+                    clicked = label_with_links(ui, job, links).or(clicked.take());
                 });
             }
             Block::Code(code) => render_code_block(ui, code),
             Block::Table { header, rows } => render_table(ui, header, rows, max_run),
-            Block::Paragraph(job) => { ui.add(egui::Label::new(job.clone()).wrap()); }
+            Block::Paragraph(job, links) => {
+                clicked = label_with_links(ui, job, links).or(clicked.take());
+            }
         }
     }
+    clicked
 }
 
 /// True if `lines[i]` looks like a table header row (contains a `|`)
@@ -304,7 +384,7 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
                                 for c in 0..ncols {
                                     let cell = row.get(c).map(String::as_str).unwrap_or("");
                                     let job = parse_inline(&crate::app::soft_wrap(cell, max_run), 12.0);
-                                    ui.add_sized([col_widths[c], 0.0], egui::Label::new(job).wrap());
+                                    ui.add_sized([col_widths[c], 0.0], egui::Label::new(job.0).wrap());
                                 }
                                 ui.end_row();
                             }
@@ -382,7 +462,7 @@ fn parse_numbered_prefix(line: &str) -> Option<(usize, &str)> {
 /// `vec[0]`, `[WARN]` and an unclosed bracket all have to survive untouched.
 /// Nested brackets inside the label are counted rather than ended on, so
 /// `[see [note]](x)` takes the whole label.
-fn parse_link(text: &str) -> Option<(&str, usize)> {
+fn parse_link(text: &str) -> Option<(&str, &str, usize)> {
     let bytes = text.as_bytes();
     if bytes.first() != Some(&b'[') {
         return None;
@@ -424,10 +504,10 @@ fn parse_link(text: &str) -> Option<(&str, usize)> {
     if label.is_empty() {
         return None;
     }
-    Some((label, end + 1))
+    Some((label, &text[close + 2..end], end + 1))
 }
 
-fn parse_inline(text: &str, size: f32) -> LayoutJob {
+fn parse_inline(text: &str, size: f32) -> (LayoutJob, Vec<Link>) {
     let mut job  = LayoutJob::default();
     let prop = FontId::proportional(size);
     let mono = FontId::monospace(size - 1.0);
@@ -445,9 +525,12 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
     let mut buf = String::new();
     let mut bold = false;
     let mut code = false;
+    let mut links: Vec<Link> = Vec::new();
+    // Characters appended to the job so far, which is what a click maps to.
+    let mut chars_out = 0usize;
 
-    let flush = |job: &mut LayoutJob, buf: &mut String, bold: bool, code: bool| {
-        if buf.is_empty() { return; }
+    let flush = |job: &mut LayoutJob, buf: &mut String, bold: bool, code: bool| -> usize {
+        if buf.is_empty() { return 0; }
         let f = if code {
             fmt(T.code_fg, &mono, T.code_bg)
         } else if bold {
@@ -455,8 +538,10 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
         } else {
             fmt(T.plain, &prop, Color32::TRANSPARENT)
         };
+        let n = buf.chars().count();
         job.append(buf, 0.0, f);
         buf.clear();
+        n
     };
 
     while i < len {
@@ -475,8 +560,9 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
         // and is not this change. Dropping it is still better than printing it
         // inline, because the agent names the file in prose when it matters.
         if !code && bytes[i] == b'[' {
-            if let Some((label, target_len)) = parse_link(&text[i..]) {
-                flush(&mut job, &mut buf, bold, code);
+            if let Some((label, target, took)) = parse_link(&text[i..]) {
+                chars_out += flush(&mut job, &mut buf, bold, code);
+                let start = chars_out;
                 job.append(
                     label,
                     0.0,
@@ -488,20 +574,22 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
                         ..Default::default()
                     },
                 );
-                i += target_len;
+                chars_out += label.chars().count();
+                links.push(Link { range: start..chars_out, target: target.to_string() });
+                i += took;
                 continue;
             }
         }
         // **bold**
         if !code && i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            flush(&mut job, &mut buf, bold, code);
+            chars_out += flush(&mut job, &mut buf, bold, code);
             bold = !bold;
             i += 2;
             continue;
         }
         // `inline code`
         if !bold && bytes[i] == b'`' {
-            flush(&mut job, &mut buf, bold, code);
+            chars_out += flush(&mut job, &mut buf, bold, code);
             code = !code;
             i += 1;
             continue;
@@ -511,9 +599,10 @@ fn parse_inline(text: &str, size: f32) -> LayoutJob {
         buf.push_str(&text[i..end]);
         i = end;
     }
-    flush(&mut job, &mut buf, bold, code);
+    chars_out += flush(&mut job, &mut buf, bold, code);
+    let _ = chars_out;
 
-    job
+    (job, links)
 }
 #[cfg(test)]
 mod link_tests {
@@ -527,11 +616,15 @@ mod link_tests {
     /// and code and everything else fell through to literal text.
     #[test]
     fn a_link_renders_as_its_text() {
-        let (label, took) = parse_link(
+        let (label, target, took) = parse_link(
             "[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md) says",
         )
         .expect("that is a link");
         assert_eq!(label, "language design directive");
+        assert_eq!(
+            target,
+            "CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md"
+        );
         // Everything up to and including the closing paren.
         assert_eq!(
             took,
@@ -562,7 +655,8 @@ mod link_tests {
     /// Brackets inside the label are counted, not ended on.
     #[test]
     fn a_nested_bracket_does_not_end_the_label() {
-        let (label, _) = parse_link("[see [note] here](x.md)").expect("a link");
+        let (label, target, _) = parse_link("[see [note] here](x.md)").expect("a link");
+        assert_eq!(target, "x.md");
         assert_eq!(label, "see [note] here");
     }
 
@@ -570,11 +664,15 @@ mod link_tests {
     /// label — which is the thing the report was about.
     #[test]
     fn the_target_is_not_in_the_rendered_output() {
-        let job = parse_inline(
+        let (job, links) = parse_inline(
             "see the [design directive](specs/vulkgryph-design-directive.md) for why",
             14.0,
         );
         let rendered = job.text.clone();
+        // The target left the text, but not the page: it is what a click follows.
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].target, "specs/vulkgryph-design-directive.md");
+        assert_eq!(&rendered[links[0].range.clone()], "design directive");
         assert!(rendered.contains("design directive"), "{rendered:?}");
         assert!(
             !rendered.contains("specs/vulkgryph-design-directive.md"),
@@ -590,12 +688,86 @@ mod link_tests {
     /// that is someone showing the markdown rather than using it.
     #[test]
     fn a_link_inside_code_stays_literal() {
-        let job = parse_inline("write `[a](b)` to link", 14.0);
+        let (job, links) = parse_inline("write `[a](b)` to link", 14.0);
         assert!(
             job.text.contains("[a](b)"),
             "a link inside a code span was rendered: {:?}",
             job.text
         );
+        assert!(links.is_empty(), "{links:?}");
+    }
+
+    /// Lays `text` out in a headless context and clicks at `at`, returning
+    /// whatever target the click left behind.
+    ///
+    /// Two frames: the first registers the label so egui knows its rect, the
+    /// second delivers the press and release against it.
+    fn click_at(text: &str, at: Option<egui::Pos2>) -> Option<String> {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| render(ui, text, 80));
+        };
+
+        let base = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let _ = ctx.run(base.clone(), |ctx| draw(ctx));
+
+        let events = at
+            .map(|pos| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ]
+            })
+            .unwrap_or_default();
+        let _ = ctx.run(egui::RawInput { events, ..base }, |ctx| draw(ctx));
+        take_clicked_link(&ctx)
+    }
+
+    /// The point of the whole exercise: a person clicks the link and the
+    /// application is handed the file to open.
+    #[test]
+    fn clicking_a_link_yields_its_target() {
+        // The entire paragraph is the link, so any point inside the laid-out
+        // text is inside the link's range — the test is about the click
+        // arriving, not about hit-testing a few pixels of it.
+        let text = "[the whole of this line is one link](docs/spec.md)";
+        assert_eq!(
+            click_at(text, Some(egui::pos2(40.0, 14.0))),
+            Some("docs/spec.md".to_string())
+        );
+    }
+
+    /// The discriminating half: the same frame without the click must not
+    /// produce a target. Otherwise the test above would pass on a renderer
+    /// that reported a link whenever it drew one.
+    #[test]
+    fn drawing_a_link_without_clicking_it_yields_nothing() {
+        let text = "[the whole of this line is one link](docs/spec.md)";
+        assert_eq!(click_at(text, None), None);
+        // Clicking well below the text is outside the label entirely.
+        assert_eq!(click_at(text, Some(egui::pos2(40.0, 300.0))), None);
+    }
+
+    /// A click is an event, not a state. Left in memory it would reopen the
+    /// file on every frame for as long as the message stayed on screen.
+    #[test]
+    fn a_click_is_delivered_once() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|d| d.insert_temp(clicked_link_slot(), "docs/spec.md".to_string()));
+        assert_eq!(take_clicked_link(&ctx), Some("docs/spec.md".to_string()));
+        assert_eq!(take_clicked_link(&ctx), None);
     }
 }
 

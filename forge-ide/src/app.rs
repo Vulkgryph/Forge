@@ -2335,6 +2335,204 @@ const POLLING_COMPLAINT_AFTER: std::time::Duration = std::time::Duration::from_s
 /// reading "Forge IDE" are indistinguishable in the Dock, which is the problem
 /// this solves. A remote window says so, since telling a local window from a
 /// remote one matters more than either name.
+/// Turns a markdown link target into a path to open, or `None` if it isn't
+/// one — a bare `#anchor`, a `mailto:`, anything with a scheme we don't serve.
+///
+/// Relative targets resolve against `cwd`, which is how an agent writes them:
+/// it cites `forge-ide/src/app.rs`, not the absolute path it happens to have.
+fn resolve_link_path(target: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+    // A fragment or query addresses a place *within* a document; the file to
+    // open is what comes before it.
+    let target = target.split(['#', '?']).next().unwrap_or("");
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = percent_decode(target);
+
+    let rest = match target.strip_prefix("file://") {
+        // `file:///x` and `file://localhost/x` both name `/x`; a host we
+        // don't recognise names a file on another machine, which we can't open.
+        Some(r) => r.strip_prefix("localhost").unwrap_or(r),
+        None if has_scheme(&target) => return None,
+        None => target.as_str(),
+    };
+
+    let path = if let Some(home_rel) = rest.strip_prefix("~/") {
+        std::env::var_os("HOME").map(PathBuf::from)?.join(home_rel)
+    } else if rest.starts_with('/') {
+        PathBuf::from(rest)
+    } else {
+        cwd.join(rest)
+    };
+    Some(normalise(&path))
+}
+
+/// Whether the target opens with a URL scheme — `mailto:`, `javascript:`.
+///
+/// A Windows drive letter (`C:\...`) looks like a one-letter scheme, so a
+/// single leading character doesn't count.
+fn has_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else { return false };
+    if colon < 2 {
+        return false;
+    }
+    let scheme = &target[..colon];
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+}
+
+/// Decodes `%20` and friends, leaving anything malformed as written —
+/// a literal `%` in a filename is likelier than a truncated escape.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let pair = (i + 2 < b.len())
+            .then(|| std::str::from_utf8(&b[i + 1..i + 3]).ok())
+            .flatten()
+            .filter(|_| b[i] == b'%')
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match pair {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Resolves `.` and `..` lexically.
+///
+/// Not `canonicalize`: that needs the file to exist, and the caller wants a
+/// path it can name in an error message when it doesn't.
+fn normalise(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Keep `..` that would climb past the root: dropping it would
+                // silently turn an escaping path into one that stays inside.
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod link_path_tests {
+    use super::*;
+
+    fn cwd() -> PathBuf {
+        PathBuf::from("/proj")
+    }
+
+    #[test]
+    fn relative_target_resolves_against_the_project() {
+        assert_eq!(
+            resolve_link_path("src/app.rs", &cwd()),
+            Some(PathBuf::from("/proj/src/app.rs"))
+        );
+    }
+
+    #[test]
+    fn absolute_target_is_left_alone() {
+        assert_eq!(
+            resolve_link_path("/etc/hosts", &cwd()),
+            Some(PathBuf::from("/etc/hosts"))
+        );
+    }
+
+    #[test]
+    fn a_fragment_names_a_place_in_the_file_not_a_different_file() {
+        assert_eq!(
+            resolve_link_path("docs/spec.md#goals", &cwd()),
+            Some(PathBuf::from("/proj/docs/spec.md"))
+        );
+    }
+
+    #[test]
+    fn a_bare_anchor_is_not_a_file() {
+        assert_eq!(resolve_link_path("#goals", &cwd()), None);
+    }
+
+    #[test]
+    fn schemes_we_do_not_serve_are_refused() {
+        for target in ["mailto:a@b.com", "javascript:alert(1)", "ftp://h/x"] {
+            assert_eq!(resolve_link_path(target, &cwd()), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn file_urls_name_a_local_path() {
+        assert_eq!(
+            resolve_link_path("file:///etc/hosts", &cwd()),
+            Some(PathBuf::from("/etc/hosts"))
+        );
+        assert_eq!(
+            resolve_link_path("file://localhost/etc/hosts", &cwd()),
+            Some(PathBuf::from("/etc/hosts"))
+        );
+    }
+
+    #[test]
+    fn escaped_spaces_survive_into_the_filename() {
+        assert_eq!(
+            resolve_link_path("docs/design%20notes.md", &cwd()),
+            Some(PathBuf::from("/proj/docs/design notes.md"))
+        );
+    }
+
+    #[test]
+    fn a_lone_percent_is_a_filename_character_not_a_broken_escape() {
+        assert_eq!(
+            resolve_link_path("100%.md", &cwd()),
+            Some(PathBuf::from("/proj/100%.md"))
+        );
+    }
+
+    #[test]
+    fn dot_segments_collapse() {
+        assert_eq!(
+            resolve_link_path("src/../docs/./spec.md", &cwd()),
+            Some(PathBuf::from("/proj/docs/spec.md"))
+        );
+    }
+
+    #[test]
+    fn climbing_out_of_the_project_is_reported_as_written() {
+        // Not clamped to the project: the reader asked for it, and the caller
+        // still checks the file exists before opening it.
+        assert_eq!(
+            resolve_link_path("../other/x.rs", &cwd()),
+            Some(PathBuf::from("/other/x.rs"))
+        );
+    }
+
+    #[test]
+    fn a_windows_drive_letter_is_not_a_url_scheme() {
+        assert!(resolve_link_path(r"C:\notes.md", &cwd()).is_some());
+    }
+
+    #[test]
+    fn whitespace_only_targets_are_not_files() {
+        assert_eq!(resolve_link_path("   ", &cwd()), None);
+        assert_eq!(resolve_link_path("", &cwd()), None);
+    }
+}
+
 fn window_title(
     active_file: Option<&std::path::Path>,
     cwd: &std::path::Path,
@@ -6212,6 +6410,13 @@ impl IdeApp {
         // Pages the agent has asked a person to open, before anything is laid
         // out — so the tab exists this frame rather than next.
         self.drain_browser_events();
+
+        // A markdown link the reader clicked. Collected here rather than at the
+        // point of the click because that happens deep inside the agent panel's
+        // closures, which already hold the borrow this needs.
+        if let Some(target) = crate::markdown::take_clicked_link(ctx) {
+            self.follow_markdown_link(ctx, &target);
+        }
 
         // Keep the window's title current. Sent only when it changes: a
         // viewport command every frame would be a platform round-trip 60 times
@@ -14561,6 +14766,23 @@ impl IdeApp {
         if copied > 0 {
             self.file_tree.refresh();
             self.status = format!("Copied {copied} file(s)");
+        }
+    }
+
+    /// Acts on a markdown link the reader clicked in the agent panel.
+    ///
+    /// Web links go to the browser; anything that resolves to a file under
+    /// this project opens in a tab, so the reader can read the thing the
+    /// agent cited instead of taking its word for it.
+    fn follow_markdown_link(&mut self, ctx: &egui::Context, target: &str) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            ctx.open_url(egui::OpenUrl::new_tab(target));
+            return;
+        }
+        match resolve_link_path(target, &self.cwd) {
+            Some(path) if path.is_file() => self.open_file(path),
+            Some(path) => self.status = format!("No such file: {}", path.display()),
+            None => self.status = format!("Can't open link: {target}"),
         }
     }
 

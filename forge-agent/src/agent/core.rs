@@ -3007,6 +3007,96 @@ impl Agent {
                     "[Compacting context...]".to_string(),
                 ));
 
+                // First, ask the agent to write its own handoff.
+                //
+                // A continuation of this conversation rather than a separate
+                // call: it sees its real messages instead of a rendering
+                // truncated to 500 characters each, it has its own system
+                // prompt and notes, and it knows what it was doing because it
+                // is the thing that was doing it. There is no schema to echo
+                // and no JSON to fail to parse.
+                //
+                // Only when the history still fits, which is the normal case
+                // at the 80% threshold — a conversation already past the
+                // window cannot ask itself anything, and the chunked
+                // summariser below exists for exactly that.
+                let fits = self.current_context_tokens() as usize
+                    <= (self.max_context_tokens as f64 * 0.95) as usize;
+                let own_handoff = if fits {
+                    match crate::agent::compaction::write_own_handoff(
+                        &self.client,
+                        &self.model_id,
+                        &self.history,
+                    )
+                    .await
+                    {
+                        Ok(handoff) => handoff,
+                        Err(e) => {
+                            let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                                "[Could not write a handoff ({e}); summarising instead]"
+                            )));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(handoff) = own_handoff {
+                    // The same three markers `perform_compaction` writes.
+                    // Without them the log has no record that a compaction
+                    // happened, so `load_from_last_compaction` finds no commit
+                    // and a resumed session replays the entire history —
+                    // undoing the compaction and, on a conversation that was
+                    // compacted because it did not fit, making it unresumable.
+                    let before = self.history.len();
+                    let _ = self.log.log_compaction_start(before);
+                    let _ = self.log.log_compaction_summary(
+                        crate::agent::log_types::CompactionSummary {
+                            goal: String::new(),
+                            repo_map: Vec::new(),
+                            work_completed: Vec::new(),
+                            // The handoff is prose, and prose is the whole
+                            // point — it goes in verbatim, carrying its own
+                            // marker so a reader can tell who wrote it.
+                            current_state: handoff.clone(),
+                            commands_run: Vec::new(),
+                            decisions: Vec::new(),
+                            next_actions: Vec::new(),
+                            pitfalls: Vec::new(),
+                        },
+                    );
+                    let log_path = self.log.path().to_string_lossy().to_string();
+                    let mut new_history = crate::agent::compaction::rebuild_history(
+                        &self.system_prompt,
+                        &handoff,
+                        &self.history,
+                        keep_rolling_window,
+                        &log_path,
+                    );
+                    let report = fit_history_to_window(
+                        &mut new_history,
+                        (self.max_context_tokens as f64 * OVERFLOW_RECOVERY_FRACTION) as usize,
+                    );
+                    if report.changed() {
+                        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                            "[Kept the most recent context that fits: dropped {}, shortened {}]",
+                            report.dropped, report.truncated
+                        )));
+                    }
+                    self.history = new_history;
+                    self.last_prompt_tokens = self.current_context_tokens();
+                    self.compaction_count += 1;
+                    self.rewind_checkpoints.clear();
+                    self.update_meta();
+                    let after = self.history.len();
+                    let _ = self.log.log_compaction_commit(after, after.saturating_sub(2));
+                    let _ = self.event_tx.send(AgentEvent::AssistantMessage(
+                        "[Context compacted — I wrote my own handoff]".to_string(),
+                    ));
+                    return Ok(());
+                }
+
                 // Room to write a document rather than a reply. The summary
                 // is the only record of everything it replaces, and the
                 // endpoint's ordinary per-reply budget was cutting the JSON

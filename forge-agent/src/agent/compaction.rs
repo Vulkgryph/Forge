@@ -48,6 +48,103 @@ const ROLLING_PLAN_MARKER: &str = "[Forge rolling-window approved plan]";
 /// last ROLLING_WINDOW_SIZE messages are appended after the summary. When false
 /// (used when switching to a small-context model), only the system prompt and
 /// compaction summary are kept so the result fits tight context budgets.
+/// Marks a handoff the agent wrote itself, so the log and the UI can tell it
+/// apart from a summariser's structured output.
+pub(crate) const HANDOFF_MARKER: &str = "[Handoff, written by me before my context was replaced]";
+
+/// Ask the agent to write its own handoff, in its own conversation.
+///
+/// `Ok(None)` when it declined to produce usable prose, which is the signal to
+/// fall back to the external summariser rather than compact on nothing.
+///
+/// The history is sent as it is — no rendering, no truncation. That is the
+/// point, and it is also why this only works when the history still fits: the
+/// caller checks that before asking. A conversation already past the window
+/// cannot ask itself anything, and that is exactly what the chunked
+/// summariser is for.
+pub(crate) async fn write_own_handoff(
+    client: &ApiClient,
+    model_id: &str,
+    history: &[Message],
+) -> Result<Option<String>> {
+    let mut asked: Vec<Message> = history.to_vec();
+    asked.push(Message::system(HANDOFF_REQUEST));
+
+    // No tools. The instruction is "write this"; a model holding tools will
+    // sometimes go and do more work first, which is sensible of it and the
+    // wrong moment.
+    let response = client
+        .chat(model_id, &asked, &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("handoff call failed: {e}"))?;
+
+    let text = response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    // Short enough to be an acknowledgement rather than a handoff — "Okay, I
+    // will continue" is not a record of anything, and compacting onto it would
+    // throw the session away for nothing.
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 200 {
+        return Ok(None);
+    }
+    Ok(Some(format!("{HANDOFF_MARKER}\n\n{trimmed}")))
+}
+
+/// What the agent is asked, in its own conversation, when it is time to compact.
+///
+/// This is the whole of the continuation approach. Rather than rendering the
+/// history into text and handing it to a stranger — a second call whose system
+/// prompt is "You are a helpful assistant", with no tools, no notes, and a
+/// transcript truncated to 500 characters a message — the agent is asked to
+/// write its own handoff, in the conversation it is already having.
+///
+/// Three failure classes stop existing rather than being mitigated:
+///
+///   * No transcript rendering, so no per-message truncation. It sees the
+///     actual messages, because they are its own.
+///   * No summariser schema, so there is nothing to echo back. A model that
+///     parroted the requested JSON had that stored as the session's record.
+///   * Prose rather than JSON, so there is no parse to fail. An otherwise
+///     excellent summary was being discarded over one field's shape.
+///
+/// And it knows what it was doing, because it is the thing that was doing it:
+/// its own system prompt, its notes, its todo list, and the actual decisions
+/// rather than a paraphrase of a truncated rendering of them.
+///
+/// Tools are withheld for this one call. Asked to write a handoff with tools
+/// available, a model will sometimes go and do more work instead — which is
+/// reasonable behaviour and the wrong moment for it.
+const HANDOFF_REQUEST: &str = "\
+[System: Your context is nearly full, so this conversation is about to be \
+replaced by a shorter one. Before that happens, write the handoff that your \
+own continuation will wake up to. Everything not in your handoff and not in \
+the last few messages is gone from your context — though the full transcript \
+stays on disk and you will be told where.\n\
+\n\
+Write it for yourself, not as a report for the user. Nobody is reading this \
+but you. Include, in whatever shape serves it:\n\
+\n\
+- What you are trying to accomplish, and any constraint or rule the user \
+  stated — in their words, not paraphrased. A rule you paraphrase is a rule \
+  you will break.\n\
+- Exact things: file paths, identifiers, commands, numbers, versions. A \
+  path you approximate is a path you cannot open.\n\
+- What you have already established, and what you tried that did not work \
+  and why. The second is the more valuable: without it you will repeat the \
+  attempt and mistake it for progress.\n\
+- Decisions taken and the reasoning, so they are not relitigated.\n\
+- Anything still undecided, marked as undecided rather than silently \
+  resolved.\n\
+- What you were in the middle of, precisely enough to resume mid-step.\n\
+\n\
+Be as long as the material needs. Do not call any tool; write the handoff as \
+your reply. Do not address the user, do not ask whether to continue, and do \
+not treat this as a stopping point — it is not one.]";
+
 /// What a compaction produced, and whether its summary is trustworthy.
 pub struct CompactionOutcome {
     pub history: Vec<Message>,
@@ -79,7 +176,13 @@ pub async fn perform_compaction(
     let degraded = summary_is_degraded(&summary);
     let log_path = log.path().to_string_lossy().to_string();
     let new_history =
-        rebuild_history(system_prompt, &summary, history, keep_rolling_window, &log_path);
+        rebuild_history(
+            system_prompt,
+            &summary.to_context_string(),
+            history,
+            keep_rolling_window,
+            &log_path,
+        );
 
     let messages_after = new_history.len();
     // The window is whatever came after the system prompt and the summary.
@@ -97,7 +200,7 @@ pub async fn perform_compaction(
 /// call — the ordering here is the whole behaviour, and it was wrong.
 pub(crate) fn rebuild_history(
     system_prompt: &str,
-    summary: &crate::agent::log_types::CompactionSummary,
+    summary_text: &str,
     history: &[Message],
     keep_rolling_window: bool,
     log_path: &str,
@@ -108,7 +211,7 @@ pub(crate) fn rebuild_history(
     new_history.push(Message::system(system_prompt));
 
     // 2. The summary, as something the model said.
-    new_history.push(Message::assistant(&summary.to_context_string()));
+    new_history.push(Message::assistant(summary_text));
 
     // 3. Rolling window of recent messages (skip system prompt)
     if keep_rolling_window {
@@ -1606,7 +1709,7 @@ mod continuation_tests {
     /// handoff. Reported from a live session.
     #[test]
     fn a_compacted_history_ends_by_saying_to_carry_on() {
-        let rebuilt = rebuild_history("sys", &summary(), &[], false, "/tmp/fixture/conversation.jsonl");
+        let rebuilt = rebuild_history("sys", &summary().to_context_string(), &[], false, "/tmp/fixture/conversation.jsonl");
 
         let last = rebuilt.last().expect("a rebuilt history is never empty");
         assert_eq!(last.role, "system", "the last word came from the model, not the harness");
@@ -1628,7 +1731,7 @@ mod continuation_tests {
             Message::user("do the thing"),
             Message::assistant("part way through"),
         ];
-        let rebuilt = rebuild_history("sys", &summary(), &history, true, "/tmp/fixture/conversation.jsonl");
+        let rebuilt = rebuild_history("sys", &summary().to_context_string(), &history, true, "/tmp/fixture/conversation.jsonl");
 
         assert!(
             rebuilt.len() > 3,
@@ -1822,7 +1925,7 @@ mod transcript_pointer_tests {
     #[test]
     fn the_rebuilt_history_says_where_the_transcript_is() {
         let path = "/work/.forge/sessions/20260101_000000_000/conversation.jsonl";
-        let rebuilt = rebuild_history("sys", &summary(), &[], false, path);
+        let rebuilt = rebuild_history("sys", &summary().to_context_string(), &[], false, path);
         let text: String = rebuilt
             .iter()
             .filter_map(|m| m.content.as_deref())
@@ -1844,7 +1947,7 @@ mod transcript_pointer_tests {
     /// the reason this message exists at all.
     #[test]
     fn the_carry_on_instruction_is_still_last() {
-        let rebuilt = rebuild_history("sys", &summary(), &[], false, "/tmp/x.jsonl");
+        let rebuilt = rebuild_history("sys", &summary().to_context_string(), &[], false, "/tmp/x.jsonl");
         let last = rebuilt.last().and_then(|m| m.content.as_deref()).unwrap_or_default();
         assert!(
             last.contains("middle of your work"),

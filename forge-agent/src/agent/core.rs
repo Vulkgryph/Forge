@@ -3020,9 +3020,49 @@ impl Agent {
                 // at the 80% threshold — a conversation already past the
                 // window cannot ask itself anything, and the chunked
                 // summariser below exists for exactly that.
-                let fits = self.current_context_tokens() as usize
-                    <= (self.max_context_tokens as f64 * 0.95) as usize;
-                let own_handoff = if fits {
+                // Why this did or did not happen, every time. The first
+                // version reported only the error case, so a handoff rejected
+                // for being too short, or never attempted because the gate
+                // said no, looked identical from outside to one that was
+                // never implemented — which is exactly the state this was
+                // found in.
+                let now_tokens = self.current_context_tokens() as usize;
+                let room = (self.max_context_tokens as f64 * 0.95) as usize;
+                // Too full to ask? Make room and ask anyway.
+                //
+                // Giving up here was wrong, and it meant the handoff almost
+                // never ran. Compaction triggers at 80%, but the turn that
+                // trips it adds its own content first, so by the time this
+                // code runs the context is routinely past 95% — measured at
+                // 103% on one run and 122% on another. The agent was being
+                // told it was too full to describe its own work, and a
+                // stranger summarised a truncated rendering instead, which is
+                // the worse outcome on every axis.
+                //
+                // Trimming first costs the oldest messages. The handoff is
+                // written from what remains, and what remains is the recent
+                // work — which is both the part most worth describing and the
+                // part the rolling window was going to keep anyway.
+                if now_tokens > room {
+                    let before = self.history.len();
+                    let report = fit_history_to_window(&mut self.history, room);
+                    let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                        "[Too full to write a handoff at {now_tokens} tokens against \
+                         {room} of room — dropped {} of {before} oldest messages to \
+                         make space for one.]",
+                        report.dropped
+                    )));
+                }
+                let now_tokens = self.current_context_tokens() as usize;
+                let own_handoff = if now_tokens > room {
+                    let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                        "[Still {now_tokens} tokens after trimming, against {room} of \
+                         room — the fixed cost of the system prompt and tool \
+                         definitions alone exceeds this window. Summarising instead; \
+                         raise max_context_tokens for this endpoint.]"
+                    )));
+                    None
+                } else {
                     match crate::agent::compaction::write_own_handoff(
                         &self.client,
                         &self.model_id,
@@ -3030,7 +3070,15 @@ impl Agent {
                     )
                     .await
                     {
-                        Ok(handoff) => handoff,
+                        Ok(Some(handoff)) => Some(handoff),
+                        Ok(None) => {
+                            let _ = self.event_tx.send(AgentEvent::AssistantMessage(
+                                "[The handoff came back too short to be one; \
+                                 summarising instead.]"
+                                    .to_string(),
+                            ));
+                            None
+                        }
                         Err(e) => {
                             let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
                                 "[Could not write a handoff ({e}); summarising instead]"
@@ -3038,8 +3086,6 @@ impl Agent {
                             None
                         }
                     }
-                } else {
-                    None
                 };
 
                 if let Some(handoff) = own_handoff {

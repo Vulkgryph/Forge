@@ -80,29 +80,6 @@ impl egui::util::cache::ComputerMut<(&str, usize), std::sync::Arc<Vec<Block>>> f
 
 type MdBlockCache<'a> = egui::util::cache::FrameCache<std::sync::Arc<Vec<Block>>, MdBlockComputer>;
 
-/// `max_run` is forwarded to `soft_wrap` (see its own doc comment) — applied
-/// to each piece of *display* text individually, never to the raw input as a
-/// whole. Applying it beforehand, to the whole raw markdown text, used to
-/// corrupt structural parsing: a GFM table separator row (`|---|---|---|`)
-/// is pure dashes and pipes with no whitespace at all, so any separator over
-/// `max_run` characters — routine with 4+ columns — got a zero-width space
-/// spliced into the middle of a dash run, failing the "every char is `-` or
-/// `:`" check that recognizes it as a separator at all. The whole table then
-/// silently fell back to one garbled plain-text paragraph. Wrapping only
-/// the final cell/paragraph/heading text, after structure is already parsed
-/// from the pristine original lines, fixes this at the root.
-/// Renders `text` as markdown into `ui`.
-///
-/// The parse — line classification, paragraph merging, and the
-/// `parse_inline` `LayoutJob` construction for every paragraph/list/table —
-/// is memoized per `(text, max_run)` in an egui frame cache. It used to run
-/// unconditionally every frame for every message, which scaled directly with
-/// conversation length (measured ~85ms/frame for a 1442-item conversation)
-/// and, because the chat panel repaints continuously while an agent streams,
-/// pegged a CPU core and made typing lag behind. Now only the one message
-/// whose text actually changed this frame re-parses; every stable message is
-/// a cache hit, and emit-time work is just widget layout over the already-built
-/// jobs (whose shaped `Galley`s egui caches on its own).
 /// Where a clicked link target is left for the application to collect.
 ///
 /// Stashed in egui memory rather than returned, because `render` is called
@@ -123,6 +100,33 @@ pub fn take_clicked_link(ctx: &egui::Context) -> Option<String> {
     ctx.data_mut(|d| d.remove_temp::<String>(clicked_link_slot()))
 }
 
+/// Renders `text` as markdown into `ui`.
+///
+/// The parse — line classification, paragraph merging, and the `parse_inline`
+/// `LayoutJob` construction for every paragraph/list/table — is memoized per
+/// `(text, max_run)` in an egui frame cache. It used to run unconditionally
+/// every frame for every message, which scaled directly with conversation
+/// length (measured ~85ms/frame for a 1442-item conversation) and, because the
+/// chat panel repaints continuously while an agent streams, pegged a CPU core
+/// and made typing lag behind. Now only the one message whose text actually
+/// changed this frame re-parses; every stable message is a cache hit, and
+/// emit-time work is just widget layout over the already-built jobs (whose
+/// shaped `Galley`s egui caches on its own).
+///
+/// A link the reader clicked is left in egui memory for `take_clicked_link`
+/// rather than returned — see `clicked_link_slot`.
+///
+/// `max_run` is forwarded to `soft_wrap` (see its own doc comment) — applied
+/// to each piece of *display* text individually, never to the raw input as a
+/// whole. Applying it beforehand, to the whole raw markdown text, used to
+/// corrupt structural parsing: a GFM table separator row (`|---|---|---|`)
+/// is pure dashes and pipes with no whitespace at all, so any separator over
+/// `max_run` characters — routine with 4+ columns — got a zero-width space
+/// spliced into the middle of a dash run, failing the "every char is `-` or
+/// `:`" check that recognizes it as a separator at all. The whole table then
+/// silently fell back to one garbled plain-text paragraph. Wrapping only
+/// the final cell/paragraph/heading text, after structure is already parsed
+/// from the pristine original lines, fixes this at the root.
 pub fn render(ui: &mut egui::Ui, text: &str, max_run: usize) {
     let blocks = ui.memory_mut(|mem| {
         mem.caches.cache::<MdBlockCache<'_>>().get((text, max_run))
@@ -611,24 +615,24 @@ mod link_tests {
     /// The reported case, verbatim from the agent panel.
     ///
     /// A link to a file rendered as the whole of
-    /// `[language design directive](CascadeProjects/.../vulkgryph-design-directive.md)`
+    /// `[language design directive](specs/language-design-directive.md)`
     /// in the middle of a sentence, because the inline parser knew only bold
     /// and code and everything else fell through to literal text.
     #[test]
     fn a_link_renders_as_its_text() {
         let (label, target, took) = parse_link(
-            "[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md) says",
+            "[language design directive](specs/language-design-directive.md) says",
         )
         .expect("that is a link");
         assert_eq!(label, "language design directive");
         assert_eq!(
             target,
-            "CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md"
+            "specs/language-design-directive.md"
         );
         // Everything up to and including the closing paren.
         assert_eq!(
             took,
-            "[language design directive](CascadeProjects/Bastion_Vulkgryph/specs/vulkgryph-design-directive.md)".len()
+            "[language design directive](specs/language-design-directive.md)".len()
         );
     }
 

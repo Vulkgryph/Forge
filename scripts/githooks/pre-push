@@ -1,0 +1,60 @@
+#!/bin/bash
+# Refuses a push that would publish an identity.
+#
+# This is the last moment anything is still private, and the only check that has
+# the two things CI cannot: this machine (its home directory and account name)
+# and .git/private-names, the untracked list of names worth protecting. CI sees
+# neither — a runner's identity is not ours — so it can only apply the generic
+# rule. Both halves are needed.
+#
+# It also scans commit *messages*, which nothing ever did. A username leaked
+# into this repository twice, and the second time was in the message of the very
+# commit that removed the first one. A check on files alone would have passed it.
+#
+# Enabled per clone, since hooks are not part of a checkout:
+#     git config core.hooksPath scripts/githooks
+# Bypass for a single push, when you have looked and it is a false positive:
+#     git push --no-verify
+set -uo pipefail
+
+repo="$(git rev-parse --show-toplevel)"
+checker="$repo/scripts/check_private.py"
+[ -f "$checker" ] || exit 0   # not this repo's concern
+
+remote_sha_is_empty() { [ "$1" = "0000000000000000000000000000000000000000" ]; }
+
+status=0
+# stdin carries one line per ref being pushed: <local ref> <local sha> <remote ref> <remote sha>
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    # A deletion has nothing to inspect.
+    [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+
+    if remote_sha_is_empty "$remote_sha"; then
+        # A branch the remote has never seen. Everything on it that is not
+        # already published is new, so compare against every other remote ref
+        # rather than treating the whole history as new — that would re-scan
+        # hundreds of already-public commits on every first push of a branch.
+        range="$local_sha --not $(git for-each-ref --format='%(objectname)' refs/remotes 2>/dev/null | tr '\n' ' ')"
+        [ -z "$(git for-each-ref refs/remotes 2>/dev/null)" ] && range="$local_sha"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    if ! /usr/bin/python3 "$checker" --messages "$range"; then
+        status=1
+    fi
+done
+
+# The working tree as it stands, with this machine's identity in play. CI runs
+# the same scan without it.
+if ! /usr/bin/python3 "$checker" --tracked; then
+    status=1
+fi
+
+if [ "$status" != 0 ]; then
+    echo
+    echo "!!! push refused: something above would publish an identity."
+    echo "    Fix it, or 'git push --no-verify' if you have looked and it is wrong."
+    echo "    A name that should always be refused goes in .git/private-names."
+fi
+exit "$status"

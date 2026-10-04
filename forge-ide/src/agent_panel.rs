@@ -18,7 +18,7 @@ fn default_true() -> bool { true }
 ///    end user's `.app` actually lives, not baked in at compile time (same
 ///    reasoning as MoltenVK's own path resolution in `gfx.rs`).
 /// 2. The monorepo's shared workspace `target/{release,debug}/forge-agent`,
-///    relative to this crate's own manifest dir — dev convenience for
+///    relative to this crate's own manifest dir. Debug builds only — dev
 ///    `cargo run`/`./target/debug/forge-ide` inside the source checkout.
 /// 3. Bare `"forge-agent"`, resolved via `PATH` — for a separate install
 ///    (forge's own `install.sh`) with no bundled copy alongside this binary.
@@ -32,9 +32,22 @@ pub(crate) fn resolve_forge_agent_path() -> std::ffi::OsString {
         }
     }
 
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(manifest.join("../target/release").join(&binary));
-    candidates.push(manifest.join("../target/debug").join(&binary));
+    // Debug builds only. `env!("CARGO_MANIFEST_DIR")` is an absolute path on
+    // whichever machine compiled this, baked in as a string literal — so in a
+    // release binary it publishes the builder's account and checkout layout to
+    // anyone who runs `strings`. The 0.6.0 disk image shipped exactly that.
+    //
+    // Nothing is lost by dropping it from release builds: a release binary run
+    // from inside the checkout finds forge-agent beside its own executable
+    // (candidate 1 — both land in target/release), and an installed one finds it
+    // on PATH (candidate 3). This fallback only ever helped a debug binary reach
+    // a release-built agent, or the reverse.
+    #[cfg(debug_assertions)]
+    {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        candidates.push(manifest.join("../target/release").join(&binary));
+        candidates.push(manifest.join("../target/debug").join(&binary));
+    }
 
     candidates.into_iter()
         .find(|p| p.is_file())

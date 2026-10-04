@@ -19,7 +19,23 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
 # forge-ide is a member of the monorepo's shared workspace, not its own
 # workspace root - build output lands one level up, at the workspace root's
 # target/, not a local ide/target/.
-BUILD_DIR="../target/release"
+# Compile somewhere that names nobody.
+#
+# --remap-path-prefix fixes panic locations, but it cannot touch a path a build
+# script bakes in as ordinary data. openssl-sys compiles OpenSSL from source and
+# records its install directory — which lives under the target dir — so the
+# 0.6.0 binary shipped two copies of
+# `/Users/<username>/CascadeProjects/<project>/target/release/build/openssl-sys-*/out/...`,
+# publishing the checkout layout as well as the account. No compile flag removes
+# those; the only fix is for the directory itself to be anonymous.
+#
+# A side benefit: release builds use different RUSTFLAGS from dev builds, and
+# sharing one target dir meant each kind of build invalidated the other's cache.
+# They no longer fight.
+export CARGO_TARGET_DIR="${FORGE_RELEASE_TARGET_DIR:-/private/var/tmp/forge-release-build}"
+BUILD_DIR="$CARGO_TARGET_DIR/release"
+# The .app itself stays beside the checkout — its path is never compiled into
+# anything, and sign_notarize_dmg.sh looks for it here.
 OUT_DIR="../target/dist"
 APP="$OUT_DIR/$APP_NAME.app"
 
@@ -113,41 +129,40 @@ done
 # fails silently — the build succeeds and the binary ships the paths anyway.
 # That is exactly how 0.6.0 went out, so the flags are not trusted: the binaries
 # are read back and packaging stops before anything is signed or published.
+#
+# The same check reads the source tree in CI and commit messages in the pre-push
+# hook, out of one list of names — scripts/check_private.py. One list on purpose:
+# each leak this was written for slipped past a check covering a different
+# surface, and a second copy of the patterns here is how they drift apart again.
 echo "==> Checking no binary names the build machine"
-HOME_USER="$(basename "$HOME_DIR")"
-NAMES=(-e "$HOME_DIR")
-# A short home-directory name ("dev", "ci") would match far too much to mean
-# anything; the path above still covers it.
-[ "${#HOME_USER}" -gt 3 ] && NAMES+=(-e "$HOME_USER")
-[ "$(id -un)" != "$HOME_USER" ] && NAMES+=(-e "$(id -un)")
-leaks=0
-check_anonymous() {
-    local f="$1" found
-    [ -f "$f" ] || return 0
-    found=$(LC_ALL=C strings -n 6 "$f" 2>/dev/null | grep -F "${NAMES[@]}" | sort -u || true)
-    [ -z "$found" ] && return 0
-    echo "!!! $f names the build machine:"
-    printf '%s\n' "$found" | head -3 | sed 's/^/        /'
-    leaks=$((leaks + 1))
-}
+CHECKER="../scripts/check_private.py"
+if [ ! -f "$CHECKER" ]; then
+    # Not a soft skip. A missing check that warns and carries on is
+    # indistinguishable from a passing one by the time anyone reads the log, and
+    # this step is what stands between a home directory and a download.
+    echo "!!! $CHECKER is missing — cannot verify the binaries are anonymous."
+    echo "    Refusing to package rather than publish unchecked artifacts."
+    exit 1
+fi
+ARTIFACTS=()
 for exe in forge-ide forge-agent forge-server forge-tui-rs; do
-    check_anonymous "$BUILD_DIR/$exe"
+    [ -f "$BUILD_DIR/$exe" ] && ARTIFACTS+=("$BUILD_DIR/$exe")
 done
 for target in $REMOTE_TARGETS; do
     for crate in $REMOTE_CRATES; do
-        check_anonymous "../target/$target/release/$crate"
+        [ -f "$CARGO_TARGET_DIR/$target/release/$crate" ] \
+            && ARTIFACTS+=("$CARGO_TARGET_DIR/$target/release/$crate")
     done
 done
-if [ "$leaks" != "0" ]; then
+if ! /usr/bin/python3 "$CHECKER" --artifacts "${ARTIFACTS[@]}"; then
     echo
-    echo "!!! $leaks binary/binaries would publish the path of the machine that"
-    echo "    built them. Nothing has been signed. Panic locations are string"
-    echo "    literals that \`strip\` does not remove — check the"
-    echo "    --remap-path-prefix flags above still match this machine's layout"
-    echo "    (HOME=$HOME_DIR), then build again."
+    echo "!!! the binaries above would publish the machine that built them."
+    echo "    Nothing has been signed. Panic locations are string literals that"
+    echo "    \`strip\` does not remove, and a path baked in by a build script is"
+    echo "    not a compile flag's to fix — check the --remap-path-prefix flags"
+    echo "    and CARGO_TARGET_DIR further up, then build again."
     exit 1
 fi
-echo "    clean"
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
@@ -175,7 +190,7 @@ done
 for target in $REMOTE_TARGETS; do
   arch="${target%%-*}"
   for crate in $REMOTE_CRATES; do
-    remote="../target/$target/release/$crate"
+    remote="$CARGO_TARGET_DIR/$target/release/$crate"
     if [ -f "$remote" ]; then
       cp "$remote" "$APP/Contents/Resources/$crate-$arch"
     fi

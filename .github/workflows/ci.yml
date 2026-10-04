@@ -130,22 +130,25 @@ jobs:
       # Shell syntax only — running the installer would write into the runner's
       # home directory and fetch a toolchain. Catches the class of mistake that
       # breaks `install.sh` for everyone while every test still passes.
-      # A home directory in the documentation is somebody's username published
-      # on a public repository, and an instruction that works on exactly one
-      # machine. `%USERPROFILE%`, `$HOME` or a relative path is always what was
-      # meant.
+      # A home directory anywhere public is somebody's username published on a
+      # public repository, and an instruction that works on exactly one machine.
+      # `%USERPROFILE%`, `$HOME` or a relative path is always what was meant.
       #
-      # Prose and scripts, not source: tests use paths like /home/sysadmin and
-      # /Users/someone as deliberate placeholders, and a check that shouted
-      # about those would be switched off inside a week. Platform docs and
-      # installers are where this actually happens, because they get written by
-      # running real commands on a real machine.
-      - name: No home directories in the documentation
-        run: |
-          if git grep -nIE 'C:\\Users\\|/Users/[A-Za-z]|/home/[A-Za-z]' -- '*.md' '*.ps1' '*.sh' '*.cmd'; then
-            echo "::error::a home directory is published above; use %USERPROFILE%, \$HOME or a relative path"
-            exit 1
-          fi
+      # This replaced a grep over '*.md' '*.ps1' '*.sh' '*.cmd'. That was limited
+      # to prose on the reasoning that source legitimately contains paths like
+      # /Users/someone and /home/sysadmin as placeholders, and a check that
+      # shouted about those would be switched off inside a week. The reasoning
+      # was right and was also the hole: a machine path reached a test from a
+      # pasted bug report, in a file the grep never looked at. check_private.py
+      # knows which names are placeholders, so it can afford to read everything.
+      #
+      # A runner has no developer identity to match against, so what works here
+      # is the generic rule — any /Users/<name> or C:\Users\<name> that is not a
+      # known placeholder, which catches a contributor's path as well as ours.
+      # The identity-specific half runs in the pre-push hook, where this machine
+      # and .git/private-names are available.
+      - name: Nobody's home directory or name in the tree
+        run: python3 scripts/check_private.py --tracked
 
       # Facts, not chores. A rule of the form "you touched this directory, now
       # edit its README" fires on typo fixes and refactors, and the way people

@@ -4,6 +4,24 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- **The released disk image named the account that built it, about nine hundred times.** `strings` on any of 0.6.0's three binaries returned the absolute path of every dependency file that can panic — 570 in `forge-ide`, 326 in `forge-agent`, 26 in `forge-server`. Counted in the published artifact, not inferred from the source.
+
+  `strip = true` has been set in the release profile the whole time and does nothing about it. A panic site — `panic!`, `unwrap`, `expect`, a slice index — stores its source location in `.rodata` as a string literal for `core::panic::Location` to point at. That is program data, not debug info. Cargo compiles a registry dependency by its absolute path, because `~/.cargo/registry` is outside the workspace, so every one of those literals carries the builder's home directory. Workspace members are compiled by relative path, which is why the project's own files never appeared.
+
+  Fixed with `--remap-path-prefix`, so a panic now reports `crates/anyhow-1.0.104/src/error.rs` — which still says which dependency and which line, and names nobody. The catch-all rule is listed first because rustc applies the *last* matching prefix, not the first.
+
+- **Two further paths that no compile flag could reach.** The artifact check caught what the flag could not: `forge-ide` also carried the checkout's own location three times. One came from `env!("CARGO_MANIFEST_DIR")` in the dev-only fallback that locates `forge-agent`; an environment variable is not a source path, so remapping never touched it, and it is now compiled only into debug builds — a release binary finds the agent beside its own executable or on `PATH`. The other two came from `openssl-sys`, which compiles OpenSSL and records its install directory as ordinary data. Release builds therefore compile into a target directory outside `$HOME`, which also stops release and dev builds invalidating each other's cache through `RUSTFLAGS`.
+
+  Both published images were rebuilt from their own tags, verified by downloading what is now served, and remain signed and notarized.
+
+### Added
+
+- **`scripts/check_private.py` — one list of names, every surface that can publish one.** Three identities leaked out of this repository, and each got past a check that was looking somewhere else: a check on prose missed a machine path in a test, and nothing had ever read a commit message or a build artifact. A username leaked twice, the second time in the message of the commit that removed the first.
+
+  CI reads the tracked tree, the `pre-push` hook reads commit messages and refuses the push, and packaging reads the built binaries before anything is signed. The names cannot be stored here — a list of protected names in a public repository is the leak — so they come from the machine itself and from `.git/private-names`, a file that cannot be committed because `.git` is not part of a tree. Placeholders like `/Users/someone` are recognised, which is what lets this read source rather than prose only. See [CONTRIBUTING](../CONTRIBUTING.md).
+
 ### Removed
 
 - **The hand-written Vulkan renderer is gone.** `gfx.rs` and `egui_pass.rs` — 1,421 lines — plus the SPIR-V shaders, the `vulkan-renderer` feature, and the `ash`, `ash-window` and `shaderc` dependencies.

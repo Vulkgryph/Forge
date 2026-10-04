@@ -58,7 +58,29 @@ everything at once.
 - That `NOTICE` names every licence in the shipped dependency graph that is not MIT or Apache-2.0 — a new dependency with unusual terms fails the build rather than waiting for an audit
 - That documentation links resolve to a file that exists (vendored trees excluded; the checker strips `#fragments`, so anchors are not machine-verified)
 - On Windows: the protocol, search and the terminal client run their full suites, and the agent builds and runs its provider fault matrix — not its unit tests. That much gates. The editor **is** built there, but as a `continue-on-error` step that cannot fail the build, so a Windows regression in `forge-ide` will still not be caught by CI.
-- That no documentation or installer script contains a home directory. `%USERPROFILE%`, `$HOME` or a relative path instead — an absolute path through someone's home publishes their username and only works on their machine.
+- That no file in the tree names anybody's home directory — `scripts/check_private.py --tracked`. `%USERPROFILE%`, `$HOME` or a relative path instead: an absolute path through someone's home publishes their username and only works on their machine. Placeholders (`/Users/someone`, `/home/sysadmin`, `C:\Users\<username>`) are recognised and allowed, which is why this can read source and not only prose.
+
+## Keeping names and machines out of what we publish
+
+Four things can carry an identity out of here, and the same checker covers all of them from one list of names:
+
+| surface | what runs it |
+| --- | --- |
+| the tracked tree | CI, on every push and pull request |
+| commit messages | the `pre-push` hook |
+| release binaries | `package_macos.sh`, before anything is signed |
+
+**Enable the hook once per clone** — hooks are not part of a checkout:
+
+```sh
+git config core.hooksPath scripts/githooks
+```
+
+It refuses a push that would publish a home directory or a name, and scans commit messages as well as files. A username leaked here twice; the second time was in the message of the very commit that removed the first, so files alone are not enough. `git push --no-verify` overrides it when you have looked and it is wrong.
+
+**Names that must never appear** go in `.git/private-names`, one per line. That path is deliberate: `.git` is never part of a commit, so the list cannot itself become the leak — which a list of protected names checked into a public repository would be. CI has no such file and no developer identity to compare against, so it applies the generic rule only; the identity-specific half is the hook's job.
+
+**A release binary is not covered by reading the source.** Every `panic!`, `unwrap` and slice index stores its source location in `.rodata` as a string literal for `core::panic::Location`, and `strip` does not remove them — the 0.6.0 disk image shipped about nine hundred copies of the builder's home path. `--remap-path-prefix` fixes those. It does **not** fix a path that arrives as data rather than as a source location: `env!("CARGO_MANIFEST_DIR")` and anything a build script bakes in (openssl-sys records its install directory) are ordinary strings. Those need the compile-time paths themselves to be anonymous, which is why release builds use a target directory outside `$HOME`. If you add a dependency that compiles native code, the packaging guard is what will tell you.
 
 ## House rules
 

@@ -23,6 +23,40 @@ BUILD_DIR="../target/release"
 OUT_DIR="../target/dist"
 APP="$OUT_DIR/$APP_NAME.app"
 
+# Keep the machine this was built on out of what gets published.
+#
+# `strip = true` in the release profile does not do it. Every panic site —
+# `panic!`, `unwrap`, `expect`, a slice index — stores its source location as a
+# string literal in .rodata for `core::panic::Location` to point at. That is
+# program data, not debug info, so stripping does not touch it, and a build from
+# a checkout under a home directory ships the absolute path of every dependency
+# file that can panic. The 0.6.0 disk image carries about nine hundred of them
+# across its three binaries; `strings` is all it takes to read them.
+#
+# Set here rather than in Cargo.toml because the profile key for it
+# (`trim-paths`) is still unstable as of Cargo 1.97, and rustflags cannot be
+# scoped to a profile — putting these in .cargo/config.toml would remap debug
+# builds too and stop a debugger finding dependency sources.
+#
+# Appended, not assigned: RUSTFLAGS is one string that replaces rather than
+# merges, so overwriting an inherited value (CI sets `-D warnings`) would
+# quietly change what is being built.
+HOME_DIR="${HOME%/}"
+WORKSPACE="$(cd .. && pwd)"
+# The catch-all goes FIRST because rustc applies the last matching prefix, not
+# the first — it walks the list in reverse. So this is the fallback: anything
+# under the home directory that the specific rules below do not name still has
+# the username replaced, and a dependency vendored or patched from somewhere
+# unanticipated cannot leak one just by not having been thought of.
+REMAP=" --remap-path-prefix=$HOME_DIR/=home/"
+# Then the specific cases, which override it to something a person reading a
+# panic report can act on: `crates/serde-1.0/src/de.rs` says which dependency
+# and which line, and names nobody.
+REMAP="$REMAP --remap-path-prefix=$HOME_DIR/.cargo/registry/src/=crates/"
+REMAP="$REMAP --remap-path-prefix=$HOME_DIR/.rustup/toolchains/=rust/"
+REMAP="$REMAP --remap-path-prefix=$WORKSPACE/=./"
+export RUSTFLAGS="${RUSTFLAGS:-}$REMAP"
+
 echo "==> Building release binary"
 cargo build --release
 
@@ -74,6 +108,46 @@ for target in $REMOTE_TARGETS; do
     fi
   done
 done
+
+# The remapping above is a compile flag, and a compile flag that stops working
+# fails silently — the build succeeds and the binary ships the paths anyway.
+# That is exactly how 0.6.0 went out, so the flags are not trusted: the binaries
+# are read back and packaging stops before anything is signed or published.
+echo "==> Checking no binary names the build machine"
+HOME_USER="$(basename "$HOME_DIR")"
+NAMES=(-e "$HOME_DIR")
+# A short home-directory name ("dev", "ci") would match far too much to mean
+# anything; the path above still covers it.
+[ "${#HOME_USER}" -gt 3 ] && NAMES+=(-e "$HOME_USER")
+[ "$(id -un)" != "$HOME_USER" ] && NAMES+=(-e "$(id -un)")
+leaks=0
+check_anonymous() {
+    local f="$1" found
+    [ -f "$f" ] || return 0
+    found=$(LC_ALL=C strings -n 6 "$f" 2>/dev/null | grep -F "${NAMES[@]}" | sort -u || true)
+    [ -z "$found" ] && return 0
+    echo "!!! $f names the build machine:"
+    printf '%s\n' "$found" | head -3 | sed 's/^/        /'
+    leaks=$((leaks + 1))
+}
+for exe in forge-ide forge-agent forge-server forge-tui-rs; do
+    check_anonymous "$BUILD_DIR/$exe"
+done
+for target in $REMOTE_TARGETS; do
+    for crate in $REMOTE_CRATES; do
+        check_anonymous "../target/$target/release/$crate"
+    done
+done
+if [ "$leaks" != "0" ]; then
+    echo
+    echo "!!! $leaks binary/binaries would publish the path of the machine that"
+    echo "    built them. Nothing has been signed. Panic locations are string"
+    echo "    literals that \`strip\` does not remove — check the"
+    echo "    --remap-path-prefix flags above still match this machine's layout"
+    echo "    (HOME=$HOME_DIR), then build again."
+    exit 1
+fi
+echo "    clean"
 
 echo "==> Assembling $APP"
 rm -rf "$APP"

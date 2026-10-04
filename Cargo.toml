@@ -27,6 +27,19 @@ winit = { path = "forge-ide/vendor/winit-0.30.13" }
 [profile.release]
 strip = true
 lto   = true
+# `strip = true` above is not enough to keep the build machine out of the
+# binary: every `panic!`, `unwrap`, and `expect` bakes its source location into
+# .rodata as a string literal for `core::panic::Location` to point at, which is
+# program data rather than debug info, so stripping leaves it untouched. Built
+# from a checkout under a home directory, the result ships the absolute path of
+# every dependency file that can panic.
+#
+# The profile key for this (`trim-paths`) is still unstable as of Cargo 1.97, so
+# the remapping is applied as rustflags by forge-ide/scripts/package_macos.sh,
+# which is what builds anything we publish. It is deliberately not set here or
+# in .cargo/config.toml: rustflags cannot be scoped to a profile, and remapping
+# debug builds too would stop a debugger finding dependency sources. If
+# `trim-paths` stabilizes, it belongs here and the script's flags can go.
 
 [profile.release.package.forge-server]
 opt-level = "z"

@@ -24,6 +24,11 @@ Usage:
     check_private.py --messages <range>      # e.g. origin/main..HEAD
     check_private.py --artifacts <path>...
     check_private.py --all <range>           # everything, for a pre-push hook
+    check_private.py --history               # every revision ever, for an audit
+
+`--tracked` reads the tree as it stands, which is what CI and the hook need and
+is not an audit: a path deleted in a later commit stays in the history forever
+and `--tracked` cannot see it. `--history` is the one that can.
 
 Exits non-zero when something would carry an identity out, and prints what and
 where.
@@ -43,6 +48,11 @@ PLACEHOLDERS = {
     "someone", "me", "you", "user", "username", "<username>", "youruser",
     "your-user", "yourname", "sysadmin", "runner", "ci", "root", "test",
     "tester", "example", "home", "forge", "dev", "build", "builder", "admin",
+    # Metasyntactic: `/Users/<name>`, `C:\Users\<account>`. These appear in the
+    # documentation *of this check*, which is how the omission was found — it
+    # flagged its own explanation. A check whose first finding is a false
+    # positive in its own docs is a check someone switches off.
+    "name", "login", "account", "whoami", "someuser", "person",
 }
 
 # A home directory on any of the three platforms, with whoever it belongs to
@@ -174,6 +184,67 @@ def scan_tracked(scanner: Scanner, repo: Path) -> None:
             scanner.inspect(f"{name}:{n}", line)
 
 
+def scan_history(scanner: Scanner, repo: Path) -> tuple[int, int]:
+    """Every version of every file ever committed, plus every commit message.
+
+    The audit mode, and the one the other modes cannot stand in for: `--tracked`
+    reads the tree as it is now, so anything removed in a later commit is
+    invisible to it while remaining in the history forever. A file that was
+    fixed is not a file that was never wrong.
+
+    Returns (blobs read, messages read) so a clean result can be shown to have
+    actually looked at something.
+    """
+    listing = subprocess.run(
+        ["git", "rev-list", "--objects", "--all"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    )
+    # Lines are "<sha> <path>" for blobs and trees; commits have no path. Keying
+    # by sha means identical content across a hundred revisions is read once.
+    wanted: dict[str, str] = {}
+    for line in listing.stdout.splitlines():
+        sha, _, path = line.partition(" ")
+        if not path:
+            continue
+        parts = Path(path).parts
+        if SKIP_DIRS.intersection(parts) or Path(path).name in SKIP_FILES:
+            continue
+        wanted.setdefault(sha, path)
+
+    if wanted:
+        # Binary mode throughout: a blob is bytes, and decoding the whole batch
+        # as text would corrupt every binary one and mangle the byte offsets the
+        # header sizes refer to. So `input` has to be bytes as well.
+        batch = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=repo, input=("\n".join(wanted) + "\n").encode("ascii"),
+            capture_output=True, check=True,
+        )
+        raw, pos = batch.stdout, 0
+        while pos < len(raw):
+            nl = raw.find(b"\n", pos)
+            if nl == -1:
+                break
+            header = raw[pos:nl].decode("ascii", errors="replace").split()
+            pos = nl + 1
+            if len(header) < 3:
+                continue
+            sha, kind, size = header[0], header[1], int(header[2])
+            body, pos = raw[pos:pos + size], pos + size + 1
+            if kind != "blob":
+                continue
+            if b"\0" in body[:8192]:
+                for run in printable_runs(body):
+                    scanner.inspect(f"{wanted[sha]} @{sha[:9]} (binary)", run)
+                continue
+            text = body.decode("utf-8", errors="replace")
+            for n, line in enumerate(text.splitlines(), 1):
+                scanner.inspect(f"{wanted[sha]}:{n} @{sha[:9]}", line)
+
+    messages = scan_messages(scanner, repo, "--all")
+    return len(wanted), messages
+
+
 def scan_messages(scanner: Scanner, repo: Path, rev_range: str) -> int:
     out = subprocess.run(
         ["git", "log", "--format=%H%x00%B%x00", rev_range],
@@ -246,6 +317,9 @@ def main() -> int:
         rev_range = argv[1] if len(argv) > 1 else "origin/main..HEAD"
         n = scan_messages(scanner, repo, rev_range)
         print(f"    {n} commit message(s) in {rev_range}")
+    if mode == "--history":
+        blobs, messages = scan_history(scanner, repo)
+        print(f"    {blobs} distinct file version(s) and {messages} commit message(s)")
     if mode == "--artifacts":
         for name in argv[1:]:
             path = Path(name)

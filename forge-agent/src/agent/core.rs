@@ -1383,10 +1383,18 @@ impl Agent {
     async fn process_turn(&mut self) -> Result<()> {
         self.refresh_notes();
         const MAX_CONSECUTIVE_SAME_TOOL: usize = 100;
+        // Where the *correction* happens. The stop above is a backstop, not the
+        // intervention: by a hundred identical calls the work is long lost, and
+        // stopping is all that is left. Ten is past any accident and early
+        // enough that saying something can still change the outcome — the same
+        // reasoning as the `consecutive_shell_runs` nudge, which fires at three.
+        const LOOP_NUDGE_AT: usize = 10;
         const MAX_TOOLLESS_INTENT_RETRIES: usize = 1;
         const NETWORK_RETRY_DELAYS_SECS: [u64; 10] = [1, 1, 1, 2, 4, 10, 20, 20, 45, 60];
         let mut last_tool_signature: Option<String> = None;
         let mut consecutive_count: usize = 0;
+        // One correction per run of identical calls, not one per call.
+        let mut loop_nudged = false;
         let mut toolless_intent_retries: usize = 0;
         let mut network_retry_index: usize = 0;
 
@@ -1777,17 +1785,57 @@ impl Agent {
                     } else {
                         last_tool_signature = Some(signature);
                         consecutive_count = 1;
+                        loop_nudged = false;
+                    }
+
+                    // Tell the model, in history where it can act on it. The
+                    // call still runs: the point is to change the next decision,
+                    // not to refuse this one, and a tool that is legitimately
+                    // repeated should not start failing because of a count.
+                    if consecutive_count >= LOOP_NUDGE_AT && !loop_nudged {
+                        loop_nudged = true;
+                        self.history.push(Message::system(&format!(
+                            "[System: `{}` has now been called {} times in a row with \
+                             byte-identical arguments. A tool given the same input returns \
+                             the same output, so the next call cannot tell you anything the \
+                             last one did not — whatever you are waiting to change will not. \
+                             Change the approach instead: re-read the previous result in case \
+                             the answer is already in it, vary the arguments, use a different \
+                             tool, delegate_task for a fresh perspective, or ask_question if \
+                             this needs something only the user knows. If you are polling for \
+                             background work, you do not need to — completions are delivered \
+                             to you automatically when they finish.]",
+                            tc.function.name, consecutive_count
+                        )));
                     }
 
                     if consecutive_count >= MAX_CONSECUTIVE_SAME_TOOL {
-                        let _ = self.event_tx.send(AgentEvent::AssistantMessage(
-                            format!(
-                                "[Loop detected: {} called {} times consecutively with same args. Stopping.]",
-                                tc.function.name, consecutive_count
-                            ),
-                        ));
+                        let reason = format!(
+                            "Stopped: `{}` was called {} times in a row with identical \
+                             arguments, including after a correction saying the result would \
+                             not change. The turn was ended rather than left to spend the \
+                             budget on a call with no new information in it.",
+                            tc.function.name, consecutive_count
+                        );
+                        // Nothing after this point in the turn runs — not the
+                        // remaining tools, not the delegate_tasks below — so
+                        // every call in this message is answered here. An
+                        // unanswered tool_use makes the *next* request invalid
+                        // (compaction.rs documents the same rule), and the
+                        // failure surfaces as a provider error that says
+                        // nothing about looping.
+                        self.answer_unanswered_tool_calls(tool_calls, &reason);
+                        // In history too, not only as an event: an event is
+                        // drawn for the user and then gone, so a model resuming
+                        // this conversation had no idea why it was cut off.
+                        self.history.push(Message::system(&format!("[System: {reason}]")));
+                        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                            "[Loop detected: {} called {} times consecutively with the same \
+                             arguments. Stopping.]",
+                            tc.function.name, consecutive_count
+                        )));
                         self.withdraw_refused_pages("the turn ended");
-                let _ = self.event_tx.send(AgentEvent::Done);
+                        let _ = self.event_tx.send(AgentEvent::Done);
                         return Ok(());
                     }
 
@@ -3219,6 +3267,25 @@ impl Agent {
     fn count_tool_call(&mut self) -> bool {
         self.total_tool_calls += 1;
         self.total_tool_calls % 50 == 0 && self.depth == 0
+    }
+
+    /// Give every call in `tool_calls` a result it does not already have.
+    ///
+    /// Returning from the middle of the tool loop cannot simply walk away. The
+    /// assistant message carrying these calls is already in history, and a
+    /// `tool_use` with no matching `tool_result` makes the conversation invalid
+    /// for the next request — compaction.rs drops orphaned results for the same
+    /// reason. The calls still queued, and the delegate_tasks that run after the
+    /// loop, would all be left unanswered.
+    fn answer_unanswered_tool_calls(&mut self, tool_calls: &[ToolCall], reason: &str) {
+        let pending: Vec<Message> = unanswered_tool_calls(&self.history, tool_calls)
+            .into_iter()
+            .map(|tc| Message::tool_result(&tc.id, &tc.function.name, reason))
+            .collect();
+        for msg in pending {
+            let _ = self.log.log_message(&msg);
+            self.history.push(msg);
+        }
     }
 
     /// Inject a periodic review system message into history.
@@ -5557,9 +5624,82 @@ Rules:
     )
 }
 
+/// Which of `tool_calls` have no `tool_result` in `history` yet.
+///
+/// Split out from the method so it can be tested without standing up an agent,
+/// a client and an event channel to ask one question about two slices.
+fn unanswered_tool_calls<'a>(history: &[Message], tool_calls: &'a [ToolCall]) -> Vec<&'a ToolCall> {
+    let answered: std::collections::HashSet<&str> =
+        history.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    tool_calls
+        .iter()
+        .filter(|tc| !answered.contains(tc.id.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: crate::api::types::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    /// The defect this exists for: the loop-detector's stop path returned from
+    /// the middle of the tool loop, so the call that tripped it, the calls still
+    /// queued behind it, and the delegate_tasks that run after the loop all went
+    /// unanswered. The assistant message naming them is already in history, and
+    /// a tool_use with no tool_result makes the next request invalid — so the
+    /// turn after a detected loop failed with a provider error that said nothing
+    /// about looping.
+    #[test]
+    fn a_call_with_no_result_is_reported_as_unanswered() {
+        let calls = vec![call("a", "read_file"), call("b", "run_shell"), call("c", "delegate_task")];
+        let history = vec![
+            Message::assistant_with_tools(None, calls.clone()),
+            Message::tool_result("a", "read_file", "contents"),
+        ];
+        let pending: Vec<&str> =
+            unanswered_tool_calls(&history, &calls).iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(pending, vec!["b", "c"], "only the unanswered ones");
+    }
+
+    /// And the discriminating half: a turn that answered everything must not
+    /// have results invented for it. A function that returned every call would
+    /// pass the test above and corrupt every normal turn.
+    #[test]
+    fn a_fully_answered_turn_has_nothing_pending() {
+        let calls = vec![call("a", "read_file"), call("b", "run_shell")];
+        let history = vec![
+            Message::assistant_with_tools(None, calls.clone()),
+            Message::tool_result("a", "read_file", "contents"),
+            Message::tool_result("b", "run_shell", "done"),
+        ];
+        assert!(unanswered_tool_calls(&history, &calls).is_empty());
+    }
+
+    /// Results from earlier in the same conversation answer their own calls and
+    /// must not be read as answering this message's.
+    #[test]
+    fn an_earlier_turns_result_does_not_answer_this_turns_call() {
+        let earlier = vec![call("old", "read_file")];
+        let now = vec![call("new", "read_file")];
+        let history = vec![
+            Message::assistant_with_tools(None, earlier.clone()),
+            Message::tool_result("old", "read_file", "contents"),
+            Message::assistant_with_tools(None, now.clone()),
+        ];
+        let pending: Vec<&str> =
+            unanswered_tool_calls(&history, &now).iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(pending, vec!["new"]);
+    }
 
     #[test]
     fn prompt_heuristic_ignores_file_line_colons() {

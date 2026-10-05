@@ -233,7 +233,19 @@ jobs:
       - name: Bootstrap references paths that exist
         run: bash scripts/test_bootstrap_paths.sh
 
+      # Release builds normally compile outside $HOME so that paths a build
+      # script bakes into a binary — openssl-sys records its install directory —
+      # cannot name whoever built it. On a runner that is both unnecessary and
+      # expensive: a runner's identity is `runner`, a placeholder that leaks
+      # nothing, and nothing built here is ever published. Pointing it back at
+      # the workspace keeps rust-cache working, which it cannot do for a
+      # directory outside the checkout — otherwise this job becomes a cold LTO
+      # release build on every run.
+      #
+      # The anonymity guard inside the script still runs, and still gates.
       - name: Package the app bundle
+        env:
+          FORGE_RELEASE_TARGET_DIR: ${{ github.workspace }}/target
         run: bash forge-ide/scripts/package_macos.sh
 
       - name: The bundle contains what it claims to

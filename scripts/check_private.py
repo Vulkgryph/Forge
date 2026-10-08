@@ -76,6 +76,24 @@ SKIP_DIRS = {"vendor", "target", ".git", "node_modules"}
 SKIP_FILES = {"Cargo.lock", "package-lock.json"}
 
 
+def names_a_placeholder(literal: str) -> bool:
+    """Whether `literal` identifies nobody, and so must not be matched on.
+
+    A bare name is checked directly. A path is judged by its last component,
+    which is the part that names a person: `/Users/runner` is a CI runner's home
+    directory and belongs to no one, but only the `runner` inside it says so.
+
+    Without this the guard failed on GitHub's macOS runner. $HOME there is
+    `/Users/runner`, the release build compiles under it, and a path baked in by
+    a build script therefore contains it — so packaging refused to sign over a
+    path that identifies a throwaway VM. A check whose first failure is a false
+    positive is a check somebody turns off, which is the whole reason the
+    placeholder list exists.
+    """
+    token = literal.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+    return token.lower() in PLACEHOLDERS or literal.lower() in PLACEHOLDERS
+
+
 def names_from_git_dir(repo: Path) -> list[str]:
     """Extra literals to refuse, read from `.git/private-names`.
 
@@ -124,7 +142,7 @@ class Scanner:
     def __init__(self, repo: Path):
         self.literals = [
             n for n in machine_names() + names_from_git_dir(repo)
-            if n.lower() not in PLACEHOLDERS
+            if not names_a_placeholder(n)
         ]
         self.findings: list[tuple[str, str]] = []
 

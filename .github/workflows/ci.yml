@@ -35,6 +35,16 @@ jobs:
           shellcheck install.sh scripts/test_linux_installer.sh scripts/test_bootstrap_paths.sh
           bash scripts/test_linux_installer.sh
 
+      # The privacy guard failed CI three times running, every time a false
+      # positive on a clean tree — which is how a check gets switched off rather
+      # than fixed. Two of those were only reachable on a runner, where the
+      # account and home directory are both placeholders and the identity list is
+      # empty by design. That cannot be reproduced by setting an environment
+      # variable, so the test injects it. Here rather than in the macOS job
+      # because the script is platform-independent and this job finishes first.
+      - name: The privacy guard does not cry wolf
+        run: python3 scripts/test_check_private.py
+
   agent:
     name: agent, protocol and terminal UI
     runs-on: ubuntu-latest

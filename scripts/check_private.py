@@ -318,15 +318,27 @@ def main() -> int:
         ).stdout.strip()
     )
     scanner = Scanner(repo)
-    if not scanner.literals:
-        # Nothing to match on means a pass that proves nothing. Say so rather
-        # than printing a reassuring tick.
-        print("!!! no identity to check against (no HOME, no .git/private-names)")
-        return 1
-
     mode = argv[0]
-    print(f"==> checking against {len(scanner.literals)} identity string(s) "
-          f"plus any unknown home path")
+    if scanner.literals:
+        print(f"==> checking against {len(scanner.literals)} identity string(s) "
+              f"plus any unknown home path")
+    else:
+        # No *literals* is not nothing to check. The generic rule — any
+        # /Users/<name> that is not a known placeholder — does not need to know
+        # whose machine this is, and it is the half that catches a contributor's
+        # path as well as ours.
+        #
+        # This was fatal, on the reasoning that a pass with nothing to match on
+        # proves nothing. It made CI fail on a clean tree: a runner's account is
+        # `runner` and its home is /Users/runner, both placeholders, so every
+        # literal is correctly discarded and the list is empty by design. The
+        # workflow says as much in a comment one commit older than the check
+        # that contradicted it. Said out loud instead, so a run cannot look
+        # stronger than it was.
+        print("==> no identity specific to this machine to match against "
+              "(account and home directory are both placeholders)")
+        print("    the generic rule still applies; the identity-specific half "
+              "runs in the pre-push hook")
     if mode in ("--tracked", "--all"):
         files = tracked_files(repo)
         print(f"    {len(files)} tracked file(s)")

@@ -4,6 +4,16 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex login failed on Windows with a missing-parameter error.** The browser was opened with `cmd /c start "" <url>` through `Command::args`, which quotes arguments by the C runtime's rules — rules `cmd.exe` does not follow, since it re-parses the command line itself. Those rules only add quotes around whitespace, and a percent-encoded URL has none, so the URL arrived unquoted and `&` was read as cmd's command separator.
+
+  The browser therefore received `…/oauth/authorize?response_type=code` and nothing else, while `client_id=…`, `redirect_uri=…`, `code_challenge=…` and `state=…` were each run as separate commands. The authorization server replied, correctly, that parameters were missing. macOS and Linux were unaffected: `open` and `xdg-open` take the URL as a single argument with no shell in between.
+
+  Now built as a quoted raw command line, so `&` cannot split it, with the empty `""` first because `start` reads a lone quoted argument as the window title. The construction is a separate function tested on any platform — the defect was invisible on both platforms this is normally developed on — and the tests assert the failure rather than the shape of the fix: a miniature of cmd's own splitting rule shows the old form breaking into three commands and the new one staying as one. The Windows-only arm is type-checked for `x86_64-pc-windows-msvc`.
+
+  Until you have a build with this in, the URL printed in the terminal under "If the browser doesn't open, visit:" is complete and correct — pasting it works.
+
 ### Added
 
 - **A memory that expires.** `remember` records a short note that survives into later requests, with a lifetime the agent chooses; `forget` drops one. Everything expires, and that is the design rather than a limitation — the failure mode of a memory system is not forgetting, it is asserting something that stopped being true, read with the same confidence as a correct note and with nothing to prompt a recheck. An entry that expires is wrong for a bounded time.

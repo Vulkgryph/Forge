@@ -8,6 +8,26 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// The command line for `cmd /c` that opens `url` in the default browser.
+///
+/// Quoted, so that `cmd` cannot read `&` in a query string as a command
+/// separator. The empty `""` comes first because `start` reads a single quoted
+/// argument as the new window's title — `start "<url>"` sets a title and opens
+/// nothing.
+///
+/// Built here rather than inline so it can be tested on any platform. The
+/// defect it exists for was invisible on the two platforms this is usually
+/// developed on.
+// Compiled on Windows, where it is used, and under `test` everywhere, so the
+// behaviour stays checked on the platforms this is developed on.
+#[cfg(any(target_os = "windows", test))]
+fn windows_start_command_line(url: &str) -> String {
+    // A literal quote would close the quoting and hand the rest to cmd. Every
+    // URL this is called with is already percent-encoded, so one cannot appear,
+    // but this function does not get to assume its callers stay that way.
+    format!("/c start \"\" \"{}\"", url.replace('"', "%22"))
+}
+
 /// Best-effort launch of the user's default browser at `url`.
 /// Errors are ignored: every OAuth caller also prints the URL to stderr
 /// so the user can copy-paste manually if the auto-open fails.
@@ -16,9 +36,21 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
+    {
+        // `raw_arg`, not `args`. Rust quotes arguments by the C runtime's
+        // rules, which only add quotes around whitespace — and `cmd.exe` does
+        // not follow those rules anyway, it re-parses the line itself. A
+        // percent-encoded URL contains no spaces, so it arrived bare, and `&`
+        // is cmd's command separator: the browser was handed everything up to
+        // the first `&` and each remaining query parameter was run as its own
+        // command. An OAuth URL lost its client_id, redirect_uri,
+        // code_challenge and state that way, and the authorization server
+        // answered, correctly, that parameters were missing.
+        use std::os::windows::process::CommandExt as _;
+        let _ = std::process::Command::new("cmd")
+            .raw_arg(windows_start_command_line(url))
+            .spawn();
+    }
 
     // Linux, BSD, illumos, etc. — xdg-open is the freedesktop standard.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1329,6 +1361,73 @@ pub fn xai_display_name(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::windows_start_command_line;
+
+    /// What a `cmd /c` line does when cmd re-parses it: `&` outside quotes
+    /// separates commands. Written out so the test asserts the actual failure
+    /// rather than the shape of the fix.
+    fn cmd_would_split_into(line: &str) -> Vec<String> {
+        let mut parts = vec![String::new()];
+        let mut quoted = false;
+        for c in line.chars() {
+            match c {
+                '"' => {
+                    quoted = !quoted;
+                    parts.last_mut().unwrap().push(c);
+                }
+                '&' if !quoted => parts.push(String::new()),
+                _ => parts.last_mut().unwrap().push(c),
+            }
+        }
+        parts
+    }
+
+    /// The reported bug: Codex login on Windows failed with a missing
+    /// parameter. The URL reached `cmd` unquoted, so everything after the first
+    /// `&` became a separate command and the browser got only `response_type`.
+    #[test]
+    fn an_oauth_url_reaches_the_browser_whole() {
+        let url = "https://auth.openai.com/oauth/authorize?response_type=code\
+&client_id=app_X&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb\
+&code_challenge=abc&code_challenge_method=S256&state=xyz";
+        let line = windows_start_command_line(url);
+        assert_eq!(
+            cmd_would_split_into(&line).len(),
+            1,
+            "cmd would run this as several commands: {line}"
+        );
+        assert!(line.contains(url), "the URL was altered: {line}");
+    }
+
+    /// And the discriminating half: the same assertion against the old
+    /// construction must fail, or it is testing nothing.
+    #[test]
+    fn the_unquoted_form_is_what_broke() {
+        let url = "https://e.test/a?x=1&y=2&z=3";
+        let broken = format!("/c start \"\" {url}");
+        assert_eq!(
+            cmd_would_split_into(&broken).len(),
+            3,
+            "the old form really did split, which is why login failed"
+        );
+        assert_eq!(cmd_would_split_into(&windows_start_command_line(url)).len(), 1);
+    }
+
+    /// `start` reads a single quoted argument as a window title, so the empty
+    /// title has to come first or a title is set and no browser opens.
+    #[test]
+    fn the_empty_window_title_comes_first() {
+        let line = windows_start_command_line("https://e.test/");
+        assert!(line.starts_with("/c start \"\" \""), "{line}");
+    }
+
+    /// A quote in the URL would close the quoting and hand the rest to cmd.
+    #[test]
+    fn a_quote_in_the_url_cannot_escape_the_quoting() {
+        let line = windows_start_command_line("https://e.test/?q=\"&calc");
+        assert!(!line.contains("\"&"), "a bare quote survived: {line}");
+        assert_eq!(cmd_would_split_into(&line).len(), 1, "{line}");
+    }
 
     /// Forge does not present itself to a provider as that provider's own
     /// client.

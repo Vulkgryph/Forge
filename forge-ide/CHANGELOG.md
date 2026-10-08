@@ -48,7 +48,7 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
-- **Markdown links in the agent panel rendered as their source.** Reported from use: a sentence came out carrying the whole of `[language design directive](specs/language-design-directive.md)` inline. The inline parser knew `**bold**` and `` `code` `` and nothing else, so everything it did not recognise fell through to literal text — which the file's own comment said in as many words, and which is easy to miss until an agent writes a paragraph naming three files.
+- **Markdown links in the agent panel rendered as their source.** Reported from use: a sentence came out carrying the whole of its link markup inline — the label `[language design directive]` and then, as visible text, the parenthesised target that should have been invisible. The inline parser knew `**bold**` and `` `code` `` and nothing else, so everything it did not recognise fell through to literal text — which the file's own comment said in as many words, and which is easy to miss until an agent writes a paragraph naming three files.
 
   Links now render as their text, in a link colour and underlined. The target is dropped rather than printed. For a file path that is a real loss, and the honest fix is making them clickable so the path does not need showing — that needs hit-testing a galley range rather than setting a colour, and is not this change. `[` keeps its ordinary meaning: `[WARN]`, `vec[0]`, an unclosed bracket and a link inside backticks are all left alone, and nested brackets in a label are counted rather than ended on.
 

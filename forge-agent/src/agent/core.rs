@@ -591,7 +591,6 @@ pub struct Agent {
     /// Kept apart because notes change during a session and the prompt has to
     /// be rebuilt from something stable. `system_prompt` is this plus whatever
     /// is currently remembered.
-    system_prompt_base: String,
     last_prompt_tokens: u32,
     last_completion_tokens: u32,
     total_prompt_tokens: u64,
@@ -685,27 +684,12 @@ impl Agent {
         // per request, and so a note written this session is picked up by the
         // next prompt rebuild rather than immediately — the prefix has to stay
         // stable within a turn for caching to be worth anything.
-        let memory_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let memory_dir = ToolExecutor::memory_dir(executor.project_root());
-        let notes = crate::agent::memory::render(
-            &crate::agent::memory::load(&memory_dir, memory_now),
-            memory_now,
-        );
-
-        let system_prompt_base = build_system_prompt(
+        let system_prompt = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
-            None,
         );
-        let system_prompt = match notes.as_deref() {
-            Some(notes) => format!("{system_prompt_base}{notes}"),
-            None => system_prompt_base.clone(),
-        };
 
         let mut history = Vec::new();
         history.push(Message::system(&system_prompt));
@@ -724,7 +708,6 @@ impl Agent {
             auto_mode: false,
             compaction_pending: false,
             max_context_tokens,
-            system_prompt_base,
             last_prompt_tokens: 0,
             last_completion_tokens: 0,
             total_prompt_tokens: 0,
@@ -785,27 +768,12 @@ impl Agent {
         // per request, and so a note written this session is picked up by the
         // next prompt rebuild rather than immediately — the prefix has to stay
         // stable within a turn for caching to be worth anything.
-        let memory_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let memory_dir = ToolExecutor::memory_dir(executor.project_root());
-        let notes = crate::agent::memory::render(
-            &crate::agent::memory::load(&memory_dir, memory_now),
-            memory_now,
-        );
-
-        let system_prompt_base = build_system_prompt(
+        let system_prompt = build_system_prompt(
             executor.project_root().to_string_lossy().as_ref(),
             app_config.agent.subagents.max_concurrent,
             app_config.agent.subagents.max_depth,
             executor.scratchpad().map(|p| p.root()),
-            None,
         );
-        let system_prompt = match notes.as_deref() {
-            Some(notes) => format!("{system_prompt_base}{notes}"),
-            None => system_prompt_base.clone(),
-        };
         let loaded = log.load_from_last_compaction()?;
         let rewind_checkpoints = log
             .rewind_checkpoints_for_resume()?
@@ -867,7 +835,6 @@ impl Agent {
             auto_mode: false,
             compaction_pending: false,
             max_context_tokens,
-            system_prompt_base,
             last_prompt_tokens: estimated_prompt_tokens,
             last_completion_tokens: 0,
             total_prompt_tokens: 0,
@@ -1358,52 +1325,21 @@ impl Agent {
     /// message invalidates a cached prefix, so paying that on every turn
     /// rather than only when the notes change would be a real cost once
     /// prompt caching is in.
-    /// Rebuild the system prompt from the base plus whatever has to survive.
+
+    /// The notes as they stand, for appending to a request.
     ///
-    /// Called when the conversation is replaced, and not otherwise. It used to
-    /// run at the top of every turn, which was wrong twice over.
-    ///
-    /// It is noise. Being told the same thing on consecutive turns does not
-    /// inform; it crowds out the work, and the model starts skimming the part of
-    /// the prompt that is always the same.
-    ///
-    /// And it was expensive in a way nothing could see. `responses_request`
-    /// concatenates every system message into `instructions`, which is the front
-    /// of the request, and OpenAI's cache matches on an exact prefix — so one
-    /// changed byte there re-bills the whole conversation at full price. Notes
-    /// change when the agent records one; the repository position changed
-    /// whenever a file was edited. In an active session that invalidated the
-    /// cache nearly every turn, and nothing read `cached_tokens`, so the cost
-    /// was invisible.
-    ///
-    /// Compaction is the right moment because it is the only one that matters:
-    /// notes exist to survive the conversation being replaced, and that is when
-    /// it is replaced. Between compactions the agent can ask — see the
-    /// `workspace_status` tool — which costs one tool call when it wants to know
-    /// rather than a paragraph every turn whether it does or not.
-    fn refresh_notes(&mut self) {
+    /// Read each time rather than cached: the agent can record one mid-turn, and
+    /// a note it has just written being absent until some later event is the
+    /// kind of surprise that makes a feature feel broken. The framing — that
+    /// these are notes rather than instructions, and that each expires — comes
+    /// from `memory::render`, so it travels with them wherever they are put.
+    fn current_notes(&self) -> Option<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let dir = ToolExecutor::memory_dir(self.executor.project_root());
-        let notes = crate::agent::memory::render(&crate::agent::memory::load(&dir, now), now);
-        // Deliberately not the repository position. It changes on every edit,
-        // which is exactly the volatility that cannot sit in a cached prefix,
-        // and it is a question with an answer the agent can ask for.
-        let wanted = match notes.as_deref() {
-            Some(notes) => format!("{}{}", self.system_prompt_base, notes),
-            None => self.system_prompt_base.clone(),
-        };
-        if wanted == self.system_prompt {
-            return;
-        }
-        self.system_prompt = wanted;
-        if let Some(first) = self.history.first_mut() {
-            if first.role == "system" {
-                first.content = Some(self.system_prompt.clone());
-            }
-        }
+        crate::agent::memory::render(&crate::agent::memory::load(&dir, now), now)
     }
 
     async fn process_turn(&mut self) -> Result<()> {
@@ -1486,7 +1422,19 @@ impl Agent {
 
             // Race the API call against cancellation
             // Build an owned history buffer so the stream future doesn't borrow self.
-            let history_owned: Vec<Message> = self.history.clone();
+            let mut history_owned: Vec<Message> = self.history.clone();
+            // Notes ride along at the end, and are not part of the conversation.
+            //
+            // They used to be folded into the system prompt, which is the front
+            // of the request and the thing the provider's cache is keyed on — so
+            // recording a note re-billed every turn that came before it. Appended
+            // here instead: the prefix never moves, the note is always current,
+            // and because this is the request's copy of the history rather than
+            // the history itself, nothing accumulates and nothing has to be
+            // cleaned up later.
+            if let Some(notes) = self.current_notes() {
+                history_owned.push(Message::system(&notes));
+            }
             let tools_owned = tools.clone();
             let model_id_owned = self.model_id.clone();
             let client_owned = self.client.clone();
@@ -3234,9 +3182,6 @@ impl Agent {
                         )));
                     }
                     self.history = new_history;
-                    // The one moment the surviving notes have to be re-stated:
-                    // the conversation that held them has just been replaced.
-                    self.refresh_notes();
                     self.last_prompt_tokens = self.current_context_tokens();
                     self.compaction_count += 1;
                     self.rewind_checkpoints.clear();
@@ -3293,9 +3238,6 @@ impl Agent {
                             )));
                         }
                         self.history = new_history;
-                        // Same reason as the handoff path above: this is the
-                        // other place the conversation is replaced.
-                        self.refresh_notes();
                         self.last_prompt_tokens = self.current_context_tokens();
                         self.compaction_count += 1;
                         self.rewind_checkpoints.clear();
@@ -5531,7 +5473,6 @@ fn build_system_prompt(
     max_concurrent: usize,
     max_depth: usize,
     scratchpad: Option<&std::path::Path>,
-    notes: Option<&str>,
 ) -> String {
     let base = format!(
         r#"You are an autonomous codebase agent. Your primary workspace is: {}
@@ -5605,22 +5546,18 @@ Be concise and direct in your responses. Focus on actionable feedback."#,
 
     // Only described when there is one, so an agent running without a lab is
     // never told about a directory that does not exist.
-    let mut prompt = match scratchpad {
+    let prompt = match scratchpad {
         None => base,
         Some(lab) => format!(
             "{base}\n\n{}",
             scratchpad_section(&lab.to_string_lossy())
         ),
     };
-    // Last, and only when there is something to say. Appending puts the
-    // volatile part at the end, so everything a reader needs to understand the
-    // agent's instructions is in a fixed prefix — but note that this does not
-    // make the *system message* stable: writing a note does change it, and
-    // does invalidate a cached prefix once. That is why `refresh_notes` only
-    // rewrites it when the text actually differs, rather than every turn.
-    if let Some(notes) = notes {
-        prompt.push_str(notes);
-    }
+    // Notes are deliberately absent. They are appended to each *request*
+    // instead — see `current_notes` — so this string is written once per session
+    // and never changes, which is what keeps the provider's cached prefix valid
+    // for the whole session. Folding them in here meant recording a note
+    // re-billed every turn before it.
     prompt
 }
 
@@ -5868,7 +5805,7 @@ mod scratchpad_prompt_tests {
     #[test]
     fn the_agent_is_told_where_its_working_area_is() {
         let lab = Path::new("/tmp/forge-lab/session-123");
-        let prompt = build_system_prompt("/work", 4, 4, Some(lab), None);
+        let prompt = build_system_prompt("/work", 4, 4, Some(lab));
         assert!(
             prompt.contains("/tmp/forge-lab/session-123"),
             "the path is the one thing it cannot infer"
@@ -5882,7 +5819,7 @@ mod scratchpad_prompt_tests {
     /// exist — it would write there and the writes would prompt like any other.
     #[test]
     fn without_a_working_area_it_is_not_mentioned() {
-        let prompt = build_system_prompt("/work", 4, 4, None, None);
+        let prompt = build_system_prompt("/work", 4, 4, None);
         assert!(!prompt.to_lowercase().contains("scratchpad"), "{prompt}");
         assert!(!prompt.contains("forge-lab"));
         // The rest of the prompt is unaffected.
@@ -5891,25 +5828,22 @@ mod scratchpad_prompt_tests {
 
     /// Notes reach the prompt, and land after everything stable.
     ///
-    /// Appended rather than interleaved so the prefix stays byte-identical
-    /// between requests: prompt caching keys on a prefix, and a note written
-    /// mid-session must not invalidate the system prompt and tool definitions
-    /// ahead of it.
+    /// The system prompt does not depend on the notes, and that is the point.
+    ///
+    /// Notes used to be folded in here. The system prompt is the front of the
+    /// request and the provider keys its cache on a prefix, so recording a note
+    /// moved the prefix and re-billed every turn that came before it. They are
+    /// appended to each request instead — see `current_notes` — and the
+    /// corresponding assertion lives beside the request builder, where it can
+    /// check the prefix is unchanged while the note still arrives.
     #[test]
-    fn recorded_notes_are_appended_to_the_prompt() {
-        let without = build_system_prompt("/work", 4, 4, None, None);
-        let with = build_system_prompt("/work", 4, 4, None, Some("\n\n## Your notes\n\n- x\n"));
-
-        assert!(with.contains("## Your notes"), "the notes are missing");
+    fn the_system_prompt_is_fixed_for_a_session() {
+        let a = build_system_prompt("/work", 4, 4, None);
+        let b = build_system_prompt("/work", 4, 4, None);
+        assert_eq!(a, b, "the prompt is not stable across calls with the same inputs");
         assert!(
-            with.starts_with(&without),
-            "the notes were not appended — everything before them moved, which \
-             invalidates the cached prefix on every write"
-        );
-        assert_eq!(
-            without,
-            build_system_prompt("/work", 4, 4, None, None),
-            "the prompt is not stable across calls with the same inputs"
+            !a.contains("## Your notes"),
+            "notes are back in the system prompt, which moves the cached prefix:\n{a}"
         );
     }
 }

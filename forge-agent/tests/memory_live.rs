@@ -78,6 +78,19 @@ impl Provider {
             .unwrap_or_default()
     }
 
+    /// Everything sent, as one string.
+    ///
+    /// `system_prompt` is not enough to see a note any more. Notes are appended
+    /// to the request rather than folded into the system prompt — that is what
+    /// keeps the provider's cached prefix stable — and `build_openai_messages`
+    /// then demotes any system message that is not first to `user`, tagged
+    /// `[System]`, because some local servers reject a system message in the
+    /// middle. So the note arrives, correctly, in a role this did not look at.
+    fn request_text(&self, n: usize) -> String {
+        let requests = self.requests.lock().unwrap();
+        requests.get(n).map(|r| r.to_string()).unwrap_or_default()
+    }
+
     fn request_count(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
@@ -433,14 +446,20 @@ fn a_note_survives_the_conversation_without_being_repeated_every_turn() {
     one_turn(&mut agent, "what are you working on?");
     agent.stop();
 
-    // Not re-stated mid-session. The system prompt is the front of the request
-    // and every system message is concatenated into it, so rewriting it per
-    // turn both repeats itself and invalidates the provider's prefix cache.
+    // Delivered on the later turn — appended to the request, so it is current
+    // without anything having been rewritten.
     let mid = provider.request_count() - 1;
+    assert!(
+        provider.request_text(mid).contains("other-agent-owns-botauth"),
+        "the note did not reach the later turn at all"
+    );
+    // And not in the system prompt, which is the front of the request and what
+    // the provider keys its cache on. Folding it in there is what re-billed
+    // every earlier turn whenever a note was written.
     let mid_prompt = provider.system_prompt(mid);
     assert!(
         !mid_prompt.contains("other-agent-owns-botauth"),
-        "the note was injected again mid-session, which is the noise this removed:\n{mid_prompt}"
+        "the note is back in the cached prefix:\n{mid_prompt}"
     );
 
     // But it is on disk, and a conversation that starts fresh carries it. This
@@ -456,18 +475,15 @@ fn a_note_survives_the_conversation_without_being_repeated_every_turn() {
     resumed.stop();
 
     let last = provider.request_count() - 1;
-    let prompt = provider.system_prompt(last);
+    let sent = provider.request_text(last);
     assert!(
-        prompt.contains("other-agent-owns-botauth"),
-        "the note did not survive into a new conversation. System prompt of request {last}:\n{prompt}"
+        sent.contains("other-agent-owns-botauth"),
+        "the note did not survive into a new conversation (request {last})"
     );
+    assert!(sent.contains("Do not edit it"), "the note's text is missing");
     assert!(
-        prompt.contains("Do not edit it"),
-        "the note's text is missing from the prompt:\n{prompt}"
-    );
-    assert!(
-        prompt.contains("not instructions"),
-        "the notes are not framed as checkable claims:\n{prompt}"
+        sent.contains("not instructions"),
+        "the notes are not framed as checkable claims"
     );
 }
 
@@ -502,12 +518,15 @@ fn an_expired_note_is_not_offered_and_is_deleted() {
     one_turn(&mut agent, "anything to report?");
     agent.stop();
 
-    let prompt = provider.system_prompt(0);
+    // Read from the whole request: notes are appended to it rather than folded
+    // into the system prompt, and a non-leading system message is demoted to
+    // `user` on the way out, so `system_prompt` cannot see them.
+    let sent = provider.request_text(0);
     assert!(
-        !prompt.contains("stopped being true"),
-        "an expired note was given to the model:\n{prompt}"
+        !sent.contains("stopped being true"),
+        "an expired note was given to the model:\n{sent}"
     );
-    assert!(prompt.contains("This is still true."), "the live note is missing:\n{prompt}");
+    assert!(sent.contains("This is still true."), "the live note is missing:\n{sent}");
     assert_eq!(
         notes_on_disk(&home),
         vec!["current"],

@@ -115,13 +115,6 @@ pub fn signer() -> Option<std::sync::Arc<Signer>> {
 /// would orphan every signature already published against it, and the only
 /// symptom would be sites quietly ceasing to recognise the crawler.
 pub fn generate_key(path: &std::path::Path) -> Result<String, String> {
-    if path.exists() {
-        return Err(format!(
-            "{} already exists — refusing to overwrite a signing key, because \
-             replacing one silently orphans every signature published against it",
-            path.display()
-        ));
-    }
     let rng = ring::rand::SystemRandom::new();
     let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
         .map_err(|_| "could not generate a key".to_string())?;
@@ -138,24 +131,51 @@ pub fn generate_key(path: &std::path::Path) -> Result<String, String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, &pem).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    restrict_to_owner(path);
+
+    // Created owner-only and exclusively, in the one call that does both.
+    //
+    // This was `fs::write` followed by a `chmod`, which is wrong twice over. The
+    // file existed at the umask default until the chmod landed — a window in
+    // which anyone on the machine could read a signing key — and the chmod's
+    // result was discarded, so if it ever failed the key stayed world-readable
+    // permanently and silently. `mode` is applied by `open(2)` itself, so there
+    // is no window and nothing left to fail separately.
+    //
+    // `create_new` is the other half: it opens with O_EXCL, so the refusal to
+    // overwrite is decided by the kernel. Checking `exists()` and writing
+    // afterwards is a race two concurrent runs both win — both see no key, both
+    // write, and the second destroys the first one's. Orphaning every signature
+    // published against a key is worth more care than a check that can be lost
+    // between two syscalls.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    // Windows has no mode to set here. The file inherits the ACL of its parent,
+    // which for a per-user config directory is already owner-only, and
+    // `create_new` still gives the exclusivity.
+    let mut file = opts.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} already exists — refusing to overwrite a signing key, because \
+                 replacing one silently orphans every signature published against it",
+                path.display()
+            )
+        } else {
+            format!("cannot create {}: {e}", path.display())
+        }
+    })?;
+    {
+        use std::io::Write as _;
+        file.write_all(pem.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
 
     let signer = Signer::new(doc.as_ref(), "https://example.invalid")?;
     Ok(signer.keyid)
-}
-
-/// Owner-only, because this file is the crawler's identity.
-#[cfg(unix)]
-fn restrict_to_owner(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_to_owner(_path: &std::path::Path) {
-    // Windows inherits the parent directory's ACL, which for a per-user
-    // config directory is already owner-only.
 }
 
 /// The DER between the PEM armour. Written here rather than pulled in,
@@ -544,6 +564,47 @@ mod tests {
     }
 
     /// Forge makes its own key, so nobody has to find a working openssl.
+    /// The race the previous code lost.
+    ///
+    /// `exists()` and then write is a check two concurrent runs both pass: both
+    /// see no key, both write, and the second destroys the first — orphaning
+    /// every signature already published against it. O_EXCL hands the decision
+    /// to the kernel, so exactly one call can win no matter how many arrive at
+    /// once. Eight threads released from a barrier together, which loses the
+    /// race reliably when the check and the write are separate.
+    #[test]
+    fn only_one_of_many_concurrent_calls_creates_a_key() {
+        let dir = std::env::temp_dir().join(format!("forge-keygen-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("bot-auth.pem");
+
+        const THREADS: usize = 8;
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let mut running = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let path = path.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            running.push(std::thread::spawn(move || {
+                gate.wait();
+                generate_key(&path).is_ok()
+            }));
+        }
+        let created = running
+            .into_iter()
+            .map(|h| h.join().expect("no thread panicked"))
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(created, 1, "{created} concurrent calls created a key; exactly one may");
+
+        // The survivor has to be a whole key, not a half-written one.
+        let pem = std::fs::read(&path).expect("a key is on disk");
+        let der = pkcs8_from_pem(&pem).expect("the surviving key is armoured correctly");
+        assert!(Signer::new(&der, "https://vulkgryph.com").is_ok(), "it does not load");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_generated_key_is_usable_private_and_not_overwritten() {
         let dir = std::env::temp_dir().join(format!("forge-keygen-{}", std::process::id()));

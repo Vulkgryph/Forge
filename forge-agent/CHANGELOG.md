@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A refused compaction left the conversation growing, and nothing on disk said so.** Reported as "70% before I restart, 203% after", which is exactly what it does.
+
+  Compaction needs a model call: the agent is asked to write its own handoff, or a summariser is asked for structured JSON. When that call failed the whole error path was one line — say so in the UI, continue with the full history — and the turn ended as an error. The next request then overflowed the window, and the emergency trimmer shortened the conversation *in memory*. Neither the failure nor the trim was recorded, so the session looked healthy at 70% while the log had not advanced since the last successful compaction. Every restart replayed everything after it; in the reported session that was a week, 20,555 records, about 2.1M tokens against a 1M window.
+
+  Continuing with the full history was never an answer: compaction runs because the conversation no longer fits, so declining to shorten it leaves the next request as impossible as the one that triggered it. A summary needs the provider to agree; shortening does not. When the call fails the conversation is now trimmed locally, the model is told that the older messages were dropped rather than summarised and that the session log still holds them, and the result is written where a resume reads it.
+
+  Reproduced against the real agent binary rather than reasoned about: the test harness refuses both compaction calls the way a content filter does, with a 400 and an error body, and asserts three things — requests stay inside the window, the log carries a marker, and a resumed session stays inside the window too. It fails against the previous code at the first assertion, and suppressing only the commit record makes the resume assertion fail with the reported symptom, so the recording is load-bearing rather than incidental.
+
+  What this does not fix: why the call is refused. The compaction request is the entire conversation in one payload, which is the most refusal-prone thing the agent sends, and a project doing low-level security work will trip a content filter there first. The failure is now survivable and visible; it is still a failure.
+
 - **A provider refusing the content silently deleted the conversation.** A moderation refusal arrives as a `response.failed` event, and the error text used to be the entire SSE payload — which embeds every tool definition, one of which describes a parameter as "Maximum number of results". The context-overflow test asks whether the error text contains "maximum", so a refusal was classified as an oversized request: the history was trimmed to 80% of the window and the turn carried on. Every policy cut ate the thread, and the block was never reported.
 
   Reported as two separate complaints — that compaction loses the thread and needs the whole brief re-pasted, and that the agent spins producing nothing when blocked. They were one bug. Measured against the payload from the report rather than supposed: the raw text really does contain "maximum", and the classifier really does match it.

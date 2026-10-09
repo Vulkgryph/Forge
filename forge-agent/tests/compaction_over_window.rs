@@ -30,6 +30,13 @@ const WAIT: Duration = Duration::from_secs(90);
 /// the turn's own call and inspect both.
 struct Provider {
     requests: Mutex<Vec<Value>>,
+    /// When set, any call that exists to shrink the conversation is refused the
+    /// way a provider's content filter refuses one: a 400 with an error body.
+    ///
+    /// This is not hypothetical. Compaction sends the whole conversation in one
+    /// request, which is the most refusal-prone thing the agent ever does, and a
+    /// refusal there used to mean the conversation simply kept growing.
+    refuse_compaction: std::sync::atomic::AtomicBool,
 }
 
 impl Provider {
@@ -68,7 +75,10 @@ impl Provider {
 fn start_provider() -> (Arc<Provider>, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().unwrap().port();
-    let state = Arc::new(Provider { requests: Mutex::new(Vec::new()) });
+    let state = Arc::new(Provider {
+        requests: Mutex::new(Vec::new()),
+        refuse_compaction: std::sync::atomic::AtomicBool::new(false),
+    });
     let served = Arc::clone(&state);
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -122,6 +132,28 @@ fn handle(mut stream: TcpStream, state: &Provider) -> std::io::Result<()> {
     let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
     let text = request.to_string();
     state.requests.lock().unwrap().push(request);
+
+    // Either call that shrinks the conversation: the structured summariser, or
+    // the agent writing its own handoff.
+    let shrinking = text.contains("conversation summarizer")
+        || text.contains("summarizing part")
+        || text.contains("write the handoff");
+    if shrinking && state.refuse_compaction.load(std::sync::atomic::Ordering::Relaxed) {
+        let body = json!({
+            "error": {
+                "code": "cyber_policy",
+                "message": "This content was flagged for possible cybersecurity risk."
+            }
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        return Ok(());
+    }
 
     // A summariser call wants JSON in the shape `CompactionSummary` parses.
     // Everything that identifies this fixture goes in a field the merge keeps,
@@ -508,5 +540,105 @@ fn after_compacting_the_conversation_is_under_the_window() {
         resummarised, 0,
         "a short message straight after compacting compacted again, so one \
          compaction does not bring the conversation under the threshold"
+    );
+}
+
+/// The reported failure: compaction refused, and the conversation grows anyway.
+///
+/// Observed in use as "70% before I restart, 203% after". The cause is that
+/// compaction needs a model call, and when that call fails the agent says so in
+/// the UI and continues with the full history. The emergency trimmer then
+/// shortens the conversation *in memory* on the next overflow, so the session
+/// looks healthy — while the log never advances, because neither the failure nor
+/// the trim is recorded. Every restart replays everything since the last
+/// successful compaction, which in the reported session was a week of work.
+///
+/// Two things are asserted, and the second is the one that bites: the
+/// conversation has to stay bounded, and the log has to carry a record a resume
+/// can find. Bounded-but-unrecorded is exactly the state that produced 203%.
+#[test]
+fn a_refused_compaction_still_bounds_and_records_the_conversation() {
+    let (provider, port) = start_provider();
+    provider
+        .refuse_compaction
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let home = fixture("refused-compaction");
+    write_config(&home, port);
+    let mut agent = Agent::start(&home, None);
+    assert!(agent.wait_for_any(&["init"]).is_some(), "the agent never started");
+
+    // Enough turns to cross the window several times over.
+    let bulk = "the loader reads a header and then each segment in turn. ".repeat(120);
+    for i in 0..10 {
+        agent.send(json!({
+            "type": "send_message",
+            "content": format!("turn {i}: {bulk}")
+        }));
+        let end = agent.wait_for_any(&["done", "error", "cancelled"]);
+        let kind = end.as_ref().and_then(|m| m.get("type")).and_then(|t| t.as_str());
+        assert_eq!(kind, Some("done"), "turn {i} ended as {kind:?}: {end:?}");
+    }
+    agent.stop();
+
+    // 1. The requests must stay inside the window. Growing without limit is
+    //    what makes a session unusable rather than merely expensive.
+    let window: usize = 40_000;
+    let largest = provider.largest_request_chars();
+    assert!(
+        largest / 4 < window,
+        "a request reached ~{} tokens against a {window} window — nothing bounded it",
+        largest / 4
+    );
+
+    // 2. And whatever bounded it has to be on disk. This is the half that was
+    //    missing: trimming in memory leaves a session that resumes at its
+    //    pre-trim size, however healthy it looked before the restart.
+    let log = std::fs::read_to_string(
+        std::fs::read_dir(home.join("workspace/.forge/sessions"))
+            .expect("sessions dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("conversation.jsonl"))
+            .find(|p| p.exists())
+            .expect("a conversation log"),
+    )
+    .expect("readable log");
+    assert!(
+        log.contains("compaction_commit") || log.contains("history_trimmed"),
+        "nothing in the log marks where the conversation was shortened, so a \
+         resume will replay all of it"
+    );
+
+    // 3. And the symptom itself: resume it. This is the half that was reported —
+    //    "70% before I restart, 203% after". A resume reads back from the last
+    //    recorded shortening, so if nothing was recorded it replays everything
+    //    that was only ever trimmed in memory.
+    let session = std::fs::read_dir(home.join("workspace/.forge/sessions"))
+        .expect("sessions dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| !n.starts_with('.'))
+        .expect("a session directory");
+
+    let before_resume = provider.largest_request_chars();
+    let mut resumed = Agent::start(&home, Some(&session));
+    assert!(
+        resumed.wait_for_any(&["init"]).is_some(),
+        "the resumed agent never started"
+    );
+    resumed.send(json!({ "type": "send_message", "content": "carry on" }));
+    let end = resumed.wait_for_any(&["done", "error", "cancelled"]);
+    let kind = end.as_ref().and_then(|m| m.get("type")).and_then(|t| t.as_str());
+    resumed.stop();
+    assert_eq!(kind, Some("done"), "the resumed turn ended as {kind:?}: {end:?}");
+
+    let after_resume = provider.largest_request_chars();
+    assert!(
+        after_resume / 4 < window,
+        "the resumed conversation sent ~{} tokens against a {window} window — it \
+         replayed what had only been trimmed in memory (largest before resume was \
+         ~{} tokens)",
+        after_resume / 4,
+        before_resume / 4
     );
 }

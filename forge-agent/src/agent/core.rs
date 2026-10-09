@@ -3254,9 +3254,71 @@ impl Agent {
                         ));
                     }
                     Err(e) => {
-                        let _ = self.event_tx.send(AgentEvent::Error(format!(
-                            "[Compaction failed: {}. Continuing with full history.]",
-                            e
+                        // Continuing with the full history was the old answer and
+                        // it is not one. Compaction only runs because the
+                        // conversation no longer fits, so refusing to shorten it
+                        // leaves the next request as impossible as this one — and
+                        // the turn ended as an error, which is how a week of
+                        // sessions came to look like "70% before I restart, 203%
+                        // after": the emergency trimmer shortened it in memory on
+                        // the next overflow, nothing was written down, and every
+                        // resume replayed the lot.
+                        //
+                        // A summary needs the provider to agree. Shortening does
+                        // not. So when the call fails the conversation is trimmed
+                        // locally, the model is told what happened, and the result
+                        // is recorded where a resume can find it.
+                        let before = self.history.len();
+                        let _ = self.log.log_compaction_start(before);
+                        let note = format!(
+                            "[Compaction could not write a summary: {e}. The older \
+                             messages were dropped to make room rather than \
+                             summarised, so detail from earlier in this \
+                             conversation is gone rather than condensed. The \
+                             session log on disk still has all of it. If something \
+                             earlier matters, read it back from there rather than \
+                             relying on memory of it.]"
+                        );
+                        // Written as the summary record because that is what a
+                        // resume reads. Honest about being no summary: a record
+                        // claiming one, with nothing in it, would restore a
+                        // conversation whose history had silently vanished.
+                        let _ = self.log.log_compaction_summary(
+                            crate::agent::log_types::CompactionSummary {
+                                goal: String::new(),
+                                repo_map: Vec::new(),
+                                work_completed: Vec::new(),
+                                current_state: note.clone(),
+                                commands_run: Vec::new(),
+                                decisions: Vec::new(),
+                                next_actions: Vec::new(),
+                                pitfalls: Vec::new(),
+                            },
+                        );
+                        let log_path = self.log.path().to_string_lossy().to_string();
+                        let mut new_history = crate::agent::compaction::rebuild_history(
+                            &self.system_prompt,
+                            &note,
+                            &self.history,
+                            keep_rolling_window,
+                            &log_path,
+                        );
+                        let report = fit_history_to_window(
+                            &mut new_history,
+                            (self.max_context_tokens as f64 * OVERFLOW_RECOVERY_FRACTION) as usize,
+                        );
+                        self.history = new_history;
+                        self.last_prompt_tokens = self.current_context_tokens();
+                        self.compaction_count += 1;
+                        self.rewind_checkpoints.clear();
+                        self.update_meta();
+                        let after = self.history.len();
+                        let _ = self.log.log_compaction_commit(after, after.saturating_sub(2));
+                        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                            "[Could not summarise the context ({e}) — dropped the \
+                             oldest {} messages to make room instead. The session \
+                             log keeps them.]",
+                            report.dropped + before.saturating_sub(after)
                         )));
                     }
                 }

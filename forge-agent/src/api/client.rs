@@ -1515,9 +1515,8 @@ impl ApiClient {
                     break;
                 }
                 "response.failed" | "response.incomplete" => {
-                    let _ = tx.send(StreamEvent::Error(format!(
-                        "Responses API stream ended with event {}: {}",
-                        event_type, data
+                    let _ = tx.send(StreamEvent::Error(responses_failure_message(
+                        &event_type, data,
                     )));
                     return;
                 }
@@ -2332,9 +2331,102 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
     })
 }
 
+/// What a `response.failed` or `response.incomplete` event actually says.
+///
+/// The whole SSE payload used to be pasted into the error. That payload is a
+/// JSON object hundreds of characters wide whose first field is `"type"`, so
+/// anything that clips a long error showed `{"type":"resp…` and stopped before
+/// the reason — which is the only part worth reading. Reported from use exactly
+/// that way: an error nobody could act on.
+///
+/// The reason lives in `response.error.message` for a failure and in
+/// `response.incomplete_details.reason` for an incomplete one. Both are pulled
+/// out here, with the status and error code when present, and the raw payload
+/// is kept only when nothing could be parsed out of it — in which case saying
+/// so is better than implying the text was chosen.
+fn responses_failure_message(event_type: &str, data: &str) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(data).ok();
+    // Either the event wrapper `{"type":..,"response":{..}}` or, defensively, a
+    // bare response object.
+    let response = parsed.as_ref().and_then(|v| {
+        v.get("response").filter(|r| !r.is_null()).or(Some(v))
+    });
+
+    let field = |obj: Option<&serde_json::Value>, path: &[&str]| -> Option<String> {
+        let mut cur = obj?;
+        for key in path {
+            cur = cur.get(*key)?;
+        }
+        cur.as_str().map(str::to_string)
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(message) = field(response, &["error", "message"]) {
+        parts.push(message);
+    }
+    if let Some(reason) = field(response, &["incomplete_details", "reason"]) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(code) = field(response, &["error", "code"]) {
+        parts.push(format!("code: {code}"));
+    }
+    if let Some(status) = field(response, &["status"]) {
+        parts.push(format!("status: {status}"));
+    }
+
+    if parts.is_empty() {
+        // Nothing recognisable. The payload is all there is, so it travels —
+        // but labelled as unparsed rather than presented as an explanation.
+        return format!("{event_type} with no error detail; raw payload: {data}");
+    }
+    format!("{event_type}: {}", parts.join(" — "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported case, from the payload a user pasted out of the UI.
+    ///
+    /// What they saw was `{"type":"resp…` — the whole SSE event went into the
+    /// error, and the first field of that object is `"type"`, so every display
+    /// that clips a long error cut it off before the reason. The reason was
+    /// `cyber_policy`: OpenAI's classifier refusing the request. Nothing in the
+    /// message a person actually read told them that.
+    #[test]
+    fn a_failed_response_reports_the_reason_not_the_envelope() {
+        let data = r#"{"type":"response.failed","sequence_number":41,"response":{
+            "id":"resp_abc","status":"failed","output":[],
+            "error":{"code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request."},
+            "incomplete_details":null}}"#;
+        let msg = responses_failure_message("response.failed", data);
+        assert!(msg.contains("flagged for possible cybersecurity risk"), "{msg}");
+        assert!(msg.contains("cyber_policy"), "the code is what to search for: {msg}");
+        assert!(msg.contains("response.failed"), "{msg}");
+        // The envelope must not be what a reader gets first.
+        assert!(!msg.starts_with('{'), "still leading with raw JSON: {msg}");
+        assert!(!msg.contains("sequence_number"), "envelope noise survived: {msg}");
+    }
+
+    /// An incomplete response says why somewhere else entirely.
+    #[test]
+    fn an_incomplete_response_reports_its_reason() {
+        let data = r#"{"type":"response.incomplete","response":{"status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        let msg = responses_failure_message("response.incomplete", data);
+        assert!(msg.contains("max_output_tokens"), "{msg}");
+    }
+
+    /// And the discriminating case: when there is nothing to extract, the
+    /// payload still has to travel — labelled as unparsed rather than presented
+    /// as an explanation. A function that always returned a tidy sentence would
+    /// pass the tests above while throwing away the only evidence.
+    #[test]
+    fn an_unrecognisable_payload_is_passed_through_and_labelled() {
+        let msg = responses_failure_message("response.failed", "not json at all");
+        assert!(msg.contains("not json at all"), "the evidence was dropped: {msg}");
+        assert!(msg.contains("no error detail"), "it did not admit it could not parse: {msg}");
+    }
 
     #[tokio::test]
     async fn responses_stream_requires_explicit_success() {

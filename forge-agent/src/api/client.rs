@@ -2331,6 +2331,51 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
     })
 }
 
+/// Whether an error is the provider refusing the content, rather than failing.
+///
+/// Returns the code it was recognised by, so a caller can name it.
+///
+/// This distinction was missing, and its absence cost more than a bad message.
+/// A refusal used to arrive as the whole SSE payload pasted into one string —
+/// and that payload embeds every tool definition, one of which describes a
+/// parameter as "Maximum number of results". The caller's context-overflow test
+/// asks whether the error text contains "maximum". So a moderation cut was read
+/// as an oversized request, which trims the conversation to fit and carries on:
+/// the thread was silently deleted and the block never reported. Measured
+/// against the real payload from a report, not supposed.
+///
+/// A refusal is terminal. Retrying the same content gets refused again, and
+/// shrinking the history does not make forbidden content allowed.
+pub fn provider_refusal(error: &str) -> Option<&'static str> {
+    // Codes first: they are unambiguous, where prose is a guess.
+    const CODES: &[&str] = &[
+        "cyber_policy",
+        "content_policy",
+        "content_filter",
+        "safety_violation",
+        "moderation_blocked",
+    ];
+    let lower = error.to_lowercase();
+    for code in CODES {
+        if lower.contains(code) {
+            return Some(code);
+        }
+    }
+    // Prose, for providers that send no code. Kept narrow: a phrase a refusal
+    // uses and an ordinary failure does not.
+    const PHRASES: &[(&str, &str)] = &[
+        ("flagged for possible", "flagged"),
+        ("violates our", "policy"),
+        ("against our usage policies", "usage_policy"),
+    ];
+    for (phrase, name) in PHRASES {
+        if lower.contains(phrase) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// What a `response.failed` or `response.incomplete` event actually says.
 ///
 /// The whole SSE payload used to be pasted into the error. That payload is a
@@ -2385,6 +2430,46 @@ fn responses_failure_message(event_type: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal from the report is recognised as one.
+    #[test]
+    fn a_policy_refusal_is_recognised() {
+        let msg = "response.failed: This content was flagged for possible cybersecurity \
+                   risk. — code: cyber_policy — status: failed";
+        assert_eq!(provider_refusal(msg), Some("cyber_policy"));
+    }
+
+    /// And the thing that actually went wrong: the raw payload a refusal used to
+    /// produce contains "Maximum" from a tool description, so the caller's
+    /// context-overflow test matched it and trimmed the conversation. Whatever
+    /// the text looks like, a refusal must be classified as a refusal first.
+    #[test]
+    fn a_refusal_is_not_mistaken_for_an_oversized_request() {
+        let raw = "Responses API stream ended with event response.failed: \
+                   {\"error\":{\"code\":\"cyber_policy\"},\"max_results\":{\"description\":\
+                   \"Maximum number of results to return.\"}}";
+        assert!(raw.to_lowercase().contains("maximum"), "the hazard is gone from the fixture");
+        assert_eq!(
+            provider_refusal(raw),
+            Some("cyber_policy"),
+            "a refusal that happens to contain 'maximum' must still read as a refusal"
+        );
+    }
+
+    /// The discriminating half. An ordinary failure must not be called a refusal,
+    /// or every transient error would end the turn instead of being retried.
+    #[test]
+    fn an_ordinary_failure_is_not_a_refusal() {
+        for benign in [
+            "error sending request for url: connection refused",
+            "context_length_exceeded: maximum context length is 128000 tokens",
+            "429 resource-exhausted: at capacity",
+            "Responses API stream ended before completion",
+            "503 Service Unavailable",
+        ] {
+            assert_eq!(provider_refusal(benign), None, "{benign}");
+        }
+    }
 
     /// The reported case, from the payload a user pasted out of the UI.
     ///

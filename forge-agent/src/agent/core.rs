@@ -1603,6 +1603,36 @@ impl Agent {
                     return Ok(());
                 }
 
+                // Before any heuristic, because a refusal is not a failure and
+                // the heuristics below read free-form provider prose. A refusal
+                // whose text happened to contain "maximum" was classified as an
+                // oversized request and the conversation was trimmed to fit —
+                // so a moderation cut silently deleted the thread and the block
+                // was never reported. Retrying is equally useless: the same
+                // content gets refused again, and a shorter history does not
+                // make forbidden content allowed.
+                if let Some(code) = crate::api::client::provider_refusal(&e) {
+                    // Into history, so the model knows it was refused rather
+                    // than that something broke. Without this it has no reason
+                    // not to send the same thing again.
+                    self.history.push(Message::system(&format!(
+                        "[System: the provider refused this request — {code}. This is a \
+                         content decision by the model provider, not an error in Forge and \
+                         not a problem with the conversation's size; nothing was retried \
+                         and nothing was dropped. The same content will be refused again. \
+                         To continue: say the same thing differently, or switch to another \
+                         endpoint. The provider's own words: {e}]"
+                    )));
+                    // A distinct prefix, so a block reads as a block in the log
+                    // and in any client, rather than as one more API error.
+                    let _ = self.event_tx.send(AgentEvent::Error(format!(
+                        "Blocked by the provider ({code}) — not retried. {e}"
+                    )));
+                    self.withdraw_refused_pages("the provider refused the request");
+                    let _ = self.event_tx.send(AgentEvent::Done);
+                    return Ok(());
+                }
+
                 let err_lower = e.to_lowercase();
                 let is_context_overflow = err_lower.contains("context")
                     || err_lower.contains("too long")

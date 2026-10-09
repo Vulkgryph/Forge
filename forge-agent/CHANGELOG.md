@@ -2,6 +2,18 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A provider refusing the content silently deleted the conversation.** A moderation refusal arrives as a `response.failed` event, and the error text used to be the entire SSE payload — which embeds every tool definition, one of which describes a parameter as "Maximum number of results". The context-overflow test asks whether the error text contains "maximum", so a refusal was classified as an oversized request: the history was trimmed to 80% of the window and the turn carried on. Every policy cut ate the thread, and the block was never reported.
+
+  Reported as two separate complaints — that compaction loses the thread and needs the whole brief re-pasted, and that the agent spins producing nothing when blocked. They were one bug. Measured against the payload from the report rather than supposed: the raw text really does contain "maximum", and the classifier really does match it.
+
+  A refusal is now recognised by its code before any heuristic runs, and treated as terminal: nothing is retried, nothing is dropped, and the turn ends saying so. Retrying is pointless — the same content is refused again — and a shorter history does not make forbidden content allowed. The model is told in the conversation that it was refused and that it will have to say the thing differently or use another endpoint, because otherwise it has no reason not to send the same request again. The event carries a distinct prefix so a block reads as a block rather than as one more API error.
+
+  The underlying fragility is unchanged and worth naming: the overflow test matches bare substrings — `maximum`, `exceed`, `400` — in free-form provider prose. Classifying refusals first removes the case that was actually biting; it does not make that test sound.
+
 ## [0.6.1] — 2026-10-08
 
 ### Security

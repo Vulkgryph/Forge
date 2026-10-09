@@ -18,6 +18,71 @@ pub struct SpawnedCommand {
 /// caller doesn't pass `timeout_secs`. Matches top-level `wait=true`.
 pub const DEFAULT_SHELL_WAIT_TIMEOUT_SECS: u64 = 300;
 
+/// One line describing where the repository actually stands, or nothing.
+///
+/// "Done" was being asserted in prose while commits sat local-only — reported
+/// from weeks of use, and true of this project's own sessions. Nothing checked
+/// it, so the claim and the facts drifted silently.
+///
+/// This was briefly injected into the system prompt on every turn, which was
+/// wrong on both counts: it is noise when repeated, and it sits in the cached
+/// prefix, so a changed file count re-billed the whole conversation. It is a
+/// question with an answer, so it is answered when asked.
+///
+/// Returns `None` when there is nothing to say. A line that appears every turn
+/// saying everything is fine is a line people stop reading.
+fn repo_position_line(ahead: usize, dirty: usize, upstream: &str) -> Option<String> {
+    if ahead == 0 && dirty == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if ahead > 0 {
+        parts.push(format!(
+            "{ahead} commit{} not pushed to {upstream}",
+            if ahead == 1 { "" } else { "s" }
+        ));
+    }
+    if dirty > 0 {
+        parts.push(format!(
+            "{dirty} file{} with uncommitted changes",
+            if dirty == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!(
+        "{}. Work that exists only on this machine is not delivered; say so \
+         plainly rather than describing it as done.",
+        parts.join(", ")
+    ))
+}
+
+/// Reads the position with `git`, or `None` if this is not a usable checkout.
+///
+/// Counts only. The content of a diff belongs in a tool call somebody made, not
+/// in every system prompt, and two numbers are what the claim actually turns on.
+fn read_repo_position(root: &std::path::Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    // No upstream is normal — a fresh branch, or a checkout with no remote.
+    // There is then no "not pushed" to report, so only dirtiness is counted.
+    let upstream = git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    let ahead = match upstream.as_deref() {
+        Some(u) if !u.is_empty() => git(&["rev-list", "--count", &format!("{u}..HEAD")])
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let dirty = git(&["status", "--porcelain"])
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    repo_position_line(ahead, dirty, upstream.as_deref().unwrap_or("its upstream"))
+}
+
 /// Kill a spawned shell and any pipeline grandchildren.
 ///
 /// Unix PTY/spawn paths call `setsid()`, so the direct child is a session and
@@ -150,6 +215,7 @@ impl ToolExecutor {
             // is not a memory anyone would use.
             "read_file" | "list_directory" | "search_code" | "glob_files" | "todo_write"
             | "write_plan" | "exit_plan_mode" | "ask_question" | "remember" | "forget"
+            | "workspace_status"
                 => ToolKind::Read,
             "enter_plan_mode" => ToolKind::Execute,
             "apply_patch" => ToolKind::Write, // <-- FIX: Added apply_patch
@@ -254,6 +320,7 @@ impl ToolExecutor {
             }
             "glob_files" => self.glob_files(args).await,
             "todo_write" => self.todo_write(args).await,
+            "workspace_status" => self.workspace_status(),
             "remember" => self.remember(args),
             "forget" => self.forget(args),
             // The engine in `forge-search`, not a scrape of someone else's
@@ -1110,6 +1177,35 @@ impl ToolExecutor {
             .unwrap_or(0)
     }
 
+    /// Where things stand, when the agent asks rather than being told.
+    ///
+    /// Replaces a paragraph that was appended to the system prompt every turn.
+    /// Repeating it did not inform — it crowded the work and trained the model
+    /// to skim the invariant part of its instructions — and because every system
+    /// message is concatenated into the front of the request, a changed file
+    /// count invalidated the provider's prefix cache and re-billed the whole
+    /// conversation.
+    fn workspace_status(&self) -> Result<String> {
+        let root = self.project_root();
+        let mut out = String::new();
+
+        match read_repo_position(root) {
+            Some(line) => out.push_str(&format!("Repository: {line}\n")),
+            None => out.push_str("Repository: nothing uncommitted, nothing unpushed.\n"),
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = Self::memory_dir(root);
+        match crate::agent::memory::render(&crate::agent::memory::load(&dir, now), now) {
+            Some(notes) => out.push_str(notes.trim_start()),
+            None => out.push_str("Notes: none recorded."),
+        }
+        Ok(out)
+    }
+
     fn remember(&self, args: &serde_json::Value) -> Result<String> {
         use crate::agent::memory;
 
@@ -1770,6 +1866,7 @@ mod tests {
 
 #[cfg(test)]
 mod todo_tests {
+
     use super::*;
     use serde_json::json;
 
@@ -2005,3 +2102,45 @@ mod tool_classification_coverage {
     }
 }
 
+/// Where the repository stands, which `workspace_status` reports when asked.
+#[cfg(test)]
+mod repo_position_tests {
+    /// Silence when there is nothing to report. A line claiming all is well on
+    /// every call is a line people stop reading, and then it is absent when it
+    /// matters.
+    #[test]
+    fn a_clean_checkout_has_no_position_line() {
+        assert_eq!(crate::tools::executor::repo_position_line(0, 0, "origin/main"), None);
+    }
+
+    /// The failure this exists for: work described as finished while it has
+    /// never left the machine.
+    #[test]
+    fn local_only_commits_are_named_with_their_upstream() {
+        let line = crate::tools::executor::repo_position_line(3, 0, "origin/main").expect("something to say");
+        assert!(line.contains("3 commits not pushed"), "{line}");
+        assert!(line.contains("origin/main"), "it did not say where: {line}");
+        assert!(line.contains("not delivered"), "it did not say why it matters: {line}");
+    }
+
+    #[test]
+    fn one_commit_is_singular() {
+        let line = crate::tools::executor::repo_position_line(1, 0, "origin/main").unwrap();
+        assert!(line.contains("1 commit not"), "{line}");
+        assert!(!line.contains("1 commits"), "{line}");
+    }
+
+    #[test]
+    fn uncommitted_changes_are_counted_too() {
+        let line = crate::tools::executor::repo_position_line(0, 2, "origin/main").unwrap();
+        assert!(line.contains("2 files with uncommitted"), "{line}");
+        assert!(!line.contains("not pushed"), "nothing is unpushed: {line}");
+    }
+
+    #[test]
+    fn both_conditions_appear_together() {
+        let line = crate::tools::executor::repo_position_line(2, 5, "origin/trunk").unwrap();
+        assert!(line.contains("2 commits not pushed to origin/trunk"), "{line}");
+        assert!(line.contains("5 files with uncommitted changes"), "{line}");
+    }
+}

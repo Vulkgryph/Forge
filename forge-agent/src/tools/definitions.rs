@@ -169,6 +169,23 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "workspace_status".to_string(),
+                    description: "Where things stand right now: commits not pushed, files not \
+                        committed, and the notes you have recorded. Ask when it matters — \
+                        before saying work is finished, or after a compaction when you want \
+                        the position confirmed rather than assumed. You are deliberately not \
+                        told this every turn: being told the same thing repeatedly is noise \
+                        that crowds out the work.".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                },
+            },
+            ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "remember".to_string(),
@@ -652,6 +669,10 @@ pub fn get_toggleable_tool_names() -> Vec<&'static str> {
         "search_documents",
         "remember",
         "forget",
+        // Reads the repository position and your own notes. Toggleable like the
+        // rest: a tool the model can call is a tool someone can switch off, and
+        // the coverage test exists to make that non-optional.
+        "workspace_status",
         "shell_exec",
         "delegate_task",
     ]

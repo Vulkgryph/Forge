@@ -403,7 +403,11 @@ fn a_note_the_agent_records_lands_in_the_workspace() {
 /// a request made after it — which is also what proves the prompt is rebuilt
 /// per turn rather than once at construction.
 #[test]
-fn a_recorded_note_reaches_the_model_on_a_later_turn() {
+fn a_note_survives_the_conversation_without_being_repeated_every_turn() {
+    // Both halves of the contract, because each alone is satisfiable by a bug.
+    // A note that is re-stated every turn passes "it reached the model" while
+    // being the noise this stopped injecting; a note that is never stated
+    // passes "it is not repeated" while being useless.
     let (provider, port) = start_provider(vec![
         Reply::Tool {
             name: "remember".into(),
@@ -415,8 +419,10 @@ fn a_recorded_note_reaches_the_model_on_a_later_turn() {
             .to_string(),
         },
         Reply::Text("Noted.".into()),
-        // A second turn, whose request is the one that must carry the note.
+        // A later turn in the same session, which must NOT carry it again.
         Reply::Text("Understood.".into()),
+        // And the first turn of a fresh session, which must.
+        Reply::Text("Carrying on.".into()),
     ]);
     let home = fixture("reaches-model");
     write_config(&home, port);
@@ -427,11 +433,33 @@ fn a_recorded_note_reaches_the_model_on_a_later_turn() {
     one_turn(&mut agent, "what are you working on?");
     agent.stop();
 
+    // Not re-stated mid-session. The system prompt is the front of the request
+    // and every system message is concatenated into it, so rewriting it per
+    // turn both repeats itself and invalidates the provider's prefix cache.
+    let mid = provider.request_count() - 1;
+    let mid_prompt = provider.system_prompt(mid);
+    assert!(
+        !mid_prompt.contains("other-agent-owns-botauth"),
+        "the note was injected again mid-session, which is the noise this removed:\n{mid_prompt}"
+    );
+
+    // But it is on disk, and a conversation that starts fresh carries it. This
+    // is the same code path compaction takes — the prompt is rebuilt from the
+    // base plus whatever survived — so it is the survival guarantee under test.
+    assert!(
+        !notes_on_disk(&home).is_empty(),
+        "the note was not recorded at all, so neither half means anything"
+    );
+    let mut resumed = Agent::start(&home);
+    assert!(resumed.wait_for("init").is_some(), "the second agent never started");
+    one_turn(&mut resumed, "what do you know?");
+    resumed.stop();
+
     let last = provider.request_count() - 1;
     let prompt = provider.system_prompt(last);
     assert!(
         prompt.contains("other-agent-owns-botauth"),
-        "the note never reached the model. System prompt of request {last}:\n{prompt}"
+        "the note did not survive into a new conversation. System prompt of request {last}:\n{prompt}"
     );
     assert!(
         prompt.contains("Do not edit it"),
@@ -442,6 +470,7 @@ fn a_recorded_note_reaches_the_model_on_a_later_turn() {
         "the notes are not framed as checkable claims:\n{prompt}"
     );
 }
+
 
 /// An expired note is not offered to the model, and is gone from disk.
 #[test]
@@ -577,6 +606,8 @@ fn forgetting_a_note_removes_it_from_the_prompt() {
         },
         Reply::Text("Dropped it.".into()),
         Reply::Text("Nothing in my notes.".into()),
+        // The fresh session's turn, which is where the absence is checked.
+        Reply::Text("Still nothing.".into()),
     ]);
     let home = fixture("forget");
     write_config(&home, port);
@@ -601,6 +632,16 @@ fn forgetting_a_note_removes_it_from_the_prompt() {
     agent.stop();
 
     assert!(notes_on_disk(&home).is_empty(), "forget left the file behind");
+
+    // Checked against a conversation that starts fresh, because that is now the
+    // only place notes are stated. Asserting on a later turn of the same
+    // session would pass whether forget worked or not, since nothing is
+    // re-injected mid-session any more.
+    let mut resumed = Agent::start(&home);
+    assert!(resumed.wait_for("init").is_some(), "the second agent never started");
+    one_turn(&mut resumed, "what do you know?");
+    resumed.stop();
+
     let last = provider.request_count() - 1;
     let prompt = provider.system_prompt(last);
     assert!(

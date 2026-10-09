@@ -6,6 +6,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A generated signing key really is created owner-only now.** 0.6.0 said this was fixed and it was not: the file was still written with `fs::write` and `chmod`ed afterwards, so it existed at the umask default until the second call landed — and the `chmod`'s result was discarded, so a failure left the key world-readable permanently and silently. The refusal to overwrite was also still `exists()` followed by a write, a check two concurrent runs both pass: both see no key, both write, and the second destroys the first, orphaning every signature already published against it.
+
+  Both are now one `open(2)`: `create_new` for exclusivity decided by the kernel, and the mode applied at creation so there is no window and nothing left to fail separately. Tested by releasing eight threads from a barrier onto the same path and asserting exactly one creates a key — which the previous code could not satisfy.
+
+- **An API failure showed `{"type":"resp…` and nothing else.** The whole SSE payload of a `response.failed` event went into the error message. That payload is a JSON object hundreds of characters wide whose first field is `"type"`, so anything that clips a long error cut it off before the reason. Reported from use with the reason invisible; it turned out to be `cyber_policy`, the provider's own classifier refusing the request, which is both actionable and impossible to guess. The message now leads with `error.message`, plus the code and status, and keeps the raw payload only when nothing parses out of it — labelled as unparsed rather than offered as an explanation.
+
 - **Codex login failed on Windows with a missing-parameter error.** The browser was opened with `cmd /c start "" <url>` through `Command::args`, which quotes arguments by the C runtime's rules — rules `cmd.exe` does not follow, since it re-parses the command line itself. Those rules only add quotes around whitespace, and a percent-encoded URL has none, so the URL arrived unquoted and `&` was read as cmd's command separator.
 
   The browser therefore received `…/oauth/authorize?response_type=code` and nothing else, while `client_id=…`, `redirect_uri=…`, `code_challenge=…` and `state=…` were each run as separate commands. The authorization server replied, correctly, that parameters were missing. macOS and Linux were unaffected: `open` and `xdg-open` take the URL as a single argument with no shell in between.

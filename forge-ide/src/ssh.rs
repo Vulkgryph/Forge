@@ -721,14 +721,33 @@ struct ClientHandler {
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
     fn check_server_key(
-        &mut self, key: &ssh_key::PublicKey,
+        &mut self, key: &russh::keys::PublicKeyOrCertificate,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         let host = self.host.clone();
         let port = self.port;
         let trust_new = self.trust_new;
         let found = Arc::clone(&self.found);
-        let key = key.clone();
+        // russh 0.63 widened this from a public key to a key *or* a host
+        // certificate. Only the key half can be checked: `check_known_hosts`
+        // still takes a `PublicKey`, and known_hosts has nowhere to record a
+        // certificate — so a certificate cannot be verified here and is
+        // refused, rather than being unwrapped to its signing key and treated
+        // as if the host had presented that key directly.
+        //
+        // Refused without offering to trust it, too. `trust_new` writes the key
+        // to known_hosts so the question is asked once; a certificate could
+        // never be written, so the prompt would return on every connection and
+        // "trust" would be a button that does nothing. Nothing requests
+        // certificate host-key algorithms, so this is unreachable today and is
+        // here so that it stays a refusal if that changes.
+        let key = match key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => Some(key.clone()),
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => None,
+        };
         async move {
+            let Some(key) = key else {
+                return Ok(false);
+            };
             let fingerprint = key.fingerprint(Default::default()).to_string();
             let verdict = match russh::keys::check_known_hosts(&host, port, &key) {
                 Ok(true) => HostKey::Known,

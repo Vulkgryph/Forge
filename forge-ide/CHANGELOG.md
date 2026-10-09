@@ -6,6 +6,10 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **Four advisories in the SSH stack, one of them high severity.** `russh` 0.62 → 0.63, which clears GHSA-47hw-gvq5-r2gm (high: client-side channel-scoped handler callbacks firing for the wrong channel), a CHANNEL_OPEN memory-exhaustion flood, missing X25519 zero-point validation in hybrid ML-KEM key exchange, and a MAC negotiation issue. `rustls` and `pageant` moved to their patched releases in the same pass.
+
+  0.63 widened `check_server_key` from a public key to a key *or* a host certificate, so host-key verification had to be adapted. A certificate is refused: `check_known_hosts` takes a `PublicKey` and known_hosts has nowhere to record a certificate, so it cannot be verified — and it is refused without offering to trust it, because `trust_new` works by writing the key down so the question is asked once, and a certificate could never be written, which would make "trust" a button that asks again on every connection. Nothing requests certificate host-key algorithms, so this is unreachable today; it is written down so it stays a refusal if that changes.
+
 - **The released disk image named the account that built it, about nine hundred times.** `strings` on any of 0.6.0's three binaries returned the absolute path of every dependency file that can panic — 570 in `forge-ide`, 326 in `forge-agent`, 26 in `forge-server`. Counted in the published artifact, not inferred from the source.
 
   `strip = true` has been set in the release profile the whole time and does nothing about it. A panic site — `panic!`, `unwrap`, `expect`, a slice index — stores its source location in `.rodata` as a string literal for `core::panic::Location` to point at. That is program data, not debug info. Cargo compiles a registry dependency by its absolute path, because `~/.cargo/registry` is outside the workspace, so every one of those literals carries the builder's home directory. Workspace members are compiled by relative path, which is why the project's own files never appeared.

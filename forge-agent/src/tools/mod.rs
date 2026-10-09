@@ -14,5 +14,5 @@ pub mod web;
 pub use definitions::{
     ask_question_definition, delegate_task_definition, enter_plan_mode_definition,
 };
-pub use executor::{terminate_child, SpawnedCommand, ToolExecutor, ToolKind};
+pub use executor::{terminate_child, SpawnedCommand, ToolExecutor, ToolKind, DEFAULT_SHELL_WAIT_TIMEOUT_SECS};
 pub use scratchpad::Scratchpad;

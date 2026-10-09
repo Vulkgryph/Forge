@@ -1365,10 +1365,13 @@ impl Agent {
             .unwrap_or(0);
         let dir = ToolExecutor::memory_dir(self.executor.project_root());
         let notes = crate::agent::memory::render(&crate::agent::memory::load(&dir, now), now);
-        let wanted = match notes.as_deref() {
-            Some(notes) => format!("{}{}", self.system_prompt_base, notes),
-            None => self.system_prompt_base.clone(),
-        };
+        let position = read_repo_position(self.executor.project_root());
+        let wanted = format!(
+            "{}{}{}",
+            self.system_prompt_base,
+            notes.as_deref().unwrap_or(""),
+            position.as_deref().unwrap_or(""),
+        );
         if wanted == self.system_prompt {
             return;
         }
@@ -5654,6 +5657,74 @@ Rules:
     )
 }
 
+/// One line describing where the repository actually stands, or nothing.
+///
+/// "Done" was being asserted in prose while commits sat local-only — reported
+/// from weeks of use, and true of this project's own sessions. Nothing checked
+/// it, so the claim and the facts drifted silently.
+///
+/// This does not gate a claim; it makes one falsifiable. The model is told the
+/// position at the start of every turn, so a statement that work is finished
+/// while three commits have never left the machine is contradicted by the
+/// context it was written in. A real gate would need the project to declare
+/// what finished means — pushed? reviewed? released? — which is not something
+/// the agent can decide on its behalf.
+///
+/// Returns `None` when there is nothing to say. A line that appears every turn
+/// saying everything is fine is a line people stop reading.
+fn repo_position_line(ahead: usize, dirty: usize, upstream: &str) -> Option<String> {
+    if ahead == 0 && dirty == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if ahead > 0 {
+        parts.push(format!(
+            "{ahead} commit{} not pushed to {upstream}",
+            if ahead == 1 { "" } else { "s" }
+        ));
+    }
+    if dirty > 0 {
+        parts.push(format!(
+            "{dirty} file{} with uncommitted changes",
+            if dirty == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!(
+        "\n\n[Repository, at the start of this turn: {}. \
+         Work that exists only on this machine is not delivered; say so plainly \
+         rather than describing it as done.]",
+        parts.join(", ")
+    ))
+}
+
+/// Reads the position with `git`, or `None` if this is not a usable checkout.
+///
+/// Counts only. The content of a diff belongs in a tool call somebody made, not
+/// in every system prompt, and two numbers are what the claim actually turns on.
+fn read_repo_position(root: &std::path::Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    // No upstream is normal — a fresh branch, or a checkout with no remote.
+    // There is then no "not pushed" to report, so only dirtiness is counted.
+    let upstream = git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    let ahead = match upstream.as_deref() {
+        Some(u) if !u.is_empty() => git(&["rev-list", "--count", &format!("{u}..HEAD")])
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let dirty = git(&["status", "--porcelain"])
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    repo_position_line(ahead, dirty, upstream.as_deref().unwrap_or("its upstream"))
+}
+
 /// Which of `tool_calls` have no `tool_result` in `history` yet.
 ///
 /// Split out from the method so it can be tested without standing up an agent,
@@ -5680,6 +5751,46 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    /// Silence when there is nothing to report. A line that appears every turn
+    /// saying all is well is a line people stop reading, and then it is not
+    /// there when it matters.
+    #[test]
+    fn a_clean_checkout_says_nothing() {
+        assert_eq!(repo_position_line(0, 0, "origin/main"), None);
+    }
+
+    /// The failure this exists for: work described as finished while it has
+    /// never left the machine. Reported from weeks of use, and true of this
+    /// project's own sessions.
+    #[test]
+    fn local_only_commits_are_named_with_their_upstream() {
+        let line = repo_position_line(3, 0, "origin/main").expect("something to say");
+        assert!(line.contains("3 commits not pushed"), "{line}");
+        assert!(line.contains("origin/main"), "it did not say where: {line}");
+        assert!(line.contains("not delivered"), "it did not say why it matters: {line}");
+    }
+
+    #[test]
+    fn one_commit_is_singular() {
+        let line = repo_position_line(1, 0, "origin/main").unwrap();
+        assert!(line.contains("1 commit not"), "{line}");
+        assert!(!line.contains("1 commits"), "{line}");
+    }
+
+    #[test]
+    fn uncommitted_changes_are_counted_too() {
+        let line = repo_position_line(0, 2, "origin/main").unwrap();
+        assert!(line.contains("2 files with uncommitted"), "{line}");
+        assert!(!line.contains("not pushed"), "nothing is unpushed: {line}");
+    }
+
+    #[test]
+    fn both_conditions_appear_together() {
+        let line = repo_position_line(2, 5, "origin/trunk").unwrap();
+        assert!(line.contains("2 commits not pushed to origin/trunk"), "{line}");
+        assert!(line.contains("5 files with uncommitted changes"), "{line}");
     }
 
     /// The defect this exists for: the loop-detector's stop path returned from

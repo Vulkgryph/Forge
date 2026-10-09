@@ -753,6 +753,29 @@ impl SubagentRunner {
             def.max_turns = Some(mt as usize);
         }
 
+        // A subagent could not see its own clock, and chose shell timeouts
+        // without knowing one existed. A long hardware gate was handed to one
+        // and killed partway through, leaving the machine it was driving
+        // stranded — the parent would have waited half an hour, but the
+        // per-call shell limit ended it in minutes, and nothing had said so.
+        //
+        // Appended rather than placed in the agent definition so it survives a
+        // system_prompt_override: someone writing a custom prompt for a
+        // long-running task is precisely who needs this, and is also most
+        // likely to replace whatever it was attached to.
+        let budget = self.app_config.agent.subagents.max_delegate_secs;
+        if budget > 0 {
+            def.system_prompt.push_str(&format!(
+                "\n\nYour time budget: the parent stops waiting after {budget}s total. \
+                 A single shell_exec call defaults to a {}s limit regardless of that \
+                 budget — pass timeout_secs explicitly if a command needs longer, and keep \
+                 it inside the budget above. If a task cannot finish in {budget}s, say so \
+                 and return rather than starting it: a command killed halfway can leave \
+                 whatever it was driving unfinished, which is worse than not starting.",
+                crate::tools::DEFAULT_SHELL_WAIT_TIMEOUT_SECS
+            ));
+        }
+
         // Resolve model
         let (client, model_id, max_ctx) = match &def.model {
             AgentModel::Inherit => (

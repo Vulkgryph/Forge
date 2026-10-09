@@ -869,8 +869,14 @@ impl ToolExecutor {
 
         let mut result = if timed_out {
             format!(
-                "$ {}\nTIMEOUT: Command exceeded {}s limit (subagent/direct shell_exec) and was killed.\n",
-                command, timeout_secs
+                "$ {}\nTIMEOUT: Command exceeded {}s limit (subagent/direct shell_exec) \
+                 and was killed.\nThis limit is per-call and defaults to {}s — it is not \
+                 the whole budget. Pass timeout_secs explicitly for a command that needs \
+                 longer, or run_in_background=true and poll it. A command that cannot \
+                 finish inside a subagent's remaining budget belongs in the main turn: \
+                 killing it halfway can leave whatever it was driving in an unfinished \
+                 state, which is worse than not having started.\n",
+                command, timeout_secs, DEFAULT_SHELL_WAIT_TIMEOUT_SECS
             )
         } else {
             format!("$ {}\nExit code: {}\n", command, exit_code)

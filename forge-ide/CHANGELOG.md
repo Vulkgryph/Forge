@@ -4,6 +4,34 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [0.6.1] — 2026-10-08
 
+### Added
+
+- **`scripts/check_private.py` — one list of names, every surface that can publish one.** Three identities leaked out of this repository, and each got past a check that was looking somewhere else: a check on prose missed a machine path in a test, and nothing had ever read a commit message or a build artifact. A username leaked twice, the second time in the message of the commit that removed the first.
+
+  CI reads the tracked tree, the `pre-push` hook reads commit messages and refuses the push, and packaging reads the built binaries before anything is signed. The names cannot be stored here — a list of protected names in a public repository is the leak — so they come from the machine itself and from `.git/private-names`, a file that cannot be committed because `.git` is not part of a tree. Placeholders like `/Users/someone` are recognised, which is what lets this read source rather than prose only. See [CONTRIBUTING](../CONTRIBUTING.md).
+
+- **Files that are not UTF-8 open, and are written back the way they came.** A latin-1 source file, a UTF-16 file off a Windows box, or one stray byte all used to be refused with "is not a text file" — a message that was right about binaries and wrong about everything else. The encoding is remembered on the buffer and reversed on save, so `encode(decode(bytes)) == bytes`; without that, decoding would have been *worse* than refusing, since saving wrote UTF-8 and would have rewritten a UTF-16 file with its byte-order mark left as mojibake. Detection stops at a byte-order mark and a UTF-8 check — guessing between latin-1, Windows-1252 and Shift-JIS is what `encoding_rs` is for — and latin-1 is the fallback because it is total and exactly reversible. Binaries are still refused, now saying so specifically. A save that would drop characters the encoding cannot hold is refused rather than performed.
+
+- **CRLF files keep their line endings.** This was broken for every file, not just unusual ones: `str::lines()` strips the `\r` and saving wrote `\n`, so opening and saving any CRLF file rewrote every line in it.
+
+- **Composed input reaches the terminal.** The input loop matched `Event::Text` and `Event::Key` and nothing else, so `Event::Ime` was dropped — Japanese, Chinese and Korean could not be typed into the built-in terminal at all. The editor was unaffected because `TextEdit` handles IME itself, which is why it was broken only where nobody would look. Both the local and SSH terminals now route it through one function, since they had the same omission.
+
+### Changed
+
+- **Wide characters take two terminal columns.** Every CJK ideograph, fullwidth form and most emoji occupied one column where the program writing to the terminal had assumed two — and since applications compute their own padding from those widths, the alignment was wrong before it was drawn. `git log` on a repository with Chinese commit messages came apart. Wide characters now claim the column after them with a spacer, which is skipped wherever a row becomes text and is not written to the session file (reconstructed from the character's width instead, so the saved format is unchanged and old sessions still load). Box drawing, powerline separators and the arrows Forge's own TUI prints stay single-width — the regression this could most easily have caused, and tested for. Combining marks are dropped rather than given a column: a cell holds one `char`, so `e` + combining-acute renders as `e`, and the alternative puts every following column wrong.
+
+- **The language server is told what changed, not sent the whole file.** `didChange` shipped the entire document, JSON-encoded, on every keystroke — and being called from the frame loop, on frames with no edit at all. Identical text now sends nothing, and an edit sends one range computed from a common prefix and suffix. Deliberately not a minimal diff: a change at both ends of a file sends the middle too, because a wrong minimal diff silently desynchronises the server's copy and every diagnostic after it points at the wrong line. Gated on the server's declared `textDocumentSync`, read from the initialize result rather than assumed — the response used to be read and discarded.
+
+### Removed
+
+- **The hand-written Vulkan renderer is gone.** `gfx.rs` and `egui_pass.rs` — 1,421 lines — plus the SPIR-V shaders, the `vulkan-renderer` feature, and the `ash`, `ash-window` and `shaderc` dependencies.
+
+  It was opt-in, and nothing built it. No CI job ever enabled the feature, so it had not been compiled by a machine since it stopped being the default, and on macOS it could not run at all without MoltenVK — a third-party dylib this repository deliberately does not redistribute. Its own comment said it was "kept while wgpu proves itself in real use"; by now wgpu has shipped a notarized macOS release and drawn frames on Windows under D3D12, which is the bar that sentence set.
+
+  What it also removes: a documented build requirement nobody needed. `forge-ide/README.md` listed a GLSL toolchain — `cmake` and a C++ compiler — as a prerequisite for every build, thirteen lines after the bullet explaining that Vulkan was optional. New contributors were installing a toolchain to compile shaders that were never compiled.
+
+  Renderer selection is now unconditional: wgpu, which picks the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux. The 25 `#[cfg(feature = "vulkan-renderer")]` switch points in `main.rs` are gone with it.
+
 ### Fixed
 
 - **Four advisories in the SSH stack, one of them high severity.** `russh` 0.62 → 0.63, which clears GHSA-47hw-gvq5-r2gm (high: client-side channel-scoped handler callbacks firing for the wrong channel), a CHANNEL_OPEN memory-exhaustion flood, missing X25519 zero-point validation in hybrid ML-KEM key exchange, and a MAC negotiation issue. `rustls` and `pageant` moved to their patched releases in the same pass.
@@ -19,38 +47,6 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 - **Two further paths that no compile flag could reach.** The artifact check caught what the flag could not: `forge-ide` also carried the checkout's own location three times. One came from `env!("CARGO_MANIFEST_DIR")` in the dev-only fallback that locates `forge-agent`; an environment variable is not a source path, so remapping never touched it, and it is now compiled only into debug builds — a release binary finds the agent beside its own executable or on `PATH`. The other two came from `openssl-sys`, which compiles OpenSSL and records its install directory as ordinary data. Release builds therefore compile into a target directory outside `$HOME`, which also stops release and dev builds invalidating each other's cache through `RUSTFLAGS`.
 
   Both published images were rebuilt from their own tags, verified by downloading what is now served, and remain signed and notarized.
-
-### Added
-
-- **`scripts/check_private.py` — one list of names, every surface that can publish one.** Three identities leaked out of this repository, and each got past a check that was looking somewhere else: a check on prose missed a machine path in a test, and nothing had ever read a commit message or a build artifact. A username leaked twice, the second time in the message of the commit that removed the first.
-
-  CI reads the tracked tree, the `pre-push` hook reads commit messages and refuses the push, and packaging reads the built binaries before anything is signed. The names cannot be stored here — a list of protected names in a public repository is the leak — so they come from the machine itself and from `.git/private-names`, a file that cannot be committed because `.git` is not part of a tree. Placeholders like `/Users/someone` are recognised, which is what lets this read source rather than prose only. See [CONTRIBUTING](../CONTRIBUTING.md).
-
-### Removed
-
-- **The hand-written Vulkan renderer is gone.** `gfx.rs` and `egui_pass.rs` — 1,421 lines — plus the SPIR-V shaders, the `vulkan-renderer` feature, and the `ash`, `ash-window` and `shaderc` dependencies.
-
-  It was opt-in, and nothing built it. No CI job ever enabled the feature, so it had not been compiled by a machine since it stopped being the default, and on macOS it could not run at all without MoltenVK — a third-party dylib this repository deliberately does not redistribute. Its own comment said it was "kept while wgpu proves itself in real use"; by now wgpu has shipped a notarized macOS release and drawn frames on Windows under D3D12, which is the bar that sentence set.
-
-  What it also removes: a documented build requirement nobody needed. `forge-ide/README.md` listed a GLSL toolchain — `cmake` and a C++ compiler — as a prerequisite for every build, thirteen lines after the bullet explaining that Vulkan was optional. New contributors were installing a toolchain to compile shaders that were never compiled.
-
-  Renderer selection is now unconditional: wgpu, which picks the platform's own API — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux. The 25 `#[cfg(feature = "vulkan-renderer")]` switch points in `main.rs` are gone with it.
-
-### Added
-
-- **Files that are not UTF-8 open, and are written back the way they came.** A latin-1 source file, a UTF-16 file off a Windows box, or one stray byte all used to be refused with "is not a text file" — a message that was right about binaries and wrong about everything else. The encoding is remembered on the buffer and reversed on save, so `encode(decode(bytes)) == bytes`; without that, decoding would have been *worse* than refusing, since saving wrote UTF-8 and would have rewritten a UTF-16 file with its byte-order mark left as mojibake. Detection stops at a byte-order mark and a UTF-8 check — guessing between latin-1, Windows-1252 and Shift-JIS is what `encoding_rs` is for — and latin-1 is the fallback because it is total and exactly reversible. Binaries are still refused, now saying so specifically. A save that would drop characters the encoding cannot hold is refused rather than performed.
-
-- **CRLF files keep their line endings.** This was broken for every file, not just unusual ones: `str::lines()` strips the `\r` and saving wrote `\n`, so opening and saving any CRLF file rewrote every line in it.
-
-- **Composed input reaches the terminal.** The input loop matched `Event::Text` and `Event::Key` and nothing else, so `Event::Ime` was dropped — Japanese, Chinese and Korean could not be typed into the built-in terminal at all. The editor was unaffected because `TextEdit` handles IME itself, which is why it was broken only where nobody would look. Both the local and SSH terminals now route it through one function, since they had the same omission.
-
-### Changed
-
-- **Wide characters take two terminal columns.** Every CJK ideograph, fullwidth form and most emoji occupied one column where the program writing to the terminal had assumed two — and since applications compute their own padding from those widths, the alignment was wrong before it was drawn. `git log` on a repository with Chinese commit messages came apart. Wide characters now claim the column after them with a spacer, which is skipped wherever a row becomes text and is not written to the session file (reconstructed from the character's width instead, so the saved format is unchanged and old sessions still load). Box drawing, powerline separators and the arrows Forge's own TUI prints stay single-width — the regression this could most easily have caused, and tested for. Combining marks are dropped rather than given a column: a cell holds one `char`, so `e` + combining-acute renders as `e`, and the alternative puts every following column wrong.
-
-- **The language server is told what changed, not sent the whole file.** `didChange` shipped the entire document, JSON-encoded, on every keystroke — and being called from the frame loop, on frames with no edit at all. Identical text now sends nothing, and an edit sends one range computed from a common prefix and suffix. Deliberately not a minimal diff: a change at both ends of a file sends the middle too, because a wrong minimal diff silently desynchronises the server's copy and every diagnostic after it points at the wrong line. Gated on the server's declared `textDocumentSync`, read from the initialize result rather than assumed — the response used to be read and discarded.
-
-### Fixed
 
 - **Markdown links in the agent panel rendered as their source.** Reported from use: a sentence came out carrying the whole of its link markup inline — the label `[language design directive]` and then, as visible text, the parenthesised target that should have been invisible. The inline parser knew `**bold**` and `` `code` `` and nothing else, so everything it did not recognise fell through to literal text — which the file's own comment said in as many words, and which is easy to miss until an agent writes a paragraph naming three files.
 

@@ -4,21 +4,17 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [0.6.1] — 2026-10-08
 
-### Fixed
+### Security
 
-- **A generated signing key really is created owner-only now.** 0.6.0 said this was fixed and it was not: the file was still written with `fs::write` and `chmod`ed afterwards, so it existed at the umask default until the second call landed — and the `chmod`'s result was discarded, so a failure left the key world-readable permanently and silently. The refusal to overwrite was also still `exists()` followed by a write, a check two concurrent runs both pass: both see no key, both write, and the second destroys the first, orphaning every signature already published against it.
+- **Offline mode did not cover everything that leaves the machine, and did not reach subagents.** Two separate holes behind one documented promise — "no outgoing request except to the endpoint you configured" — with different ranges, checked against the tags. `offline_mode` arrived in 0.3.0; `disabled_tools` has existed since 0.1.0; `search_papers` arrived in 0.5.0.
 
-  Both are now one `open(2)`: `create_new` for exclusivity decided by the kernel, and the mode applied at creation so there is no window and nothing left to fail separately. Tested by releasing eight threads from a barrier onto the same path and asserting exactly one creates a key — which the previous code could not satisfy.
+  `search_papers` was never in the force-off set — affects 0.5.0 through 0.6.0. It is enabled by default and calls Europe PMC at `www.ebi.ac.uk`, so the promise was false for anyone who had not disabled it by hand, which is the default state. The comment in the code asserted that `web_search` and `web_fetch` "are the only normal tools that reach the network" and was the reason nobody looked again.
 
-- **An API failure showed `{"type":"resp…` and nothing else.** The whole SSE payload of a `response.failed` event went into the error message. That payload is a JSON object hundreds of characters wide whose first field is `"type"`, so anything that clips a long error cut it off before the reason. Reported from use with the reason invisible; it turned out to be `cyber_policy`, the provider's own classifier refusing the request, which is both actionable and impossible to guess. The message now leads with `error.message`, plus the code and status, and keeps the raw payload only when nothing parses out of it — labelled as unparsed rather than offered as an explanation.
+  Subagents honoured neither `offline_mode` nor the operator's own `disabled_tools` — affects 0.3.0 through 0.6.0 for `offline_mode`, and every release for `disabled_tools`. A subagent's tools were filtered against its agent definition alone, and the built-in `general` agent lists `web_search` and `web_fetch` — so with `offline_mode = true`, `delegate_task` handed a subagent live web tools. The switch held for the agent you could see and not for the ones it started.
 
-- **Codex login failed on Windows with a missing-parameter error.** The browser was opened with `cmd /c start "" <url>` through `Command::args`, which quotes arguments by the C runtime's rules — rules `cmd.exe` does not follow, since it re-parses the command line itself. Those rules only add quotes around whitespace, and a percent-encoded URL has none, so the URL arrived unquoted and `&` was read as cmd's command separator.
+  Both paths now derive the disabled set from one function. What it returns is tested, and the subagent path has a guard that fails if the session's list stops being consulted.
 
-  The browser therefore received `…/oauth/authorize?response_type=code` and nothing else, while `client_id=…`, `redirect_uri=…`, `code_challenge=…` and `state=…` were each run as separate commands. The authorization server replied, correctly, that parameters were missing. macOS and Linux were unaffected: `open` and `xdg-open` take the URL as a single argument with no shell in between.
-
-  Now built as a quoted raw command line, so `&` cannot split it, with the empty `""` first because `start` reads a lone quoted argument as the window title. The construction is a separate function tested on any platform — the defect was invisible on both platforms this is normally developed on — and the tests assert the failure rather than the shape of the fix: a miniature of cmd's own splitting rule shows the old form breaking into three commands and the new one staying as one. The Windows-only arm is type-checked for `x86_64-pc-windows-msvc`.
-
-  Until you have a build with this in, the URL printed in the terminal under "If the browser doesn't open, visit:" is complete and correct — pasting it works.
+- **`search_documents` could not be turned off from the UI.** Affects 0.5.0 through 0.6.0, the releases it has existed in. The model was offered it and the tools menu never listed it, because it was missing from the toggle list — so the only way to stop it was editing `disabled_tools` by hand. It reads and indexes whatever prose files it is pointed at, which is the kind of tool a switch is for. A test now requires every tool the model is offered to be one the user can disable.
 
 ### Added
 
@@ -70,19 +66,27 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
   Found by driving the real binary against a provider that records what it was asked, in `tests/compaction_over_window.rs` — reading the code gave two different wrong answers first, that the summariser request would be over the window and fail, and then that nothing was wrong. Neither survived a test. The same file also establishes what does work: at over 100% the summary is produced (`split_transcript` chunks the transcript rather than sending an oversized request), the recent messages survive verbatim beside it, and one compaction is enough — a short message straight afterwards does not compact again.
 
-### Security
+### Changed
 
-- **Offline mode did not cover everything that leaves the machine, and did not reach subagents.** Two separate holes behind one documented promise — "no outgoing request except to the endpoint you configured" — with different ranges, checked against the tags. `offline_mode` arrived in 0.3.0; `disabled_tools` has existed since 0.1.0; `search_papers` arrived in 0.5.0.
+- Documented that Forge rewrites `config.toml` on every startup and does not preserve comments or layout — measured, not inferred: a hand-written 27-line file with two comments comes back as 50 lines with none. Values are preserved.
 
-  `search_papers` was never in the force-off set — affects 0.5.0 through 0.6.0. It is enabled by default and calls Europe PMC at `www.ebi.ac.uk`, so the promise was false for anyone who had not disabled it by hand, which is the default state. The comment in the code asserted that `web_search` and `web_fetch` "are the only normal tools that reach the network" and was the reason nobody looked again.
-
-  Subagents honoured neither `offline_mode` nor the operator's own `disabled_tools` — affects 0.3.0 through 0.6.0 for `offline_mode`, and every release for `disabled_tools`. A subagent's tools were filtered against its agent definition alone, and the built-in `general` agent lists `web_search` and `web_fetch` — so with `offline_mode = true`, `delegate_task` handed a subagent live web tools. The switch held for the agent you could see and not for the ones it started.
-
-  Both paths now derive the disabled set from one function. What it returns is tested, and the subagent path has a guard that fails if the session's list stops being consulted.
-
-- **`search_documents` could not be turned off from the UI.** Affects 0.5.0 through 0.6.0, the releases it has existed in. The model was offered it and the tools menu never listed it, because it was missing from the toggle list — so the only way to stop it was editing `disabled_tools` by hand. It reads and indexes whatever prose files it is pointed at, which is the kind of tool a switch is for. A test now requires every tool the model is offered to be one the user can disable.
+- `search_papers` now appears in the offline documentation and in the "what requires network" table, which had listed two tools when there were three.
 
 ### Fixed
+
+- **A generated signing key really is created owner-only now.** 0.6.0 said this was fixed and it was not: the file was still written with `fs::write` and `chmod`ed afterwards, so it existed at the umask default until the second call landed — and the `chmod`'s result was discarded, so a failure left the key world-readable permanently and silently. The refusal to overwrite was also still `exists()` followed by a write, a check two concurrent runs both pass: both see no key, both write, and the second destroys the first, orphaning every signature already published against it.
+
+  Both are now one `open(2)`: `create_new` for exclusivity decided by the kernel, and the mode applied at creation so there is no window and nothing left to fail separately. Tested by releasing eight threads from a barrier onto the same path and asserting exactly one creates a key — which the previous code could not satisfy.
+
+- **An API failure showed `{"type":"resp…` and nothing else.** The whole SSE payload of a `response.failed` event went into the error message. That payload is a JSON object hundreds of characters wide whose first field is `"type"`, so anything that clips a long error cut it off before the reason. Reported from use with the reason invisible; it turned out to be `cyber_policy`, the provider's own classifier refusing the request, which is both actionable and impossible to guess. The message now leads with `error.message`, plus the code and status, and keeps the raw payload only when nothing parses out of it — labelled as unparsed rather than offered as an explanation.
+
+- **Codex login failed on Windows with a missing-parameter error.** The browser was opened with `cmd /c start "" <url>` through `Command::args`, which quotes arguments by the C runtime's rules — rules `cmd.exe` does not follow, since it re-parses the command line itself. Those rules only add quotes around whitespace, and a percent-encoded URL has none, so the URL arrived unquoted and `&` was read as cmd's command separator.
+
+  The browser therefore received `…/oauth/authorize?response_type=code` and nothing else, while `client_id=…`, `redirect_uri=…`, `code_challenge=…` and `state=…` were each run as separate commands. The authorization server replied, correctly, that parameters were missing. macOS and Linux were unaffected: `open` and `xdg-open` take the URL as a single argument with no shell in between.
+
+  Now built as a quoted raw command line, so `&` cannot split it, with the empty `""` first because `start` reads a lone quoted argument as the window title. The construction is a separate function tested on any platform — the defect was invisible on both platforms this is normally developed on — and the tests assert the failure rather than the shape of the fix: a miniature of cmd's own splitting rule shows the old form breaking into three commands and the new one staying as one. The Windows-only arm is type-checked for `x86_64-pc-windows-msvc`.
+
+  Until you have a build with this in, the URL printed in the terminal under "If the browser doesn't open, visit:" is complete and correct — pasting it works.
 
 - **A resumed conversation could report "114% ctx" with nothing to explain it.** Reported from use. The figure clients show is `last_prompt_tokens / max_context_tokens`, and on resume the numerator is an *estimate of the restored transcript* rather than a measured request — so a long conversation comes back over 100% before anything has trimmed it. The number was accurate and unexplained, which reads either as a broken display or as work already lost. Neither is true: nothing is discarded until the next turn.
 
@@ -101,12 +105,6 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 - `scripts/ssh_fault_proxy.py` could not start. It imported a fixture deleted when the resilience harness was ported to Rust, so it raised before either listener existed and the SSH reproduction path in `FAILURE-TESTING.md` had been unusable since. The provider is inlined, and a refused upstream no longer takes the whole script down with it.
 
 - Removed `forge-agent/forge`, a Bun wrapper for the TypeScript client retired in 0.3.0. Its target directory had been gone for releases; running it could only print a Bun error.
-
-### Changed
-
-- Documented that Forge rewrites `config.toml` on every startup and does not preserve comments or layout — measured, not inferred: a hand-written 27-line file with two comments comes back as 50 lines with none. Values are preserved.
-
-- `search_papers` now appears in the offline documentation and in the "what requires network" table, which had listed two tools when there were three.
 
 ## [0.6.0] — 2026-09-29
 

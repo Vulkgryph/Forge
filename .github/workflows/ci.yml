@@ -32,7 +32,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils shellcheck
       - name: Shell and packaging checks
         run: |
-          shellcheck install.sh scripts/test_linux_installer.sh scripts/test_bootstrap_paths.sh
+          shellcheck install.sh uninstall.sh scripts/test_linux_installer.sh scripts/test_bootstrap_paths.sh
           bash scripts/test_linux_installer.sh
 
       # The privacy guard failed CI three times running, every time a false

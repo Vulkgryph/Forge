@@ -1672,12 +1672,23 @@ fn build_responses_body(
     stream: bool,
     reasoning: &EndpointReasoningConfig,
 ) -> serde_json::Value {
+    // Only the first system message — the base prompt. Every system message used
+    // to be concatenated here, and `instructions` is the front of the request,
+    // which is what OpenAI matches its prompt cache against. So each nudge,
+    // notice and correction the agent injects mid-conversation was moved to the
+    // front, invalidating the cache for everything behind it: in an active
+    // session most turns re-billed the whole conversation.
+    //
+    // It also put them where they could not be read properly. "You have run this
+    // command three times in a row" is written to land at the moment it
+    // happened; hoisted into the system prompt it reads as a standing
+    // instruction with no referent. Later system messages now stay in place.
     let instructions = messages
         .iter()
-        .filter(|m| m.role == "system")
-        .filter_map(|m| m.content.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .find(|m| m.role == "system")
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("")
+        .to_string();
 
     let input = convert_messages_to_responses_input(messages);
     let response_tools = convert_tools_to_responses(tools);
@@ -1950,7 +1961,22 @@ fn parse_tool_call_block(block: &str) -> Option<(String, String)> {
 }
 
 fn convert_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
-    let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
+    // The first system message went to `instructions`; the rest belong here, at
+    // the point in the conversation where they were said.
+    let mut base_taken = false;
+    let non_system: Vec<&Message> = messages
+        .iter()
+        .filter(|m| {
+            if m.role != "system" {
+                return true;
+            }
+            if base_taken {
+                return true;
+            }
+            base_taken = true;
+            false
+        })
+        .collect();
     let mut emitted_function_call_ids = std::collections::HashSet::new();
     let mut input = Vec::new();
     for (idx, msg) in non_system.iter().enumerate() {
@@ -1958,6 +1984,13 @@ fn convert_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::
             "user" => input.push(serde_json::json!({
                 "type": "message",
                 "role": "user",
+                "content": [{"type": "input_text", "text": msg.content.as_deref().unwrap_or("")}],
+            })),
+            // `developer` is this API's name for an instruction that is not the
+            // user speaking. Kept in sequence so it is read where it applies.
+            "system" => input.push(serde_json::json!({
+                "type": "message",
+                "role": "developer",
                 "content": [{"type": "input_text", "text": msg.content.as_deref().unwrap_or("")}],
             })),
             "assistant" => {
@@ -2065,6 +2098,16 @@ fn parse_responses_usage(value: Option<&serde_json::Value>) -> Option<Usage> {
         .or_else(|| u.get("completion_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    // What the provider says it served from cache. Nothing read this, so whether
+    // caching worked has never been observable — which is how a prefix being
+    // invalidated every turn could go unnoticed indefinitely.
+    let cached = u
+        .get("input_tokens_details")
+        .or_else(|| u.get("prompt_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let _ = cached;
     let total = u
         .get("total_tokens")
         .and_then(|v| v.as_u64())
@@ -2469,6 +2512,54 @@ mod tests {
         ] {
             assert_eq!(provider_refusal(benign), None, "{benign}");
         }
+    }
+
+    /// The cache argument, as an assertion rather than a story.
+    ///
+    /// `instructions` is the front of the request and OpenAI matches its prompt
+    /// cache on an exact prefix. Every system message used to be concatenated
+    /// into it, so a nudge injected on turn nine changed the prefix and
+    /// re-billed turns one through eight. The base prompt must be all that
+    /// lands there, no matter what else the agent has said since.
+    #[test]
+    fn an_injected_notice_does_not_change_the_cached_prefix() {
+        let base = Message::system("BASE PROMPT");
+        let before = vec![base.clone(), Message::user("do the thing")];
+        let after = vec![
+            base.clone(),
+            Message::user("do the thing"),
+            Message::system("[System: you have run `ls` 3 times in a row.]"),
+            Message::user("carry on"),
+        ];
+
+        let tools: Vec<ToolDefinition> = vec![];
+        let r = EndpointReasoningConfig::default();
+        let a = build_responses_body("m", &before, &tools, 1024, false, &r);
+        let b = build_responses_body("m", &after, &tools, 1024, false, &r);
+
+        assert_eq!(a["instructions"], b["instructions"], "the cached prefix moved");
+        assert_eq!(a["instructions"].as_str().unwrap(), "BASE PROMPT");
+    }
+
+    /// And it has to still reach the model — in sequence, where it applies.
+    /// Dropping it would keep the prefix stable and lose the correction.
+    #[test]
+    fn an_injected_notice_is_still_sent_in_its_place() {
+        let msgs = vec![
+            Message::system("BASE PROMPT"),
+            Message::user("first"),
+            Message::system("[System: a correction]"),
+            Message::user("second"),
+        ];
+        let tools: Vec<ToolDefinition> = vec![];
+        let body = build_responses_body("m", &msgs, &tools, 1024, false, &EndpointReasoningConfig::default());
+        let input = body["input"].as_array().expect("input is a list");
+
+        let roles: Vec<&str> = input.iter().filter_map(|i| i["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "developer", "user"], "{roles:?}");
+        let text = serde_json::to_string(input).unwrap();
+        assert!(text.contains("a correction"), "the correction was dropped: {text}");
+        assert!(!text.contains("BASE PROMPT"), "the base prompt is duplicated into input");
     }
 
     /// The reported case, from the payload a user pasted out of the UI.

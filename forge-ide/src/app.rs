@@ -4711,6 +4711,13 @@ pub struct IdeApp {
     /// `settings.update_check_prompted` is still false.
     show_update_prompt: bool,
     update_check_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::update_check::UpdateAvailable>, String>>>,
+    /// Set when a person asked for the check, rather than it coming due.
+    ///
+    /// The periodic check is silent unless it finds something, which is right
+    /// for a check nobody asked for. A check someone clicked has to answer:
+    /// "you are up to date" and "the check failed" are both results, and
+    /// showing neither makes the menu item look broken.
+    update_check_manual: bool,
     update_checked: Option<std::time::Instant>,
     update_available: Option<crate::update_check::UpdateAvailable>,
     /// Whether a newer build is sitting on disk than the one this window is
@@ -5246,6 +5253,7 @@ impl IdeApp {
             pending_ssh_connect: pending_ssh,
             show_update_prompt: false,
             update_check_rx: None,
+            update_check_manual: false,
             update_checked: None,
             update_available: None,
             build_is_stale: false,
@@ -6923,11 +6931,27 @@ impl IdeApp {
                         != self.update_available.as_ref().map(|r| &r.latest_version) {
                         self.update_banner_dismissed = false;
                     }
+                    if std::mem::take(&mut self.update_check_manual) {
+                        // A newer release raises the banner on its own, so this
+                        // only has to answer the case the banner cannot: there
+                        // is nothing to show, and the person is owed a sentence
+                        // saying so rather than a menu that blinked.
+                        self.status = crate::update_check::manual_result_message(
+                            result.as_ref(),
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                    }
                     self.update_available = result;
                     self.update_check_rx = None;
                 }
                 Ok(Err(error)) => {
                     self.update_check_rx = None;
+                    if std::mem::take(&mut self.update_check_manual) {
+                        // In the status bar as well as the log. A check someone
+                        // clicked must not fail into a pane they would have to
+                        // know to open.
+                        self.status = format!("Update check failed: {error}");
+                    }
                     self.output_log(format!("Release check failed: {error}"), OutputLevel::Warn);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -7954,6 +7978,21 @@ impl IdeApp {
         if self.update_check_rx.is_some() { return; }
         self.update_checked = Some(std::time::Instant::now());
         self.update_check_rx = Some(crate::update_check::spawn_check());
+    }
+
+    /// Check now, because somebody asked.
+    ///
+    /// Deliberately not gated on `settings.check_for_updates`: that setting
+    /// governs checking on its own initiative, and someone who turned it off
+    /// and then clicked this is asking for this one. If a check is already in
+    /// flight its result is simply adopted — firing a second request at GitHub
+    /// to answer a question already in the post is rude to them and no faster
+    /// for us.
+    fn check_for_updates_now(&mut self) {
+        self.update_check_manual = true;
+        self.update_banner_dismissed = false;
+        self.status = "Checking for updates…".to_string();
+        self.start_update_check();
     }
 
     /// One-time "want update checks?" prompt, shown until answered once.
@@ -10627,6 +10666,7 @@ impl IdeApp {
         let mut changed = false;
         let mut close   = false;
         let mut enable_updates_now = false;
+        let mut check_now = false;
         let mut open_onboarding = false;
         // What the user has typed into the Skip All confirmation, when one is
         // open. Taken from `self` here and written back at the end, because the
@@ -11010,6 +11050,11 @@ impl IdeApp {
 
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
+                    if ui.button("Check Now").clicked() { check_now = true; }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
                     lbl(ui, "Check for Updates on Startup");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
@@ -11238,6 +11283,7 @@ impl IdeApp {
             ctx.request_repaint();
         }
         if enable_updates_now { self.start_update_check(); }
+        if check_now { self.check_for_updates_now(); }
         if open_onboarding { self.onboarding = Some(crate::onboarding::OnboardingStep::ProviderPicker); }
         if close   { self.settings_open = false; }
     }
@@ -13036,6 +13082,21 @@ impl IdeApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_tree, "File Tree");
                     ui.checkbox(&mut self.show_term, "Terminal");
+                });
+                // Help, because that is where someone looks for it. There was
+                // no way to ask at all: updates were checked on a schedule and
+                // announced only when one existed, so anyone who had turned
+                // that off, or who simply wanted to know, had nowhere to click.
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Check for Updates").clicked() {
+                        self.check_for_updates_now();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("Forge {}", env!("CARGO_PKG_VERSION")))
+                            .color(egui::Color32::from_gray(150)),
+                    );
                 });
                 // Window, rather than more of File.
                 //

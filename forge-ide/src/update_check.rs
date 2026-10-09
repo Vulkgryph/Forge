@@ -18,6 +18,23 @@ pub fn check_due(enabled: bool, pending: bool, elapsed: Option<std::time::Durati
 /// Spawns the check on a background thread and returns immediately; poll
 /// the receiver from the draw loop the same way other background tasks in
 /// this codebase are drained (e.g. `ssh_connect_rx`).
+/// What to tell someone who asked for a check, given what it found.
+///
+/// Only the no-update case strictly needs saying — a newer release raises the
+/// banner by itself — but both are returned from one place so the two can never
+/// drift into disagreeing about the version they name.
+///
+/// Here rather than in the draw loop so it can be asserted without standing up
+/// an application: the bug this exists for is a menu item that answered
+/// nothing, and "answered nothing" is exactly what a test of the draw loop
+/// would have found hardest to see.
+pub fn manual_result_message(result: Option<&UpdateAvailable>, current: &str) -> String {
+    match result {
+        Some(update) => format!("Forge {} is available", update.latest_version),
+        None => format!("Forge {current} is the latest release"),
+    }
+}
+
 pub fn spawn_check() -> mpsc::Receiver<Result<Option<UpdateAvailable>, String>> {
     let (tx, rx) = mpsc::channel();
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -87,11 +104,34 @@ fn is_newer(latest: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::{is_newer, manual_result_message, UpdateAvailable};
 
     /// The repository has to be the live one. Every installed copy asks it for
     /// updates on startup, and the retired standalone checkout would answer
     /// nothing forever — or, worse, with releases from before the merge.
+    /// A manual check has to answer even when there is nothing to report.
+    /// Silence is what made the missing menu item indistinguishable from a
+    /// broken one.
+    #[test]
+    fn a_manual_check_says_so_when_there_is_nothing_to_report() {
+        let msg = manual_result_message(None, "0.6.1");
+        assert!(msg.contains("0.6.1"), "{msg}");
+        assert!(msg.contains("latest"), "{msg}");
+        assert!(!msg.is_empty());
+    }
+
+    /// And names the new version when there is one, rather than the current.
+    #[test]
+    fn a_manual_check_names_the_new_version() {
+        let update = UpdateAvailable {
+            latest_version: "0.7.0".to_string(),
+            url: "https://example.invalid/r".to_string(),
+        };
+        let msg = manual_result_message(Some(&update), "0.6.1");
+        assert!(msg.contains("0.7.0"), "{msg}");
+        assert!(!msg.contains("0.6.1"), "it reported the version you already have: {msg}");
+    }
+
     #[test]
     fn updates_are_checked_against_the_monorepo() {
         assert_eq!(super::RELEASES_REPO, "Vulkgryph/Forge");

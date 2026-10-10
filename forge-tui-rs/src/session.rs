@@ -288,6 +288,14 @@ pub struct Session {
     /// the turn, so the agent's acknowledgement is not announced as a
     /// cancellation — from where they are sitting, the message was never sent.
     took_message_back: bool,
+    /// Set when the client has already said why the turn is stopping.
+    ///
+    /// Pressing Escape produced two notices for one event: the key handler
+    /// explains itself immediately, and then the agent's `Cancelled` added a
+    /// bare lowercase "cancelled" underneath it. One event, two lines, the
+    /// second of which reads like a leaked protocol token rather than a
+    /// sentence. Observed by driving the real terminal UI, not by reading it.
+    cancel_explained: bool,
     /// Index of the assistant entry being streamed into.
     streaming: Option<usize>,
     /// Index of the reasoning entry being streamed into, and when it began.
@@ -382,6 +390,7 @@ impl Session {
             streaming: None,
             reasoning: None,
             took_message_back: false,
+            cancel_explained: false,
             turn_start: None,
             turn_began_at: None,
             turn_tokens_at_start: (0, 0),
@@ -437,6 +446,16 @@ impl Session {
 
     pub fn push_system(&mut self, text: impl Into<String>) {
         self.entries.push(Entry::new(EntryKind::System, text));
+    }
+
+    /// Say why the turn is stopping, and suppress the agent's generic notice.
+    ///
+    /// The client knows the reason — a key was pressed — where the agent only
+    /// knows that it stopped. Whoever knows more should be the one to speak,
+    /// and only one of them should.
+    pub fn push_cancel_reason(&mut self, text: impl Into<String>) {
+        self.cancel_explained = true;
+        self.push_system(text);
     }
 
     pub fn push_error(&mut self, text: impl Into<String>) {
@@ -564,9 +583,14 @@ impl Session {
 
             AgentMessage::Cancelled => {
                 let took_back = std::mem::take(&mut self.took_message_back);
+                let explained = std::mem::take(&mut self.cancel_explained);
                 self.end_turn();
-                if !took_back {
-                    self.entries.push(Entry::new(EntryKind::System, "cancelled"));
+                // Nothing to add when the message was retracted (nothing was
+                // ever sent) or when the client has already named the reason.
+                // Otherwise this is the only notice there will be, so it reads
+                // as a sentence rather than as the event's name.
+                if !took_back && !explained {
+                    self.entries.push(Entry::new(EntryKind::System, "Stopped."));
                 }
             }
 
@@ -1522,7 +1546,44 @@ mod tests {
         s.apply(AgentMessage::AssistantToken { content: "On it".into() });
         assert_eq!(s.reclaim_unanswered_message(), None);
         s.apply(AgentMessage::Cancelled);
-        assert_eq!(last(&s).content, "cancelled");
+        assert_eq!(last(&s).content, "Stopped.");
+    }
+
+    /// One event, one notice.
+    ///
+    /// Pressing Escape used to produce two lines: the key handler explaining
+    /// itself, then a bare lowercase "cancelled" from the agent's confirmation
+    /// underneath it. Found by driving the real terminal UI; reading either
+    /// site alone looks correct, because each is.
+    #[test]
+    fn a_reason_given_by_the_client_is_not_repeated_by_the_agent() {
+        let (mut s, before) = thinking_about("go");
+        s.apply(AgentMessage::AssistantToken { content: "working".into() });
+        s.push_cancel_reason("Interrupted by Escape.");
+        let after_reason = s.entries().len();
+        s.apply(AgentMessage::Cancelled);
+
+        assert_eq!(
+            s.entries().len(),
+            after_reason,
+            "the agent added a second notice: {:?}",
+            kinds(&s)
+        );
+        assert_eq!(last(&s).content, "Interrupted by Escape.");
+        assert!(after_reason > before, "the reason itself was not shown");
+    }
+
+    /// And the suppression is one-shot: a later cancellation nobody explained
+    /// still gets its notice, or interrupting once would silence every one after.
+    #[test]
+    fn the_suppression_does_not_persist_to_the_next_cancellation() {
+        let (mut s, _) = thinking_about("first");
+        s.push_cancel_reason("Interrupted by Escape.");
+        s.apply(AgentMessage::Cancelled);
+
+        s.apply(AgentMessage::AssistantToken { content: "second turn".into() });
+        s.apply(AgentMessage::Cancelled);
+        assert_eq!(last(&s).content, "Stopped.", "{:?}", kinds(&s));
     }
 
     #[test]
@@ -1764,7 +1825,7 @@ mod tests {
         s.apply(AgentMessage::AssistantToken { content: "partial".into() });
         s.apply(AgentMessage::Cancelled);
         assert_eq!(s.activity, Activity::Idle);
-        assert_eq!(last(&s).content, "cancelled");
+        assert_eq!(last(&s).content, "Stopped.");
     }
 
     /// A rewind mid-turn discards what the turn produced.

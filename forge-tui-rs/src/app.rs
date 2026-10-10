@@ -527,7 +527,7 @@ impl App {
                     // see `keys::ESCAPE_TIMEOUT` — but timing can never settle
                     // it completely, so the next occurrence should at least
                     // name itself instead of being a mystery.
-                    self.session_mut().push_system("Interrupted by Escape.");
+                    self.session_mut().push_cancel_reason("Interrupted by Escape.");
                     return (
                         Outcome::Continue,
                         vec![Effect::Send(ClientMessage::CancelRun)],
@@ -3285,6 +3285,45 @@ mod tests {
         let text = rendered(&mut app);
         assert_eq!(text.matches(crate::screen::SYNC_BEGIN).count(), 1);
         assert!(!text.contains("\x1b[3J"));
+    }
+
+    /// The same notice at the widths people actually use.
+    ///
+    /// One width proves one layout. A narrow terminal is where a notice turns
+    /// into rubble, and the part that must survive is the cause: `cyber_policy`
+    /// broken across a line break is a string nobody can search for, in the
+    /// message whose whole purpose is to be searched for.
+    #[test]
+    fn the_refusal_notice_survives_a_narrow_terminal() {
+        for cols in [52usize, 60, 72, 80, 100, 120] {
+            let (mut app, _rows) = app_with(0);
+            app.session_mut().apply(AgentMessage::AssistantMessage {
+                content: "[Could not summarise the context — the provider refused \
+                          the request (cyber_policy). Dropped the oldest 3 messages \
+                          to make room; the session log keeps them.]"
+                    .to_string(),
+            });
+            app.sync_dialog();
+            let inline = crate::inline::Inline::new(cols, 40);
+            let block = app.live_lines(&inline, cols);
+            let grid: String =
+                block.lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+            println!("── {cols} cols ──\n{grid}\n");
+
+            // The cause has to be findable on one line.
+            assert!(
+                grid.lines().any(|l| l.contains("cyber_policy")),
+                "the cause was split across lines at {cols} cols:\n{grid}"
+            );
+            // Nothing may run past the width it was given.
+            for line in grid.lines() {
+                assert!(
+                    line.chars().count() <= cols,
+                    "a line is {} wide at {cols} cols: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
     }
 
     /// What a reader actually sees when compaction is refused.

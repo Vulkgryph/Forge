@@ -642,3 +642,19 @@ fn a_refused_compaction_still_bounds_and_records_the_conversation() {
         before_resume / 4
     );
 }
+
+// Exit-time reconciliation — `reconcile_log_before_exit` — is covered by unit
+// tests on its decision rather than end to end, deliberately.
+//
+// An integration test was written here and removed. Driving the rolling window
+// in this harness does not produce the state the reconciliation exists for:
+// measured at exit, a resume would have restored 4 messages and ~3,440 tokens
+// against a live history of 7 messages and ~6,056, inside an 8,000-token
+// window. The restored side is *smaller*, so there is nothing to repair and the
+// check correctly declines.
+//
+// The reported failure had a 1M window and ~2.1M tokens of log after the last
+// marker, which this fixture's proportions do not reach. Reproducing it needs a
+// fixture whose log outgrows its window by a multiple, which is a different
+// test from the ones here. Left undone and written down rather than left as a
+// passing test that exercises nothing.

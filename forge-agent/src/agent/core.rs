@@ -430,6 +430,28 @@ fn normalized_model_override(value: &str) -> Option<String> {
 /// recovery overflows again, which is a slower version of the same failure.
 const OVERFLOW_RECOVERY_FRACTION: f64 = 0.80;
 
+/// Whether resuming this session would come back unusable.
+///
+/// `restored` is what the log would hand back — everything after the last
+/// recorded shortening. `in_memory` is what the conversation actually is. They
+/// diverge whenever something shortens the history without writing a marker,
+/// and five code paths can shorten it while only three record anything: the
+/// overflow trimmer and the rolling window both drop messages silently.
+///
+/// The question is deliberately not "do these match". They never match exactly:
+/// the live history carries a system prompt and sometimes a summary that the
+/// restored messages do not. The question is whether a resume would exceed the
+/// window, because that is the state that cannot be worked in — it is what
+/// "70% before I restart, 203% after" is.
+fn resume_would_overflow(restored_tokens: usize, in_memory_tokens: usize, window: usize) -> bool {
+    if window == 0 {
+        return false;
+    }
+    // Only when restoring is *worse* than what is in hand. A conversation that
+    // is simply large, and was always large, is not a divergence to repair.
+    restored_tokens > window && restored_tokens > in_memory_tokens
+}
+
 fn estimate_prompt_tokens_from_history(history: &[Message]) -> u32 {
     let chars: usize = history
         .iter()
@@ -1260,9 +1282,73 @@ impl Agent {
             }
         }
 
+        // Before the final bookkeeping, so meta.json describes the session a
+        // resume will actually get.
+        self.reconcile_log_before_exit();
         let _ = self.log.log_run_state(RunState::Idle);
         self.update_meta();
         Ok(())
+    }
+
+    /// Before the session ends, make the log agree with the conversation.
+    ///
+    /// Everything that shortens the history is supposed to record it, because a
+    /// resume reads back from the last recorded shortening. Two paths do not —
+    /// the overflow trimmer and the rolling window — and a third did not until
+    /// yesterday. Each omission is the same bug and each was found separately,
+    /// a week apart, by someone noticing their conversation had come back twice
+    /// the size of the window.
+    ///
+    /// Rather than keep finding them one at a time, this checks the actual
+    /// question at the one moment it can still be answered: if this session
+    /// were resumed now, would it come back over the window? If so, something
+    /// shortened the history without saying so, and the marker is written here.
+    /// A path added later that forgets to record is covered without knowing
+    /// about it.
+    ///
+    /// Honest about what it is: no summary was written, so the older messages
+    /// were dropped rather than condensed. The log still holds them above this
+    /// point; what changes is where a resume starts reading.
+    fn reconcile_log_before_exit(&mut self) {
+        let Ok(restored) = self.log.load_from_last_compaction() else {
+            return;
+        };
+        let restored_tokens = crate::agent::compaction::estimate_history_tokens(&restored.messages);
+        let in_memory_tokens = crate::agent::compaction::estimate_history_tokens(&self.history);
+        if !resume_would_overflow(restored_tokens, in_memory_tokens, self.max_context_tokens) {
+            return;
+        }
+
+        let before = self.history.len();
+        let _ = self.log.log_compaction_start(before);
+        let note = format!(
+            "[The conversation was shortened during this session without a summary \
+             being written — dropped to fit the context window rather than \
+             condensed. Resuming from this point restores about {in_memory_tokens} \
+             tokens; reading from further back would have restored about \
+             {restored_tokens} against a {} limit, which is why this marker exists. \
+             The messages before it are still in the session log and can be read \
+             from there.]",
+            self.max_context_tokens
+        );
+        let _ = self.log.log_compaction_summary(crate::agent::log_types::CompactionSummary {
+            goal: String::new(),
+            repo_map: Vec::new(),
+            work_completed: Vec::new(),
+            current_state: note,
+            commands_run: Vec::new(),
+            decisions: Vec::new(),
+            next_actions: Vec::new(),
+            pitfalls: Vec::new(),
+        });
+        let after = self.history.len();
+        let _ = self.log.log_compaction_commit(after, after.saturating_sub(2));
+        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+            "[Session log realigned on exit: a resume would have restored about \
+             {restored_tokens} tokens against a {} limit. It will now restore about \
+             {in_memory_tokens}.]",
+            self.max_context_tokens
+        )));
     }
 
     async fn run_user_turn(&mut self, msg: String) -> Result<()> {
@@ -5721,6 +5807,36 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    /// The state this exists to catch: a resume that comes back over the window
+    /// when what is in hand is not.
+    #[test]
+    fn a_resume_larger_than_the_window_is_a_divergence() {
+        assert!(resume_would_overflow(2_100_000, 200_000, 1_000_000));
+    }
+
+    /// The discriminating cases, each of which a careless check would get wrong.
+    #[test]
+    fn an_ordinary_session_is_not_treated_as_divergent() {
+        // Under the window: nothing to repair, however big the conversation is.
+        assert!(!resume_would_overflow(900_000, 200_000, 1_000_000));
+        // Over the window but no worse than what is in hand — the conversation
+        // is simply large, and rewriting the marker would gain nothing while
+        // claiming a shortening that never happened.
+        assert!(!resume_would_overflow(1_200_000, 1_200_000, 1_000_000));
+        assert!(!resume_would_overflow(1_200_000, 1_400_000, 1_000_000));
+        // No known window: the question cannot be answered, so it is not
+        // answered. Guessing here would rewrite the log of every session whose
+        // model never reported a context length.
+        assert!(!resume_would_overflow(5_000_000, 1_000, 0));
+    }
+
+    /// Exactly at the window is not over it.
+    #[test]
+    fn the_boundary_is_not_a_divergence() {
+        assert!(!resume_would_overflow(1_000_000, 10, 1_000_000));
+        assert!(resume_would_overflow(1_000_001, 10, 1_000_000));
     }
 
     /// The defect this exists for: the loop-detector's stop path returned from

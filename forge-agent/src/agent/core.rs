@@ -3270,8 +3270,11 @@ impl Agent {
                         // is recorded where a resume can find it.
                         let before = self.history.len();
                         let _ = self.log.log_compaction_start(before);
+                        let why = crate::agent::compaction::short_failure_reason(
+                            &e.to_string(),
+                        );
                         let note = format!(
-                            "[Compaction could not write a summary: {e}. The older \
+                            "[Compaction could not write a summary — {why}. The older \
                              messages were dropped to make room rather than \
                              summarised, so detail from earlier in this \
                              conversation is gone rather than condensed. The \
@@ -3315,9 +3318,9 @@ impl Agent {
                         let after = self.history.len();
                         let _ = self.log.log_compaction_commit(after, after.saturating_sub(2));
                         let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
-                            "[Could not summarise the context ({e}) — dropped the \
-                             oldest {} messages to make room instead. The session \
-                             log keeps them.]",
+                            "[Could not summarise the context — {why}. Dropped the \
+                             oldest {} messages to make room; the session log keeps \
+                             them.]",
                             report.dropped + before.saturating_sub(after)
                         )));
                     }

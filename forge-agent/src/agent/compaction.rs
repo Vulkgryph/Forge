@@ -700,6 +700,35 @@ pub(crate) fn summary_is_degraded(summary: &CompactionSummary) -> bool {
 /// a threshold: compaction only ran after a request had already been built
 /// oversized, and the summarizer call that follows — which needs context of
 /// its own — was made at the exact moment there was none left.
+/// A compaction failure in one readable clause.
+///
+/// The raw error is a provider message with a JSON body inside it. Interpolated
+/// into a notice it came to 278 characters and wrapped to four lines of
+/// `{"error":{"code":...}}` — the same unreadable shape as the `{"type":"resp…`
+/// error that was fixed a day earlier, reintroduced by putting an error
+/// straight into a sentence. The body goes to the log; the notice gets the
+/// reason.
+pub fn short_failure_reason(error: &str) -> String {
+    if let Some(code) = crate::api::client::provider_refusal(error) {
+        return format!("the provider refused the request ({code})");
+    }
+    // Otherwise the first clause, without the JSON. Providers put the useful
+    // part first and the payload after a colon.
+    let head = error
+        .split(&['{', '\n'][..])
+        .next()
+        .unwrap_or(error)
+        .trim()
+        .trim_end_matches(':')
+        .trim();
+    const LIMIT: usize = 90;
+    if head.chars().count() <= LIMIT {
+        return head.to_string();
+    }
+    let cut: String = head.chars().take(LIMIT).collect();
+    format!("{}…", cut.trim_end())
+}
+
 pub fn should_compact(last_prompt_tokens: u32, max_context_tokens: usize, at_percent: u8) -> bool {
     if max_context_tokens == 0 {
         return false;
@@ -2135,3 +2164,38 @@ mod transcript_truncation_tests {
 
 
 
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::short_failure_reason;
+
+    /// The reported shape. The raw error carried a JSON body and the notice came
+    /// to 278 characters across four wrapped lines; a reader needs the reason.
+    #[test]
+    fn a_refusal_is_one_clause_not_a_payload() {
+        let raw = "Summarizer LLM call failed: API error (400 Bad Request): \
+                   {\"error\":{\"code\":\"cyber_policy\",\"message\":\"This content was \
+                   flagged for possible cybersecurity risk.\"}}";
+        let out = short_failure_reason(raw);
+        assert!(out.contains("refused"), "{out}");
+        assert!(out.contains("cyber_policy"), "the code is what to search for: {out}");
+        assert!(!out.contains('{'), "the JSON body survived: {out}");
+        assert!(out.chars().count() < 70, "still too long to read: {out:?} ({} chars)", out.chars().count());
+    }
+
+    /// An ordinary failure keeps its own words rather than being called a refusal.
+    #[test]
+    fn a_transport_failure_says_what_it_was() {
+        let out = short_failure_reason("error sending request for url: connection reset by peer");
+        assert!(out.contains("connection reset"), "{out}");
+        assert!(!out.contains("refused the request"), "mislabelled as a refusal: {out}");
+    }
+
+    /// And something enormous is cut rather than wrapped across the screen.
+    #[test]
+    fn a_long_message_is_trimmed() {
+        let out = short_failure_reason(&"a very long provider complaint ".repeat(20));
+        assert!(out.chars().count() <= 91, "{} chars", out.chars().count());
+        assert!(out.ends_with('…'), "{out}");
+    }
+}

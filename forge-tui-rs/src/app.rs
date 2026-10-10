@@ -3287,6 +3287,41 @@ mod tests {
         assert!(!text.contains("\x1b[3J"));
     }
 
+    /// What a reader actually sees when compaction is refused.
+    ///
+    /// Checked by rendering rather than by reading the format string. The first
+    /// version of this notice interpolated the provider's error, JSON body and
+    /// all: 278 characters, four wrapped lines of `{"error":{"code":...}}`, with
+    /// the one useful word buried in the middle. The notice carries the reason
+    /// and the consequence now, and the payload stays in the log.
+    #[test]
+    fn a_refused_compaction_reads_as_a_sentence_on_screen() {
+        let (mut app, _rows) = app_with(0);
+        app.session_mut().apply(AgentMessage::AssistantMessage {
+            content: "[Could not summarise the context — the provider refused the \
+                      request (cyber_policy). Dropped the oldest 3 messages to make \
+                      room; the session log keeps them.]"
+                .to_string(),
+        });
+        let grid = live_text(&mut app);
+        // Asserted against the text with its wrapping collapsed. The notice is
+        // three lines wide on screen, so a phrase that reads continuously to a
+        // person is not a contiguous substring — and a test that insists it is
+        // tests the line width rather than the words.
+        let flowed = grid.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The things a reader needs: what failed, why, and what it cost.
+        assert!(flowed.contains("Could not summarise the context"), "{grid}");
+        assert!(flowed.contains("cyber_policy"), "the cause is missing: {grid}");
+        assert!(flowed.contains("the session log keeps them"), "{grid}");
+        // And the thing they must not be given.
+        assert!(!flowed.contains("{\"error\""), "a JSON payload reached the screen:\n{grid}");
+        assert!(!flowed.contains("400 Bad Request"), "transport noise on screen:\n{grid}");
+        // Three lines, not four of payload. The first version was 278 characters.
+        let body: Vec<&str> = grid.lines().filter(|l| l.contains("summarise") || l.contains("cyber_policy") || l.contains("keeps them")).collect();
+        assert!(body.len() <= 3, "the notice spread over {} lines:\n{grid}", body.len());
+    }
+
     /// The context bar has to reflect real usage, since it is what tells you a
     /// compaction is coming. Text and dot-separated, as the TypeScript bar was —
     /// no gauge, which was my invention.

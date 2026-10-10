@@ -636,13 +636,28 @@ impl Session {
 
             AgentMessage::ApiRetry { attempt, max_attempts, delay_secs, error } => {
                 self.activity = Activity::Retrying { attempt, max_attempts };
-                self.entries.push(Entry::new(
-                    EntryKind::System,
-                    format!(
-                        "retrying in {delay_secs}s ({attempt}/{max_attempts}): {}",
-                        first_line(&error),
-                    ),
-                ));
+                let text = format!(
+                    "Retrying in {delay_secs}s ({attempt}/{max_attempts}) — {}",
+                    first_line(&error),
+                );
+                // One line that counts down, not one line per second.
+                //
+                // The agent emits an ApiRetry every second of the delay so the
+                // countdown moves, and this pushed a new entry for each: a 60s
+                // wait wrote sixty lines, and ten attempts at the configured
+                // delays would write a hundred and sixty. That is the wall of
+                // text. The same notice updating in place says the same thing.
+                let replaceable = self
+                    .entries
+                    .last()
+                    .is_some_and(|e| e.kind == EntryKind::System && e.content.starts_with("Retrying in "));
+                if replaceable {
+                    if let Some(last) = self.entries.last_mut() {
+                        last.content = text;
+                    }
+                } else {
+                    self.entries.push(Entry::new(EntryKind::System, text));
+                }
             }
 
             // ── Tools ─────────────────────────────────────────────────────
@@ -1817,6 +1832,57 @@ mod tests {
         assert!(s.pending.is_some());
         s.apply(AgentMessage::Done);
         assert!(s.pending.is_none(), "no orphaned dialog");
+    }
+
+    /// A countdown is one notice, not one per second.
+    ///
+    /// The agent emits an ApiRetry every second so the number moves. This used
+    /// to append an entry for each: sixty lines for a sixty-second wait, and a
+    /// hundred and sixty across the configured attempts. Reported as walls of
+    /// text, and that is where they came from.
+    #[test]
+    fn a_retry_countdown_collapses_into_one_line() {
+        let mut s = session();
+        let before = s.entries().len();
+        for remaining in (1..=30).rev() {
+            s.apply(AgentMessage::ApiRetry {
+                attempt: 1,
+                max_attempts: 10,
+                delay_secs: remaining,
+                error: "connection reset".into(),
+            });
+        }
+        assert_eq!(
+            s.entries().len(),
+            before + 1,
+            "thirty ticks produced {} entries: {:?}",
+            s.entries().len() - before,
+            kinds(&s)
+        );
+        // And it is the latest state, not the first.
+        assert!(last(&s).content.contains("Retrying in 1s"), "{}", last(&s).content);
+        assert!(last(&s).content.contains("connection reset"), "{}", last(&s).content);
+    }
+
+    /// But a retry after other output starts its own line, or the notice would
+    /// overwrite whatever happened in between.
+    #[test]
+    fn a_retry_after_other_output_is_its_own_entry() {
+        let mut s = session();
+        s.apply(AgentMessage::ApiRetry {
+            attempt: 1, max_attempts: 10, delay_secs: 5, error: "reset".into(),
+        });
+        let after_first = s.entries().len();
+        s.push_system("something else happened");
+        s.apply(AgentMessage::ApiRetry {
+            attempt: 2, max_attempts: 10, delay_secs: 5, error: "reset".into(),
+        });
+        assert_eq!(
+            s.entries().len(),
+            after_first + 2,
+            "the second retry replaced unrelated output: {:?}",
+            kinds(&s)
+        );
     }
 
     #[test]

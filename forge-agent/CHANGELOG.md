@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A failing provider wrote walls of text, and sometimes a web page.** Three faults in the same path, all found by driving the real terminal UI rather than reading it.
+
+  A retry countdown appended one transcript line per second. The agent emits an `ApiRetry` every second so the number moves, and each one became its own entry: a sixty-second wait wrote sixty lines, and the ten configured delays would write a hundred and sixty. The notice now updates in place — unless something else has been printed since, in which case it starts a new line rather than overwriting whatever happened in between.
+
+  The error body went into the message verbatim. One 501 produced a complete HTML page — twenty-one lines of `<!DOCTYPE html>` and CSS in the chat. Bodies are condensed where the error is built, so every caller benefits: a JSON body keeps the `message` field the provider already picked out, markup is described rather than printed (with its `<title>`, which is the useful part), and anything else keeps its first line, capped and cut on a character boundary. The full body still reaches the session log, which is where something that size belongs.
+
+  And "API error: API error (501 Not Implemented)" said it twice, because one layer prefixed what another had already labelled.
+
+  Verified by running the binary against a provider that answers 503 with an HTML page: `<!DOCTYPE` and the CSS are gone from the screen, the title survives, the double prefix is gone, and the retry is one line. A test keeps the condensing honest in both directions — a short plain message passes through untouched, because a function that always summarised would pass the HTML and JSON cases while discarding every error worth reading.
+
 - **A refused compaction left the conversation growing, and nothing on disk said so.** Reported as "70% before I restart, 203% after", which is exactly what it does.
 
   Compaction needs a model call: the agent is asked to write its own handoff, or a summariser is asked for structured JSON. When that call failed the whole error path was one line — say so in the UI, continue with the full history — and the turn ended as an error. The next request then overflowed the window, and the emergency trimmer shortened the conversation *in memory*. Neither the failure nor the trim was recorded, so the session looked healthy at 70% while the log had not advanced since the last successful compaction. Every restart replayed everything after it; in the reported session that was a week, 20,555 records, about 2.1M tokens against a 1M window.

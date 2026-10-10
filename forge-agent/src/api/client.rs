@@ -637,7 +637,11 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
-            return Err(format!("API error ({}): {}", status, body_text));
+            return Err(format!(
+                "API error ({}): {}",
+                status,
+                condense_error_body(&body_text)
+            ));
         }
 
         let json: serde_json::Value = response
@@ -714,7 +718,8 @@ impl ApiClient {
             let body_text = response.text().await.unwrap_or_default();
             let _ = tx.send(StreamEvent::Error(format!(
                 "API error ({}): {}",
-                status, body_text
+                status,
+                condense_error_body(&body_text)
             )));
             return;
         }
@@ -2374,6 +2379,65 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
     })
 }
 
+/// A provider's error body, reduced to something a person can read.
+///
+/// What arrives here is whatever the server felt like sending. One 501 produced
+/// a complete HTML page: 21 lines and 571 characters of `<!DOCTYPE html>` and
+/// CSS, rendered verbatim into the chat, observed by driving the real terminal
+/// UI. Others send a JSON object. Neither belongs in a sentence.
+///
+/// The useful part is almost always a `message` field or the first line of
+/// prose, so that is what is kept, capped. The full body still reaches the
+/// session log, which is where something this size belongs.
+pub fn condense_error_body(body: &str) -> String {
+    const LIMIT: usize = 200;
+
+    // A JSON error object: the provider has already picked out the sentence.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let picked = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .or_else(|| v.get("message"))
+            .or_else(|| v.get("detail"))
+            .and_then(|m| m.as_str());
+        if let Some(msg) = picked {
+            return truncate_for_display(msg, LIMIT);
+        }
+    }
+
+    // Markup is a page, not a message. Say what it was rather than printing it.
+    let head = body.trim_start();
+    if head.starts_with("<!DOCTYPE") || head.starts_with("<html") || head.starts_with('<') {
+        let title = body
+            .split_once("<title>")
+            .and_then(|(_, rest)| rest.split_once("</title>"))
+            .map(|(t, _)| t.trim().to_string());
+        return match title {
+            Some(t) if !t.is_empty() => {
+                format!("an HTML error page ({})", truncate_for_display(&t, 80))
+            }
+            _ => format!("an HTML error page, {} bytes", body.len()),
+        };
+    }
+
+    let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    truncate_for_display(first, LIMIT)
+}
+
+/// `text`, or its first `limit` characters with an ellipsis.
+///
+/// Counted in characters rather than bytes: slicing a UTF-8 string at a byte
+/// offset panics mid-character, and an error path is the worst place to learn
+/// that.
+fn truncate_for_display(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{}…", kept.trim_end())
+}
+
 /// Whether an error is the provider refusing the content, rather than failing.
 ///
 /// Returns the code it was recognised by, so a caller can name it.
@@ -2473,6 +2537,45 @@ fn responses_failure_message(event_type: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 501 observed by driving the real terminal UI: a whole HTML page, 21
+    /// lines and 571 characters, rendered into the chat.
+    #[test]
+    fn an_html_error_page_is_described_not_printed() {
+        let body = "<!DOCTYPE HTML>\n<html lang=\"en\">\n<head>\n<title>Error response</title>\n\
+                    <style type=\"text/css\">:root { color-scheme: light dark; }</style>\n\
+                    </head>\n<body>\n<h1>501 Not Implemented</h1>\n</body>\n</html>";
+        let out = condense_error_body(body);
+        assert!(out.contains("HTML error page"), "{out}");
+        assert!(out.contains("Error response"), "the title is the useful part: {out}");
+        assert!(!out.contains("<"), "markup survived: {out}");
+        assert!(out.chars().count() < 80, "{} chars: {out}", out.chars().count());
+    }
+
+    /// A JSON body has already picked out the sentence; use it.
+    #[test]
+    fn a_json_error_body_keeps_only_its_message() {
+        let out = condense_error_body(
+            r#"{"error":{"code":"rate_limit","message":"Rate limit reached for requests."}}"#,
+        );
+        assert_eq!(out, "Rate limit reached for requests.");
+    }
+
+    /// The discriminating case: a short plain message must survive untouched.
+    /// A function that always summarised would pass the two above and throw
+    /// away every error worth reading.
+    #[test]
+    fn a_plain_message_is_left_alone() {
+        assert_eq!(condense_error_body("upstream connect error"), "upstream connect error");
+    }
+
+    /// And anything enormous is cut on a character boundary, not a byte one.
+    #[test]
+    fn a_huge_body_is_truncated_without_splitting_a_character() {
+        let out = condense_error_body(&"日本語のエラー".repeat(200));
+        assert!(out.chars().count() <= 201, "{} chars", out.chars().count());
+        assert!(out.ends_with('…'), "{out}");
+    }
 
     /// The refusal from the report is recognised as one.
     #[test]

@@ -1655,7 +1655,15 @@ impl Agent {
                 let message = if is_provider_busy {
                     format!("Provider at capacity: {}", e)
                 } else {
-                    format!("API error: {}", e)
+                    // Not prefixed again when it already says so. The pty
+                    // capture read "API error: API error (501 Not Implemented)",
+                    // which is the sort of thing nobody notices in a format
+                    // string and everybody notices on screen.
+                    if e.starts_with("API error") {
+                        e.clone()
+                    } else {
+                        format!("API error: {}", e)
+                    }
                 };
                 let _ = self.event_tx.send(AgentEvent::Error(message));
                 return Ok(());

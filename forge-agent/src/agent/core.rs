@@ -478,7 +478,7 @@ fn estimate_prompt_tokens_from_history(history: &[Message]) -> u32 {
     ((chars / 4).max(history.len() * 8)).min(u32::MAX as usize) as u32
 }
 
-fn preview_text(text: &str) -> String {
+pub(crate) fn preview_text(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > 80 {
         format!("{}...", compact.chars().take(77).collect::<String>())
@@ -2062,6 +2062,14 @@ impl Agent {
                                         was_denied = true;
                                         break;
                                     }
+                                    // Queued rather than discarded. `_ => continue`
+                                    // threw away a message sent while an approval
+                                    // was pending, which is a plausible moment to
+                                    // send one — the user is looking at a prompt.
+                                    Some(UserAction::SendMessage(msg)) => {
+                                        self.queue_user_message(msg);
+                                        continue;
+                                    }
                                     _ => continue,
                                 }
                             }
@@ -2268,6 +2276,33 @@ impl Agent {
                                                 }
                                             }
                                             Some(UserAction::SendMessage(msg)) => {
+                                                // Down to whoever is working, as well as
+                                                // queued here. Queued alone meant the message
+                                                // was not acted on until the subagents had
+                                                // finished — which for a long delegation is
+                                                // after it no longer matters.
+                                                //
+                                                // Relayed to all of them, and labelled as a
+                                                // user message rather than an instruction from
+                                                // the parent, because this cannot tell which
+                                                // one it was meant for. Each decides whether it
+                                                // changes what it is doing. Queued at their next
+                                                // turn boundary, never interrupting a call in
+                                                // flight.
+                                                if !metas.is_empty() {
+                                                    for meta in &metas {
+                                                        let _ = meta.approval_tx.send(
+                                                            UserAction::SendMessage(msg.clone()),
+                                                        );
+                                                    }
+                                                    let _ = self.event_tx.send(
+                                                        AgentEvent::AssistantMessage(format!(
+                                                            "[Relayed to {} running subagent(s): \"{}\"]",
+                                                            metas.len(),
+                                                            preview_text(&msg)
+                                                        )),
+                                                    );
+                                                }
                                                 self.queue_user_message(msg);
                                             }
                                             Some(UserAction::CancelRun) => {

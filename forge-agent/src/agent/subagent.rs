@@ -213,9 +213,40 @@ impl SubagentRunner {
         let mut last_prompt_tokens: u32 = 0;
         let mut toolless_intent_retries: usize = 0;
         let mut tool_observations: Vec<String> = Vec::new();
+        // Messages that arrived while this subagent was gated on an approval.
+        // They cannot be acted on there — it is waiting for one specific answer
+        // — so they are held until the next turn boundary.
+        let mut relayed_while_gated: Vec<String> = Vec::new();
         let max_turns = self.agent_def.max_turns.filter(|max| *max > 0);
 
         loop {
+            // Anything the parent relayed since the last turn.
+            //
+            // This channel existed only for approvals, and was only ever read
+            // while an approval was pending — so with auto-approve on, which is
+            // how this is usually run, a subagent never read it at all. A message
+            // sent down it sat unread until the run ended.
+            //
+            // Drained here, at the turn boundary, for the same reason the parent
+            // queues rather than interrupts: a message that lands mid-tool-call
+            // either arrives too late to matter or arrives in the middle of
+            // something and derails it. This is the point where the next decision
+            // has not been made yet.
+            let mut relayed_now = std::mem::take(&mut relayed_while_gated);
+            relayed_now.extend(drain_relayed_messages(approval_rx));
+            for relayed in relayed_now {
+                let _ = self.status_tx.send(SubagentEvent::Message(format!(
+                    "[Message relayed from the user: {}]",
+                    crate::agent::core::preview_text(&relayed)
+                )));
+                history.push(Message::system(&format!(
+                    "[The user sent this while you were working, relayed by the agent that \
+                     delegated to you. It is information, not necessarily a new instruction, \
+                     and it may have been addressed to somebody else working in parallel — \
+                     judge whether it changes what you are doing: {relayed}]"
+                )));
+            }
+
             let estimated_prompt_tokens =
                 last_prompt_tokens.max(estimate_prompt_tokens_from_history(&history));
             let remaining_ratio =
@@ -476,6 +507,16 @@ impl SubagentRunner {
                                         None => {
                                             denied = true;
                                             break;
+                                        }
+                                        // Keep a relayed message rather than
+                                        // discarding it: `_ => continue` here
+                                        // threw away anything that was not an
+                                        // approval for this exact call, which
+                                        // included every message meant for this
+                                        // subagent.
+                                        Some(UserAction::SendMessage(msg)) => {
+                                            relayed_while_gated.push(msg);
+                                            continue;
                                         }
                                         _ => continue,
                                     }
@@ -901,6 +942,30 @@ fn looks_like_tool_intent_without_action(content: Option<&str>) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Everything the parent has relayed and not yet handed over.
+///
+/// Non-blocking on purpose: this runs at every turn boundary, and a blocking
+/// read would stop a subagent that has nothing waiting for it.
+fn drain_relayed_messages(rx: &mut mpsc::UnboundedReceiver<UserAction>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(action) = rx.try_recv() {
+        match action {
+            UserAction::SendMessage(msg) => {
+                let trimmed = msg.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+            // An approval that arrives when nothing is gated has nowhere to go.
+            // Dropping it is correct and was already the behaviour; it is only
+            // written down here so the next reader does not mistake it for an
+            // oversight.
+            _ => {}
+        }
+    }
+    out
+}
+
 fn estimate_prompt_tokens_from_history(history: &[Message]) -> u32 {
     let chars: usize = history
         .iter()
@@ -991,6 +1056,38 @@ fn summarize_args(args_json: &str) -> String {
 }
 #[cfg(test)]
 mod subagent_offline_tests {
+
+    /// Messages relayed from the parent are picked up; nothing else is.
+    #[test]
+    fn a_relayed_message_is_drained_and_an_approval_is_not() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(super::UserAction::SendMessage("check the loader bounds".into())).unwrap();
+        tx.send(super::UserAction::ApproveAction("t1".into())).unwrap();
+        tx.send(super::UserAction::SendMessage("  and the header  ".into())).unwrap();
+        tx.send(super::UserAction::SendMessage("   ".into())).unwrap();
+
+        let got = super::drain_relayed_messages(&mut rx);
+        assert_eq!(got, vec!["check the loader bounds", "and the header"]);
+    }
+
+    /// Non-blocking, which is the whole reason it can sit at a turn boundary: a
+    /// blocking read would stop a subagent that has nothing waiting for it.
+    #[test]
+    fn draining_an_empty_channel_returns_at_once() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::UserAction>();
+        assert!(super::drain_relayed_messages(&mut rx).is_empty());
+    }
+
+    /// And a closed channel is not an error — the parent finishing before a
+    /// subagent reads is ordinary.
+    #[test]
+    fn draining_a_closed_channel_is_not_a_failure() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::UserAction>();
+        tx.send(super::UserAction::SendMessage("last word".into())).unwrap();
+        drop(tx);
+        assert_eq!(super::drain_relayed_messages(&mut rx), vec!["last word"]);
+        assert!(super::drain_relayed_messages(&mut rx).is_empty());
+    }
     /// A subagent's tool list must be filtered by what the session forbids,
     /// not only by what its own definition offers.
     ///

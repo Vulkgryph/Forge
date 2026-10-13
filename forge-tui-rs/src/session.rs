@@ -256,6 +256,15 @@ pub enum Effect {
 }
 
 /// Everything known about the current session.
+/// A running tool's progress, for the status line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolProgress {
+    pub tool_name: String,
+    pub elapsed_secs: u64,
+    /// The budget it works against, when it has one.
+    pub expected_secs: Option<u64>,
+}
+
 pub struct Session {
     // ── From init ─────────────────────────────────────────────────────────
     pub connected:      bool,
@@ -288,6 +297,9 @@ pub struct Session {
     /// the turn, so the agent's acknowledgement is not announced as a
     /// cancellation — from where they are sitting, the message was never sent.
     took_message_back: bool,
+    /// What a running tool has reported about itself, for the status line.
+    /// Cleared when the turn ends, so a finished tool stops being advertised.
+    tool_progress: Option<ToolProgress>,
     /// Set when the client has already said why the turn is stopping.
     ///
     /// Pressing Escape produced two notices for one event: the key handler
@@ -390,6 +402,7 @@ impl Session {
             streaming: None,
             reasoning: None,
             took_message_back: false,
+            tool_progress: None,
             cancel_explained: false,
             turn_start: None,
             turn_began_at: None,
@@ -442,6 +455,11 @@ impl Session {
             .rev()
             .find(|e| matches!(e.kind, EntryKind::Assistant) && !e.content.trim().is_empty())
             .map(|e| e.content.as_str())
+    }
+
+    /// What a running tool is reporting, if anything.
+    pub fn tool_progress(&self) -> Option<&ToolProgress> {
+        self.tool_progress.as_ref()
     }
 
     pub fn push_system(&mut self, text: impl Into<String>) {
@@ -632,6 +650,18 @@ impl Session {
                         self.pending = None;
                     }
                 }
+            }
+
+            // Status only. No entry: this arrives every second, and appending
+            // one per tick is exactly how the retry countdown wrote sixty lines.
+            AgentMessage::ToolProgress {
+                tool_name, elapsed_secs, expected_secs, ..
+            } => {
+                self.tool_progress = Some(ToolProgress {
+                    tool_name,
+                    elapsed_secs,
+                    expected_secs,
+                });
             }
 
             AgentMessage::ApiRetry { attempt, max_attempts, delay_secs, error } => {
@@ -1291,6 +1321,7 @@ impl Session {
     }
 
     fn end_turn(&mut self) {
+        self.tool_progress = None;
         self.finish_reasoning();
         self.streaming = None;
         self.turn_start = None;

@@ -2019,11 +2019,26 @@ impl AgentSession {
             "Requested discussion.");
     }
 
-    /// Interrupts the in-flight turn — forge handles `cancel_run` at every
-    /// await point in its own agent loop (mid-completion, mid-tool-call,
-    /// mid-shell-exec), so this is a real interrupt, not just a client-side
-    /// "stop listening." `turn_active` clears itself once the matching
-    /// `Cancelled` event comes back, same as it already does today.
+    /// Interrupts the in-flight turn.
+    ///
+    /// This is a real interrupt rather than a client-side "stop listening":
+    /// forge races the cancel against the model stream, against a running tool,
+    /// and against shell execution, so it lands mid-flight.
+    ///
+    /// It did not, for tools. This comment claimed it did — "every await point…
+    /// mid-tool-call" — while the agent ran each tool as a bare await and only
+    /// checked for a cancel between tools. A first `web_search` allows itself
+    /// about 159 seconds, so the button was dead for two and a half minutes and
+    /// the claim here is why nobody went looking. Fixed on the agent side; the
+    /// sentence is kept as a warning about asserting behaviour you have not
+    /// watched.
+    ///
+    /// Background work is deliberately not cancelled: `run_in_background`
+    /// detaches, and stopping a turn does not stop a daemon someone started on
+    /// purpose. Seeing and killing those needs its own affordance.
+    ///
+    /// `turn_active` clears itself once the matching `Cancelled` event comes
+    /// back, same as it already does today.
     pub fn cancel_run(&mut self) {
         let _ = self.write(&OutgoingMsg::CancelRun);
     }

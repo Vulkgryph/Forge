@@ -106,6 +106,22 @@ pub enum AgentEvent {
         agent_type: String,
         summary: String,
     },
+    /// A tool is still running: elapsed time, and the budget it is working
+    /// against when one is known.
+    ///
+    /// `web_search` bounds itself to 159 seconds and reports when it stopped on
+    /// that budget, but from outside the call it is a silent await — which is
+    /// how a crawl working exactly as designed came to look like a hang. With a
+    /// figure to count against, a client can draw a bar rather than a spinner.
+    ToolProgress {
+        tool_id: String,
+        tool_name: String,
+        elapsed_secs: u64,
+        /// `None` when the tool has no budget to measure against — then it is
+        /// elapsed time only, which is still better than nothing.
+        expected_secs: Option<u64>,
+    },
+
     ToolOutput {
         tool_name: String,
         content: String,
@@ -3660,18 +3676,95 @@ impl Agent {
 
         // Resolve web tool summarizer
         let summarizer = self.resolve_web_summarizer();
-        let result = match self
-            .executor
-            .execute(
+        // Raced against the stop button, and ticked so a slow tool shows progress.
+        //
+        // This was a bare `.await`. Cancellation is checked between tools, by a
+        // non-blocking try_recv, so once a tool started the stop button did
+        // nothing until it returned on its own — and a first `web_search` is
+        // allowed 159 seconds by its own budget. Two and a half minutes of a
+        // dead button reads as a hang, which is what was reported. The client's
+        // own comment claimed this already worked at "every await point…
+        // mid-tool-call", which is why nobody looked.
+        //
+        // Everything is cancellable, including tools that write. Abandoning the
+        // future does not undo what it has already done, so a cancelled call
+        // says so in its result rather than pretending nothing happened: the
+        // model is told the effect is unknown and to check before relying on it.
+        // Background work is untouched — `run_in_background` spawns a detached
+        // task, so dropping this future cannot reach it.
+        let expected_secs = match tc.function.name.as_str() {
+            "web_search" => Some(crate::tools::search::expected_search_seconds()),
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        let mut queued_during: Vec<String> = Vec::new();
+        let mut deferred: Vec<UserAction> = Vec::new();
+        let mut interrupted = false;
+        let result = {
+            let exec = self.executor.execute(
                 &tc.function.name,
                 &args,
                 summarizer.as_ref().map(|(c, m)| (c, m.as_str())),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => format!("Tool error: {}", e),
+            );
+            tokio::pin!(exec);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.tick().await; // the first tick fires immediately; skip it
+            loop {
+                tokio::select! {
+                    done = &mut exec => {
+                        break match done {
+                            Ok(r) => r,
+                            Err(e) => format!("Tool error: {}", e),
+                        };
+                    }
+                    _ = tick.tick() => {
+                        let _ = self.event_tx.send(AgentEvent::ToolProgress {
+                            tool_id: tc.id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            elapsed_secs: started.elapsed().as_secs(),
+                            expected_secs: expected_secs.map(|s| s as u64),
+                        });
+                    }
+                    action = self.action_rx.recv() => {
+                        match action {
+                            Some(UserAction::CancelRun) | Some(UserAction::Quit) | None => {
+                                interrupted = true;
+                                break String::new();
+                            }
+                            // Held rather than applied: `queue_user_message`
+                            // needs `&mut self`, and the running tool holds a
+                            // borrow of it until this loop ends.
+                            Some(UserAction::SendMessage(msg)) => queued_during.push(msg),
+                            // Parked, not dropped. A background command's
+                            // completion arrives while the model is working, so
+                            // whichever nested loop owns the channel is the one
+                            // that would lose it — see `deferred_actions`. The
+                            // structural test over this file caught this arm as
+                            // `Some(_) => {}`, which is the whole reason it
+                            // exists: it catches the next one, not the last one.
+                            Some(other) => deferred.push(other),
+                        }
+                    }
+                }
+            }
         };
+        for msg in queued_during {
+            self.queue_user_message(msg);
+        }
+        for action in deferred {
+            self.deferred_actions.push_back(action);
+        }
+        if interrupted {
+            let elapsed = started.elapsed().as_secs();
+            let _ = self.event_tx.send(AgentEvent::Cancelled);
+            return Ok(format!(
+                "CANCELLED: {} was stopped by the user after {}s, part-way through. \
+                 Whatever it had already done is done — a file it was writing may be \
+                 incomplete, a command it started may have run. Check the current state \
+                 before relying on anything this call was supposed to produce.",
+                tc.function.name, elapsed
+            ));
+        }
 
         let success = !result.starts_with("Tool error:");
         if success {

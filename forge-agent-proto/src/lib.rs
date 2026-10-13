@@ -197,6 +197,20 @@ pub enum AgentMessage {
         rewind_checkpoints: Vec<RewindCheckpoint>,
     },
 
+    /// A tool is still running. Status, not transcript.
+    ///
+    /// Deliberately not a message: this arrives once a second, and appending a
+    /// line for each is how a retry countdown came to write sixty of them. A
+    /// client should update one indicator in place, or ignore it.
+    ToolProgress {
+        tool_id: String,
+        tool_name: String,
+        elapsed_secs: u64,
+        /// The budget this tool works against, when it has one — `web_search`
+        /// bounds itself to about 159 seconds. `None` means elapsed time only.
+        expected_secs: Option<u64>,
+    },
+
     // ── Subagents ─────────────────────────────────────────────────────────
     SubagentStarted {
         id: String,
@@ -323,6 +337,7 @@ impl AgentMessage {
             Self::EndpointsUpdated { .. } => "endpoints_updated",
             Self::SessionCleared { .. } => "session_cleared",
             Self::SessionLoaded { .. } => "session_loaded",
+            Self::ToolProgress { .. } => "tool_progress",
             Self::SubagentStarted { .. } => "subagent_started",
             Self::SubagentStatus { .. } => "subagent_status",
             Self::SubagentFinished { .. } => "subagent_finished",

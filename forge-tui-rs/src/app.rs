@@ -1646,6 +1646,26 @@ impl App {
                 parts.push(format!("{pct}% ctx"));
             }
         }
+        // A slow tool, with a bar when it has a budget to measure against.
+        // `web_search` allows itself about 159 seconds and says when it stopped
+        // on that budget — but from outside it was a silent wait, which is how a
+        // crawl behaving exactly as designed came to look like a hang.
+        if let Some(p) = self.session.tool_progress() {
+            parts.push(match p.expected_secs {
+                Some(total) if total > 0 => {
+                    let done = (p.elapsed_secs.min(total) * 10 / total) as usize;
+                    format!(
+                        "{} {}{} {}s/{}s",
+                        p.tool_name,
+                        "█".repeat(done),
+                        "░".repeat(10 - done),
+                        p.elapsed_secs,
+                        total
+                    )
+                }
+                _ => format!("{} {}s", p.tool_name, p.elapsed_secs),
+            });
+        }
         if self.session.plan_mode {
             parts.push("PLAN".into());
         }

@@ -106,6 +106,15 @@ enum OutgoingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         subagent_id: Option<String>,
     },
+    /// A tool is still running — status, not transcript. See the proto message
+    /// of the same name: once a second, so a client updates one indicator
+    /// rather than appending a line.
+    ToolProgress {
+        tool_id: String,
+        tool_name: String,
+        elapsed_secs: u64,
+        expected_secs: Option<u64>,
+    },
     ToolOutput {
         tool_name: String,
         content: String,
@@ -497,6 +506,14 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
             success: *success,
             subagent_id: subagent_id.clone(),
         },
+        AgentEvent::ToolProgress { tool_id, tool_name, elapsed_secs, expected_secs } => {
+            OutgoingMessage::ToolProgress {
+                tool_id: tool_id.clone(),
+                tool_name: tool_name.clone(),
+                elapsed_secs: *elapsed_secs,
+                expected_secs: *expected_secs,
+            }
+        }
         AgentEvent::ToolOutput { tool_name, content } => OutgoingMessage::ToolOutput {
             tool_name: tool_name.clone(),
             content: content.clone(),

@@ -339,10 +339,20 @@ const DEFAULT_MAX_PAGES: usize = 120;
 /// The ceiling is what keeps it honest in the other direction: 500 pages at a
 /// second each is over eight minutes, and a tool call that long should stop
 /// and say it stopped rather than hold the turn.
-fn crawl_budget_secs(max_pages: usize, politeness: f64) -> f64 {
+pub fn crawl_budget_secs(max_pages: usize, politeness: f64) -> f64 {
     const OVERHEAD: f64 = 15.0;
     const CEILING: f64 = 300.0;
     (max_pages as f64 * politeness * 1.2 + OVERHEAD).min(CEILING)
+}
+
+/// How long a `web_search` may take, for a caller that wants to show progress.
+///
+/// The crawl bounds itself and says when it stopped on the budget, but from
+/// outside the tool it is an opaque await of up to five minutes — which reads
+/// as a hang, especially while the stop button was ignored mid-tool. Exposed so
+/// the turn loop can count against a real number instead of guessing.
+pub fn expected_search_seconds() -> f64 {
+    crawl_budget_secs(DEFAULT_MAX_PAGES, POLITENESS)
 }
 
 /// Seconds between requests to one host. A courtesy setting, not a

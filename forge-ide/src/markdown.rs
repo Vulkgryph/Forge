@@ -609,6 +609,180 @@ fn parse_inline(text: &str, size: f32) -> (LayoutJob, Vec<Link>) {
     (job, links)
 }
 #[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    /// Render one markdown block into a `Ui` of a fixed width and report how
+    /// wide it actually turned out.
+    ///
+    /// The panel in the editor is narrow and resizable, so "what did this
+    /// block do with the width it was given" is the whole question — and it
+    /// is answerable without a window.
+    fn rendered_width(md: &str, avail: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut used = 0.0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Measured through a child `Ui` given exactly `avail` to work
+                // in. A panel's own `min_rect` is the panel, not what was put
+                // in it, so measuring that reports the window width for
+                // everything and says nothing about wrapping.
+                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
+                    render(ui, md, 80);
+                });
+                used = inner.response.rect.width();
+            });
+        });
+        used
+    }
+
+    /// The same measurement, through the container stack the transcript
+    /// actually renders an assistant message in: a `horizontal_top` for the
+    /// left gutter, a `vertical` inside it, and the width set from what that
+    /// vertical reports as available.
+    ///
+    /// Worth reproducing exactly rather than approximating. A block that
+    /// wraps when handed a plain `Ui` can still overflow here, because what
+    /// `available_width` means depends on the layouts above it — and a list
+    /// item opens a *third* layout inside this one.
+    fn width_as_the_transcript_renders_it(md: &str, avail: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let (pad_l, pad_r) = (10.0, 12.0);
+        let mut used = 0.0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(pad_l);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(crate::app::content_width(ui, pad_r));
+                            render(ui, md, 80);
+                        });
+                    });
+                });
+                used = inner.response.rect.width();
+            });
+        });
+        used
+    }
+
+    /// The same stack, reporting height instead of width.
+    ///
+    /// `set_max_width(ui.available_width() - pad_r)` subtracts a constant
+    /// from a number that gets smaller as the panel is dragged in, and
+    /// nothing stops the result going negative. A `Ui` with a negative width
+    /// has nowhere to put text.
+    fn height_as_the_transcript_renders_it(md: &str, avail: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let (pad_l, pad_r) = (10.0, 12.0);
+        let mut used = 0.0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(pad_l);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(crate::app::content_width(ui, pad_r));
+                            render(ui, md, 80);
+                        });
+                    });
+                });
+                used = inner.response.rect.height();
+            });
+        });
+        used
+    }
+
+    /// Dragging the panel in must make a message taller, never empty. The
+    /// same words in less width is more lines.
+    #[test]
+    fn a_message_is_still_drawn_when_the_panel_is_dragged_narrow() {
+        let wide = height_as_the_transcript_renders_it(PROSE, 400.0);
+        assert!(wide > 0.0, "nothing drawn even at 400px");
+        for avail in [120.0_f32, 60.0, 30.0, 16.0, 8.0] {
+            let h = height_as_the_transcript_renders_it(PROSE, avail);
+            assert!(
+                h >= wide,
+                "at {avail}px the message was {h} tall against {wide} at 400px — \
+                 it stopped being drawn",
+            );
+        }
+    }
+
+    /// And the same for a list, which is the shape that was reported.
+    #[test]
+    fn a_list_is_still_drawn_when_the_panel_is_dragged_narrow() {
+        let wide = height_as_the_transcript_renders_it(&format!("- {PROSE}"), 400.0);
+        for avail in [120.0_f32, 60.0, 30.0, 16.0, 8.0] {
+            let h = height_as_the_transcript_renders_it(&format!("- {PROSE}"), avail);
+            assert!(h >= wide, "at {avail}px the list was {h} tall against {wide}");
+        }
+    }
+
+    /// A paragraph in the real stack, as the control: if this overflows too
+    /// then the fault is the stack, not the list item.
+    #[test]
+    fn a_paragraph_in_the_transcript_stays_inside_the_panel() {
+        let w = width_as_the_transcript_renders_it(PROSE, 300.0);
+        assert!(w <= 301.0, "a paragraph took {w} in a panel of 300");
+    }
+
+    /// The report: a list escapes the width that holds a paragraph.
+    #[test]
+    fn a_bullet_in_the_transcript_stays_inside_the_panel() {
+        let w = width_as_the_transcript_renders_it(&format!("- {PROSE}"), 300.0);
+        assert!(w <= 301.0, "a bullet took {w} in a panel of 300");
+    }
+
+    const PROSE: &str =
+        "Froze five new training-distribution tasks and four separate held-out \
+         ones, then ran every model over all nine of them before admitting any";
+
+    /// A paragraph wraps to the panel, which is the behaviour a list item is
+    /// measured against below.
+    #[test]
+    fn a_paragraph_stays_inside_the_panel() {
+        let w = rendered_width(PROSE, 300.0);
+        assert!(w <= 301.0, "a paragraph took {w} in a panel of 300");
+    }
+
+    /// A bullet is the same text with a marker in front of it, so it has the
+    /// same amount of wrapping to do and one more reason to do it.
+    #[test]
+    fn a_bullet_stays_inside_the_panel() {
+        let w = rendered_width(&format!("- {PROSE}"), 300.0);
+        assert!(w <= 301.0, "a bullet took {w} in a panel of 300");
+    }
+
+    /// Numbered items are built by the same arm and go the same way.
+    #[test]
+    fn a_numbered_item_stays_inside_the_panel() {
+        let w = rendered_width(&format!("1. {PROSE}"), 300.0);
+        assert!(w <= 301.0, "a numbered item took {w} in a panel of 300");
+    }
+
+    /// Several in a row, which is what a list actually is — and the shape the
+    /// report came in as.
+    #[test]
+    fn a_whole_list_stays_inside_the_panel() {
+        let md = format!("- {PROSE}\n- {PROSE}\n- {PROSE}");
+        let w = rendered_width(&md, 300.0);
+        assert!(w <= 301.0, "a list took {w} in a panel of 300");
+    }
+
+    /// Narrower still: the panel is draggable, and nothing says a list stops
+    /// being a list at 180 pixels.
+    #[test]
+    fn a_bullet_stays_inside_a_narrow_panel() {
+        let w = rendered_width(&format!("- {PROSE}"), 180.0);
+        assert!(w <= 181.0, "a bullet took {w} in a panel of 180");
+    }
+}
+
+#[cfg(test)]
 mod link_tests {
     use super::*;
 

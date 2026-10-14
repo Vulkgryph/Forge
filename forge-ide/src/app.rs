@@ -2618,7 +2618,7 @@ fn draw_perm_mode_row(
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width() - 8.0);
+                ui.set_max_width(content_width(ui, 8.0));
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(label).size(12.5).color(color).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2687,6 +2687,25 @@ fn text_width(ui: &egui::Ui, text: &str, size: f32, monospace: bool) -> f32 {
     ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x)
 }
 
+
+/// The width left for content once `pad` has been reserved, never negative.
+///
+/// `ui.available_width() - pad` is the obvious way to write this, and it is
+/// wrong at the one moment that matters. The panel is draggable, so the
+/// number being subtracted from goes to zero — and a `Ui` given a negative
+/// width has nowhere to lay anything out. egui asserts on it
+/// (`child_size.x >= 0.0`); where that assert is not compiled in, the
+/// content is laid into no space and never appears. That is what dragging
+/// the agent panel narrow looked like: cards keeping their markers and
+/// losing every word in them, and the words not coming back on the way out.
+///
+/// The floor is a few characters rather than zero, so a panel dragged to
+/// nothing clips its text instead of erasing it.
+pub(crate) fn content_width(ui: &egui::Ui, pad: f32) -> f32 {
+    /// Narrow enough to be useless and wide enough to still be text.
+    const NARROWEST: f32 = 24.0;
+    (ui.available_width() - pad).max(NARROWEST)
+}
 
 fn wrap_run(ui: &egui::Ui, size: f32, monospace: bool) -> usize {
     let font = if monospace {
@@ -3203,7 +3222,7 @@ fn draw_read_group(ui: &mut egui::Ui, items: &[ChatItem], start: usize, end: usi
             .inner_margin(egui::Margin::symmetric(10.0, 7.0))
             .rounding(6.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     let mut i = start;
                     let mut first = true;
@@ -3321,7 +3340,7 @@ fn draw_write_card(
             .rounding(6.0)
             .inner_margin(egui::Margin { left: 12.0, right: 10.0, top: 7.0, bottom: 7.0 })
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     // Right to left, so the diffstat and its button claim their
                     // space before the path does: they are controls, and a
@@ -3496,7 +3515,7 @@ fn draw_terminal_card(
             .rounding(6.0)
             .inner_margin(egui::Margin::symmetric(11.0, 8.0))
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         match (approval, result.is_some(), success) {
@@ -3634,7 +3653,7 @@ fn draw_question_card(
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if answered {
@@ -3794,7 +3813,7 @@ fn draw_plan_card(
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     let header = ui.horizontal(|ui| {
                         if resolved {
@@ -3948,7 +3967,7 @@ fn draw_input_needed_card(
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(6.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if resolved { paint_checkmark(ui, accent); } else { paint_ring(ui, accent); }
@@ -4080,7 +4099,7 @@ fn draw_checkpoint_card(
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .rounding(4.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     // Two lines, always. The preview and the controls cannot
                     // share one: reserving space by measuring buttons is never
@@ -4182,7 +4201,7 @@ fn draw_provider_busy_card(
     ui.horizontal(|ui| {
         ui.add_space(pad_l);
         ui.vertical(|ui| {
-            ui.set_max_width(ui.available_width() - pad_r);
+            ui.set_max_width(content_width(ui, pad_r));
             ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), wrap_run(ui, 12.5, false)))
                 .color(egui::Color32::from_rgb(255, 110, 100)));
             if resolved {
@@ -4455,6 +4474,64 @@ mod remote_pty_size_tests {
 }
 
 #[cfg(test)]
+mod todo_width_tests {
+    use super::*;
+
+    const TASK: &str = "Run the reviewer over the five training runs and record \
+                        which of them the admission check actually accepts";
+
+    /// How tall one todo row comes out in a panel of `avail` pixels.
+    ///
+    /// Height is the measurement that answers the question, because the
+    /// failure is text that is not drawn at all: a row with its text missing
+    /// is one marker high however wide the panel is, and a row whose text is
+    /// there gets taller as the panel narrows and the wrapping doubles it up.
+    fn todo_row_height(avail: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let rows = vec![(TodoStatus::Done, TASK.to_string())];
+        let mut h = 0.0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
+                    draw_todo_list(ui, &rows);
+                });
+                h = inner.response.rect.height();
+            });
+        });
+        h
+    }
+
+    /// The control: at a comfortable width the task is one or two lines.
+    #[test]
+    fn a_task_is_drawn_in_a_wide_panel() {
+        let h = todo_row_height(400.0);
+        assert!(h > 8.0, "nothing was drawn at 400px: height {h}");
+    }
+
+    /// The report. Dragging the panel narrow made the contents vanish — the
+    /// row keeps its marker and loses its text, because the sub-layout the
+    /// text goes into is allocated `available_width()` and that is not a
+    /// positive number once the marker and the card's padding have taken
+    /// their share.
+    ///
+    /// Narrower means *taller*, never emptier: the same words in less width
+    /// is more lines.
+    #[test]
+    fn a_task_survives_a_panel_dragged_narrow() {
+        let wide = todo_row_height(400.0);
+        for avail in [120.0_f32, 60.0, 30.0, 12.0, 4.0] {
+            let h = todo_row_height(avail);
+            assert!(
+                h >= wide,
+                "at {avail}px the row was {h} tall against {wide} at 400px — \
+                 the task text stopped being drawn",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod remote_pty_flush_tests {
     use super::*;
 
@@ -4681,7 +4758,7 @@ fn draw_subagent_block(
             .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 6.0, bottom: 6.0 })
             .rounding(4.0)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() - pad_r);
+                ui.set_max_width(content_width(ui, pad_r));
                 ui.vertical(|ui| {
                     let header = ui.horizontal(|ui| {
                         paint_disclosure_triangle(ui, expanded, egui::Color32::from_gray(150));
@@ -8470,7 +8547,7 @@ impl IdeApp {
         ui.horizontal(|ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("split_tabs")
-                .max_width(ui.available_width() - 28.0)
+                .max_width(content_width(ui, 28.0))
                 .show(ui, |ui| {
                     for (i, b) in self.buffers.iter().enumerate() {
                         let name = b.path.as_ref()
@@ -9395,7 +9472,7 @@ impl IdeApp {
                                         // this file) — needs its own vertical + max-width here
                                         // since this note is long enough to need it.
                                         ui.vertical(|ui| {
-                                            ui.set_max_width(ui.available_width() - 6.0);
+                                            ui.set_max_width(content_width(ui, 6.0));
                                             ui.label(egui::RichText::new(
                                                 "Priority requests higher scheduling priority from xAI \
                                                  during high demand, at double their standard per-token \
@@ -10096,7 +10173,7 @@ impl IdeApp {
                                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                                     .rounding(6.0)
                                     .show(ui, |ui| {
-                                        ui.set_max_width(ui.available_width() - pad_r);
+                                        ui.set_max_width(content_width(ui, pad_r));
                                         // Must switch to a vertical layout before adding the label:
                                         // Frame content inherits the layout direction of whatever
                                         // it's placed inside (the `ui.horizontal` above, for the
@@ -10116,7 +10193,7 @@ impl IdeApp {
                             let body = ui.horizontal_top(|ui| {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
-                                    ui.set_max_width(ui.available_width() - pad_r);
+                                    ui.set_max_width(content_width(ui, pad_r));
                                     crate::markdown::render(ui, text, wrap_run(ui, 12.5, false));
                                 });
                             }).response.rect;
@@ -10129,7 +10206,7 @@ impl IdeApp {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
-                                    ui.set_max_width(ui.available_width() - pad_r);
+                                    ui.set_max_width(content_width(ui, pad_r));
                                     ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(11.0)
                                         .color(egui::Color32::from_gray(130)));
                                 });
@@ -10154,7 +10231,7 @@ impl IdeApp {
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(4.0)
                                     .show(ui, |ui| {
-                                        ui.set_max_width(ui.available_width() - pad_r);
+                                        ui.set_max_width(content_width(ui, pad_r));
                                         // See the comment on the ToolRequest arm above — Frame content
                                         // inherits the horizontal layout of its parent row and won't
                                         // wrap without an explicit vertical layout here.
@@ -10243,7 +10320,7 @@ impl IdeApp {
                                 // almost entirely off-screen as a result, with only its first few
                                 // words visible at the left edge.
                                 ui.vertical(|ui| {
-                                    ui.set_max_width(ui.available_width() - pad_r);
+                                    ui.set_max_width(content_width(ui, pad_r));
                                     ui.label(egui::RichText::new(soft_wrap(&format!("  {msg}"), wrap_run(ui, 12.5, false))).color(egui::Color32::from_rgb(255,110,100)));
                                 });
                             });
@@ -10253,7 +10330,7 @@ impl IdeApp {
                             ui.horizontal(|ui| {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
-                                    ui.set_max_width(ui.available_width() - pad_r);
+                                    ui.set_max_width(content_width(ui, pad_r));
                                     ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(110)));
                                 });
                             });
@@ -10552,7 +10629,7 @@ impl IdeApp {
             // Initialize Repository button
             ui.horizontal(|ui| {
                 ui.add_space(pad);
-                let btn_w = ui.available_width() - pad;
+                let btn_w = content_width(ui, pad);
                 let resp = ui.add_sized(
                     egui::vec2(btn_w, 28.0),
                     egui::Button::new(
@@ -10589,7 +10666,7 @@ impl IdeApp {
             //  working path today without bundling auth.)
             ui.horizontal(|ui| {
                 ui.add_space(pad);
-                let btn_w = ui.available_width() - pad;
+                let btn_w = content_width(ui, pad);
                 let resp = ui.add_sized(
                     egui::vec2(btn_w, 28.0),
                     egui::Button::new(
@@ -11169,7 +11246,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "One step is one edit as you would count it: adding or removing a \
                              line starts a step, and a burst of typing becomes a single step. \
@@ -11202,7 +11279,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "Writes files that already have a name. A tab you have never \
                              saved is left alone — use Save to give it a home first.")
@@ -11239,7 +11316,7 @@ impl IdeApp {
                     // into an explicit `ui.vertical` here is the fix (see
                     // the same gotcha noted for chat-panel cards).
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "Only applies to fully quitting and relaunching — Reload Window \
                              (Ctrl+Shift+R) always restores tabs and terminals regardless of \
@@ -11274,7 +11351,7 @@ impl IdeApp {
                         ui.horizontal(|ui| {
                             ui.add_space(14.0);
                             ui.vertical(|ui| {
-                                ui.set_max_width(ui.available_width() - 14.0);
+                                ui.set_max_width(content_width(ui, 14.0));
                                 ui.label(egui::RichText::new(status)
                                     .size(10.0).color(egui::Color32::from_gray(100)));
                             });
@@ -11311,7 +11388,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "Checks GitHub releases on startup and hourly while open. \
                              Off by default — this is the only network call Forge IDE \
@@ -11339,7 +11416,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "Configures ~/.config/forge/config.toml — shared by this IDE's \
                              agent panel, the reference TUI, and any forge-agent invocation.")
@@ -11401,7 +11478,7 @@ impl IdeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 14.0);
+                        ui.set_max_width(content_width(ui, 14.0));
                         ui.label(egui::RichText::new(
                             "Default permission mode for new agent tabs — each tab can still \
                              override this individually from the dropdown next to its model picker. \
@@ -11452,7 +11529,7 @@ impl IdeApp {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
-                            ui.set_max_width(ui.available_width() - 14.0);
+                            ui.set_max_width(content_width(ui, 14.0));
                             ui.label(egui::RichText::new(
                                 "Every new agent tab will skip every approval prompt — writes and \
                                  shell commands, without asking. A remote session started this way \
@@ -12569,7 +12646,7 @@ impl IdeApp {
         // Reserve fixed space for the Aa toggle, give the rest to the input.
         // Allocate the row up front so the TextEdit can't push the panel wider.
         let cwd      = self.cwd.clone();
-        let row_w    = ui.available_width() - 12.0;
+        let row_w    = content_width(ui, 12.0);
         let aa_w     = 28.0;
         let input_w  = (row_w - aa_w - 8.0).max(60.0);
 
@@ -13180,7 +13257,7 @@ impl IdeApp {
                 // already known, from a terminal in the next panel.
                 ui.horizontal(|ui| {
                     let resp = ui.add(egui::TextEdit::singleline(&mut typed)
-                        .desired_width(ui.available_width() - 150.0)
+                        .desired_width(content_width(ui, 150.0))
                         .font(egui::TextStyle::Monospace)
                         .hint_text("/path/on/the/remote"));
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {

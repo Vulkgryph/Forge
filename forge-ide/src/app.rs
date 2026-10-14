@@ -4387,6 +4387,139 @@ fn note_remote_boundary(items: &mut Vec<ChatItem>, host: &str) -> bool {
     true
 }
 
+/// The size a newly-connected remote pty has to be told about, as
+/// (cols, rows), or `None` if what it was opened with is already right.
+///
+/// `pty/open` is issued from a background thread, and until it answers there
+/// is no shell for `ssh_resize_pty` to write to, so every resize in that
+/// window is dropped. The panel's size lands in `ssh_term_size` regardless,
+/// and the draw loop only speaks up when the panel differs from *that* — so
+/// after the open completes nothing ever notices the far end disagrees, and a
+/// remote shell spends the whole session wrapping its lines at whatever width
+/// the open happened to guess (80 columns, when the panel had not been
+/// measured even once). Both sizes are (rows, cols); the result is swapped
+/// because that is the order the pty calls take.
+fn remote_pty_resize_needed(opened: (u16, u16), wanted: (u16, u16)) -> Option<(u16, u16)> {
+    let (rows, cols) = wanted;
+    // Never measured — there is no better size to ask for yet, and asking for
+    // 0x0 would be worse than the guess the pty already has.
+    if rows == 0 || cols == 0 { return None; }
+    if opened == wanted { return None; }
+    Some((cols, rows))
+}
+
+#[cfg(test)]
+mod remote_pty_size_tests {
+    use super::remote_pty_resize_needed;
+
+    /// The bug, as a test. A remote terminal's first frame opens the pty
+    /// before the panel has been measured, so it opens at the 80x24 fallback;
+    /// the panel turns out to be 140x38. Nothing after this point compares the
+    /// two, so without the flush the far end stays at 80 columns all session.
+    #[test]
+    fn a_pty_opened_before_the_panel_was_measured_is_told_the_real_size() {
+        assert_eq!(remote_pty_resize_needed((24, 80), (38, 140)), Some((140, 38)));
+    }
+
+    /// Returned as (cols, rows) because that is the order `pty/resize` and
+    /// `ssh_resize_pty` take, while the sizes being compared are (rows, cols).
+    /// Getting this backwards transposes the terminal, which is the kind of
+    /// mistake that looks like it works until the panel is not square.
+    #[test]
+    fn the_result_is_cols_rows_not_rows_cols() {
+        let (cols, rows) = remote_pty_resize_needed((24, 80), (10, 200)).unwrap();
+        assert_eq!((cols, rows), (200, 10));
+    }
+
+    /// The guess was right, which happens whenever the terminal is reopened at
+    /// a size it has already settled on. No round trip for nothing.
+    #[test]
+    fn a_size_that_already_matches_is_not_resent() {
+        assert_eq!(remote_pty_resize_needed((38, 140), (38, 140)), None);
+    }
+
+    /// Nothing has measured the panel yet. Asking for 0x0 would replace a
+    /// usable guess with an unusable certainty — some programs divide by it.
+    #[test]
+    fn an_unmeasured_panel_leaves_the_opening_guess_alone() {
+        assert_eq!(remote_pty_resize_needed((24, 80), (0, 0)), None);
+        assert_eq!(remote_pty_resize_needed((24, 80), (38, 0)), None);
+        assert_eq!(remote_pty_resize_needed((24, 80), (0, 140)), None);
+    }
+
+    /// A one-column difference still wraps every long line in the wrong place.
+    #[test]
+    fn one_column_out_is_still_out() {
+        assert_eq!(remote_pty_resize_needed((38, 140), (38, 139)), Some((139, 38)));
+    }
+}
+
+#[cfg(test)]
+mod remote_clipboard_tests {
+    use super::*;
+
+    /// The half of OSC 52 that the parser's own tests cannot reach: taking the
+    /// text off the grid during a frame and handing it to the window system.
+    ///
+    /// Driven through the real `draw_ssh_terminal` in a headless egui frame,
+    /// because the two lines that do this live in a draw and nowhere else — a
+    /// parser that decodes perfectly into a field nobody reads is still a
+    /// remote shell that cannot copy.
+    #[test]
+    fn a_remote_copy_request_reaches_the_window_system() {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-osc52-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir), ..Default::default()
+        });
+
+        // Exactly what a program on the remote writes to copy "hello".
+        app.ssh_term.lock().unwrap().process("\x1b]52;c;aGVsbG8=\x07");
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let out = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_ssh_terminal(ui));
+        });
+
+        assert_eq!(
+            out.platform_output.copied_text, "hello",
+            "the remote's copy never left the grid",
+        );
+    }
+
+    /// And an ordinary frame does not keep re-copying. Setting `copied_text`
+    /// on every frame would overwrite whatever the person copied since, from
+    /// anywhere on the machine, several times a second.
+    #[test]
+    fn a_frame_with_nothing_to_copy_leaves_the_clipboard_alone() {
+        let dir = std::env::temp_dir()
+            .join(format!("forge-osc52-quiet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir), ..Default::default()
+        });
+        app.ssh_term.lock().unwrap().process("\x1b]52;c;aGVsbG8=\x07");
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        // The frame that takes it, then the next one.
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_ssh_terminal(ui));
+        });
+        let out = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_ssh_terminal(ui));
+        });
+
+        assert!(
+            out.platform_output.copied_text.is_empty(),
+            "a quiet frame copied {:?} over the clipboard",
+            out.platform_output.copied_text,
+        );
+    }
+}
+
 /// Whether this subagent has an approval waiting on it.
 ///
 /// The one reason left for the docked strip to exist. A subagent's activity is
@@ -4848,6 +4981,16 @@ pub struct IdeApp {
     ssh_host_key_changed: Option<String>,
     /// Size the remote pty and the grid were last told about.
     ssh_term_size: (u16, u16),
+    /// The size `pty/open` was actually issued with, as (rows, cols).
+    ///
+    /// The open happens on a background thread, so for as long as it is in
+    /// flight there is no shell to send a resize to and every one is dropped.
+    /// Meanwhile `ssh_term_size` settles on the real size, and the draw loop
+    /// only sends a resize when the panel differs from *that* — so it never
+    /// sends another, and the far end keeps the size it was opened with for
+    /// the life of the session. Recorded here so that the size actually in
+    /// force can be compared against the size wanted once the shell arrives.
+    ssh_pty_opened_size: (u16, u16),
     /// A size seen but not yet held long enough to act on — see the resize
     /// debounce in `draw_ssh_terminal`.
     ssh_term_pending_size: Option<((u16, u16), std::time::Instant)>,
@@ -5194,6 +5337,7 @@ impl IdeApp {
             ssh_host_key_prompt: None,
             ssh_host_key_changed: None,
             ssh_term_size: (0, 0),
+            ssh_pty_opened_size: (0, 0),
             ssh_term_pending_size: None,
             ssh_term_cached_galley: None,
             ssh_term_cached_scrollback_galley: None,
@@ -6711,6 +6855,17 @@ impl IdeApp {
                 Ok(Ok(shell)) => {
                     self.ssh_shell = Some(shell);
                     self.ssh_pty_rx = None;
+                    // First moment there is anything to send a resize to. The
+                    // panel has been measured since the open was issued, and
+                    // every resize in between went nowhere, so unless the
+                    // guess happened to be right the far end is wrong and
+                    // nothing downstream will ever notice.
+                    if let Some((cols, rows)) =
+                        remote_pty_resize_needed(self.ssh_pty_opened_size, self.ssh_term_size)
+                    {
+                        self.ssh_resize_pty(cols, rows);
+                        self.ssh_pty_opened_size = self.ssh_term_size;
+                    }
                     self.output_log("Remote terminal connected".to_string(), OutputLevel::Success);
                     ctx.request_repaint();
                 }
@@ -6874,6 +7029,11 @@ impl IdeApp {
                     // Unset, so the next frame fits it to the panel rather than
                     // leaving the opening size in place.
                     self.ssh_term_size = (0, 0);
+                    // This connection brought its own shell, so a resize sent
+                    // on the next frame reaches something; there is no open in
+                    // flight to be stale against. Cleared so a later lazy open
+                    // on this connection is judged against nothing.
+                    self.ssh_pty_opened_size = (0, 0);
                     self.ssh_term_pending_size = None;
                     self.ssh_term_focused = false;
                     self.bottom_tab = BottomTab::Terminal; // switch to terminal tab
@@ -9528,7 +9688,8 @@ impl IdeApp {
                                                 vec![c2 + egui::vec2(-3.0, -4.0), c2 + egui::vec2(-3.0, 4.0), c2 + egui::vec2(4.0, 0.0)],
                                                 egui::Color32::from_rgb(160, 220, 160), egui::Stroke::NONE,
                                             ));
-                                            let _ = resp2.clone().on_hover_text("Interrupt current turn and send this now");
+                                            let _ = resp2.clone().on_hover_text(
+                                                "Send now, without interrupting the turn");
                                             if resp2.clicked() { send_now_idx = Some(qi); }
                                         });
                                     });
@@ -11637,6 +11798,14 @@ impl IdeApp {
                 // is never looked at again and the size never settles.
                 ui.ctx().request_repaint_after(RESIZE_SETTLE);
             }
+        }
+
+        // A program on the remote asked for the clipboard with OSC 52. This is
+        // the case the sequence exists for: a process on another machine
+        // cannot reach this one's pasteboard, so copying out of a remote shell
+        // works only if the terminal here acts on the request.
+        if let Some(text) = self.ssh_term.lock().ok().and_then(|mut g| g.take_clipboard()) {
+            ui.output_mut(|o| o.copied_text = text);
         }
 
         // Click to focus / click outside to blur
@@ -15607,6 +15776,12 @@ impl IdeApp {
             (0, _) | (_, 0) => (24u16, 80u16),
             (r, c) => (r, c),
         };
+        // What the far end will actually be running at until something says
+        // otherwise. On the first frame of a remote terminal this is the 80x24
+        // fallback above — `draw_ssh_terminal` has not measured the panel yet,
+        // and it is called immediately after this, so by the time the open
+        // completes the wanted size is known and this one is stale.
+        self.ssh_pty_opened_size = (rows, cols);
 
         let (tx, rx) = mpsc::channel();
         self.ssh_pty_rx = Some(rx);
@@ -15879,7 +16054,11 @@ impl IdeApp {
     fn ssh_resize_pty(&mut self, cols: u16, rows: u16) {
         let Some(ssh) = &self.ssh else { return };
         if self.ssh_shell.is_none() {
-            return; // no pty open yet; it will be opened at the right size
+            // Nothing to send to yet. The open is already in flight with
+            // whatever size was known when it was issued, which is not
+            // necessarily this one — `remote_pty_resize_needed` settles that
+            // when the shell arrives.
+            return;
         }
         let id = { let mut n = ssh.next_id.lock().unwrap(); let i = *n; *n += 1; i };
         let msg = forge_proto::Rpc::request(

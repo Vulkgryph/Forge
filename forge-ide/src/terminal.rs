@@ -295,6 +295,54 @@ struct AltSaved {
 /// comparable bail-out.
 const SYNC_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// How much of an OSC payload is kept, in characters.
+///
+/// OSC 52 carries the text being copied, so this is a cap on a copy, and the
+/// thing being capped arrives from the far end of a connection — an
+/// unbounded buffer here is a program on another machine deciding how much
+/// of this one's memory to use. A megabyte of base64 is roughly 768 KiB of
+/// text, which is a larger copy than a person makes from a terminal and far
+/// smaller than a problem.
+const OSC_PAYLOAD_LIMIT: usize = 1 << 20;
+
+/// Standard base64 (RFC 4648 §4) back to bytes, or `None` if `s` is not
+/// base64 at all.
+///
+/// The counterpart to the encoder the terminal client uses to *send* OSC 52;
+/// this is the end that receives one. Rejecting rather than skipping an
+/// unexpected byte is deliberate — a payload with something else in it is
+/// not a copy that lost a character, it is not a copy, and turning it into
+/// one puts bytes nobody sent on the clipboard.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in s.bytes() {
+        // Padding only ever ends the data, so there is nothing after it to
+        // read whether it is one `=` or two.
+        if b == b'=' { break; }
+        let six = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            // Senders wrap long base64, and the line breaks are not data.
+            b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        acc = acc << 6 | u32::from(six);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    // Any remaining bits are the padding bits of the final group, which
+    // belong to no byte.
+    Some(out)
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum PState { Ground, Esc, Csi, Osc, Charset }
 
@@ -342,6 +390,26 @@ pub struct Grid {
     dim:          bool,
     parse_st:     PState,
     parse_params: String,
+    /// An OSC payload that outgrew `OSC_PAYLOAD_LIMIT`, so what was kept is
+    /// only the front of it. Decoding a truncated base64 payload yields
+    /// plausible bytes that are not what was sent, which for a clipboard
+    /// means quietly pasting the wrong thing — so the sequence is dropped
+    /// instead.
+    osc_truncated: bool,
+    /// Text a program asked to put on the system clipboard with OSC 52,
+    /// waiting for a frame to hand it to the window system.
+    ///
+    /// This is how copying works at all over SSH: a remote program cannot
+    /// reach this machine's pasteboard, so it asks the terminal to do it.
+    /// Set from the feeder thread, which has no egui context, and taken by
+    /// whichever draw path owns this grid.
+    ///
+    /// Only *setting* the clipboard is honoured. OSC 52 can also ask to read
+    /// it back (`52;c;?`), which would let anything running on a remote host
+    /// — or printing to the terminal there — silently exfiltrate whatever is
+    /// on the clipboard of the machine you are sitting at. That query is
+    /// consumed and never answered.
+    pending_clipboard: Option<String>,
     /// Main-screen contents saved while the alternate screen (`ESC[?1049h`) is
     /// active. `Some` means we are on the alternate screen.
     ///
@@ -417,6 +485,7 @@ impl Grid {
             current_bg: None,
             dim: false,
             parse_st: PState::Ground, parse_params: String::new(),
+            osc_truncated: false, pending_clipboard: None,
             alt_screen: None, sync_update: None,
             autowrap: true,
             bracketed_paste: false,
@@ -878,6 +947,43 @@ impl Grid {
         }
     }
 
+    /// Act on a finished OSC sequence.
+    ///
+    /// Only OSC 52 does anything. The others that turn up here — window
+    /// title, working directory, colour queries — are consumed and ignored,
+    /// which is what happened to all of them before.
+    fn dispatch_osc(&mut self, payload: &str) {
+        let truncated = std::mem::take(&mut self.osc_truncated);
+        let Some(rest) = payload.strip_prefix("52;") else { return };
+        // Only the front of the payload survived, so the base64 is cut mid
+        // stream. It would still decode, into bytes that are not what was
+        // copied.
+        if truncated { return; }
+        // `52;<selection>;<data>`. The selection names which clipboard — `c`
+        // for the usual one, `p`/`s` for X's others, or several at once —
+        // and there is one clipboard here, so it is read only to find where
+        // the data starts.
+        let Some((_selection, data)) = rest.split_once(';') else { return };
+        // `?` asks the terminal to send the clipboard *back*. Never answered:
+        // see `pending_clipboard`.
+        if data == "?" { return; }
+        if let Some(bytes) = base64_decode(data) {
+            // Lossy on purpose. The payload is bytes, and the clipboard holds
+            // text; a remote program on a different locale sending something
+            // that is not UTF-8 should cost the odd replacement character,
+            // not the whole copy.
+            self.pending_clipboard = Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+
+    /// Take the text a program asked to be copied, if any is waiting.
+    ///
+    /// Called from a draw, which is the first point where there is a window
+    /// system to hand it to.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
     fn dispatch_csi(&mut self, cmd: char, params: &str) {
         // DEC private modes (`ESC [ ? <n> h`/`l`) — TUI frameworks like ink
         // (which Claude Code is built on) hide the real terminal cursor and
@@ -999,9 +1105,33 @@ impl Grid {
                         self.parse_params.push(c);
                     }
                 }
+                // An OSC payload used to be discarded a character at a time,
+                // which made every one of these a no-op — including OSC 52,
+                // the only way a program on a remote host can copy to the
+                // clipboard of the machine someone is sitting at. Collected
+                // now, and acted on at the terminator.
                 PState::Osc => match c {
-                    '\x07' | '\x1b' => { self.parse_st = PState::Ground; }
-                    _ => {}
+                    '\x07' => {
+                        let payload = std::mem::take(&mut self.parse_params);
+                        self.dispatch_osc(&payload);
+                        self.parse_st = PState::Ground;
+                    }
+                    // ESC here opens the other terminator, `ESC \` (ST).
+                    // Handed to `Esc` rather than `Ground` so that the `\`
+                    // is consumed as the rest of the terminator; from Ground
+                    // it printed as a literal backslash at the cursor.
+                    '\x1b' => {
+                        let payload = std::mem::take(&mut self.parse_params);
+                        self.dispatch_osc(&payload);
+                        self.parse_st = PState::Esc;
+                    }
+                    _ => {
+                        if self.parse_params.len() < OSC_PAYLOAD_LIMIT {
+                            self.parse_params.push(c);
+                        } else {
+                            self.osc_truncated = true;
+                        }
+                    }
                 },
             }
         }
@@ -1594,6 +1724,12 @@ impl Terminal {
             self.pending_size = None;
         }
 
+        // A program asked for the clipboard with OSC 52. Done here because
+        // the feeder thread that parsed it has no window system to reach.
+        if let Some(text) = self.grid.lock().ok().and_then(|mut g| g.take_clipboard()) {
+            ui.output_mut(|o| o.copied_text = text);
+        }
+
         let (version, scrollback_version, cur_row, cur_col, cursor_visible) = {
             let g = self.grid.lock().unwrap();
             let (r, c) = g.cursor();
@@ -2166,6 +2302,181 @@ mod ink_redraw_tests {
         assert!(g.scrollback.len() > 50,
                 "100 lines of real output on a 24-row screen should scroll, got {}",
                 g.scrollback.len());
+    }
+}
+
+#[cfg(test)]
+mod osc52_clipboard_tests {
+    use super::{base64_decode, Grid, OSC_PAYLOAD_LIMIT};
+
+    /// An OSC 52 copy request as a program actually writes one.
+    fn copy_seq(text: &str) -> String {
+        // The encoder lives in the terminal client, so the bytes are built
+        // here rather than shared — what is under test is this end reading
+        // what some other program wrote, not a round trip with ourselves.
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let data = text.as_bytes();
+        let mut b64 = String::new();
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    b64.push(ALPHABET[(n >> (18 - i * 6) & 0x3f) as usize] as char);
+                } else {
+                    b64.push('=');
+                }
+            }
+        }
+        format!("\x1b]52;c;{b64}\x07")
+    }
+
+    /// The bug. Copying inside a remote shell is OSC 52 and nothing else —
+    /// a process on another machine cannot reach this one's pasteboard — and
+    /// the parser consumed the payload a character at a time and dropped it,
+    /// so every copy over SSH went nowhere.
+    #[test]
+    fn a_copy_request_reaches_the_clipboard() {
+        let mut g = Grid::with_size(10, 40);
+        g.process(&copy_seq("cargo test -p forge-ide"));
+        assert_eq!(g.take_clipboard().as_deref(), Some("cargo test -p forge-ide"));
+    }
+
+    /// Taken once. A second frame must not re-copy and clobber whatever the
+    /// person has copied since.
+    #[test]
+    fn the_text_is_handed_over_only_once() {
+        let mut g = Grid::with_size(10, 40);
+        g.process(&copy_seq("once"));
+        assert!(g.take_clipboard().is_some());
+        assert_eq!(g.take_clipboard(), None);
+    }
+
+    /// `ESC \` is the other terminator, and it is what tmux and anything
+    /// speaking strict ECMA-48 send.
+    #[test]
+    fn the_string_terminator_ends_a_sequence_as_well_as_bel() {
+        let mut g = Grid::with_size(10, 40);
+        let seq = copy_seq("via ST").replace('\x07', "\x1b\\");
+        g.process(&seq);
+        assert_eq!(g.take_clipboard().as_deref(), Some("via ST"));
+        // And the `\` was consumed as part of the terminator rather than
+        // printed at the cursor, which is what sending it to Ground did.
+        assert!(!g.all_text().contains('\\'), "a literal backslash was printed");
+    }
+
+    /// Nothing else about the display may change. An OSC sequence moves no
+    /// cursor and prints nothing, and the payload is not text to display —
+    /// it used to be dropped, so it was at least never printed, and that
+    /// much has to stay true now that it is being collected.
+    #[test]
+    fn a_copy_request_prints_nothing() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("before");
+        g.process(&copy_seq("some long clipboard payload here"));
+        g.process("after");
+        assert_eq!(g.all_text().trim_end(), "beforeafter");
+    }
+
+    /// Split across reads, because a 1 KiB copy does not arrive in one chunk
+    /// from a socket. The parser is a state machine for exactly this reason,
+    /// and an OSC payload is the one part that was never reassembled.
+    #[test]
+    fn a_sequence_split_across_chunks_is_still_one_copy() {
+        let mut g = Grid::with_size(10, 40);
+        let seq = copy_seq("reassembled across reads");
+        let mid = seq.len() / 2;
+        // Not on a char boundary by accident — the payload is all ASCII.
+        g.process(&seq[..mid]);
+        assert_eq!(g.take_clipboard(), None, "copied before the terminator arrived");
+        g.process(&seq[mid..]);
+        assert_eq!(g.take_clipboard().as_deref(), Some("reassembled across reads"));
+    }
+
+    /// `52;c;?` asks the terminal to send the clipboard back to the program.
+    /// Over SSH that is anything running on — or merely printing to — a
+    /// remote host reading the clipboard of the machine someone is sitting
+    /// at. Consumed, never answered.
+    #[test]
+    fn a_read_of_the_clipboard_is_not_answered() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("\x1b]52;c;?\x07");
+        assert_eq!(g.take_clipboard(), None);
+        assert_eq!(g.all_text().trim_end(), "");
+    }
+
+    /// The other OSC sequences still do nothing, as they always did. A
+    /// window title is not a copy request.
+    #[test]
+    fn other_osc_sequences_do_not_touch_the_clipboard() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("\x1b]0;a window title\x07");
+        g.process("\x1b]7;file:///Users/someone/src\x1b\\");
+        assert_eq!(g.take_clipboard(), None);
+        assert_eq!(g.all_text().trim_end(), "");
+    }
+
+    /// Past the cap the kept payload is the front of the base64, which still
+    /// decodes — into bytes that are not what was copied. Dropped instead of
+    /// quietly putting the wrong thing on the clipboard.
+    #[test]
+    fn an_oversized_payload_is_dropped_rather_than_truncated() {
+        let mut g = Grid::with_size(10, 40);
+        g.process(&copy_seq(&"x".repeat(OSC_PAYLOAD_LIMIT)));
+        assert_eq!(g.take_clipboard(), None);
+    }
+
+    /// And the cap does not wedge the parser: the sequence after an oversized
+    /// one is read normally.
+    #[test]
+    fn a_copy_after_an_oversized_one_still_works() {
+        let mut g = Grid::with_size(10, 40);
+        g.process(&copy_seq(&"x".repeat(OSC_PAYLOAD_LIMIT)));
+        g.process(&copy_seq("back to normal"));
+        assert_eq!(g.take_clipboard().as_deref(), Some("back to normal"));
+    }
+
+    #[test]
+    fn base64_round_trips_the_rfc_vectors() {
+        for (text, b64) in [
+            ("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_decode(b64).as_deref(), Some(text.as_bytes()), "{b64}");
+        }
+    }
+
+    /// Missing padding is accepted — senders omit it — but a byte outside the
+    /// alphabet means the payload is not base64, and guessing at it would put
+    /// bytes nobody sent on the clipboard.
+    #[test]
+    fn base64_accepts_missing_padding_and_rejects_rubbish() {
+        assert_eq!(base64_decode("Zm9vYg").as_deref(), Some(&b"foob"[..]));
+        assert_eq!(base64_decode("Zm9v\r\nYmFy").as_deref(), Some(&b"foobar"[..]));
+        assert_eq!(base64_decode("not base64!"), None);
+    }
+
+    /// A payload that is not UTF-8 costs a replacement character, not the
+    /// copy. A remote in another locale is a normal thing to be connected to.
+    #[test]
+    fn bytes_that_are_not_text_still_produce_a_copy() {
+        let mut g = Grid::with_size(10, 40);
+        // `\xff` is not valid UTF-8 in any position.
+        g.process("\x1b]52;c;/w==\x07");
+        assert_eq!(g.take_clipboard().as_deref(), Some("\u{fffd}"));
+    }
+
+    /// A malformed sequence is consumed without copying and without leaving
+    /// the parser mid-sequence.
+    #[test]
+    fn a_copy_request_with_no_data_field_is_ignored() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("\x1b]52\x07");
+        g.process("\x1b]52;c\x07");
+        assert_eq!(g.take_clipboard(), None);
+        g.process(&copy_seq("still parsing"));
+        assert_eq!(g.take_clipboard().as_deref(), Some("still parsing"));
     }
 }
 

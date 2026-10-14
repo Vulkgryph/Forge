@@ -1855,21 +1855,34 @@ impl AgentSession {
         }
     }
 
-    /// Interrupts the current turn and sends `index`'s queued message as
-    /// soon as the cancellation actually completes — moves it to the front
-    /// of the queue, since `dispatch_next_queued` (called from both the
-    /// `Done` and `Cancelled` handlers) always sends whatever's there next.
-    /// No-op if `index` is out of bounds; if there's no active turn to
-    /// interrupt after all (a race with it finishing on its own), just
-    /// dispatches immediately instead of waiting for a cancellation that
-    /// was never coming.
+    /// Send `index`'s queued message to the agent now, mid-turn, without
+    /// interrupting what it is doing.
+    ///
+    /// This used to cancel the turn, because there was no other way to be
+    /// heard: a message written while the agent was working went nowhere, so
+    /// the only way to reach it was to stop it first and lose whatever the
+    /// current tool call had done. The agent reads its action channel between
+    /// steps now and parks what arrives until the step finishes, so the
+    /// message lands without costing the turn.
+    ///
+    /// It goes into the transcript as it is sent, where a person can see that
+    /// it was delivered and is no longer waiting. Once sent it cannot be
+    /// revoked — that is the difference between this and leaving it queued.
+    ///
+    /// No-op if `index` is out of bounds. With no agent behind the session
+    /// yet the message stays where it is; there is nothing to deliver it to,
+    /// and dropping it would lose what someone typed.
     pub fn send_queued_now(&mut self, index: usize) {
         if index >= self.queued.len() { return; }
+        if self.pending.is_some() { return; }
         let msg = self.queued.remove(index);
-        self.queued.insert(0, msg);
         if self.turn_active {
-            self.cancel_run();
+            self.items.push(ChatItem::User(msg.clone()));
+            let _ = self.write(&OutgoingMsg::SendMessage { content: msg });
         } else {
+            // Nothing to interleave with — this is an ordinary send, and
+            // `send_user` is the one place that sets a turn up.
+            self.queued.insert(0, msg);
             self.dispatch_next_queued();
         }
     }
@@ -2184,6 +2197,76 @@ mod tests {
         append_tool_output(&mut items, "shell_exec".into(), "one\n".into());
         append_tool_output(&mut items, "shell_exec".into(), "two".into());
         assert_eq!(card(&items).1, "one\ntwo");
+    }
+
+    /// A session with no process behind it but a turn supposedly in flight.
+    /// `write` is a no-op without a child, so what a message *did* is read off
+    /// the session's own state rather than the wire.
+    fn mid_turn_session() -> AgentSession {
+        let mut s = AgentSession::failed(String::new());
+        s.spawn_err = None;
+        s.turn_active = true;
+        s
+    }
+
+    /// Typing while the agent is working queues the message rather than
+    /// interleaving it — that part is deliberate, and is what the queue strip
+    /// in the panel is showing.
+    #[test]
+    fn a_message_typed_during_a_turn_is_queued() {
+        let mut s = mid_turn_session();
+        s.send_user("stop using the old endpoint".into());
+        assert_eq!(s.queued.len(), 1);
+        assert!(s.items.is_empty(), "it went out mid-turn without being asked to");
+    }
+
+    /// The fix. Sending a queued message mid-turn used to mean cancelling the
+    /// turn to be heard — the message went back to the front of the queue and
+    /// waited for the cancellation, losing whatever the running tool had done.
+    /// Checked against that behaviour rather than assumed to differ from it:
+    /// the first two assertions both fail on it, since it left the message
+    /// queued and put nothing in the transcript. The third does not — a cancel
+    /// is a message to the agent and `turn_active` stays set either way until
+    /// the agent answers — so it documents the intent without testing it.
+    #[test]
+    fn a_queued_message_can_be_sent_without_cancelling_the_turn() {
+        let mut s = mid_turn_session();
+        s.send_user("use the staging endpoint".into());
+
+        s.send_queued_now(0);
+
+        assert!(s.queued.is_empty(), "still waiting for a turn to end");
+        assert!(
+            s.items.iter().any(|i| matches!(i, ChatItem::User(t) if t.contains("staging"))),
+            "the message never reached the transcript",
+        );
+        assert!(s.turn_active, "the turn was cancelled to deliver a message");
+    }
+
+    /// Out of bounds is a no-op, not a panic. The index comes from a row in a
+    /// list that a `Done` arriving the same frame can empty.
+    #[test]
+    fn sending_a_queued_message_that_is_no_longer_there_does_nothing() {
+        let mut s = mid_turn_session();
+        s.send_queued_now(0);
+        s.send_queued_now(7);
+        assert!(s.queued.is_empty());
+        assert!(s.items.is_empty());
+    }
+
+    /// Nothing to deliver to yet, so it stays queued. Sending into a session
+    /// with no agent behind it loses the message and leaves the tab looking
+    /// like it is thinking about it.
+    #[test]
+    fn a_reconnecting_tab_keeps_its_message_instead_of_sending_it() {
+        let mut s = AgentSession::pending("Reconnecting…".into(), None);
+        s.send_user("what did the build say?".into());
+        assert_eq!(s.queued.len(), 1);
+
+        s.send_queued_now(0);
+
+        assert_eq!(s.queued.len(), 1, "handed to a session with no agent");
+        assert!(s.items.is_empty());
     }
 
     #[test]

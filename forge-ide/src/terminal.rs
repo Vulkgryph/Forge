@@ -344,7 +344,17 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum PState { Ground, Esc, Csi, Osc, Charset }
+enum PState {
+    Ground, Esc, Csi, Osc, Charset,
+    /// Inside a device control string (`ESC P … ST`).
+    Dcs,
+    /// An ESC seen inside a DCS, which is either the start of the `ESC \`
+    /// that ends it or — inside tmux's passthrough — half of a doubled ESC
+    /// belonging to the payload. Which one it is takes the next character to
+    /// tell, and getting it wrong ends the sequence in the middle of the
+    /// thing it is carrying.
+    DcsEsc,
+}
 
 pub struct Grid {
     /// Lines scrolled off the top of the viewport, oldest first. Never
@@ -390,12 +400,21 @@ pub struct Grid {
     dim:          bool,
     parse_st:     PState,
     parse_params: String,
-    /// An OSC payload that outgrew `OSC_PAYLOAD_LIMIT`, so what was kept is
-    /// only the front of it. Decoding a truncated base64 payload yields
-    /// plausible bytes that are not what was sent, which for a clipboard
-    /// means quietly pasting the wrong thing — so the sequence is dropped
-    /// instead.
-    osc_truncated: bool,
+    /// An OSC or DCS payload that outgrew `OSC_PAYLOAD_LIMIT`, so what was
+    /// kept is only the front of it. Decoding a truncated base64 payload
+    /// yields plausible bytes that are not what was sent, which for a
+    /// clipboard means quietly pasting the wrong thing — so the sequence is
+    /// dropped instead.
+    string_truncated: bool,
+    /// How many layers of tmux passthrough are currently being unwrapped.
+    ///
+    /// A passthrough payload is fed back through this parser, and nothing
+    /// stops the thing inside it being another passthrough — from the far
+    /// end of a connection, which makes the nesting depth someone else's
+    /// choice and an unbounded one a way to exhaust this process's stack.
+    /// Two is enough for the real case (a terminal inside tmux inside tmux)
+    /// and far short of a problem.
+    dcs_depth: u8,
     /// Text a program asked to put on the system clipboard with OSC 52,
     /// waiting for a frame to hand it to the window system.
     ///
@@ -485,7 +504,7 @@ impl Grid {
             current_bg: None,
             dim: false,
             parse_st: PState::Ground, parse_params: String::new(),
-            osc_truncated: false, pending_clipboard: None,
+            string_truncated: false, pending_clipboard: None, dcs_depth: 0,
             alt_screen: None, sync_update: None,
             autowrap: true,
             bracketed_paste: false,
@@ -952,8 +971,37 @@ impl Grid {
     /// Only OSC 52 does anything. The others that turn up here — window
     /// title, working directory, colour queries — are consumed and ignored,
     /// which is what happened to all of them before.
+    /// Act on a finished device control string.
+    ///
+    /// Only tmux's passthrough does anything. Everything else that arrives
+    /// here — sixel images, `XTGETTCAP` replies, DECRQSS — is consumed and
+    /// ignored, which is the whole improvement for those: they used to print
+    /// their payload as text.
+    fn dispatch_dcs(&mut self, payload: &str) {
+        let truncated = std::mem::take(&mut self.string_truncated);
+        // tmux does not forward escape sequences it does not understand, so
+        // anything that wants to reach the terminal *through* tmux — an OSC
+        // 52 copy, most of all — has to be wrapped in this. Which means a
+        // remote shell inside tmux cannot copy unless this is unwrapped.
+        let Some(inner) = payload.strip_prefix("tmux;") else { return };
+        if truncated { return; }
+        if self.dcs_depth >= 2 { return; }
+        // The ESCs were already undoubled on the way in, by `DcsEsc`, so
+        // what is left is the sequence tmux was asked to pass along. Fed
+        // back through the parser because that is precisely what it is:
+        // terminal input that took a detour.
+        self.dcs_depth += 1;
+        self.process(inner);
+        self.dcs_depth -= 1;
+        // A wrapper delimits what it carries, so an incomplete sequence
+        // inside one is malformed rather than split — and leaving the parser
+        // mid-sequence would make the next ordinary byte of output part of
+        // it.
+        self.parse_st = PState::Ground;
+    }
+
     fn dispatch_osc(&mut self, payload: &str) {
-        let truncated = std::mem::take(&mut self.osc_truncated);
+        let truncated = std::mem::take(&mut self.string_truncated);
         let Some(rest) = payload.strip_prefix("52;") else { return };
         // Only the front of the payload survived, so the base64 is cut mid
         // stream. It would still decode, into bytes that are not what was
@@ -1073,6 +1121,12 @@ impl Grid {
                 PState::Esc => match c {
                     '[' => { self.parse_params.clear(); self.parse_st = PState::Csi; }
                     ']' => { self.parse_params.clear(); self.parse_st = PState::Osc; }
+                    // A device control string. This used to fall to the
+                    // catch-all, which returned to Ground and printed the
+                    // whole payload as text — so a terminal inside tmux
+                    // showed `tmux;` and the remains of whatever tmux was
+                    // forwarding, at the cursor.
+                    'P' => { self.parse_params.clear(); self.parse_st = PState::Dcs; }
                     'M' => { self.cur_row = self.cur_row.saturating_sub(1); self.parse_st = PState::Ground; }
                     // Designate G0/G1 character set (`ESC ( B` = ASCII, `ESC
                     // ( 0` = DEC line-drawing, etc.) — a real 3-byte
@@ -1129,8 +1183,58 @@ impl Grid {
                         if self.parse_params.len() < OSC_PAYLOAD_LIMIT {
                             self.parse_params.push(c);
                         } else {
-                            self.osc_truncated = true;
+                            self.string_truncated = true;
                         }
+                    }
+                },
+                PState::Dcs => match c {
+                    '\x1b' => { self.parse_st = PState::DcsEsc; }
+                    // BEL is deliberately *not* a terminator here, though it
+                    // is one for an OSC. A DCS ends at ST and only ST, and
+                    // the single most important thing one of these carries
+                    // is an OSC 52 — whose own terminator is usually a BEL,
+                    // sitting in the middle of this payload. Ending here ate
+                    // that terminator and threw the copy away, which looked
+                    // exactly like the bug this is fixing.
+                    _ => {
+                        if self.parse_params.len() < OSC_PAYLOAD_LIMIT {
+                            self.parse_params.push(c);
+                        } else {
+                            self.string_truncated = true;
+                        }
+                    }
+                },
+                PState::DcsEsc => match c {
+                    // `ESC \` — the string terminator, and the end of it.
+                    '\\' => {
+                        let payload = std::mem::take(&mut self.parse_params);
+                        self.parse_st = PState::Ground;
+                        self.dispatch_dcs(&payload);
+                    }
+                    // `ESC ESC` — one escape belonging to the payload.
+                    // tmux's passthrough doubles every ESC in what it
+                    // forwards, which is exactly how an OSC 52 survives
+                    // being carried inside another escape sequence.
+                    '\x1b' => {
+                        if self.parse_params.len() < OSC_PAYLOAD_LIMIT {
+                            self.parse_params.push('\x1b');
+                        } else {
+                            self.string_truncated = true;
+                        }
+                        self.parse_st = PState::Dcs;
+                    }
+                    // An ESC followed by something else. Undoubled, so not
+                    // from tmux, and not a terminator either — kept, rather
+                    // than dropped, so a sender that does not double stands
+                    // a chance of being understood.
+                    _ => {
+                        if self.parse_params.len() + 1 < OSC_PAYLOAD_LIMIT {
+                            self.parse_params.push('\x1b');
+                            self.parse_params.push(c);
+                        } else {
+                            self.string_truncated = true;
+                        }
+                        self.parse_st = PState::Dcs;
                     }
                 },
             }
@@ -2465,6 +2569,107 @@ mod osc52_clipboard_tests {
         // `\xff` is not valid UTF-8 in any position.
         g.process("\x1b]52;c;/w==\x07");
         assert_eq!(g.take_clipboard().as_deref(), Some("\u{fffd}"));
+    }
+
+    /// Exactly what `clipboard::osc52` in the terminal client produces when
+    /// `$TMUX` is set — the wrapper, and every ESC in the payload doubled.
+    fn tmux_wrapped(text: &str) -> String {
+        let seq = copy_seq(text);
+        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+    }
+
+    /// tmux does not forward escape sequences it does not understand, so
+    /// anything copying through it wraps the request in a passthrough — and
+    /// `ESC P` fell to the parser's catch-all, which returned to Ground and
+    /// printed the payload. So inside tmux the copy was lost *and* `tmux;`
+    /// plus the remains of the sequence appeared at the cursor.
+    #[test]
+    fn a_copy_through_tmux_passthrough_reaches_the_clipboard() {
+        let mut g = Grid::with_size(10, 40);
+        g.process(&tmux_wrapped("copied inside tmux"));
+        assert_eq!(g.take_clipboard().as_deref(), Some("copied inside tmux"));
+    }
+
+    /// The visible half of the same bug.
+    #[test]
+    fn a_passthrough_prints_nothing() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("before");
+        g.process(&tmux_wrapped("payload"));
+        g.process("after");
+        assert_eq!(g.all_text().trim_end(), "beforeafter");
+        assert!(!g.all_text().contains("tmux"), "the wrapper was printed");
+    }
+
+    /// Split across reads, which is how a wrapped copy of any size arrives.
+    /// The split is placed inside the doubled-ESC pair, the one spot where
+    /// the parser has to remember half of a decision.
+    #[test]
+    fn a_passthrough_split_inside_a_doubled_escape_still_copies() {
+        let seq = tmux_wrapped("split mid-escape");
+        // Just after the first ESC of the payload's doubled pair.
+        let at = seq.find("\x1b\x1b").unwrap() + 1;
+        let mut g = Grid::with_size(10, 40);
+        g.process(&seq[..at]);
+        assert_eq!(g.take_clipboard(), None, "copied before the sequence ended");
+        g.process(&seq[at..]);
+        assert_eq!(g.take_clipboard().as_deref(), Some("split mid-escape"));
+    }
+
+    /// A terminal inside tmux inside tmux doubles twice and wraps twice.
+    #[test]
+    fn a_doubly_wrapped_copy_still_arrives() {
+        let inner = tmux_wrapped("two layers deep");
+        let outer = format!("\x1bPtmux;{}\x1b\\", inner.replace('\x1b', "\x1b\x1b"));
+        let mut g = Grid::with_size(10, 40);
+        g.process(&outer);
+        assert_eq!(g.take_clipboard().as_deref(), Some("two layers deep"));
+    }
+
+    /// The nesting depth is chosen by whatever is writing to the terminal,
+    /// which over SSH is the far end. Past the limit it stops unwrapping
+    /// rather than recursing as deep as it is told to.
+    ///
+    /// Five layers, not fifty: each one doubles every ESC below it, so the
+    /// sequence grows exponentially with the nesting and building a deep one
+    /// hangs the test rather than the parser. Five is three past the limit,
+    /// which is what this is checking.
+    #[test]
+    fn nested_passthrough_past_the_limit_stops_rather_than_recursing() {
+        let mut seq = copy_seq("never seen");
+        for _ in 0..5 {
+            seq = format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"));
+        }
+        let mut g = Grid::with_size(10, 40);
+        g.process(&seq);
+        assert_eq!(g.take_clipboard(), None);
+        // And it is still usable afterwards.
+        g.process(&copy_seq("after the nonsense"));
+        assert_eq!(g.take_clipboard().as_deref(), Some("after the nonsense"));
+    }
+
+    /// Other device control strings are consumed, not printed. A sixel image
+    /// or an `XTGETTCAP` reply is not something to display as text, which is
+    /// what happened to every one of them.
+    #[test]
+    fn other_device_control_strings_are_swallowed() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("before");
+        // A DECRQSS reply, and the shape of a sixel introducer.
+        g.process("\x1bP1$r0;1m\x1b\\");
+        g.process("\x1bP0;1;0q#0;2;0;0;0\x1b\\");
+        g.process("after");
+        assert_eq!(g.all_text().trim_end(), "beforeafter");
+        assert_eq!(g.take_clipboard(), None);
+    }
+
+    /// An unterminated passthrough must not eat the rest of the session, and
+    /// must not copy half a request.
+    #[test]
+    fn an_unterminated_passthrough_does_not_copy() {
+        let mut g = Grid::with_size(10, 40);
+        g.process("\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=");
+        assert_eq!(g.take_clipboard(), None);
     }
 
     /// A malformed sequence is consumed without copying and without leaving

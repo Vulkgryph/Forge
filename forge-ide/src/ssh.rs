@@ -238,6 +238,42 @@ pub fn fs_list_with(
         .collect())
 }
 
+/// A connection with nothing on the far end, whose channel stdin can be read
+/// back afterwards.
+///
+/// For checking what a call *sent*. The request framing and the parameters
+/// are decided on this side, which makes them testable without a machine —
+/// and the faults worth catching here have been on this side: a pty told the
+/// wrong size, or never told at all.
+#[cfg(test)]
+pub fn fake_connection() -> (SshConnection, Arc<Mutex<Vec<u8>>>) {
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let conn = SshConnection {
+        connected:   Arc::new(AtomicBool::new(true)),
+        host:        SshHost::default(),
+        remote_home: "/home/someone".into(),
+        upstream:    Arc::new(Mutex::new(None)),
+        next_id:     Arc::new(Mutex::new(1)),
+        pending:     Arc::new(Mutex::new(HashMap::new())),
+        stdin:       Arc::new(Mutex::new(Box::new(Sink(Arc::clone(&sent))))),
+        pty_pushes:  Arc::new(Mutex::new(HashMap::new())),
+        // No session and no runtime, so `Drop` has nothing to close or shut
+        // down — which is also what makes this safe to build in a test that
+        // never started either.
+        _session:    None,
+        _rt:         None,
+    };
+    (conn, sent)
+}
+
 pub struct SshConnection {
     connected: Arc<AtomicBool>,
     pub host:    SshHost,

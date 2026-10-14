@@ -4455,6 +4455,97 @@ mod remote_pty_size_tests {
 }
 
 #[cfg(test)]
+mod remote_pty_flush_tests {
+    use super::*;
+
+    /// An app with a connection that records what was sent, a shell to send
+    /// it to, and a pty opened at the fallback size while the panel turned
+    /// out to be 140x38 — the state the first frame of a remote terminal
+    /// leaves behind.
+    fn app_with_a_stale_pty(tag: &str)
+        -> (IdeApp, std::sync::Arc<std::sync::Mutex<Vec<u8>>>)
+    {
+        let dir = std::env::temp_dir().join(format!("forge-flush-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir), ..Default::default()
+        });
+        let (conn, sent) = crate::ssh::fake_connection();
+        app.ssh = Some(conn);
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        app.ssh_shell = Some(crate::ssh::ShellChannel { rx, tx });
+        app.ssh_pty_opened_size = (24, 80);
+        app.ssh_term_size = (38, 140);
+        (app, sent)
+    }
+
+    fn wire(sent: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8_lossy(&sent.lock().unwrap()).into_owned()
+    }
+
+    /// The fix, checked at the wire rather than at the decision: a
+    /// `pty/resize` carrying the panel's real size is actually written to the
+    /// connection. Nothing downstream of this ever sends another, so if it
+    /// does not go out here the remote wraps at 80 columns all session.
+    #[test]
+    fn the_remote_is_told_the_real_size_when_its_shell_arrives() {
+        let (mut app, sent) = app_with_a_stale_pty("told");
+
+        app.flush_remote_pty_size();
+
+        let w = wire(&sent);
+        assert!(w.contains("pty/resize"), "nothing was sent: {w:?}");
+        assert!(w.contains("\"cols\":140"), "wrong columns: {w:?}");
+        assert!(w.contains("\"rows\":38"), "wrong rows: {w:?}");
+    }
+
+    /// And it is sent once. A second call with nothing new to say is a round
+    /// trip for nothing.
+    #[test]
+    fn a_size_already_delivered_is_not_sent_again() {
+        let (mut app, sent) = app_with_a_stale_pty("once");
+        app.flush_remote_pty_size();
+        let after_first = wire(&sent).len();
+
+        app.flush_remote_pty_size();
+
+        assert_eq!(wire(&sent).len(), after_first, "sent the same size twice");
+    }
+
+    /// With no shell there is nothing to send to, and the opening size must
+    /// not be marked delivered — doing so records a size that never went out
+    /// and leaves the far end wrong with nothing left to correct it.
+    #[test]
+    fn with_no_shell_nothing_is_sent_and_nothing_is_marked_delivered() {
+        let (mut app, sent) = app_with_a_stale_pty("noshell");
+        app.ssh_shell = None;
+
+        app.flush_remote_pty_size();
+
+        assert!(wire(&sent).is_empty(), "sent into a connection with no pty");
+        assert_eq!(app.ssh_pty_opened_size, (24, 80), "recorded a size it never sent");
+
+        // And once a shell does exist, the correction still happens.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        app.ssh_shell = Some(crate::ssh::ShellChannel { rx, tx });
+        app.flush_remote_pty_size();
+        assert!(wire(&sent).contains("\"cols\":140"), "the correction was lost");
+    }
+
+    /// The guess was right — which is what happens on every reopen at a size
+    /// already settled on.
+    #[test]
+    fn a_pty_opened_at_the_right_size_is_left_alone() {
+        let (mut app, sent) = app_with_a_stale_pty("match");
+        app.ssh_pty_opened_size = app.ssh_term_size;
+
+        app.flush_remote_pty_size();
+
+        assert!(wire(&sent).is_empty(), "resized a pty that was already right");
+    }
+}
+
+#[cfg(test)]
 mod remote_clipboard_tests {
     use super::*;
 
@@ -6855,17 +6946,7 @@ impl IdeApp {
                 Ok(Ok(shell)) => {
                     self.ssh_shell = Some(shell);
                     self.ssh_pty_rx = None;
-                    // First moment there is anything to send a resize to. The
-                    // panel has been measured since the open was issued, and
-                    // every resize in between went nowhere, so unless the
-                    // guess happened to be right the far end is wrong and
-                    // nothing downstream will ever notice.
-                    if let Some((cols, rows)) =
-                        remote_pty_resize_needed(self.ssh_pty_opened_size, self.ssh_term_size)
-                    {
-                        self.ssh_resize_pty(cols, rows);
-                        self.ssh_pty_opened_size = self.ssh_term_size;
-                    }
+                    self.flush_remote_pty_size();
                     self.output_log("Remote terminal connected".to_string(), OutputLevel::Success);
                     ctx.request_repaint();
                 }
@@ -16042,6 +16123,32 @@ impl IdeApp {
                     ui.add_space(8.0);
                 });
             if close { self.ssh_host_key_changed = None; }
+        }
+    }
+
+    /// Reconcile the size the remote pty was opened with against the size it
+    /// should have.
+    ///
+    /// Called the moment a shell arrives, which is the first point there is
+    /// anything to send a resize to. `pty/open` is issued from a background
+    /// thread, so on the first frame of a remote terminal it goes out before
+    /// the panel has been measured — at a fallback 80x24 — and every resize
+    /// while it was in flight was dropped for want of a shell. By the time
+    /// one exists, `ssh_term_size` has settled on the real size, and the
+    /// draw loop only speaks up when the panel differs from *that*: so
+    /// nothing else will ever notice the far end disagrees, and the remote
+    /// wraps its lines at 80 columns for the life of the session.
+    ///
+    /// The opening size is only marked as delivered once something has
+    /// actually been sent. Updating it regardless would record a size that
+    /// was never transmitted, which is the same bug with a different cause.
+    fn flush_remote_pty_size(&mut self) {
+        if self.ssh_shell.is_none() { return; }
+        if let Some((cols, rows)) =
+            remote_pty_resize_needed(self.ssh_pty_opened_size, self.ssh_term_size)
+        {
+            self.ssh_resize_pty(cols, rows);
+            self.ssh_pty_opened_size = self.ssh_term_size;
         }
     }
 

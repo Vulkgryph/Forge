@@ -6,6 +6,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A server started without tool support says so, and says what to do.** A local vLLM server launched without `--enable-auto-tool-choice` and `--tool-call-parser` refuses every request that carries tools, and the whole JSON error object was printed into the chat. Forge never sends `tool_choice` — the server applies `auto` itself once a request carries tools at all — so there is nothing about the request to change, and an error naming two flags without saying they belong on the server's own command line sends someone searching Forge's settings for them. The sentence is now pulled out of the object, followed by one line saying which command needs restarting. A 400 is not retried, so this fails once rather than in a wall.
+
 - **A failing provider wrote walls of text, and sometimes a web page.** Three faults in the same path, all found by driving the real terminal UI rather than reading it.
 
   A retry countdown appended one transcript line per second. The agent emits an `ApiRetry` every second so the number moves, and each one became its own entry: a sixty-second wait wrote sixty lines, and the ten configured delays would write a hundred and sixty. The notice now updates in place — unless something else has been printed since, in which case it starts a new line rather than overwriting whatever happened in between.

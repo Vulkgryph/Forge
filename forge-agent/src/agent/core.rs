@@ -5926,6 +5926,25 @@ fn unanswered_tool_calls<'a>(history: &[Message], tool_calls: &'a [ToolCall]) ->
 mod tests {
     use super::*;
 
+    /// A 400 is the server declining the request as asked, so no wait clears
+    /// it. The one reported from a local model — a server started without
+    /// tool support — cannot succeed until someone restarts that server, and
+    /// retrying would be a wall of identical failures for a fault the person
+    /// reading them has to go and fix elsewhere.
+    #[test]
+    fn a_server_configuration_failure_is_not_retried() {
+        assert!(!is_retryable_network_error(
+            "API error (400 Bad Request): \"auto\" tool choice requires \
+             --enable-auto-tool-choice and --tool-call-parser to be set"
+        ));
+        // The ones that are worth another go, as a control: this would pass
+        // on a function that simply never retried anything.
+        for transient in ["API error (502 Bad Gateway): upstream",
+                          "API error (503 Service Unavailable): overloaded"] {
+            assert!(is_retryable_network_error(transient), "{transient}");
+        }
+    }
+
     fn call(id: &str, name: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),

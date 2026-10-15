@@ -638,9 +638,12 @@ impl ApiClient {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             return Err(format!(
-                "API error ({}): {}",
+                "API error ({}): {}{}",
                 status,
-                condense_error_body(&body_text)
+                condense_error_body(&body_text),
+                server_configuration_hint(&body_text)
+                    .map(|h| format!("\n{h}"))
+                    .unwrap_or_default(),
             ));
         }
 
@@ -717,9 +720,12 @@ impl ApiClient {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             let _ = tx.send(StreamEvent::Error(format!(
-                "API error ({}): {}",
+                "API error ({}): {}{}",
                 status,
-                condense_error_body(&body_text)
+                condense_error_body(&body_text),
+                server_configuration_hint(&body_text)
+                    .map(|h| format!("\n{h}"))
+                    .unwrap_or_default(),
             )));
             return;
         }
@@ -2389,6 +2395,33 @@ fn convert_anthropic_response(json: serde_json::Value) -> Result<ChatResponse, S
 /// The useful part is almost always a `message` field or the first line of
 /// prose, so that is what is kept, capped. The full body still reaches the
 /// session log, which is where something this size belongs.
+/// One sentence of advice for a failure caused by how the server was
+/// started, or `None` when the error is not one of those.
+///
+/// Narrow on purpose. This is for faults that no retry can clear and that
+/// name a *setting* rather than a mistake in the request — the case where
+/// the person reading the error is also the one who launched the server, so
+/// the fix is a flag on a command they ran. Everything else is left to say
+/// what the provider said; a guess appended to an error is worse than no
+/// guess, because it sends someone to look in the wrong place.
+pub fn server_configuration_hint(body: &str) -> Option<&'static str> {
+    let lower = body.to_lowercase();
+    // vLLM refuses `tool_choice: "auto"` unless it was launched to support
+    // it. Forge never sends that field — the server applies it as the
+    // default once a request carries tools at all — so nothing about the
+    // request can be changed to avoid this, which is exactly why the error
+    // needs to say where to go.
+    if lower.contains("enable-auto-tool-choice") || lower.contains("tool-call-parser") {
+        return Some(
+            "This server was started without tool support. Restart it with \
+             --enable-auto-tool-choice and --tool-call-parser set to the parser \
+             for the model being served; until then it can answer but cannot \
+             use any tool.",
+        );
+    }
+    None
+}
+
 pub fn condense_error_body(body: &str) -> String {
     const LIMIT: usize = 200;
 
@@ -2537,6 +2570,50 @@ fn responses_failure_message(event_type: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact body a vLLM server returns when it was started without tool
+    /// support, reported from a local model running under skip-all.
+    const VLLM_NO_TOOL_SUPPORT: &str = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set","type":"BadRequestError","param":null,"code":400}}"#;
+
+    /// What reached the chat was the whole JSON object. The sentence inside
+    /// it is the only part anyone can act on.
+    #[test]
+    fn the_vllm_tool_support_error_condenses_to_its_sentence() {
+        let out = condense_error_body(VLLM_NO_TOOL_SUPPORT);
+        assert_eq!(
+            out,
+            "\"auto\" tool choice requires --enable-auto-tool-choice and \
+             --tool-call-parser to be set",
+        );
+        assert!(!out.contains('{'), "the JSON object survived: {out}");
+    }
+
+    /// And it says where to go. Forge never sends `tool_choice` — the server
+    /// applies `auto` itself once a request carries tools — so there is
+    /// nothing about the request to change, and an error naming two flags
+    /// without saying they belong on the server's own command line sends
+    /// someone looking through Forge's settings for them.
+    #[test]
+    fn the_vllm_tool_support_error_says_what_to_do_about_it() {
+        let hint = server_configuration_hint(VLLM_NO_TOOL_SUPPORT)
+            .expect("no advice offered for a server started without tool support");
+        assert!(hint.contains("--enable-auto-tool-choice"), "{hint}");
+        assert!(hint.contains("--tool-call-parser"), "{hint}");
+        assert!(hint.to_lowercase().contains("restart"), "{hint}");
+    }
+
+    /// Only that fault. An ordinary bad request gets the provider's own words
+    /// and no invented advice.
+    #[test]
+    fn an_unrelated_failure_gets_no_advice() {
+        for body in [
+            r#"{"error":{"message":"context length exceeded","code":400}}"#,
+            r#"{"error":{"message":"invalid api key","code":401}}"#,
+            "Internal Server Error",
+        ] {
+            assert_eq!(server_configuration_hint(body), None, "{body}");
+        }
+    }
 
     /// The 501 observed by driving the real terminal UI: a whole HTML page, 21
     /// lines and 571 characters, rendered into the chat.

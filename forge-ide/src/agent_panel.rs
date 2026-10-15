@@ -1841,6 +1841,34 @@ impl AgentSession {
         let _ = self.write(&OutgoingMsg::SendMessage { content: trimmed });
     }
 
+    /// Hand a message to the agent in the middle of a turn.
+    ///
+    /// It goes into the transcript as it is sent, so there is something to
+    /// see: the agent picks it up at the next boundary between steps rather
+    /// than this instant, and a message that had vanished from the input box
+    /// with nothing to show for it would read as lost.
+    fn deliver_mid_turn(&mut self, msg: String) {
+        self.items.push(ChatItem::User(msg.clone()));
+        let _ = self.write(&OutgoingMsg::SendMessage { content: msg });
+    }
+
+    /// Send straight away, interleaving with a turn already in flight rather
+    /// than waiting behind it.
+    ///
+    /// What Enter does. `send_user` is the queueing door — type while the
+    /// agent works and the message waits its turn — and this is the one for
+    /// saying something *to* the agent while it is working, which until now
+    /// could only be done by stopping it.
+    pub fn send_user_now(&mut self, content: String) {
+        let trimmed = content.trim().to_string();
+        if trimmed.is_empty() { return; }
+        // Nothing behind the session yet, so there is nowhere to send: hold
+        // it, exactly as `send_user` would.
+        if self.pending.is_some() { self.queued.push(trimmed); return; }
+        if self.turn_active { self.deliver_mid_turn(trimmed); return; }
+        self.send_user(trimmed);
+    }
+
     pub(crate) fn dispatch_next_queued(&mut self) {
         if !self.queued.is_empty() {
             let next = self.queued.remove(0);
@@ -1877,8 +1905,7 @@ impl AgentSession {
         if self.pending.is_some() { return; }
         let msg = self.queued.remove(index);
         if self.turn_active {
-            self.items.push(ChatItem::User(msg.clone()));
-            let _ = self.write(&OutgoingMsg::SendMessage { content: msg });
+            self.deliver_mid_turn(msg);
         } else {
             // Nothing to interleave with — this is an ordinary send, and
             // `send_user` is the one place that sets a turn up.
@@ -2241,6 +2268,58 @@ mod tests {
             "the message never reached the transcript",
         );
         assert!(s.turn_active, "the turn was cancelled to deliver a message");
+    }
+
+    /// Pressing Enter while the agent is working has to reach it. It used to
+    /// do nothing at all: the send button had become Stop, and the key was
+    /// only read on the branch where it had not, so the words stayed in the
+    /// box — not sent, not queued, not anywhere.
+    #[test]
+    fn enter_during_a_turn_reaches_the_agent() {
+        let mut s = mid_turn_session();
+
+        s.send_user_now("use the staging endpoint".into());
+
+        assert!(
+            s.items.iter().any(|i| matches!(i, ChatItem::User(t) if t.contains("staging"))),
+            "the message did not reach the transcript",
+        );
+        assert!(s.queued.is_empty(), "it was parked instead of sent");
+        assert!(s.turn_active, "the turn was stopped to deliver it");
+    }
+
+    /// With no turn running it is an ordinary send, which is what starts one.
+    #[test]
+    fn enter_with_no_turn_running_starts_one() {
+        let mut s = AgentSession::failed(String::new());
+        s.spawn_err = None;
+
+        s.send_user_now("go".into());
+
+        assert!(s.turn_active, "no turn was started");
+        assert!(s.queued.is_empty());
+        assert_eq!(s.items.len(), 1);
+    }
+
+    /// A tab still waiting for its agent has nowhere to send, so it holds the
+    /// message rather than dropping it on the floor.
+    #[test]
+    fn enter_while_reconnecting_holds_the_message() {
+        let mut s = AgentSession::pending("Reconnecting…".into(), None);
+
+        s.send_user_now("what did the build say?".into());
+
+        assert_eq!(s.queued.len(), 1);
+        assert!(s.items.is_empty());
+    }
+
+    /// Whitespace is not a message, and must not start a turn or clear one.
+    #[test]
+    fn enter_on_an_empty_box_does_nothing() {
+        let mut s = mid_turn_session();
+        s.send_user_now("   \n".into());
+        assert!(s.items.is_empty());
+        assert!(s.queued.is_empty());
     }
 
     /// Out of bounds is a no-op, not a panic. The index comes from a row in a

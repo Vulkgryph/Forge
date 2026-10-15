@@ -10016,12 +10016,25 @@ impl IdeApp {
                                                 if running { "Stop the agent" } else { "Send  (Enter)" });
                                         }
                                         let send_key = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                                        if running {
-                                            if btn_resp.clicked() { tab.session.cancel_run(); }
-                                        } else if active && (btn_resp.clicked() || send_key) {
+                                        // Enter sends whether or not a turn is
+                                        // running. While one was, it did nothing
+                                        // whatsoever — the button had become Stop
+                                        // and the key was only read on the branch
+                                        // where it had not — so typing to a
+                                        // working agent left the words sitting in
+                                        // the box, unsent and unqueued, and the
+                                        // only way to be heard was to stop it.
+                                        let send = send_key || (!running && active && btn_resp.clicked());
+                                        if running && btn_resp.clicked() { tab.session.cancel_run(); }
+                                        if send {
                                             let mut text = std::mem::take(&mut tab.session.input);
                                             if text.ends_with('\n') { text.pop(); }
-                                            tab.session.send_user(text);
+                                            tab.session.send_user_now(text);
+                                            // Keep the caret where it was. Sending
+                                            // dropped focus, so every message after
+                                            // the first needed the box clicked
+                                            // again before it would take a word.
+                                            tab.session.request_input_focus = true;
                                         }
                                     });
                                 });

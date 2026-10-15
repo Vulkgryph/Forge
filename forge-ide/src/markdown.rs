@@ -618,54 +618,59 @@ mod wrap_tests {
     /// The panel in the editor is narrow and resizable, so "what did this
     /// block do with the width it was given" is the whole question — and it
     /// is answerable without a window.
-    fn rendered_width(md: &str, avail: f32) -> f32 {
-        let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |_| {});
-        let mut used = 0.0;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                // Measured through a child `Ui` given exactly `avail` to work
-                // in. A panel's own `min_rect` is the panel, not what was put
-                // in it, so measuring that reports the window width for
-                // everything and says nothing about wrapping.
-                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
-                    render(ui, md, 80);
-                });
-                used = inner.response.rect.width();
-            });
-        });
-        used
-    }
-
-    /// The same measurement, through the container stack the transcript
-    /// actually renders an assistant message in: a `horizontal_top` for the
-    /// left gutter, a `vertical` inside it, and the width set from what that
-    /// vertical reports as available.
+    /// The rightmost edge of anything actually painted, measured from the
+    /// left edge of the space the content was given.
     ///
-    /// Worth reproducing exactly rather than approximating. A block that
-    /// wraps when handed a plain `Ui` can still overflow here, because what
-    /// `available_width` means depends on the layouts above it — and a list
-    /// item opens a *third* layout inside this one.
-    fn width_as_the_transcript_renders_it(md: &str, avail: f32) -> f32 {
+    /// Taken from the frame's own shape list rather than from any `Ui`
+    /// rectangle. A `Ui` reports the space it was *allocated*, which is the
+    /// space it was asked to take and says nothing about whether the text
+    /// stayed in it — measuring that reported 96 pixels for a run of text
+    /// 600 wide. Shapes are not clipped geometrically (the clip rectangle
+    /// rides alongside them), so a galley laid out past the edge is still a
+    /// shape whose bounds say where it went.
+    fn painted_extent(md: &str, avail: f32, in_transcript: bool) -> f32 {
+        fn widest(shape: &egui::Shape, acc: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => for s in v { widest(s, acc) },
+                egui::Shape::Text(_) => {
+                    let r = shape.visual_bounding_rect();
+                    if r.is_finite() && r.width() > 0.0 {
+                        *acc = Some(acc.map_or(r, |a: egui::Rect| a.union(r)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |_| {});
         let (pad_l, pad_r) = (10.0, 12.0);
-        let mut used = 0.0;
-        let _ = ctx.run(Default::default(), |ctx| {
+        let mut origin = 0.0;
+        let out = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let inner = ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(pad_l);
-                        ui.vertical(|ui| {
-                            ui.set_max_width(crate::app::content_width(ui, pad_r));
-                            render(ui, md, 80);
+                origin = ui.max_rect().left();
+                ui.allocate_ui(egui::vec2(avail, 10_000.0), |ui| {
+                    if in_transcript {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(pad_l);
+                            ui.vertical(|ui| {
+                                ui.set_max_width(crate::app::content_width(ui, pad_r));
+                                render(ui, md, 80);
+                            });
                         });
-                    });
+                    } else {
+                        ui.set_max_width(avail);
+                        render(ui, md, 80);
+                    }
                 });
-                used = inner.response.rect.width();
             });
         });
-        used
+
+        let mut bounds = None;
+        for clipped in &out.shapes {
+            widest(&clipped.shape, &mut bounds);
+        }
+        bounds.map_or(0.0, |b| b.right() - origin)
     }
 
     /// The same stack, reporting height instead of width.
@@ -726,15 +731,63 @@ mod wrap_tests {
     /// then the fault is the stack, not the list item.
     #[test]
     fn a_paragraph_in_the_transcript_stays_inside_the_panel() {
-        let w = width_as_the_transcript_renders_it(PROSE, 300.0);
+        let w = painted_extent(PROSE, 300.0, true);
         assert!(w <= 301.0, "a paragraph took {w} in a panel of 300");
     }
 
     /// The report: a list escapes the width that holds a paragraph.
     #[test]
     fn a_bullet_in_the_transcript_stays_inside_the_panel() {
-        let w = width_as_the_transcript_renders_it(&format!("- {PROSE}"), 300.0);
+        let w = painted_extent(&format!("- {PROSE}"), 300.0, true);
         assert!(w <= 301.0, "a bullet took {w} in a panel of 300");
+    }
+
+    /// Does the shape scan above actually see text that left the box?
+    ///
+    /// Everything the width tests claim rests on this. The first attempt at
+    /// this control used a 60-character run with no space in it, on the
+    /// assumption it could not be wrapped — which was wrong, and quietly so:
+    /// egui breaks inside a word when the word alone will not fit, so that
+    /// "unbreakable" run wrapped like anything else and the control reported
+    /// a tidy 96 pixels. A control that cannot fail teaches nothing.
+    ///
+    /// A label in `extend` mode is the real thing: it is laid out at its full
+    /// width whatever space it was given, which is precisely the fault being
+    /// looked for, and is how a label added straight into a horizontal row
+    /// behaves.
+    #[test]
+    fn the_measurement_can_see_text_that_left_the_box() {
+        fn widest(shape: &egui::Shape, acc: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => for s in v { widest(s, acc) },
+                egui::Shape::Text(_) => {
+                    let r = shape.visual_bounding_rect();
+                    if r.is_finite() && r.width() > 0.0 {
+                        *acc = Some(acc.map_or(r, |a: egui::Rect| a.union(r)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut origin = 0.0;
+        let out = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                origin = ui.max_rect().left();
+                ui.allocate_ui(egui::vec2(100.0, 1_000.0), |ui| {
+                    ui.add(egui::Label::new("W".repeat(60)).extend());
+                });
+            });
+        });
+        let mut bounds = None;
+        for c in &out.shapes { widest(&c.shape, &mut bounds); }
+        let extent = bounds.map_or(0.0, |b: egui::Rect| b.right() - origin);
+        assert!(
+            extent > 150.0,
+            "the shape scan is blind: text laid out well past a 100px box \
+             measured {extent}, so the wrapping tests beside it prove nothing",
+        );
     }
 
     const PROSE: &str =
@@ -745,7 +798,7 @@ mod wrap_tests {
     /// measured against below.
     #[test]
     fn a_paragraph_stays_inside_the_panel() {
-        let w = rendered_width(PROSE, 300.0);
+        let w = painted_extent(PROSE, 300.0, false);
         assert!(w <= 301.0, "a paragraph took {w} in a panel of 300");
     }
 
@@ -753,14 +806,14 @@ mod wrap_tests {
     /// same amount of wrapping to do and one more reason to do it.
     #[test]
     fn a_bullet_stays_inside_the_panel() {
-        let w = rendered_width(&format!("- {PROSE}"), 300.0);
+        let w = painted_extent(&format!("- {PROSE}"), 300.0, false);
         assert!(w <= 301.0, "a bullet took {w} in a panel of 300");
     }
 
     /// Numbered items are built by the same arm and go the same way.
     #[test]
     fn a_numbered_item_stays_inside_the_panel() {
-        let w = rendered_width(&format!("1. {PROSE}"), 300.0);
+        let w = painted_extent(&format!("1. {PROSE}"), 300.0, false);
         assert!(w <= 301.0, "a numbered item took {w} in a panel of 300");
     }
 
@@ -769,7 +822,7 @@ mod wrap_tests {
     #[test]
     fn a_whole_list_stays_inside_the_panel() {
         let md = format!("- {PROSE}\n- {PROSE}\n- {PROSE}");
-        let w = rendered_width(&md, 300.0);
+        let w = painted_extent(&md, 300.0, false);
         assert!(w <= 301.0, "a list took {w} in a panel of 300");
     }
 
@@ -777,7 +830,7 @@ mod wrap_tests {
     /// being a list at 180 pixels.
     #[test]
     fn a_bullet_stays_inside_a_narrow_panel() {
-        let w = rendered_width(&format!("- {PROSE}"), 180.0);
+        let w = painted_extent(&format!("- {PROSE}"), 180.0, false);
         assert!(w <= 181.0, "a bullet took {w} in a panel of 180");
     }
 }

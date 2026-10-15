@@ -1131,7 +1131,29 @@ struct AgentTab {
     /// cost before the new character can even appear. Capped rendering
     /// keeps a long-running conversation's per-frame cost roughly constant
     /// regardless of how long it's gotten.
-    show_full_history: bool,
+    ///
+    /// How many of the most recent items to render, counted back from the
+    /// end. "Show earlier messages" raises it by another page rather than
+    /// lifting the cap, which is what it used to do — and that was a latch
+    /// with no way back: one click on a long conversation set "render
+    /// everything" for the life of the window, and nothing anywhere set it
+    /// false again.
+    ///
+    /// Measured on a window that had it: 4,003 items re-laid every frame
+    /// instead of 150, twenty-seven times the work, about 236ms a frame by
+    /// the figure above. The cost is not only the frame rate. Every one of
+    /// those frames builds thousands of short-lived strings and layout jobs
+    /// beside the few that are kept, which is the allocation pattern that
+    /// strands small-malloc regions: that window reached 11,716 of them
+    /// holding 22 GB the allocator could not hand back, exhausted the swap
+    /// file, and then page-faulted against itself until it was spending a
+    /// whole core — degrading from about 1% to 100% over nine days, and
+    /// taking every other window down with it, since they were all paging
+    /// against the same exhausted swap.
+    ///
+    /// A page at a time keeps the worst case proportional to how many times
+    /// somebody deliberately asked for more.
+    history_shown: usize,
     /// `session.items.len()` as of the last auto-save — see the auto-save
     /// call site in `draw_agent_view` for why this exists (skips a
     /// clone+JSON-serialize+disk-write of the whole conversation on every
@@ -1292,7 +1314,7 @@ impl AgentTab {
             session_password: None,
             password_auto_inject: false,
             password_tmp_path: None,
-            show_full_history: false,
+            history_shown: AGENT_HISTORY_RENDER_LIMIT,
             last_saved_item_count: 0,
             pending_mode_respawn: None,
         }
@@ -1317,7 +1339,7 @@ impl AgentTab {
             session_password: None,
             password_auto_inject: false,
             password_tmp_path: None,
-            show_full_history: false,
+            history_shown: AGENT_HISTORY_RENDER_LIMIT,
             last_saved_item_count: 0,
             pending_mode_respawn: None,
         };
@@ -4470,6 +4492,73 @@ mod remote_pty_size_tests {
     #[test]
     fn one_column_out_is_still_out() {
         assert_eq!(remote_pty_resize_needed((38, 140), (38, 139)), Some((139, 38)));
+    }
+}
+
+#[cfg(test)]
+mod history_window_tests {
+    use super::AGENT_HISTORY_RENDER_LIMIT as LIMIT;
+
+    /// What the transcript loop computes: the first item it will lay out.
+    fn render_start(total: usize, shown: usize) -> usize {
+        total.saturating_sub(shown)
+    }
+
+    /// How many items a frame actually re-lays.
+    fn rendered(total: usize, shown: usize) -> usize {
+        total - render_start(total, shown)
+    }
+
+    /// The default costs the same whatever the conversation grows to. This is
+    /// the property the cap exists for.
+    #[test]
+    fn a_long_conversation_costs_no_more_than_a_short_one() {
+        for total in [200, 1_442, 4_003, 50_000] {
+            assert_eq!(rendered(total, LIMIT), LIMIT, "at {total} items");
+        }
+    }
+
+    /// A conversation shorter than the cap shows all of itself, and asking
+    /// for more does not reach past the beginning.
+    #[test]
+    fn a_short_conversation_is_shown_whole() {
+        assert_eq!(render_start(40, LIMIT), 0);
+        assert_eq!(rendered(40, LIMIT), 40);
+        assert_eq!(render_start(40, LIMIT * 9), 0);
+    }
+
+    /// The fault. "Show earlier messages" set a flag that meant *render
+    /// everything*, and nothing ever set it back — so one click on a long
+    /// conversation committed the window to re-laying all of it on every
+    /// frame for as long as it stayed open. On the window this was found on
+    /// that was 4,003 items instead of 150.
+    ///
+    /// Each click is now worth one more page, so the worst case is
+    /// proportional to how many times somebody asked.
+    #[test]
+    fn asking_for_more_costs_one_page_not_the_whole_conversation() {
+        let total = 4_003;
+        let mut shown = LIMIT;
+        assert_eq!(rendered(total, shown), 150);
+
+        shown += LIMIT;
+        assert_eq!(rendered(total, shown), 300, "one click must not reveal everything");
+
+        // Even after a lot of deliberate clicking it is still bounded by them.
+        for _ in 0..8 { shown += LIMIT; }
+        assert_eq!(rendered(total, shown), 1_500);
+        assert!(rendered(total, shown) < total, "still not the whole conversation");
+    }
+
+    /// Enough clicks do reach the beginning — the feature still works, and
+    /// stops there rather than running off the front.
+    #[test]
+    fn enough_clicks_reach_the_start_and_stop() {
+        let total = 4_003;
+        let mut shown = LIMIT;
+        for _ in 0..100 { shown += LIMIT; }
+        assert_eq!(render_start(total, shown), 0);
+        assert_eq!(rendered(total, shown), total);
     }
 }
 
@@ -10146,16 +10235,18 @@ impl IdeApp {
                 // same cost first. Capping how far back rendering goes by
                 // default keeps a long-running conversation's per-frame
                 // cost roughly constant regardless of how long it's gotten.
-                let render_start = if tab.show_full_history || items.len() <= AGENT_HISTORY_RENDER_LIMIT {
-                    0
-                } else {
-                    items.len() - AGENT_HISTORY_RENDER_LIMIT
-                };
+                let render_start = items.len().saturating_sub(tab.history_shown);
                 if render_start > 0 {
                     ui.horizontal(|ui| {
                         ui.add_space(pad_l);
-                        if ui.small_button(format!("Show {render_start} earlier message{}",
-                            if render_start == 1 { "" } else { "s" })).clicked()
+                        // A page at a time, and the button says how many
+                        // are still behind it — "show 3,853 earlier" reads
+                        // like a disclosure and was in fact a decision to
+                        // re-lay every one of them on every frame from then
+                        // on.
+                        let step = AGENT_HISTORY_RENDER_LIMIT.min(render_start);
+                        if ui.small_button(format!(
+                            "Show {step} earlier ({render_start} older)")).clicked()
                         {
                             show_full_history_clicked = true;
                         }
@@ -10616,7 +10707,8 @@ impl IdeApp {
         }
 
         if show_full_history_clicked {
-            self.agent_tabs[self.agent_active].show_full_history = true;
+            let tab = &mut self.agent_tabs[self.agent_active];
+            tab.history_shown = tab.history_shown.saturating_add(AGENT_HISTORY_RENDER_LIMIT);
         }
 
         ui.add_space(6.0);

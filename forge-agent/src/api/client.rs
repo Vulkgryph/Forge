@@ -233,6 +233,16 @@ pub enum StreamEvent {
 struct ThinkBlockFilter {
     in_think: bool,
     pending: String,
+    /// What was inside the think block, kept rather than dropped.
+    ///
+    /// Stripping it was only ever half right. A model that reasons in the
+    /// open puts that reasoning in the same channel as its answer, and the
+    /// two are not the same thing: showing it reads as the model rambling
+    /// at you, and deleting it loses the part that explains the answer.
+    /// Held here so the caller can send it down the reasoning channel,
+    /// where it is labelled as thinking and folded away like any other
+    /// provider's.
+    thought: String,
 }
 
 impl ThinkBlockFilter {
@@ -240,7 +250,13 @@ impl ThinkBlockFilter {
         Self {
             in_think: false,
             pending: String::new(),
+            thought: String::new(),
         }
+    }
+
+    /// Take the reasoning seen since this was last called.
+    fn take_thinking(&mut self) -> String {
+        std::mem::take(&mut self.thought)
     }
 
     fn push(&mut self, text: &str) -> String {
@@ -250,13 +266,17 @@ impl ThinkBlockFilter {
         loop {
             if self.in_think {
                 if let Some(end) = find_ci(&self.pending, "</think>") {
-                    self.pending.drain(..end + "</think>".len());
+                    let taken: String = self.pending.drain(..end + "</think>".len()).collect();
+                    self.thought.push_str(&taken[..end]);
                     self.in_think = false;
                     continue;
                 }
+                // Hold back enough to recognise a terminator split across
+                // chunks; everything before it is reasoning and is kept.
                 let keep = self.pending.len().min("</think>".len() - 1);
                 let drop_len = self.pending.len().saturating_sub(keep);
-                self.pending.drain(..drop_len);
+                let taken: String = self.pending.drain(..drop_len).collect();
+                self.thought.push_str(&taken);
                 break;
             }
 
@@ -277,8 +297,11 @@ impl ThinkBlockFilter {
         output
     }
 
+    /// A stream that ended inside a think block never closed it. What was
+    /// held back waiting for a terminator is reasoning, not an answer.
     fn finish(mut self) -> String {
         if self.in_think {
+            self.thought.push_str(&std::mem::take(&mut self.pending));
             String::new()
         } else {
             std::mem::take(&mut self.pending)
@@ -832,7 +855,21 @@ impl ApiClient {
                     if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                         content_buf.push_str(text);
                         let visible = if let Some(filter) = think_filter.as_mut() {
-                            filter.push(text)
+                            let out = filter.push(text);
+                            // Reasoning written inline goes down the same
+                            // channel as a provider that reports it properly,
+                            // so it is labelled rather than discarded or read
+                            // as part of the answer.
+                            let thought = filter.take_thinking();
+                            if !thought.is_empty() {
+                                if !reasoning_emitted {
+                                    reasoning_emitted = true;
+                                    let _ = tx.send(StreamEvent::Reasoning);
+                                }
+                                reasoning_buf.push_str(&thought);
+                                let _ = tx.send(StreamEvent::ReasoningToken(thought));
+                            }
+                            out
                         } else {
                             text.to_string()
                         };
@@ -2570,6 +2607,77 @@ fn responses_failure_message(event_type: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model that reasons in the open writes its thinking into the same
+    /// channel as its answer, wrapped in `<think>`. It used to be stripped
+    /// and thrown away, or — with `preserve_thinking` on — left in the
+    /// answer, where it reads as the model rambling at you. Neither labels
+    /// it. It is reasoning, and now leaves by the reasoning door.
+    #[test]
+    fn inline_thinking_is_kept_and_separated_from_the_answer() {
+        let mut f = ThinkBlockFilter::new();
+        let visible = f.push("<think>the user wants the file read</think>Here is the file.");
+        assert_eq!(visible, "Here is the file.");
+        assert_eq!(f.take_thinking(), "the user wants the file read");
+    }
+
+    /// Taken once: a second call must not resend what was already sent, or
+    /// the reasoning panel repeats itself for the length of the turn.
+    #[test]
+    fn thinking_is_handed_over_once() {
+        let mut f = ThinkBlockFilter::new();
+        f.push("<think>abc</think>answer");
+        assert_eq!(f.take_thinking(), "abc");
+        assert_eq!(f.take_thinking(), "");
+    }
+
+    /// Streamed a token at a time, which is how it actually arrives — and
+    /// with the tags split across chunk boundaries, which is the case that
+    /// breaks naive matching.
+    #[test]
+    fn thinking_split_across_chunks_is_reassembled() {
+        let mut f = ThinkBlockFilter::new();
+        let mut visible = String::new();
+        let mut thought = String::new();
+        for chunk in ["<thi", "nk>wei", "gh the options</thi", "nk>The ans", "wer."] {
+            visible.push_str(&f.push(chunk));
+            thought.push_str(&f.take_thinking());
+        }
+        visible.push_str(&f.finish());
+        assert_eq!(visible, "The answer.");
+        assert_eq!(thought, "weigh the options");
+    }
+
+    /// A turn that ends mid-thought — the model was cut off, or the stream
+    /// dropped. What was held back is reasoning, and must not be flushed
+    /// into the answer as if it were one.
+    #[test]
+    fn an_unterminated_think_block_does_not_become_the_answer() {
+        let mut f = ThinkBlockFilter::new();
+        let visible = f.push("<think>still working it out");
+        assert_eq!(visible, "");
+        assert_eq!(f.finish(), "", "unfinished reasoning leaked into the answer");
+    }
+
+    /// Text with no thinking in it is untouched.
+    #[test]
+    fn an_ordinary_answer_passes_through_whole() {
+        let mut f = ThinkBlockFilter::new();
+        let mut visible = f.push("Just an answer, no tags.");
+        visible.push_str(&f.finish());
+        assert_eq!(visible, "Just an answer, no tags.");
+    }
+
+    /// Several blocks in one turn, which GLM does when it reconsiders.
+    #[test]
+    fn more_than_one_think_block_is_all_collected() {
+        let mut f = ThinkBlockFilter::new();
+        let mut visible = f.push("<think>first</think>A<think>second</think>B");
+        let thought = f.take_thinking();
+        visible.push_str(&f.finish());
+        assert_eq!(visible, "AB");
+        assert_eq!(thought, "firstsecond");
+    }
 
     /// The exact body a vLLM server returns when it was started without tool
     /// support, reported from a local model running under skip-all.

@@ -6,6 +6,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A model that thinks out loud has its thinking labelled, not deleted or read as the answer.** Reasoning written inline as `<think>…</think>` — what a local server sends when it was started without a reasoning parser — was stripped and thrown away, or, with `preserve_thinking` on, left in the answer where it reads as the model rambling at the reader. It now goes down the same channel as a provider that reports reasoning properly, so it is labelled as thinking and folded away like any other. Blocks split across stream chunks are reassembled, and a turn that ends mid-thought does not flush what it was thinking into the answer.
+
 - **A server started without tool support says so, and says what to do.** A local vLLM server launched without `--enable-auto-tool-choice` and `--tool-call-parser` refuses every request that carries tools, and the whole JSON error object was printed into the chat. Forge never sends `tool_choice` — the server applies `auto` itself once a request carries tools at all — so there is nothing about the request to change, and an error naming two flags without saying they belong on the server's own command line sends someone searching Forge's settings for them. The sentence is now pulled out of the object, followed by one line saying which command needs restarting. A 400 is not retried, so this fails once rather than in a wall.
 
 - **A failing provider wrote walls of text, and sometimes a web page.** Three faults in the same path, all found by driving the real terminal UI rather than reading it.

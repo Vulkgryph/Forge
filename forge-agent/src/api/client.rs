@@ -2608,6 +2608,39 @@ fn responses_failure_message(event_type: &str, data: &str) -> String {
 mod tests {
     use super::*;
 
+    /// GLM pre-opens its think block in the *prompt*, so the model never
+    /// writes an opening tag and this filter never enters think mode.
+    ///
+    /// Read from the chat template of the model being served
+    /// (`/checkpoint/chat_template.jinja`), which ends its generation prompt
+    /// with `<|assistant|>{{- '<think>' -}}`. The completion is therefore
+    /// `…reasoning…</think>…answer…` with no `<think>` in it, so the
+    /// reasoning is emitted as the answer and the stray `</think>` is
+    /// printed along with it. That is what a GLM endpoint looks like in the
+    /// panel, and it is this filter's fault, not the server's.
+    ///
+    /// Ignored because the obvious fix is wrong. Holding the start of the
+    /// stream back until a `</think>` either arrives or cannot be coming
+    /// does separate them — and loses that held text on every stream that is
+    /// cut off first, which the resilience suite catches in five places at
+    /// once: incomplete EOF, broken transport, cancellation, a stall, and an
+    /// output limit. Partial output surviving truncation matters more than
+    /// this does.
+    ///
+    /// The fix that does not trade one for the other is server-side:
+    /// `--reasoning-parser` puts the reasoning in `reasoning_content`, which
+    /// is already handled above and labelled correctly. A client-side answer
+    /// needs to know the model pre-opens the block *before* the stream
+    /// starts, rather than inferring it from content that may never arrive.
+    #[test]
+    #[ignore = "known: GLM opens its think block in the prompt — see comment"]
+    fn a_stream_that_opens_inside_a_think_block_is_still_separated() {
+        let mut f = ThinkBlockFilter::new();
+        let visible = f.push("count the sheep: 9 stay</think>Nine are left.");
+        assert_eq!(visible, "Nine are left.");
+        assert_eq!(f.take_thinking(), "count the sheep: 9 stay");
+    }
+
     /// A model that reasons in the open writes its thinking into the same
     /// channel as its answer, wrapped in `<think>`. It used to be stripped
     /// and thrown away, or — with `preserve_thinking` on — left in the

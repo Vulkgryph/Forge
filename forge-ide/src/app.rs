@@ -10311,6 +10311,19 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(content_width(ui, pad_r));
+                                    // Say what this is. Dimmed italics alone
+                                    // reads as the model talking, which is
+                                    // what a reader reported it as — and on a
+                                    // model that reasons at length it is most
+                                    // of what is on screen: measured against a
+                                    // local GLM, 675 characters of reasoning
+                                    // to 98 of answer for one short question.
+                                    // Without a word in front of it there is
+                                    // nothing to tell a reader that the part
+                                    // they are wading through is not the reply.
+                                    ui.label(egui::RichText::new("thinking")
+                                        .size(9.5)
+                                        .color(egui::Color32::from_gray(105)));
                                     ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(11.0)
                                         .color(egui::Color32::from_gray(130)));
                                 });

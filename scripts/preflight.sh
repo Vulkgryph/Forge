@@ -15,7 +15,8 @@
 #   ./scripts/preflight.sh --quick    # skip the test suites
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+# Run from the repository root whatever directory it was invoked from.
+cd "$(dirname "$0")/.." || exit 1
 
 quick=false
 [[ "${1:-}" == "--quick" ]] && quick=true
@@ -48,6 +49,7 @@ check "NOTICE covers every licence shipped" \
 
 echo
 echo "Documentation"
+# shellcheck disable=SC2016
 check "no version pinned as a literal" \
     python3 scripts/check_pinned_versions.py
 check "documentation links resolve" python3 - <<'PY'
@@ -73,8 +75,12 @@ check "bootstrap references paths that exist" bash scripts/test_bootstrap_paths.
 
 echo
 echo "Repository"
+# The single quotes are the point: these expand inside the inner shell at
+# check time, not here at parse time.
+# shellcheck disable=SC2016
 check "working tree is clean" bash -c '[ -z "$(git status --porcelain)" ]'
 check "on a branch with an upstream" bash -c 'git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null'
+# shellcheck disable=SC2016
 check "nothing unpushed" bash -c '
     n=$(git rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
     [ "$n" -eq 0 ] || { echo "$n commit(s) not pushed"; exit 1; }'

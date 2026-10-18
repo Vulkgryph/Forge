@@ -579,9 +579,13 @@ pub fn enter_plan_mode_definition() -> ToolDefinition {
         tool_type: "function".to_string(),
         function: FunctionDefinition {
             name: "enter_plan_mode".to_string(),
-            description: "Enter planning mode. In plan mode, you can only read/explore the codebase and write a plan. \
-                Use this when you need to think through a complex task before making changes. \
-                Once in plan mode, use write_plan to draft your plan and exit_plan_mode to submit it for user approval.".to_string(),
+            description: "Enter planning mode. In plan mode you can only read and explore, and write a plan; \
+                you cannot change anything until the plan is approved, so this stops the work and hands it back. \
+                Use it when the user asked for a plan, or when the task needs a decision they would want to make \
+                themselves — which files to restructure, which approach to take, anything hard to undo. \
+                Do NOT use it for work you could simply do: a task is not a plan just because it has several steps, \
+                and being unsure what the code does is a reason to go and read it, not to plan. \
+                Once in plan mode, use write_plan to draft your plan and exit_plan_mode to submit it for approval.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},

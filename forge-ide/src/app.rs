@@ -8008,76 +8008,94 @@ impl IdeApp {
                 .show(ctx, |ui| {
                     let rect = ui.max_rect();
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(24, 24, 24));
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        let count = self.buffers.len();
-                        let mut close_idx: Option<usize> = None;
-                        let mut tab_copy: Option<String> = None;
-                        for i in 0..count {
-                            let title    = self.buffers[i].title();
-                            let selected = i == self.active;
-                            let tab_entries = tab_path_menu_entries(
-                                self.buffers[i].path.as_deref(),
-                                self.workspace_root().as_deref(),
-                            );
-                            let tab_bg   = if selected { egui::Color32::from_rgb(30, 30, 30) }
-                                           else        { egui::Color32::from_rgb(24, 24, 24) };
-                            egui::Frame::none()
-                                .fill(tab_bg)
-                                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let color = if selected { egui::Color32::WHITE }
-                                                    else        { egui::Color32::from_gray(140) };
-                                        let title_resp = ui.add(
-                                            egui::Label::new(egui::RichText::new(&title).size(13.0).color(color))
-                                                .sense(egui::Sense::click()));
-                                        if title_resp.clicked() { self.active = i; }
-                                        // On the label, never the frame. Sensing
-                                        // clicks across the whole frame put a
-                                        // widget over the × as well, which
-                                        // stopped tabs closing — the menu worked
-                                        // and the close it covered did not.
-                                        if !tab_entries.is_empty() {
-                                            title_resp.context_menu(|ui| {
-                                                ui.set_min_width(200.0);
-                                                for (label, value) in &tab_entries {
-                                                    if ui.button(*label).clicked() {
-                                                        tab_copy = Some(value.clone());
-                                                        ui.close_menu();
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        let x = egui::RichText::new("×").size(13.0)
-                                            .color(egui::Color32::from_gray(100));
-                                        let xr = ui.add(egui::Label::new(x).sense(egui::Sense::click()));
-                                        if xr.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
-                                        if xr.clicked() { close_idx = Some(i); }
-                                    });
-                                });
-                            if selected {
-                                let r = ui.min_rect();
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(r.left() - 10.0, r.bottom() - 2.0),
-                                        egui::pos2(r.right() + 10.0, r.bottom()),
-                                    ),
-                                    0.0, egui::Color32::from_rgb(0, 120, 212),
+                    // Scrollable, because tabs are laid out at their natural
+                    // width and are never shrunk to fit: once they overran the
+                    // strip, the ones past the edge could not be reached at all
+                    // — not by scrolling, because there was nothing to scroll,
+                    // and not by dragging, since the strip is a fixed-height
+                    // panel. The only way back to an open file was the tree or
+                    // quick-open, which is no way to reach a tab you already
+                    // have. The split pane's own strip has always been
+                    // scrollable; this gives the main one the same treatment.
+                    //
+                    // `auto_shrink` off horizontally so the strip keeps the
+                    // full width and tabs stay left-aligned instead of
+                    // collapsing toward the middle when only a few are open.
+                    egui::ScrollArea::horizontal()
+                        .id_salt("editor_tabs")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            let count = self.buffers.len();
+                            let mut close_idx: Option<usize> = None;
+                            let mut tab_copy: Option<String> = None;
+                            for i in 0..count {
+                                let title    = self.buffers[i].title();
+                                let selected = i == self.active;
+                                let tab_entries = tab_path_menu_entries(
+                                    self.buffers[i].path.as_deref(),
+                                    self.workspace_root().as_deref(),
                                 );
+                                let tab_bg   = if selected { egui::Color32::from_rgb(30, 30, 30) }
+                                               else        { egui::Color32::from_rgb(24, 24, 24) };
+                                egui::Frame::none()
+                                    .fill(tab_bg)
+                                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let color = if selected { egui::Color32::WHITE }
+                                                        else        { egui::Color32::from_gray(140) };
+                                            let title_resp = ui.add(
+                                                egui::Label::new(egui::RichText::new(&title).size(13.0).color(color))
+                                                    .sense(egui::Sense::click()));
+                                            if title_resp.clicked() { self.active = i; }
+                                            // On the label, never the frame. Sensing
+                                            // clicks across the whole frame put a
+                                            // widget over the × as well, which
+                                            // stopped tabs closing — the menu worked
+                                            // and the close it covered did not.
+                                            if !tab_entries.is_empty() {
+                                                title_resp.context_menu(|ui| {
+                                                    ui.set_min_width(200.0);
+                                                    for (label, value) in &tab_entries {
+                                                        if ui.button(*label).clicked() {
+                                                            tab_copy = Some(value.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            let x = egui::RichText::new("×").size(13.0)
+                                                .color(egui::Color32::from_gray(100));
+                                            let xr = ui.add(egui::Label::new(x).sense(egui::Sense::click()));
+                                            if xr.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                            if xr.clicked() { close_idx = Some(i); }
+                                        });
+                                    });
+                                if selected {
+                                    let r = ui.min_rect();
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(r.left() - 10.0, r.bottom() - 2.0),
+                                            egui::pos2(r.right() + 10.0, r.bottom()),
+                                        ),
+                                        0.0, egui::Color32::from_rgb(0, 120, 212),
+                                    );
+                }
             }
-        }
-                        if let Some(idx) = close_idx {
-                            self.buffers.remove(idx);
-                            if self.active >= self.buffers.len() {
-                                self.active = self.buffers.len().saturating_sub(1);
+                            if let Some(idx) = close_idx {
+                                self.buffers.remove(idx);
+                                if self.active >= self.buffers.len() {
+                                    self.active = self.buffers.len().saturating_sub(1);
+                }
             }
-        }
-                        if let Some(text) = tab_copy {
-                            ui.output_mut(|o| o.copied_text = text.clone());
-                            self.status = format!("Copied {text}");
-                        }
-                    });
+                            if let Some(text) = tab_copy {
+                                ui.output_mut(|o| o.copied_text = text.clone());
+                                self.status = format!("Copied {text}");
+                            }
+                        });
+                        });
                 });
         }
 

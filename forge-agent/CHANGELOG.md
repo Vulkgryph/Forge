@@ -2,7 +2,7 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] — 2026-10-17
 
 ### Fixed
 
@@ -41,18 +41,6 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
   The underlying fragility is unchanged and worth naming: the overflow test matches bare substrings — `maximum`, `exceed`, `400` — in free-form provider prose. Classifying refusals first removes the case that was actually biting; it does not make that test sound.
 
 ## [0.6.1] — 2026-10-08
-
-### Security
-
-- **Offline mode did not cover everything that leaves the machine, and did not reach subagents.** Two separate holes behind one documented promise — "no outgoing request except to the endpoint you configured" — with different ranges, checked against the tags. `offline_mode` arrived in 0.3.0; `disabled_tools` has existed since 0.1.0; `search_papers` arrived in 0.5.0.
-
-  `search_papers` was never in the force-off set — affects 0.5.0 through 0.6.0. It is enabled by default and calls Europe PMC at `www.ebi.ac.uk`, so the promise was false for anyone who had not disabled it by hand, which is the default state. The comment in the code asserted that `web_search` and `web_fetch` "are the only normal tools that reach the network" and was the reason nobody looked again.
-
-  Subagents honoured neither `offline_mode` nor the operator's own `disabled_tools` — affects 0.3.0 through 0.6.0 for `offline_mode`, and every release for `disabled_tools`. A subagent's tools were filtered against its agent definition alone, and the built-in `general` agent lists `web_search` and `web_fetch` — so with `offline_mode = true`, `delegate_task` handed a subagent live web tools. The switch held for the agent you could see and not for the ones it started.
-
-  Both paths now derive the disabled set from one function. What it returns is tested, and the subagent path has a guard that fails if the session's list stops being consulted.
-
-- **`search_documents` could not be turned off from the UI.** Affects 0.5.0 through 0.6.0, the releases it has existed in. The model was offered it and the tools menu never listed it, because it was missing from the toggle list — so the only way to stop it was editing `disabled_tools` by hand. It reads and indexes whatever prose files it is pointed at, which is the kind of tool a switch is for. A test now requires every tool the model is offered to be one the user can disable.
 
 ### Added
 
@@ -103,12 +91,6 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
   It is also the wrong trade on its own terms: the summary is the compressed form of everything that trim is about to delete, so of every message present it holds the most per token. It is no longer droppable. The oldest *ordinary* messages still go first, which a second test pins so that protecting the summary cannot quietly stop the trim working.
 
   Found by driving the real binary against a provider that records what it was asked, in `tests/compaction_over_window.rs` — reading the code gave two different wrong answers first, that the summariser request would be over the window and fail, and then that nothing was wrong. Neither survived a test. The same file also establishes what does work: at over 100% the summary is produced (`split_transcript` chunks the transcript rather than sending an oversized request), the recent messages survive verbatim beside it, and one compaction is enough — a short message straight afterwards does not compact again.
-
-### Changed
-
-- Documented that Forge rewrites `config.toml` on every startup and does not preserve comments or layout — measured, not inferred: a hand-written 27-line file with two comments comes back as 50 lines with none. Values are preserved.
-
-- `search_papers` now appears in the offline documentation and in the "what requires network" table, which had listed two tools when there were three.
 
 ### Fixed
 

@@ -1,0 +1,163 @@
+# Proves a tagged commit is fit to release, and opens a draft to fill.
+#
+# Deliberately does not sign anything, and holds no secrets.
+#
+# Signing and notarisation stay on the machine that owns the Developer ID.
+# Putting that certificate into Actions would mean anything able to trigger a
+# workflow could sign code as Vulkgryph — and a signature is the one thing in
+# this project that cannot be rotated quietly, because an ad-hoc or re-issued
+# signature invalidates every macOS folder permission a user has already
+# granted. The convenience is not worth that.
+#
+# So the split is: a machine checks what a machine can check, every gate at
+# once, on the exact commit being tagged; a person builds, signs, notarises
+# and attaches the macOS bundle with forge-ide/scripts/package_macos.sh, then
+# publishes. See RELEASING.md, including the parts no workflow can check —
+# the release notes, which is where identity has actually leaked.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gates:
+    name: every gate a machine can check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # check_private.py reads commit messages
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Installer validation tools
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils shellcheck
+
+      # The same script run before a release by hand, so the two cannot drift.
+      # --quick skips the suites, which the jobs below run per platform.
+      - name: Preflight
+        run: ./scripts/preflight.sh --quick
+
+      - name: Shell and packaging checks
+        run: |
+          shellcheck install.sh uninstall.sh scripts/preflight.sh \
+                     scripts/test_linux_installer.sh scripts/test_bootstrap_paths.sh
+          bash scripts/test_linux_installer.sh
+
+      # A tag that does not match what the crates claim ships a binary
+      # announcing a version nobody released. Checked here rather than
+      # trusted, because it is a single number typed twice.
+      - name: The tag matches the version the crates declare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for crate in forge-agent forge-ide forge-tui-rs; do
+            have="$(grep -m1 '^version' "$crate/Cargo.toml" | cut -d'"' -f2)"
+            if [ "$have" != "$tag" ]; then
+              echo "::error::$crate is $have but the tag is $tag"
+              exit 1
+            fi
+          done
+          echo "all crates declare $tag"
+
+      # An entry dated and present for exactly this version. A release whose
+      # notes are written from the changelog needs the changelog to have one.
+      - name: The changelog has a section for this version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for f in forge-agent/CHANGELOG.md forge-ide/CHANGELOG.md; do
+            grep -qE "^## \[$tag\] — [0-9]{4}-[0-9]{2}-[0-9]{2}" "$f" || {
+              echo "::error::$f has no dated section for $tag"
+              exit 1
+            }
+          done
+
+  agent:
+    name: agent, protocol, search, terminal client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_windows_installer.ps1
+      - run: cargo test --locked -p forge-agent-proto -p forge-search -p forge-tui-rs
+      - run: cargo test -p forge-agent --test resilience
+
+  editor:
+    name: editor (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p forge-ide -p forge-proto -p forge-server
+
+      # Builds the bundle the way a release does — outside $HOME, with the
+      # path remapping, and with the anonymity guard running before any
+      # signing step — to prove the packaging still works on the tagged
+      # commit. The result is thrown away: it is unsigned, and an unsigned
+      # bundle must never reach a release page.
+      - name: The bundle still packages
+        env:
+          FORGE_RELEASE_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          bash forge-ide/scripts/package_macos.sh
+          app="target/dist/Forge IDE.app"
+          test -x "$app/Contents/MacOS/forge-ide"   || { echo "no editor binary"; exit 1; }
+          test -x "$app/Contents/MacOS/forge-agent" || { echo "no agent binary"; exit 1; }
+          test -f "$app/Contents/Info.plist"        || { echo "no Info.plist";  exit 1; }
+
+  draft:
+    name: open a draft to fill
+    needs: [gates, agent, windows, editor]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The body comes from the changelog, which is reviewed, rather than
+      # from generated commit summaries, which are not — and which would
+      # carry whatever a commit message happened to mention.
+      - name: Draft the release from the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          {
+            echo "<!-- Written from the changelog. Before publishing, read"
+            echo "     RELEASING.md: the filter table, and attach the signed"
+            echo "     macOS bundle built locally. -->"
+            echo
+            for f in forge-ide/CHANGELOG.md forge-agent/CHANGELOG.md; do
+              echo "## $(basename "$(dirname "$f")")"
+              echo
+              awk -v v="$ver" '
+                $0 ~ "^## \\[" v "\\]" {inside=1; next}
+                inside && /^## \[/      {exit}
+                inside                  {print}
+              ' "$f"
+              echo
+            done
+          } > NOTES.md
+          gh release create "$tag" --draft --title "Forge $ver" --notes-file NOTES.md
+
+      - name: What is left for a person
+        run: |
+          echo "::notice::Draft opened. Build and sign locally with"
+          echo "::notice::forge-ide/scripts/package_macos.sh, attach the bundle,"
+          echo "::notice::read the notes against RELEASING.md, then publish."

@@ -161,9 +161,25 @@ executable, `Info.plist` in place, and the version it reports matching the tag.
 
 ## 6. Publish
 
-1. CI green on every platform for the exact commit being tagged.
-2. Tag, annotated, and push the tag.
-3. Create the release with the notes from step 3; attach the artifacts.
+Pushing the tag starts `.github/workflows/release.yml`, which re-runs every
+mechanical gate on the exact tagged commit, checks the tag against the version
+the crates declare and that both changelogs have a dated section for it, proves
+the bundle still packages, and opens a **draft** release with a body built from
+the changelog.
+
+It signs nothing and holds no secrets. The Developer ID stays on the machine
+that owns it: anything able to trigger a workflow could otherwise sign code as
+Vulkgryph, and a signature cannot be rotated quietly — a re-issued one
+invalidates every macOS folder permission a user has already granted.
+
+So, after the workflow is green:
+
+1. Tag, annotated, and push the tag. Wait for the workflow.
+2. Build, sign and notarise locally — step 5 — and attach the bundle to the
+   draft.
+3. Read the draft body against the filter table above. The workflow wrote it
+   from the changelog, which is reviewed, but no workflow can tell whether a
+   sentence gives away a machine, a host, or a person.
 4. Supersede any older draft for a version that never shipped — delete it rather
    than leaving two entries for a number that only ever meant one thing.
 5. Read the published page as a stranger would, with the filter table open. This

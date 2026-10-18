@@ -467,3 +467,9 @@ Everything here is licensed under the [Apache License, Version 2.0](LICENSE), co
 ## Contributing
 
 None of the three projects currently accept pull requests — each is maintained by Vulkgryph LLC with contributions closed to keep maintenance scope constrained. Issues are welcome on each project; see the relevant README for details.
+
+## Configuration
+
+Endpoints, reasoning, permission modes and context strategy are documented in
+[CONFIGURATION.md](CONFIGURATION.md). Everything lives in one file,
+`~/.config/forge/config.toml`.

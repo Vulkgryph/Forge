@@ -109,3 +109,9 @@ Security issues do **not** go in the issue tracker — see [SECURITY.md](SECURIT
 By contributing — should pull requests open, or by any other route — you agree
 that your contributions are licensed under the
 [Apache License 2.0](LICENSE), the same as the rest of the project.
+
+## Releasing
+
+See [RELEASING.md](RELEASING.md). Run `./scripts/preflight.sh` first — it is
+every gate a machine can check. The steps it cannot check are the ones that
+have leaked, and they are written out in full there.

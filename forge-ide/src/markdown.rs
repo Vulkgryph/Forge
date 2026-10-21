@@ -760,6 +760,71 @@ mod wrap_tests {
         assert!(w <= 301.0, "a bullet took {w} in a panel of 300");
     }
 
+    /// A tall cell must not be drawn over the row beneath it.
+    ///
+    /// Reported from the agent panel: a table's second column overlapped the
+    /// first column's next entry, which makes a table of anything but short
+    /// values illegible.
+    ///
+    /// Checked as overlap, which is the symptom, rather than as height,
+    /// which is a proxy — a height comparison passed against the broken code
+    /// as readily as the fixed one and proved nothing. Text shapes carry
+    /// their galley, so the two cells can be found by their own text and
+    /// asked directly whether they collide.
+    /// Ignored because it fails: the cell sizing change in 42ea1ea did not
+    /// fix this, and this test is what established that. It is kept as a
+    /// reproduction — it fails for the right reason, naming the two rows and
+    /// the overlap in pixels — so whoever takes it next starts from a
+    /// measurement rather than from the screenshot.
+    ///
+    /// The remaining suspect is `egui::Grid`'s own row-height accounting with
+    /// `striped(true)`, not the cell widget: the cells now ask for their
+    /// natural height and the rows still collide.
+    #[test]
+    #[ignore = "known: table rows still overlap — see the comment"]
+    fn a_tall_cell_is_not_drawn_over_the_row_beneath_it() {
+        fn rect_of(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => for s in v { rect_of(s, needle, out) },
+                egui::Shape::Text(t) => {
+                    if t.galley.job.text.contains(needle) {
+                        let r = shape.visual_bounding_rect();
+                        *out = Some(out.map_or(r, |a: egui::Rect| a.union(r)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        const TALL: &str = "a cell long enough that it has to wrap across several lines";
+        const BELOW: &str = "SECONDROWMARKER";
+        let md = format!(
+            "| name | what |\n|---|---|\n| first | {TALL} in a column this narrow |\n| {BELOW} | x |\n"
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let out = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(egui::vec2(300.0, 10_000.0), |ui| { render(ui, &md, 80); });
+            });
+        });
+
+        let (mut tall, mut below) = (None, None);
+        for c in &out.shapes {
+            rect_of(&c.shape, TALL, &mut tall);
+            rect_of(&c.shape, BELOW, &mut below);
+        }
+        let tall = tall.expect("the wrapped cell was never drawn");
+        let below = below.expect("the next row was never drawn");
+        assert!(
+            below.top() >= tall.bottom() - 1.0,
+            "the next row starts at {} while the cell above runs to {} — \
+             they overlap by {:.1}px",
+            below.top(), tall.bottom(), tall.bottom() - below.top(),
+        );
+    }
+
     /// Does the shape scan above actually see text that left the box?
     ///
     /// Everything the width tests claim rests on this. The first attempt at

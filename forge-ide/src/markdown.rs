@@ -379,16 +379,34 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
                         .spacing([16.0, 5.0])
                         .show(ui, |ui| {
                             for (i, h) in header.iter().enumerate() {
-                                ui.add_sized([col_widths[i], 0.0], egui::Label::new(
-                                    RichText::new(crate::app::soft_wrap(h, max_run)).strong().size(12.0).color(T.heading)
-                                ));
+                                // A cell is given its column's width and takes
+                                // whatever height its text needs. `add_sized`
+                                // with a height of 0 allocated a row zero
+                                // pixels tall, so a cell that wrapped to
+                                // several lines was drawn over the row beneath
+                                // it — which is what a table of anything but
+                                // short values looked like.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_widths[i], 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        ui.add(egui::Label::new(
+                                            RichText::new(crate::app::soft_wrap(h, max_run))
+                                                .strong().size(12.0).color(T.heading)
+                                        ).wrap());
+                                    },
+                                );
                             }
                             ui.end_row();
                             for row in rows {
                                 for c in 0..ncols {
                                     let cell = row.get(c).map(String::as_str).unwrap_or("");
                                     let job = parse_inline(&crate::app::soft_wrap(cell, max_run), 12.0);
-                                    ui.add_sized([col_widths[c], 0.0], egui::Label::new(job.0).wrap());
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_widths[c], 0.0),
+                                        egui::Layout::top_down(egui::Align::LEFT),
+                                        |ui| { ui.add(egui::Label::new(job.0).wrap()); },
+                                    );
                                 }
                                 ui.end_row();
                             }

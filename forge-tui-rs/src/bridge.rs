@@ -350,10 +350,26 @@ pub fn find_agent_binary() -> PathBuf {
         }
     }
 
-    // Running from a source checkout via `cargo run`.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for rel in ["../target/release", "../target/debug"] {
-        candidates.push(manifest.join(rel).join(&binary));
+    // Running from a source checkout via `cargo run` — and only then.
+    //
+    // `CARGO_MANIFEST_DIR` is substituted at compile time, so in a released
+    // binary this is not a path to search but the directory the machine that
+    // built it happened to use, written into `.rodata`. Nothing removes it
+    // later: `--remap-path-prefix` rewrites paths in debug info and panic
+    // locations, and this is neither — it is an ordinary string literal, and
+    // `strip` leaves those alone. It reached the packaging guard, which
+    // refused to sign, which is the only reason it was not published.
+    //
+    // Compiled out of release builds rather than remapped. A binary somebody
+    // installed is never run from the checkout it was built in, so the lookup
+    // could not have succeeded there anyway — it was only ever a way for the
+    // build machine's path to travel.
+    #[cfg(debug_assertions)]
+    {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for rel in ["../target/release", "../target/debug"] {
+            candidates.push(manifest.join(rel).join(&binary));
+        }
     }
 
     for candidate in candidates {

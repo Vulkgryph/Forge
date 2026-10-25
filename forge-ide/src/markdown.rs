@@ -317,6 +317,25 @@ fn parse_table_row(line: &str) -> Vec<String> {
     t.split('|').map(|c| c.trim().to_string()).collect()
 }
 
+/// Place one table cell, reserving the height its text actually needs.
+///
+/// The height has to be known *before* the cell is allocated, because
+/// `egui::Grid` sizes a row from what its cells allocate. Asking for a height
+/// of zero — which both `add_sized([w, 0.0])` and
+/// `allocate_ui_with_layout(vec2(w, 0.0))` do — reserves a row shorter than
+/// its contents, and the overflow is drawn over the row beneath. Measured on
+/// a 152px cell, the row came up 61px short.
+///
+/// So the job is laid out here at the column's width, and the galley it
+/// produces is added at its own size. Nothing is guessed and nothing wraps
+/// twice: the same galley is what gets drawn.
+fn place_cell(ui: &mut egui::Ui, width: f32, mut job: LayoutJob) {
+    job.wrap.max_width = width;
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let size = galley.size();
+    ui.add_sized([width, size.y], egui::Label::new(galley));
+}
+
 fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_run: usize) {
     ui.add_space(4.0);
     let ncols = header.len();
@@ -379,34 +398,22 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
                         .spacing([16.0, 5.0])
                         .show(ui, |ui| {
                             for (i, h) in header.iter().enumerate() {
-                                // A cell is given its column's width and takes
-                                // whatever height its text needs. `add_sized`
-                                // with a height of 0 allocated a row zero
-                                // pixels tall, so a cell that wrapped to
-                                // several lines was drawn over the row beneath
-                                // it — which is what a table of anything but
-                                // short values looked like.
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(col_widths[i], 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        ui.add(egui::Label::new(
-                                            RichText::new(crate::app::soft_wrap(h, max_run))
-                                                .strong().size(12.0).color(T.heading)
-                                        ).wrap());
-                                    },
-                                );
+                                place_cell(ui, col_widths[i], {
+                                    let mut j = LayoutJob::default();
+                                    j.append(
+                                        &crate::app::soft_wrap(h, max_run), 0.0,
+                                        TextFormat { font_id: FontId::proportional(12.0),
+                                                     color: T.heading, ..Default::default() },
+                                    );
+                                    j
+                                });
                             }
                             ui.end_row();
                             for row in rows {
                                 for c in 0..ncols {
                                     let cell = row.get(c).map(String::as_str).unwrap_or("");
                                     let job = parse_inline(&crate::app::soft_wrap(cell, max_run), 12.0);
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(col_widths[c], 0.0),
-                                        egui::Layout::top_down(egui::Align::LEFT),
-                                        |ui| { ui.add(egui::Label::new(job.0).wrap()); },
-                                    );
+                                    place_cell(ui, col_widths[c], job.0);
                                 }
                                 ui.end_row();
                             }
@@ -771,17 +778,13 @@ mod wrap_tests {
     /// as readily as the fixed one and proved nothing. Text shapes carry
     /// their galley, so the two cells can be found by their own text and
     /// asked directly whether they collide.
-    /// Ignored because it fails: the cell sizing change in 42ea1ea did not
-    /// fix this, and this test is what established that. It is kept as a
-    /// reproduction — it fails for the right reason, naming the two rows and
-    /// the overlap in pixels — so whoever takes it next starts from a
-    /// measurement rather than from the screenshot.
-    ///
-    /// The remaining suspect is `egui::Grid`'s own row-height accounting with
-    /// `striped(true)`, not the cell widget: the cells now ask for their
-    /// natural height and the rows still collide.
+    /// The overlap scaled with the cell: a 40px cell overlapped by 5, a 152px
+    /// cell by 61. That is a row reserving part of its content's height, and
+    /// it is why asking for a height of zero — which `add_sized([w, 0.0])`
+    /// and `allocate_ui_with_layout(vec2(w, 0.0))` both do — is the fault.
+    /// The text is laid out at the column width first now, and the galley
+    /// added at its own size, so the row knows what it is holding.
     #[test]
-    #[ignore = "known: table rows still overlap — see the comment"]
     fn a_tall_cell_is_not_drawn_over_the_row_beneath_it() {
         fn rect_of(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
             match shape {
@@ -803,12 +806,18 @@ mod wrap_tests {
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |_| {});
-        let out = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.allocate_ui(egui::vec2(300.0, 10_000.0), |ui| { render(ui, &md, 80); });
+        // Three frames, not one. `egui::Grid` sizes its rows from the layout
+        // it recorded last frame, so a single frame measures a table that has
+        // never been laid out — which is a first-frame artifact, not the bug
+        // being chased.
+        let mut out = ctx.run(Default::default(), |_| {});
+        for _ in 0..3 {
+            out = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui(egui::vec2(300.0, 10_000.0), |ui| { render(ui, &md, 80); });
+                });
             });
-        });
+        }
 
         let (mut tall, mut below) = (None, None);
         for c in &out.shapes {

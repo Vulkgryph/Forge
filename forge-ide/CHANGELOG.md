@@ -6,6 +6,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **Markdown tables stop drawing over themselves.** A cell that wrapped to more than a line or two was painted across the row beneath it, which made a table of anything but short values unreadable. `egui::Grid` sizes a row from what its cells allocate, and the cells were asking for a height of zero — so the row came up short by however much the text actually needed: five pixels for a 40px cell, sixty-one for a 152px one. Cell text is now laid out at the column's width first and added at the height that produces, so the row knows what it is holding.
+
 - **The model picker scrolls.** Every configured endpoint was drawn in full, however many there were, inside a popup with no scroll area — so past roughly a dozen models the rest ran off the bottom of the display and could only be reached by making the window itself taller. It is now a bounded, scrollable list.
 
 - **The editor's tab strip scrolls.** Tabs are laid out at their natural width and never shrunk to fit, so once they overran the strip the ones past the edge could not be reached at all — not by scrolling, since there was nothing to scroll, and not by dragging, since the strip is a fixed panel. The only way back to an open file was the tree or quick-open, which is no way to reach a tab you already have. The split pane's own strip had been scrollable all along; the main one now matches.

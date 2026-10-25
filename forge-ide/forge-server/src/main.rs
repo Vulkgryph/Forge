@@ -638,7 +638,20 @@ mod mkdir_tests {
     }
 }
 
-#[cfg(test)]
+/// Unix only, like the thing it tests.
+///
+/// `bind_owner_only` is `cfg(unix)` and so are the permission bits this
+/// reaches for, but the module was gated on `test` alone — so building the
+/// tests for Windows left it calling a function that did not exist and
+/// asking a `Permissions` for a mode it does not have. Three compile errors,
+/// in a crate whose tests had never been built for Windows by anything: CI
+/// builds the editor on macOS only, and its Windows job marks this one
+/// informational.
+///
+/// The same mistake, one module up, is described in the comment above
+/// `read_loop` — it was found and fixed there without anyone checking
+/// whether the tests had it too. They did.
+#[cfg(all(test, unix))]
 mod socket_permission_tests {
     use std::os::unix::fs::PermissionsExt;
 

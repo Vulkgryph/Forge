@@ -9350,43 +9350,57 @@ impl IdeApp {
                             spread: 0.0, color: egui::Color32::from_black_alpha(90) })
                         .show(ui, |ui| {
                         ui.set_width(220.0);
-                        const GROUP_ORDER: &[&str] =
-                            &["ChatGPT", "Anthropic", "OpenAI", "xAI", "OpenRouter", "Local / Custom"];
-                        let mut first = true;
-                        for group in GROUP_ORDER {
-                            let mut in_group: Vec<&serde_json::Value> = endpoints.iter()
-                                .filter(|ep| classify_provider(ep) == *group)
-                                .collect();
-                            in_group.sort_by(|a, b| {
-                                let la = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let lb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                natural_cmp(&display_model_label(la, &endpoints), &display_model_label(lb, &endpoints))
-                            });
-                            if in_group.is_empty() { continue; }
-                            if !first {
-                                ui.add_space(6.0);
-                                ui.separator();
+                        // Scrollable and bounded. The list is every configured
+                        // endpoint grouped by provider, drawn in full however
+                        // long that came to — so past about a dozen models the
+                        // rest ran off the bottom of the display with no way to
+                        // reach them but making the window itself taller.
+                        //
+                        // `auto_shrink` vertically, so a short list is still a
+                        // short menu rather than a half-empty box.
+                        egui::ScrollArea::vertical()
+                            .id_salt("agent_model_picker_list")
+                            .max_height(380.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                            const GROUP_ORDER: &[&str] =
+                                &["ChatGPT", "Anthropic", "OpenAI", "xAI", "OpenRouter", "Local / Custom"];
+                            let mut first = true;
+                            for group in GROUP_ORDER {
+                                let mut in_group: Vec<&serde_json::Value> = endpoints.iter()
+                                    .filter(|ep| classify_provider(ep) == *group)
+                                    .collect();
+                                in_group.sort_by(|a, b| {
+                                    let la = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let lb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    natural_cmp(&display_model_label(la, &endpoints), &display_model_label(lb, &endpoints))
+                                });
+                                if in_group.is_empty() { continue; }
+                                if !first {
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.add_space(2.0);
+                                }
+                                first = false;
                                 ui.add_space(2.0);
-                            }
-                            first = false;
-                            ui.add_space(2.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new(group.to_uppercase()).size(9.5)
-                                    .color(egui::Color32::from_gray(130)));
-                            });
-                            ui.add_space(2.0);
-                            for ep in in_group {
-                                let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let is_current = name == current;
-                                let label = display_model_label(name, &endpoints);
-                                let ctx_tokens = ep.get("max_context_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                if draw_model_row(ui, &label, ctx_tokens, is_current).clicked() {
-                                    if !is_current { chosen = Some(ep.clone()); }
-                                    dismissed = true;
+                                ui.horizontal(|ui| {
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new(group.to_uppercase()).size(9.5)
+                                        .color(egui::Color32::from_gray(130)));
+                                });
+                                ui.add_space(2.0);
+                                for ep in in_group {
+                                    let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let is_current = name == current;
+                                    let label = display_model_label(name, &endpoints);
+                                    let ctx_tokens = ep.get("max_context_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    if draw_model_row(ui, &label, ctx_tokens, is_current).clicked() {
+                                        if !is_current { chosen = Some(ep.clone()); }
+                                        dismissed = true;
+                                    }
                                 }
                             }
-                        }
+                            });
                     });
                 });
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) { dismissed = true; }

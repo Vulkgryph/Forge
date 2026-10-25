@@ -6,6 +6,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **The model picker scrolls.** Every configured endpoint was drawn in full, however many there were, inside a popup with no scroll area — so past roughly a dozen models the rest ran off the bottom of the display and could only be reached by making the window itself taller. It is now a bounded, scrollable list.
+
 - **The editor's tab strip scrolls.** Tabs are laid out at their natural width and never shrunk to fit, so once they overran the strip the ones past the edge could not be reached at all — not by scrolling, since there was nothing to scroll, and not by dragging, since the strip is a fixed panel. The only way back to an open file was the tree or quick-open, which is no way to reach a tab you already have. The split pane's own strip had been scrollable all along; the main one now matches.
 
 - **Reasoning says it is reasoning.** A model's thinking was told apart from its answer correctly and then drawn as dimmed italics with nothing in front of it, which reads as the model talking rather than as its working-out. On a model that reasons at length it is also most of what is on screen — measured against a local GLM endpoint, 675 characters of reasoning to 98 of answer for one short question. It now carries a `thinking` label.

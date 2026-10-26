@@ -181,6 +181,17 @@ pub enum AgentMsg {
         #[serde(default)] subagent_id: Option<String>,
     },
     ToolOutput { tool_name: String, content: String },
+    /// A tool still running, reported about once a second while it does.
+    ///
+    /// The agent has sent this all along and the editor had no variant for
+    /// it, so `pump` could not deserialise the line and dropped it — a slow
+    /// tool looked like nothing happening at all. The terminal client has
+    /// shown a bar for it the whole time.
+    ToolProgress {
+        tool_name: String,
+        elapsed_secs: u64,
+        expected_secs: Option<u64>,
+    },
     Error      { message: String },
     ApiRetry {
         #[serde(default)] attempt:      u32,
@@ -1543,6 +1554,18 @@ impl AgentSession {
                     None => { self.set_activity("Thinking…".into(), None); self.items.push(item); }
                 }
             }
+            AgentMsg::ToolProgress { tool_name, expected_secs, .. } => {
+                // The elapsed figure in the message is not used: `activity_since`
+                // already tracks it and advances every frame, so the bar moves
+                // smoothly instead of stepping once a second.
+                self.thinking = false;
+                self.set_activity(
+                    tool_name,
+                    expected_secs
+                        .filter(|s| *s > 0)
+                        .map(|s| Expectation::AtMost(std::time::Duration::from_secs(s))),
+                );
+            }
             AgentMsg::ToolOutput { tool_name, content } => {
                 // Not mirrored into shell_events here — the tool_result that follows
                 // carries the same content already formatted with command + exit code,
@@ -2268,6 +2291,68 @@ mod tests {
             "the message never reached the transcript",
         );
         assert!(s.turn_active, "the turn was cancelled to deliver a message");
+    }
+
+    /// The exact line the agent writes while a tool runs.
+    ///
+    /// This is the half that was broken: there was no variant for it, so
+    /// `pump` could not deserialise the line and dropped it on the floor —
+    /// and a dropped line looks exactly like a tool that reports nothing.
+    /// Parsed here rather than trusted, because a shape mismatch is silent.
+    #[test]
+    fn a_tool_progress_line_parses() {
+        let line = r#"{"type":"tool_progress","tool_id":"t1","tool_name":"shell_exec","elapsed_secs":7,"expected_secs":120}"#;
+        match serde_json::from_str::<AgentMsg>(line) {
+            Ok(AgentMsg::ToolProgress { tool_name, elapsed_secs, expected_secs }) => {
+                assert_eq!(tool_name, "shell_exec");
+                assert_eq!(elapsed_secs, 7);
+                assert_eq!(expected_secs, Some(120));
+            }
+            other => panic!("did not parse as ToolProgress: {other:?}"),
+        }
+    }
+
+    /// A tool with no estimate still says it is working; it just cannot draw
+    /// a bar, and must not claim a duration it was never given.
+    #[test]
+    fn a_tool_with_no_estimate_sets_activity_without_an_expectation() {
+        let mut s = mid_turn_session();
+        s.handle(
+            AgentMsg::ToolProgress {
+                tool_name: "search_code".into(), elapsed_secs: 3, expected_secs: None,
+            },
+            SessionPolicy { password_auto_inject: false, session_password: None },
+        );
+        assert_eq!(s.activity, "search_code");
+        assert!(s.activity_expect().is_none(), "invented an expectation");
+    }
+
+    /// With an estimate, the expectation is carried so the bar has something
+    /// to fill against.
+    #[test]
+    fn a_tool_with_an_estimate_carries_it() {
+        let mut s = mid_turn_session();
+        s.handle(
+            AgentMsg::ToolProgress {
+                tool_name: "shell_exec".into(), elapsed_secs: 1, expected_secs: Some(90),
+            },
+            SessionPolicy { password_auto_inject: false, session_password: None },
+        );
+        assert_eq!(s.activity_expect().map(|e| e.duration().as_secs()), Some(90));
+    }
+
+    /// Zero is not an estimate. Dividing a bar by it is how one ends up full
+    /// the instant it appears.
+    #[test]
+    fn a_zero_estimate_is_not_treated_as_one() {
+        let mut s = mid_turn_session();
+        s.handle(
+            AgentMsg::ToolProgress {
+                tool_name: "x".into(), elapsed_secs: 0, expected_secs: Some(0),
+            },
+            SessionPolicy { password_auto_inject: false, session_password: None },
+        );
+        assert!(s.activity_expect().is_none());
     }
 
     /// Pressing Enter while the agent is working has to reach it. It used to

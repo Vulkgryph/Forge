@@ -9993,6 +9993,30 @@ impl IdeApp {
                         ui.painter().circle_filled(rect.center(), 3.5, dot);
                         let label = if tab.session.activity.is_empty() { "Working…".to_string() } else { tab.session.activity.clone() };
                         ui.label(egui::RichText::new(label).size(10.5).color(egui::Color32::from_gray(190)));
+                        // A bar, when the step said how long it expects to take.
+                        //
+                        // Drawn from `activity_elapsed` against the expectation
+                        // rather than from the elapsed figure in the message, so
+                        // it advances every frame instead of stepping once a
+                        // second when the next one arrives. Capped at the
+                        // expectation: a tool that overruns its own estimate
+                        // should look pinned at the end, not wrap around.
+                        if let (Some(exp), Some(elapsed)) =
+                            (tab.session.activity_expect(), tab.session.activity_elapsed())
+                        {
+                            let total = exp.duration().as_secs_f32().max(0.001);
+                            let frac = (elapsed.as_secs_f32() / total).clamp(0.0, 1.0);
+                            ui.add_space(6.0);
+                            let (bar, _) = ui.allocate_exact_size(
+                                egui::vec2(54.0, 4.0), egui::Sense::hover());
+                            ui.painter().rect_filled(bar, 2.0, egui::Color32::from_gray(58));
+                            if frac > 0.0 {
+                                let filled = egui::Rect::from_min_size(
+                                    bar.min, egui::vec2(bar.width() * frac, bar.height()));
+                                ui.painter().rect_filled(filled, 2.0,
+                                    egui::Color32::from_rgb(110, 150, 220));
+                            }
+                        }
                         // How long this step has been going. The difference
                         // between a model that is thinking and one that has hung
                         // is entirely in this number, and a five-minute `sleep`

@@ -6,6 +6,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **A slow tool shows its progress in the editor.** The agent has reported a running tool's elapsed and expected time about once a second all along, and the editor had no variant for that message — so it failed to deserialise and was dropped, and a tool that took two minutes looked identical to one doing nothing. The step now names itself and, when it gave an estimate, fills a bar against it. The bar is drawn from the panel's own clock rather than the figure in the message, so it advances every frame instead of stepping once a second.
+
 - **Markdown tables stop drawing over themselves.** A cell that wrapped to more than a line or two was painted across the row beneath it, which made a table of anything but short values unreadable. `egui::Grid` sizes a row from what its cells allocate, and the cells were asking for a height of zero — so the row came up short by however much the text actually needed: five pixels for a 40px cell, sixty-one for a 152px one. Cell text is now laid out at the column's width first and added at the height that produces, so the row knows what it is holding.
 
 - **The model picker scrolls.** Every configured endpoint was drawn in full, however many there were, inside a popup with no scroll area — so past roughly a dozen models the rest ran off the bottom of the display and could only be reached by making the window itself taller. It is now a bounded, scrollable list.

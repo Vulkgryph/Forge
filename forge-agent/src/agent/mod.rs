@@ -24,6 +24,7 @@ pub mod rewind;
 pub mod subagent;
 
 pub use core::{
+    BackgroundTask,
     PersistEndpoint,
     Agent, AgentEvent, QuestionItem, QuestionOption, TokenUsageSnapshot, ToolKindEvent, UserAction,
 };

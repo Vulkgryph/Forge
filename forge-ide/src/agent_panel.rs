@@ -64,6 +64,7 @@ enum OutgoingMsg {
     SwitchModel(serde_json::Value),
     ToggleAutoMode,
     UpdateEndpointReasoning { endpoint_name: String, reasoning: serde_json::Value },
+    KillBackground { id: String },
     AnswerQuestion { answer: String },
     #[cfg(target_os = "macos")]
     BrowserResult { request_id: String, final_url: String, html: String },
@@ -136,6 +137,14 @@ pub struct SessionPolicy<'a> {
     pub session_password: Option<&'a str>,
 }
 
+/// One command the agent still has running in the background.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub command: String,
+    pub elapsed_secs: u64,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMsg {
@@ -181,6 +190,12 @@ pub enum AgentMsg {
         #[serde(default)] subagent_id: Option<String>,
     },
     ToolOutput { tool_name: String, content: String },
+    /// Everything the agent still has running in the background.
+    ///
+    /// Cancelling a turn deliberately leaves background work alone, so
+    /// without this there was no way to see what was still running — and no
+    /// way to stop it that did not involve asking the model to do it.
+    BackgroundTasks { tasks: Vec<BackgroundTask> },
     /// A tool still running, reported about once a second while it does.
     ///
     /// The agent has sent this all along and the editor had no variant for
@@ -1017,6 +1032,8 @@ pub struct AgentSession {
     /// Messages typed and sent while a turn was active; drained one at a time
     /// as each turn completes.
     pub queued:   Vec<String>,
+    /// What the agent still has running in the background, as last reported.
+    pub background: Vec<BackgroundTask>,
     /// Paths written/edited by a successful tool call, drained each frame by
     /// the UI to live-reload any matching open buffer.
     pub changed_files: Vec<String>,
@@ -1184,6 +1201,7 @@ impl AgentSession {
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
+                background:  Vec::new(),
                 tool_pulses: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -1251,6 +1269,7 @@ impl AgentSession {
                 subscription_line: None,
                 turn_active: false,
                 queued:      Vec::new(),
+                background:  Vec::new(),
                 tool_pulses: 0,
                 auto_mode:   false,
                 request_input_focus: false,
@@ -1370,6 +1389,7 @@ impl AgentSession {
                 subscription_line: None,
                 turn_active: false,
                 queued:      Vec::new(),
+                background:  Vec::new(),
                 tool_pulses: 0,
                 auto_mode:   false,
                 request_input_focus: false,
@@ -1388,6 +1408,7 @@ impl AgentSession {
                 turn_tokens: 0,
                 turn_active: false,
                 queued:      Vec::new(),
+                background:  Vec::new(),
                 tool_pulses: 0,
                 changed_files: Vec::new(),
                 shell_events:  Vec::new(),
@@ -1565,6 +1586,9 @@ impl AgentSession {
                         .filter(|s| *s > 0)
                         .map(|s| Expectation::AtMost(std::time::Duration::from_secs(s))),
                 );
+            }
+            AgentMsg::BackgroundTasks { tasks } => {
+                self.background = tasks;
             }
             AgentMsg::ToolOutput { tool_name, content } => {
                 // Not mirrored into shell_events here — the tool_result that follows
@@ -2102,6 +2126,12 @@ impl AgentSession {
     ///
     /// `turn_active` clears itself once the matching `Cancelled` event comes
     /// back, same as it already does today.
+    /// Stop one background command. Fire-and-forget: the agent answers with
+    /// a fresh list, which is what the panel draws from.
+    pub fn kill_background(&mut self, id: &str) {
+        let _ = self.write(&OutgoingMsg::KillBackground { id: id.to_string() });
+    }
+
     pub fn cancel_run(&mut self) {
         let _ = self.write(&OutgoingMsg::CancelRun);
     }
@@ -2291,6 +2321,45 @@ mod tests {
             "the message never reached the transcript",
         );
         assert!(s.turn_active, "the turn was cancelled to deliver a message");
+    }
+
+    /// The line the agent sends when its background set changes.
+    ///
+    /// Parsed rather than trusted: an unknown message is dropped silently by
+    /// `pump`, which is exactly how the tool-progress bar came to be missing
+    /// for months while the agent dutifully sent it.
+    #[test]
+    fn a_background_tasks_line_parses() {
+        let line = r#"{"type":"background_tasks","tasks":[{"id":"bg-1","command":"cargo build","elapsed_secs":65}]}"#;
+        match serde_json::from_str::<AgentMsg>(line) {
+            Ok(AgentMsg::BackgroundTasks { tasks }) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "bg-1");
+                assert_eq!(tasks[0].command, "cargo build");
+                assert_eq!(tasks[0].elapsed_secs, 65);
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    /// An empty set is how "nothing is running any more" is said, and has to
+    /// clear the strip rather than leave the last list on screen forever.
+    #[test]
+    fn an_empty_background_set_clears_the_list() {
+        let mut s = mid_turn_session();
+        s.handle(
+            AgentMsg::BackgroundTasks { tasks: vec![BackgroundTask {
+                id: "bg-1".into(), command: "sleep 900".into(), elapsed_secs: 3,
+            }]},
+            SessionPolicy { password_auto_inject: false, session_password: None },
+        );
+        assert_eq!(s.background.len(), 1);
+
+        s.handle(
+            AgentMsg::BackgroundTasks { tasks: vec![] },
+            SessionPolicy { password_auto_inject: false, session_password: None },
+        );
+        assert!(s.background.is_empty(), "the strip would still show a finished job");
     }
 
     /// The exact line the agent writes while a tool runs.

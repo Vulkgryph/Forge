@@ -5,7 +5,8 @@ use tokio::sync::mpsc;
 
 use crate::agent::log_types::SessionMeta;
 use crate::agent::{
-    AgentEvent, QuestionItem, QuestionOption, TokenUsageSnapshot, ToolKindEvent, UserAction,
+    AgentEvent, BackgroundTask, QuestionItem, QuestionOption, TokenUsageSnapshot,
+    ToolKindEvent, UserAction,
 };
 use crate::config::ModelEndpoint;
 
@@ -109,6 +110,8 @@ enum OutgoingMessage {
     /// A tool is still running — status, not transcript. See the proto message
     /// of the same name: once a second, so a client updates one indicator
     /// rather than appending a line.
+    /// Everything running in the background, whenever that set changes.
+    BackgroundTasks { tasks: Vec<BackgroundTask> },
     ToolProgress {
         tool_id: String,
         tool_name: String,
@@ -506,6 +509,9 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
             success: *success,
             subagent_id: subagent_id.clone(),
         },
+        AgentEvent::BackgroundTasks(tasks) => {
+            OutgoingMessage::BackgroundTasks { tasks: tasks.clone() }
+        }
         AgentEvent::ToolProgress { tool_id, tool_name, elapsed_secs, expected_secs } => {
             OutgoingMessage::ToolProgress {
                 tool_id: tool_id.clone(),
@@ -646,6 +652,8 @@ fn agent_event_to_json(event: &AgentEvent) -> OutgoingMessage {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum IncomingMessage {
+    /// Stop one background command, by a person rather than the model.
+    KillBackground { id: String },
     SendMessage {
         content: String,
     },
@@ -802,6 +810,7 @@ fn json_to_user_action(
 ) -> Option<UserAction> {
     match msg {
         IncomingMessage::SendMessage { content } => Some(UserAction::SendMessage(content)),
+        IncomingMessage::KillBackground { id } => Some(UserAction::KillBackground(id)),
         IncomingMessage::ApproveAction { tool_id } => Some(UserAction::ApproveAction(tool_id)),
         IncomingMessage::DenyAction { tool_id, reason } => {
             Some(UserAction::DenyAction { tool_id, reason })

@@ -9896,6 +9896,7 @@ impl IdeApp {
         let text_h = composer_text_height(ui, &tab.session.input, wrap_w, panel_h * 0.40);
         let input_h = 62.0 + text_h + queue_h + activity_h;
         let mut revoke_idx: Option<usize> = None;
+        let mut kill_bg_id: Option<String> = None;
         let mut send_now_idx: Option<usize> = None;
         egui::TopBottomPanel::bottom("agent_input_panel")
             .exact_height(input_h)
@@ -9908,6 +9909,59 @@ impl IdeApp {
                 let panel_w = ui.available_width();
                 let outer_pad = 6.0;
                 let frame_outer = (panel_w - outer_pad * 2.0).max(100.0);
+                // Background work, and a way to stop it.
+                //
+                // Cancelling a turn deliberately leaves background commands
+                // running — that is the point of backgrounding them — but
+                // until now nothing showed they existed, and the only way to
+                // stop one was to ask the model to do it. A `sleep 86400`
+                // started by a turn that was then cancelled had no visible
+                // trace at all.
+                if !tab.session.background.is_empty() {
+                    for bg in tab.session.background.clone() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(outer_pad);
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(34, 38, 34))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 78, 58)))
+                                .rounding(5.0)
+                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(frame_outer - 2.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("background").size(9.5)
+                                            .color(egui::Color32::from_gray(130)));
+                                        let mins = bg.elapsed_secs / 60;
+                                        let age = if mins > 0 { format!("{mins}m") }
+                                                  else { format!("{}s", bg.elapsed_secs) };
+                                        ui.label(egui::RichText::new(age).size(9.5)
+                                            .color(egui::Color32::from_gray(150)));
+                                        // Truncate rather than wrap: this is a
+                                        // row, and a heredoc would otherwise
+                                        // grow the panel. Same reasoning as the
+                                        // queued-message strip below.
+                                        let reserved = 44.0;
+                                        let avail = (ui.available_width() - reserved).max(20.0);
+                                        ui.add_sized(
+                                            egui::vec2(avail, 16.0),
+                                            egui::Label::new(egui::RichText::new(bg.command.clone())
+                                                .size(11.0).color(egui::Color32::from_gray(205)))
+                                                .truncate(),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("stop")
+                                                .on_hover_text(format!("Stop {} — it keeps running until you do", bg.id))
+                                                .clicked()
+                                            {
+                                                kill_bg_id = Some(bg.id.clone());
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                        ui.add_space(2.0);
+                    }
+                }
                 if !tab.session.queued.is_empty() {
                     for (qi, msg) in tab.session.queued.iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -10192,6 +10246,11 @@ impl IdeApp {
         }
         if let Some(idx) = send_now_idx {
             tab.session.send_queued_now(idx);
+        }
+        // Applied here with the other deferred choices: the strip is drawn
+        // inside a closure that still holds the tab borrow.
+        if let Some(id) = kill_bg_id {
+            tab.session.kill_background(&id);
         }
 
         // ── Docked subagent strip ───────────────────────────────────────────

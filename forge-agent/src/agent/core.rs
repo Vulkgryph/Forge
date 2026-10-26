@@ -24,9 +24,26 @@ use crate::tools::{
     ask_question_definition, delegate_task_definition, enter_plan_mode_definition, ToolExecutor,
 };
 
+/// One command still running in the background, as a person needs to see it.
+///
+/// Carried as a whole set rather than as deltas: the list is short, it
+/// changes rarely, and a UI that has to reconstruct state from a stream of
+/// additions and removals gets it wrong the first time a message is missed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub command: String,
+    pub elapsed_secs: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     AssistantMessage(String),
+    /// Everything running in the background right now, sent whenever the set
+    /// changes. Cancelling a turn deliberately leaves background work alone,
+    /// so without this there was no way to see what was still running, and no
+    /// way to stop it that did not go through the model.
+    BackgroundTasks(Vec<BackgroundTask>),
     /// What the subscription has left, reported by the provider on a response.
     /// Only ChatGPT Codex sends this; other endpoints never emit it.
     UsageLimits(crate::api::client::UsageLimits),
@@ -344,6 +361,8 @@ pub enum PersistEndpoint {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     SendMessage(String),
+    /// Stop one background command by id, without going through the model.
+    KillBackground(String),
     ApproveAction(String),
     DenyAction {
         tool_id: String,
@@ -1037,6 +1056,9 @@ impl Agent {
                             let _ = tx.send(text);
                         }
                     }
+                }
+                UserAction::KillBackground(id) => {
+                    self.kill_background(&id);
                 }
                 UserAction::ToggleAutoMode => {
                     self.auto_mode = !self.auto_mode;
@@ -3138,6 +3160,7 @@ impl Agent {
         self.subagent_counter = 0;
         self.bg_counter = 0;
         self.background_commands.clear();
+        self.report_background();
         self.last_shell_command = None;
         self.consecutive_shell_runs = 0;
         self.queued_user_messages.clear();
@@ -4453,6 +4476,7 @@ impl Agent {
                 kill_tx: Some(kill_tx),
                 input_tx: Some(input_tx),
             });
+            self.report_background();
 
             let bg_reason = if run_in_background_now {
                 "started in background as requested".to_string()
@@ -4670,6 +4694,46 @@ impl Agent {
     /// twenty-three turns afterwards, each re-reading the entire history to
     /// acknowledge one line, in immediate succession. The parking fixed the
     /// older bug of losing them; it did not make them timely.
+    /// Tell whoever is watching what is running in the background.
+    ///
+    /// Called at every point the set changes rather than on a timer: the
+    /// elapsed figures go stale between calls, and a UI can compute elapsed
+    /// from its own clock, but it cannot invent a job it was never told about.
+    fn report_background(&self) {
+        let tasks: Vec<BackgroundTask> = self
+            .background_commands
+            .iter()
+            .map(|b| BackgroundTask {
+                id: b.id.clone(),
+                command: b.command.clone(),
+                elapsed_secs: b.started_at.elapsed().as_secs(),
+            })
+            .collect();
+        let _ = self.event_tx.send(AgentEvent::BackgroundTasks(tasks));
+    }
+
+    /// Stop one background command because a person asked, not the model.
+    ///
+    /// Returns whether anything matched. An id that is not running is not an
+    /// error: the job may have finished between the list being drawn and the
+    /// button being pressed, which is the normal case rather than a fault.
+    fn kill_background(&mut self, id: &str) -> bool {
+        let Some(idx) = self.background_commands.iter().position(|b| b.id == id) else {
+            self.report_background();
+            return false;
+        };
+        if let Some(tx) = self.background_commands[idx].kill_tx.take() {
+            let _ = tx.try_send(());
+        }
+        let cmd = self.background_commands[idx].command.clone();
+        self.background_commands.remove(idx);
+        let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+            "[Stopped {}: {}]", id, crate::agent::core::first_line(&cmd)
+        )));
+        self.report_background();
+        true
+    }
+
     fn take_background_completions(&mut self) -> Vec<String> {
         if !self
             .deferred_actions
@@ -5713,6 +5777,19 @@ fn over_window_notice(
 /// Shared by both delivery paths — at a tool boundary while the turn runs, and
 /// from the main loop when one finishes while nothing else is happening — so
 /// the two cannot describe the same event differently.
+/// The first line of a command, for naming it in one line of UI.
+///
+/// A backgrounded command is often a heredoc or a chain several lines long,
+/// and a list that prints the whole thing stops being a list.
+pub(crate) fn first_line(command: &str) -> String {
+    let line = command.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 60 {
+        format!("{}…", line.chars().take(59).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 fn background_notice(id: &str, command: &str, output: &str, exit_code: Option<i32>) -> String {
     let truncated: String = output.chars().take(4000).collect();
     let more = if output.len() > 4000 { "\n... (truncated)" } else { "" };
@@ -5925,6 +6002,27 @@ fn unanswered_tool_calls<'a>(history: &[Message], tool_calls: &'a [ToolCall]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backgrounded command is named by its first line, because the thing
+    /// backgrounded is often a heredoc or a chain several lines long, and a
+    /// list that prints all of it stops being a list.
+    #[test]
+    fn a_background_command_is_named_by_one_line() {
+        assert_eq!(first_line("cargo test --workspace"), "cargo test --workspace");
+        assert_eq!(first_line("  trimmed  "), "trimmed");
+        assert_eq!(first_line("python - <<'PY'\nimport os\nPY"), "python - <<'PY'");
+        let long = "x".repeat(200);
+        let out = first_line(&long);
+        assert!(out.chars().count() <= 60, "{} chars", out.chars().count());
+        assert!(out.ends_with('…'), "a trimmed name should say it was trimmed");
+    }
+
+    /// An empty command does not panic the list that draws it.
+    #[test]
+    fn a_nameless_command_is_empty_not_a_panic() {
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("\n\n"), "");
+    }
 
     /// A 400 is the server declining the request as asked, so no wait clears
     /// it. The one reported from a local model — a server started without

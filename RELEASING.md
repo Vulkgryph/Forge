@@ -144,7 +144,32 @@ Third-party licences are attributed in `NOTICE`, which `preflight.sh` checks
 against the dependency graph as it is *today*, not as it was when NOTICE was
 written.
 
-## 5. Build and sign
+## 5. Build it on Windows
+
+Not optional, and not covered by CI. `forge-ide` needs **NASM** on Windows —
+`aws-lc-sys` fails outright without it — and GitHub's runners ship NASM
+preinstalled, so the pipeline stays green on a machine that is not like the
+one a person installs onto. Promoting the editor's Windows job from
+`continue-on-error` would not have caught it.
+
+A real Windows machine found that, and found a test module calling `cfg(unix)`
+code while gated only on `test`. Both were invisible to every green build that
+preceded them.
+
+Carry the commits over without a public push:
+
+```sh
+git bundle create /tmp/f.bundle ^origin/main refs/heads/main
+scp /tmp/f.bundle <host>:                       # then, on the box:
+git fetch .../f.bundle refs/heads/main:refs/heads/wintest && git checkout wintest
+cargo test --locked -p forge-agent-proto -p forge-search -p forge-tui-rs
+cargo build -p forge-ide -p forge-proto -p forge-server
+```
+
+Name the ref in the bundle. A bundle built from a revision range alone carries
+only `HEAD`, and the fetch then matches nothing and fails silently.
+
+## 6. Build and sign
 
 ```sh
 bash forge-ide/scripts/package_macos.sh
@@ -159,7 +184,7 @@ invalidates every macOS folder permission a user has granted.
 Then confirm the bundle holds what it claims: both binaries present and
 executable, `Info.plist` in place, and the version it reports matching the tag.
 
-## 6. Publish
+## 7. Publish
 
 Pushing the tag starts `.github/workflows/release.yml`, which re-runs every
 mechanical gate on the exact tagged commit, checks the tag against the version
@@ -175,7 +200,7 @@ invalidates every macOS folder permission a user has already granted.
 So, after the workflow is green:
 
 1. Tag, annotated, and push the tag. Wait for the workflow.
-2. Build, sign and notarise locally — step 5 — and attach the bundle to the
+2. Build, sign and notarise locally — step 6 — and attach the bundle to the
    draft.
 3. Read the draft body against the filter table above. The workflow wrote it
    from the changelog, which is reviewed, but no workflow can tell whether a
@@ -185,7 +210,7 @@ So, after the workflow is green:
 5. Read the published page as a stranger would, with the filter table open. This
    is the last point at which a leak costs nothing to fix.
 
-## 7. After
+## 8. After
 
 Anything published is public permanently, whatever the platform says about
 deletion — assume it was indexed and archived within the minute. Removing a leak

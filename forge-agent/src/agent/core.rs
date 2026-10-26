@@ -2328,9 +2328,27 @@ impl Agent {
                                                 // turn boundary, never interrupting a call in
                                                 // flight.
                                                 if !metas.is_empty() {
-                                                    for meta in &metas {
+                                                    // `@name` picks one out; anything
+                                                    // else still goes to all of them.
+                                                    let (addr, body) = relay_address(&msg);
+                                                    let targets: Vec<_> = match addr {
+                                                        Some(name) => metas.iter()
+                                                            .filter(|m| relay_matches(name, &m.sub_id, &m.agent_type))
+                                                            .collect(),
+                                                        None => metas.iter().collect(),
+                                                    };
+                                                    // An address nobody answers to is a
+                                                    // typo, and silently reaching nobody
+                                                    // is the worst outcome — fall back to
+                                                    // everyone rather than drop it.
+                                                    let (targets, body) = if targets.is_empty() {
+                                                        (metas.iter().collect::<Vec<_>>(), msg.as_str())
+                                                    } else {
+                                                        (targets, body)
+                                                    };
+                                                    for meta in &targets {
                                                         let _ = meta.approval_tx.send(
-                                                            UserAction::SendMessage(msg.clone()),
+                                                            UserAction::SendMessage(body.to_string()),
                                                         );
                                                     }
                                                     let _ = self.event_tx.send(
@@ -3219,6 +3237,25 @@ impl Agent {
                 )));
                 if dropped > 0 {
                     self.rewind_checkpoints.clear();
+                }
+                // Record it, exactly as a compaction records itself.
+                //
+                // Resuming reverse-seeks for the last `compaction_commit` and
+                // reads forward from there. A rolling window trimmed the
+                // history and wrote nothing, so a resumed session found no
+                // marker and reloaded the conversation from the beginning —
+                // including everything the window had just dropped. That is
+                // how a session compacted to a comfortable size came back
+                // bigger than the window it was trimmed to fit.
+                //
+                // The record already carries a `rolling_window` field; only
+                // the compaction path was ever filling it in.
+                let kept = self.history.len();
+                if let Err(e) = self.log.log_compaction_commit(kept, kept.saturating_sub(1)) {
+                    let _ = self.event_tx.send(AgentEvent::AssistantMessage(format!(
+                        "[Rolling window trimmed, but the session log could not record it: {e}. \
+                         Resuming this session will reload the untrimmed history.]"
+                    )));
                 }
             }
             ContextStrategy::Compaction => {
@@ -5777,6 +5814,39 @@ fn over_window_notice(
 /// Shared by both delivery paths — at a tool boundary while the turn runs, and
 /// from the main loop when one finishes while nothing else is happening — so
 /// the two cannot describe the same event differently.
+
+/// Split a leading `@name` off a relayed message.
+///
+/// A message sent while subagents are working goes to all of them, because
+/// nothing said which one it was for. Naming one is how you say: `@explore
+/// stop reading tests` reaches the explore subagent and nobody else.
+///
+/// Returns the name and the message with the address removed, so what the
+/// subagent reads is the instruction rather than the envelope. A bare `@`,
+/// or an address with nothing after it, is not an address — somebody is
+/// talking about an email or a handle, and the whole message goes to
+/// everyone as before.
+pub(crate) fn relay_address(msg: &str) -> (Option<&str>, &str) {
+    let trimmed = msg.trim_start();
+    let Some(rest) = trimmed.strip_prefix('@') else { return (None, msg) };
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (name, body) = rest.split_at(end);
+    let body = body.trim_start();
+    if name.is_empty() || body.is_empty() {
+        return (None, msg);
+    }
+    (Some(name), body)
+}
+
+/// Whether a named address picks out this subagent.
+///
+/// Matched against both the id it was given and the kind of agent it is, so
+/// `@explore` works when there is one explore subagent and `@sub-2` works
+/// when there are three. Case-insensitive: the name is typed by a person.
+pub(crate) fn relay_matches(name: &str, sub_id: &str, agent_type: &str) -> bool {
+    name.eq_ignore_ascii_case(sub_id) || name.eq_ignore_ascii_case(agent_type)
+}
+
 /// The first line of a command, for naming it in one line of UI.
 ///
 /// A backgrounded command is often a heredoc or a chain several lines long,
@@ -6002,6 +6072,43 @@ fn unanswered_tool_calls<'a>(history: &[Message], tool_calls: &'a [ToolCall]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming a subagent sends to that one, and the envelope is stripped so
+    /// what it reads is the instruction rather than the address.
+    #[test]
+    fn an_addressed_message_names_its_target_and_drops_the_address() {
+        assert_eq!(relay_address("@explore stop reading tests"),
+                   (Some("explore"), "stop reading tests"));
+        assert_eq!(relay_address("  @sub-2   check the lockfile"),
+                   (Some("sub-2"), "check the lockfile"));
+    }
+
+    /// An unaddressed message goes to everyone, unchanged.
+    #[test]
+    fn an_unaddressed_message_is_left_alone() {
+        assert_eq!(relay_address("stop reading tests"), (None, "stop reading tests"));
+        assert_eq!(relay_address("look at user@example.com"),
+                   (None, "look at user@example.com"));
+    }
+
+    /// An `@` that is not an address must not eat the message. Someone
+    /// writing about a handle, or just typing, still gets heard.
+    #[test]
+    fn a_bare_at_is_not_an_address() {
+        assert_eq!(relay_address("@"), (None, "@"));
+        assert_eq!(relay_address("@explore"), (None, "@explore"));
+        assert_eq!(relay_address("@explore   "), (None, "@explore   "));
+    }
+
+    /// Matched on the id or on the kind, because `@explore` is what a person
+    /// types when there is one of them and `@sub-2` when there are three.
+    #[test]
+    fn an_address_matches_either_the_id_or_the_kind() {
+        assert!(relay_matches("explore", "sub-1", "explore"));
+        assert!(relay_matches("sub-1", "sub-1", "explore"));
+        assert!(relay_matches("EXPLORE", "sub-1", "explore"), "a person typed it");
+        assert!(!relay_matches("plan", "sub-1", "explore"));
+    }
 
     /// A backgrounded command is named by its first line, because the thing
     /// backgrounded is often a heredoc or a chain several lines long, and a

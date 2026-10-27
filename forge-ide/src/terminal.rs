@@ -1444,7 +1444,11 @@ pub struct Terminal {
     /// Kept for the terminal's lifetime (not just transiently for spawn) so
     /// session persistence can record which directory each tab was in.
     cwd:       std::path::PathBuf,
-    focused:   bool,
+    /// Whether this terminal is taking keystrokes.
+    ///
+    /// Read from outside so the composer can decline to steal the keyboard
+    /// while somebody is working in a terminal — see `a_terminal_has_focus`.
+    pub focused:   bool,
     last_rows: u16,
     last_cols: u16,
     /// A newly observed (rows, cols) and when it was first seen — only

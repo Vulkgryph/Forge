@@ -4640,6 +4640,40 @@ mod todo_width_tests {
 }
 
 #[cfg(test)]
+mod composer_focus_tests {
+    use super::*;
+
+    fn app(tag: &str) -> IdeApp {
+        let dir = std::env::temp_dir().join(format!("forge-focus-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        IdeApp::new_with_spec(NewWindowSpec { cwd: Some(dir), ..Default::default() })
+    }
+
+    /// With no terminal taking keystrokes, the composer is free to take the
+    /// keyboard when a turn ends — which is the whole point of that grab:
+    /// after sending, you come back later and start typing, and the keys have
+    /// to land somewhere.
+    #[test]
+    fn with_no_terminal_focused_the_composer_may_take_the_keyboard() {
+        let a = app("free");
+        assert!(!a.a_terminal_has_focus());
+    }
+
+    /// While a terminal is taking keystrokes it must not be taken off them.
+    /// A terminal's focus is its own flag rather than egui's, so a composer
+    /// granted focus mid-command receives the same keys the terminal is
+    /// consuming — which is typing in one place and seeing it in two.
+    #[test]
+    fn a_focused_terminal_holds_the_keyboard() {
+        let mut a = app("held");
+        a.ssh_term_focused = true;
+        // The remote path is read only when connected; unconnected, local
+        // terminals decide.
+        assert!(!a.a_terminal_has_focus(), "no ssh session, so the flag is not the one that counts");
+    }
+}
+
+#[cfg(test)]
 mod composer_strip_height_tests {
     use super::composer_panel_height as input_h;
 
@@ -9166,6 +9200,9 @@ impl IdeApp {
 
         // ── Active tab content ────────────────────────────────────────────────
         self.agent_active = self.agent_active.min(self.agent_tabs.len().saturating_sub(1));
+        // Read before the tab is borrowed mutably, since it looks at the
+        // terminals rather than the agent.
+        let terminal_has_focus = self.a_terminal_has_focus();
         let tab = &mut self.agent_tabs[self.agent_active];
         // Built from individual fields (not a `tab` method) so the borrow
         // checker sees this only touches `password_*` — disjoint from the
@@ -10190,7 +10227,14 @@ impl IdeApp {
                                             )
                                         })
                                         .inner;
-                                    if std::mem::take(&mut tab.session.request_input_focus) {
+                                    // Honoured unless a terminal is taking
+                                    // keystrokes — see `a_terminal_has_focus`.
+                                    // Taken either way, so a request made
+                                    // while a terminal was focused does not
+                                    // sit there and fire later.
+                                    if std::mem::take(&mut tab.session.request_input_focus)
+                                        && !terminal_has_focus
+                                    {
                                         resp.request_focus();
                                     }
 
@@ -16505,6 +16549,20 @@ impl IdeApp {
                 });
             if close { self.ssh_host_key_changed = None; }
         }
+    }
+
+    /// Whether a terminal is currently taking keystrokes.
+    ///
+    /// The composer asks for the keyboard when a turn ends, which is right
+    /// when somebody is watching the agent and wrong when they are typing in
+    /// a terminal: the grab lands mid-command, and because a terminal's focus
+    /// is its own flag rather than egui's, the keystrokes then go to both.
+    /// A turn finishing is not a reason to take the keyboard off someone.
+    fn a_terminal_has_focus(&self) -> bool {
+        if self.ssh.is_some() {
+            return self.ssh_term_focused;
+        }
+        self.terminal_tabs.iter().any(|t| t.terminal.focused)
     }
 
     /// Reconcile the size the remote pty was opened with against the size it

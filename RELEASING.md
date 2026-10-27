@@ -129,11 +129,19 @@ in. The release note is simply where it is easiest to forget.
 
 ## 4. Credit
 
-One contributor identity, and it is already configured:
+One contributor identity, and it is already configured — **use it rather
+than passing a name on the command line**:
 
 ```sh
-git config user.name        # windingcreek
+git config user.name        # Vulkgryph LLC
+git -c user.name=something commit   # never this
 ```
+
+0.7.0 was prepared with 26 of 82 commits authored as `windingcreek` because
+an override was passed on every commit while the repository was configured
+as `Vulkgryph LLC`. Same email, two names, in one public history. That is
+not a leak on its own, but `windingcreek` owns private repositories
+elsewhere, and two names on one email is a correlation nobody asked for.
 
 Copyright is **Vulkgryph LLC**; see `NOTICE` and `LICENSE`. Release notes are
 written in the project's voice — "Forge now…", not "I…" or "we fixed…". Nobody

@@ -307,6 +307,26 @@ impl SubagentRunner {
                     let err_msg = format!("Subagent API error: {}", e);
                     let _ = self.status_tx.send(SubagentEvent::Error(err_msg.clone()));
 
+                    // A refusal first, before any heuristic looks at the
+                    // text. The overflow test below matches on `400`, and a
+                    // moderation refusal carries a 400 — so a refused
+                    // subagent was classified as oversized and had messages
+                    // dropped out of its history, silently, which is the
+                    // exact fault the main path was fixed for. The main path
+                    // got the guard; this one was missed, and a subagent is
+                    // where a refusal is least likely to be noticed.
+                    //
+                    // Retrying is useless either way: the same content is
+                    // refused again, and a shorter history does not make
+                    // forbidden content allowed.
+                    if let Some(code) = crate::api::client::provider_refusal(&e) {
+                        let _ = self.status_tx.send(SubagentEvent::Message(format!(
+                            "[The provider refused this request — {code}. Not a size \
+                             problem, so nothing was dropped from the history.]"
+                        )));
+                        break;
+                    }
+
                     // Try context overflow recovery
                     let err_lower = e.to_lowercase();
                     let is_overflow = err_lower.contains("context")

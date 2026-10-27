@@ -68,6 +68,11 @@ jobs:
 
       # An entry dated and present for exactly this version. A release whose
       # notes are written from the changelog needs the changelog to have one.
+      # The same script preflight runs, rather than a second expression of
+      # the rule — a copy is a second thing to get wrong.
+      - name: Each crate has a dated section for its version
+        run: python3 scripts/check_changelog_heads.py
+
       - name: The changelog has a section for this version
         run: |
           tag="${GITHUB_REF_NAME#v}"

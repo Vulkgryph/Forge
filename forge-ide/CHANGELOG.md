@@ -2,7 +2,7 @@
 
 All notable changes to Forge IDE are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge IDE adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.7.0] — 2026-10-17
+## [0.7.0] — 2026-10-27
 
 ### Fixed
 
@@ -38,7 +38,9 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 - **A message can reach the agent without stopping it.** Typing while the agent worked queued the message, and the only way to deliver one was a button whose own tooltip offered to interrupt the turn — so being heard cost whatever the running tool had done. The agent reads its action channel between steps and parks what arrives until the step finishes, so the message now lands mid-turn and the turn continues; it appears in the transcript as it is sent. Leaving it queued, and revoking it, still work as before.
 
-## [0.6.1] — 2026-10-08
+## [0.6.1] — prepared 2026-10-08, never released
+
+The tag and draft were withdrawn before publication; everything below shipped as part of 0.7.0. Kept as its own section because it is what was prepared, and rewriting that would make the record tidier than the history.
 
 ### Added
 

@@ -2,7 +2,7 @@
 
 All notable changes to Forge are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Forge adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.7.0] — 2026-10-17
+## [0.7.0] — 2026-10-27
 
 ### Fixed
 
@@ -46,7 +46,9 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
   The underlying fragility is unchanged and worth naming: the overflow test matches bare substrings — `maximum`, `exceed`, `400` — in free-form provider prose. Classifying refusals first removes the case that was actually biting; it does not make that test sound.
 
-## [0.6.1] — 2026-10-08
+## [0.6.1] — prepared 2026-10-08, never released
+
+The tag and draft were withdrawn before publication; everything below shipped as part of 0.7.0. Kept as its own section because it is what was prepared, and rewriting that would make the record tidier than the history.
 
 ### Added
 

@@ -300,25 +300,28 @@ pub fn is_terminal(fd: c_int) -> bool {
     unsafe { isatty(fd) == 1 }
 }
 
-/// Read bytes from a descriptor, retrying when a signal interrupts.
+/// Read bytes from a descriptor. A signal is reported as zero bytes, not as
+/// an error and not as end-of-input.
 ///
 /// `EINTR` is expected rather than exceptional here: `SIGWINCH` arrives on every
-/// window resize and lands while this is blocked. Returning zero on it would look
-/// exactly like end-of-input and shut the session down whenever someone dragged
-/// their window.
+/// window resize and lands while this is blocked. Reporting it as a failure would
+/// look exactly like end-of-input and shut the session down whenever someone
+/// dragged their window.
+///
+/// The retry belongs to the caller, which re-polls — and must, because a real
+/// end-of-input arrives separately as `Event::InputClosed`, so only the caller
+/// can tell the two apart. This used to be written as a `loop` that every branch
+/// returned out of, and a doc comment claiming a retry that happened elsewhere.
 pub fn read_bytes(fd: c_int, buf: &mut [u8]) -> Option<usize> {
-    loop {
-        // SAFETY: writing at most `buf.len()` bytes into `buf`.
-        let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n >= 0 {
-            return Some(n as usize);
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            return Some(0); // caller re-polls; a resize is not end-of-input
-        }
-        return None;
+    // SAFETY: writing at most `buf.len()` bytes into `buf`.
+    let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n >= 0 {
+        return Some(n as usize);
     }
+    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        return Some(0); // caller re-polls; a resize is not end-of-input
+    }
+    None
 }
 
 /// Install a signal handler.

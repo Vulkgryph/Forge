@@ -6073,6 +6073,46 @@ fn unanswered_tool_calls<'a>(history: &[Message], tool_calls: &'a [ToolCall]) ->
 mod tests {
     use super::*;
 
+    /// A moderation refusal must not be read as an oversized request —
+    /// anywhere, not only in the main path.
+    ///
+    /// The subagent loop tested the error text for `400` to decide whether
+    /// to shed history, and a refusal carries a 400. So a refused subagent
+    /// quietly lost messages, which is the fault the main path was fixed
+    /// for and the one the 0.7.0 notes claim is fixed. A subagent is also
+    /// where it is least likely to be noticed.
+    ///
+    /// Asserted against the classifier both paths now consult, so the two
+    /// cannot drift apart again by one of them being edited.
+    #[test]
+    fn a_refusal_is_not_an_oversized_request() {
+        for refusal in [
+            "API error (400 Bad Request): flagged for possible violation of our usage policies",
+            "API error (400): content_policy violation",
+            "cyber_policy: refused",
+        ] {
+            assert!(
+                crate::api::client::provider_refusal(refusal).is_some(),
+                "not recognised as a refusal: {refusal}",
+            );
+        }
+    }
+
+    /// And a genuine overflow is still an overflow — a guard that swallowed
+    /// those would trade one silent failure for another.
+    #[test]
+    fn a_real_overflow_is_not_mistaken_for_a_refusal() {
+        for overflow in [
+            "API error (400 Bad Request): maximum context length exceeded",
+            "API error (413 Payload Too Large): request too long",
+        ] {
+            assert!(
+                crate::api::client::provider_refusal(overflow).is_none(),
+                "an overflow was read as a refusal: {overflow}",
+            );
+        }
+    }
+
     /// Naming a subagent sends to that one, and the envelope is stripped so
     /// what it reads is the instruction rather than the address.
     #[test]

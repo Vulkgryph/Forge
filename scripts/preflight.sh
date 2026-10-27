@@ -52,6 +52,8 @@ echo "Documentation"
 # shellcheck disable=SC2016
 check "no version pinned as a literal" \
     python3 scripts/check_pinned_versions.py
+check "each crate has a dated section for its version" \
+    python3 scripts/check_changelog_heads.py
 check "documentation links resolve" python3 - <<'PY'
 import os, re, subprocess, sys
 files = [f for f in subprocess.run(["git","ls-files","*.md"],capture_output=True,text=True)

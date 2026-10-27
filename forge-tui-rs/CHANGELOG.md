@@ -2,7 +2,19 @@
 
 All notable changes to the Forge terminal client are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.6.1] — 2026-10-08
+## [0.7.0] — 2026-10-27
+
+### Fixed
+
+- **The terminal client no longer carries the path of the machine that built it.** `find_agent_binary` searched a directory derived from `CARGO_MANIFEST_DIR`, which is substituted at compile time — so a released binary held the build machine's checkout path as an ordinary string literal, where neither `--remap-path-prefix` (which rewrites debug info and panic locations) nor `strip` could reach it. The lookup could never have succeeded on an installed copy anyway, since it is not run from the tree it was built in. Compiled out of release builds. Caught by the packaging guard, which refused to sign.
+
+### Note
+
+- **Background-command visibility is the agent and the editor, not the terminal client.** 0.7.0 lets a person see what the agent left running in the background and stop it, but that surface is in the editor's panel. Running the agent through this client, background commands are still reachable only by asking the model about them.
+
+## [0.6.1] — prepared 2026-10-08, never released
+
+The tag and draft were withdrawn before publication; everything below shipped as part of 0.7.0. Kept as its own section because it is what was prepared, and rewriting that would make the record tidier than the history.
 
 No changes to the terminal client itself. The version moves with the release so
 that the client, the agent it spawns and the editor that embeds them always
@@ -12,8 +24,6 @@ reading a bug report.
 ## [0.6.0] — 2026-09-29
 
 ### Fixed
-
-- **The terminal client no longer carries the path of the machine that built it.** `find_agent_binary` searched a directory derived from `CARGO_MANIFEST_DIR`, which is substituted at compile time — so a released binary held the build machine's checkout path as an ordinary string literal, where neither `--remap-path-prefix` (which rewrites debug info and panic locations) nor `strip` could reach it. The lookup could never have succeeded on an installed copy anyway, since it is not run from the tree it was built in. Compiled out of release builds. Caught by the packaging guard, which refused to sign.
 
 - **Choosing an option left the menu open, so it looked like nothing happened.** Pressing Enter on a model, a permission mode, a context strategy or offline on/off applied the change and then sat there showing the same menu — which reads as a keypress that did nothing, and invites pressing it again. A choice of one thing now ends the visit. Lists of independent switches, like turning individual tools on and off, still stay open, because somebody turning one off is plausibly about to turn another off.
 

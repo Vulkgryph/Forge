@@ -2729,6 +2729,25 @@ pub(crate) fn content_width(ui: &egui::Ui, pad: f32) -> f32 {
     (ui.available_width() - pad).max(NARROWEST)
 }
 
+/// How tall the composer panel must be to hold everything drawn in it.
+///
+/// Every strip inside the panel has to be counted here. The background strip
+/// was not, so its rows came out of the text area instead: with anything
+/// running in the background the composer stopped growing with what was
+/// being typed, and you could not read your own message past a line or two.
+pub(crate) fn composer_panel_height(
+    text_h: f32,
+    queued: usize,
+    background: usize,
+    active: bool,
+) -> f32 {
+    /// One row of a strip, plus the gap under the last one.
+    const ROW: f32 = 24.0;
+    const PAD: f32 = 4.0;
+    let strip = |n: usize| if n == 0 { 0.0 } else { ROW * n as f32 + PAD };
+    62.0 + text_h + strip(queued) + strip(background) + if active { 22.0 } else { 0.0 }
+}
+
 fn wrap_run(ui: &egui::Ui, size: f32, monospace: bool) -> usize {
     let font = if monospace {
         egui::FontId::monospace(size)
@@ -4617,6 +4636,48 @@ mod todo_width_tests {
                  the task text stopped being drawn",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod composer_strip_height_tests {
+    use super::composer_panel_height as input_h;
+
+    /// Every strip drawn inside the panel has to be counted in its height.
+    ///
+    /// The background strip was not, so its rows came out of the text area:
+    /// with something running in the background the composer stopped growing
+    /// with what was being typed, and you could not read your own message
+    /// past a line or two.
+    #[test]
+    fn a_strip_drawn_in_the_panel_is_counted_in_its_height() {
+        let none = input_h(60.0, 0, 0, false);
+        for n in 1..=4 {
+            let with = input_h(60.0, 0, n, false);
+            assert!(
+                with >= none + 24.0 * n as f32,
+                "{n} background row(s) added {} of height, not {}",
+                with - none, 24.0 * n as f32,
+            );
+        }
+    }
+
+    /// Queued messages and background commands can be present at once, and
+    /// each needs its own room — one must not be paid for out of the other.
+    #[test]
+    fn queued_and_background_rows_both_get_room() {
+        let base = input_h(60.0, 0, 0, false);
+        let both = input_h(60.0, 2, 3, false);
+        assert!(both >= base + 24.0 * 5.0, "five rows did not get five rows of height");
+    }
+
+    /// Typing still grows the box: the text area's own height is additive,
+    /// so a longer message is not traded against the strips.
+    #[test]
+    fn the_text_area_still_grows_independently() {
+        let short = input_h(40.0, 0, 2, true);
+        let tall = input_h(140.0, 0, 2, true);
+        assert_eq!(tall - short, 100.0, "typing stopped growing the composer");
     }
 }
 
@@ -9878,10 +9939,12 @@ impl IdeApp {
 
         // Input box pinned to bottom
         let tab = &mut self.agent_tabs[self.agent_active];
-        let queue_h = if tab.session.queued.is_empty() { 0.0 }
-                      else { 24.0 * tab.session.queued.len() as f32 + 4.0 };
+        // The background strip is drawn inside this panel, so the panel has
+        // to be tall enough for it. Left out of the height, it took its rows
+        // from the text area instead — and the composer stopped growing with
+        // what was being typed, so you could not read your own message past a
+        // line or two while anything was running in the background.
         let show_activity = tab.session.is_active();
-        let activity_h = if show_activity { 22.0 } else { 0.0 };
         // The composer grows with what is being typed instead of scrolling
         // inside three fixed lines. Bounded at 40% of the panel so the
         // transcript above never disappears behind the box, and so a very long
@@ -9894,7 +9957,9 @@ impl IdeApp {
         // of what somebody is typing below the bottom of the window.
         let wrap_w = (ui.available_width() - 12.0 - 16.0 - 4.0).max(80.0);
         let text_h = composer_text_height(ui, &tab.session.input, wrap_w, panel_h * 0.40);
-        let input_h = 62.0 + text_h + queue_h + activity_h;
+        let input_h = composer_panel_height(
+            text_h, tab.session.queued.len(), tab.session.background.len(), show_activity,
+        );
         let mut revoke_idx: Option<usize> = None;
         let mut kill_bg_id: Option<String> = None;
         let mut send_now_idx: Option<usize> = None;
@@ -12201,7 +12266,13 @@ impl IdeApp {
 
         // Click to focus / click outside to blur
         let click = ui.interact(panel_rect, focus_id.with("click"), egui::Sense::click());
-        if click.clicked() { self.ssh_term_focused = true; }
+        if click.clicked() {
+            self.ssh_term_focused = true;
+            // See the local terminal: egui's keyboard focus is separate from
+            // this flag, and a composer still holding it receives the same
+            // keystrokes this terminal is consuming.
+            ui.memory_mut(|m| m.stop_text_input());
+        }
         if ui.input(|i| i.pointer.any_click())
             && !panel_rect.contains(
                 ui.input(|i| i.pointer.interact_pos().unwrap_or_default()))

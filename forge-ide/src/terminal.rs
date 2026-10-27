@@ -2113,6 +2113,14 @@ impl Terminal {
         if panel_resp.clicked() || scroll_resp.inner.clicked() {
             ui.memory_mut(|m| m.request_focus(focus_id));
             self.focused = true;
+                // Taking the terminal's focus has to take egui's too.
+                // The two are separate: this flag decides whether the
+                // terminal consumes keys, while a `TextEdit` elsewhere keeps
+                // egui's keyboard focus until something takes it away. With
+                // the agent composer holding focus — which it now does after
+                // a message is sent, deliberately — a keystroke went to both,
+                // so typing in the terminal also typed into the chat box.
+                ui.memory_mut(|m| m.stop_text_input());
         }
         if ui.input(|i| i.pointer.any_click()) && !panel_rect.contains(
             ui.input(|i| i.pointer.interact_pos().unwrap_or_default())
@@ -2135,6 +2143,14 @@ impl Terminal {
             ui.ctx().input(|i| i.pointer.interact_pos().unwrap_or_default())
         ) {
             self.focused = true;
+                // Taking the terminal's focus has to take egui's too.
+                // The two are separate: this flag decides whether the
+                // terminal consumes keys, while a `TextEdit` elsewhere keeps
+                // egui's keyboard focus until something takes it away. With
+                // the agent composer holding focus — which it now does after
+                // a message is sent, deliberately — a keystroke went to both,
+                // so typing in the terminal also typed into the chat box.
+                ui.memory_mut(|m| m.stop_text_input());
             ui.memory_mut(|m| m.request_focus(focus_id));
             let paths: Vec<String> = dropped.iter()
                 .filter_map(|f| f.path.as_ref())

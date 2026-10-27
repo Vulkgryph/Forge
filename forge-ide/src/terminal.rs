@@ -2410,6 +2410,67 @@ mod ink_redraw_tests {
 }
 
 #[cfg(test)]
+mod resize_duplication_tests {
+    use super::Grid;
+
+    /// Lines present in the grid, viewport and history together, trimmed.
+    fn lines(g: &Grid) -> Vec<String> {
+        g.all_text().lines().map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty()).collect()
+    }
+
+    /// Making a terminal taller reveals history. It must not copy what is
+    /// already on screen.
+    ///
+    /// Reported from the editor: growing the panel by five rows produced five
+    /// repetitions of the last message instead of five rows of scrollback.
+    #[test]
+    fn growing_the_terminal_does_not_duplicate_what_is_on_screen() {
+        let mut g = Grid::with_size(6, 40);
+        for i in 0..20 { g.process(&format!("line {i}\r\n")); }
+        let before = lines(&g);
+
+        g.resize(12, 40);
+        let after = lines(&g);
+
+        for l in &after {
+            let n = after.iter().filter(|x| *x == l).count();
+            assert_eq!(n, 1, "{l:?} appears {n} times after growing\nbefore={before:?}\nafter={after:?}");
+        }
+    }
+
+    /// The same, when the width changes too — which is what happens when the
+    /// panel is dragged, and is the case the report came from.
+    #[test]
+    fn growing_and_widening_does_not_duplicate() {
+        let mut g = Grid::with_size(6, 40);
+        for i in 0..20 { g.process(&format!("message number {i} with enough text to wrap once\r\n")); }
+
+        g.resize(12, 72);
+        let after = lines(&g);
+        for l in &after {
+            let n = after.iter().filter(|x| *x == l).count();
+            assert_eq!(n, 1, "{l:?} appears {n} times after grow+widen");
+        }
+    }
+
+    /// Shrinking then growing back must not multiply anything either.
+    #[test]
+    fn a_round_trip_resize_does_not_multiply_lines() {
+        let mut g = Grid::with_size(10, 50);
+        for i in 0..15 { g.process(&format!("row {i}\r\n")); }
+        let before = lines(&g);
+
+        g.resize(5, 50);
+        g.resize(10, 50);
+        let after = lines(&g);
+
+        assert!(after.len() <= before.len() + 1,
+                "lines grew from {} to {} across a round trip", before.len(), after.len());
+    }
+}
+
+#[cfg(test)]
 mod osc52_clipboard_tests {
     use super::{base64_decode, Grid, OSC_PAYLOAD_LIMIT};
 

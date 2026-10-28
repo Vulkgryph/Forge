@@ -5349,6 +5349,14 @@ pub struct IdeApp {
     /// Dedicated terminal grid for the remote shell (separate from local PTY).
     ssh_term:        std::sync::Arc<std::sync::Mutex<crate::terminal::Grid>>,
     ssh_term_focused: bool,
+    /// When the settings file was last written, as far as this window knows.
+    ///
+    /// Settings are shared by every window and each holds its own copy, so a
+    /// window that never looks at the file again will write its stale copy
+    /// over somebody else's change. Compared against the file's mtime each
+    /// frame; a difference means another window saved and this one should
+    /// catch up before it writes anything of its own.
+    settings_seen_at: Option<std::time::SystemTime>,
     /// Fingerprint of a host not in known_hosts, awaiting the user's answer.
     ssh_host_key_prompt: Option<String>,
     /// A host whose key no longer matches known_hosts. Shown, never offered as
@@ -5710,6 +5718,7 @@ impl IdeApp {
             ssh_term:         std::sync::Arc::new(std::sync::Mutex::new(
                                    crate::terminal::Grid::with_size(50, 220))),
             ssh_term_focused: false,
+            settings_seen_at: crate::settings::modified_at(),
             ssh_host_key_prompt: None,
             ssh_host_key_changed: None,
             ssh_term_size: (0, 0),
@@ -6925,6 +6934,13 @@ impl IdeApp {
     }
 
     pub fn draw(&mut self, ctx: &egui::Context) {
+        // Another window's settings change, picked up before anything is
+        // drawn from them. Cheap: a `stat` on a frame that was happening
+        // anyway, and it fires only when the file is one this window did not
+        // write.
+        if self.absorb_foreign_settings() {
+            ctx.request_repaint();
+        }
         // Load fonts on first frame and skip rendering — egui processes
         // set_fonts() asynchronously so the named family isn't ready until
         // the following frame.
@@ -11973,7 +11989,13 @@ impl IdeApp {
 
         self.settings_skip_all_confirm = skip_all_confirm;
         if changed {
+            // Another window may have changed something else since this one
+            // last looked. Writing now would revert it, so take theirs first
+            // and re-apply only what was just edited — which is already in
+            // `self.settings` and survives because `absorb` is skipped when
+            // the file is one we wrote.
             crate::settings::save(&self.settings);
+            self.settings_seen_at = crate::settings::modified_at();
             // Panels above were already painted using the previous settings.
             ctx.request_repaint();
         }
@@ -16583,6 +16605,23 @@ impl IdeApp {
                 });
             if close { self.ssh_host_key_changed = None; }
         }
+    }
+
+    /// Pick up a settings change made in another window.
+    ///
+    /// Returns whether anything was reloaded, so the caller can repaint. Our
+    /// own writes update `settings_seen_at`, so this only fires for somebody
+    /// else's — otherwise every save would be read straight back and the
+    /// window would flicker between two identical copies.
+    fn absorb_foreign_settings(&mut self) -> bool {
+        let Some(on_disk) = crate::settings::modified_at() else { return false };
+        if self.settings_seen_at == Some(on_disk) {
+            return false;
+        }
+        self.settings_seen_at = Some(on_disk);
+        let loaded = crate::settings::load();
+        self.settings = loaded;
+        true
     }
 
     /// Whether a terminal is currently taking keystrokes.

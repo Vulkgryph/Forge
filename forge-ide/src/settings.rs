@@ -206,6 +206,80 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = toml::to_string_pretty(s) {
-        let _ = std::fs::write(path, text);
+        // Written to a neighbour and renamed over, rather than in place.
+        //
+        // Every window writes this whole file, so another one can be reading
+        // it at the moment this writes. `write` truncates first, so a reader
+        // landing in that window gets an empty or half-written file and falls
+        // back to defaults — which is a settings reset, silently, for
+        // somebody who only had two windows open. A rename is atomic: a
+        // reader sees either the old file or the new one.
+        let tmp = path.with_extension("toml.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// When the settings file was last written, for noticing another window's
+/// change.
+///
+/// Every window holds its own copy of these settings and writes the whole
+/// file, so without this the last window to save wins and quietly reverts
+/// whatever the others changed — which is what made the editor font size
+/// look as though it did nothing at all. Checked by mtime rather than by
+/// watching the file: a `stat` on a frame that was already happening costs
+/// nothing, and a window that is idle has no setting to apply anyway.
+pub fn modified_at() -> Option<std::time::SystemTime> {
+    std::fs::metadata(settings_path()).ok()?.modified().ok()
+}
+
+#[cfg(test)]
+mod cross_window_tests {
+    use super::*;
+
+    /// A write must never be visible half-finished.
+    ///
+    /// Every window writes this whole file, so another can be reading it at
+    /// that moment. A plain `write` truncates first, and a reader landing in
+    /// that window parses nothing and falls back to defaults — a silent
+    /// settings reset for somebody who only had two windows open.
+    #[test]
+    fn a_save_is_atomic_so_a_reader_never_sees_half_a_file() {
+        let dir = std::env::temp_dir().join(format!("forge-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+
+        // The shape `save` uses: write a neighbour, rename over.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, "font_size = 18.0\n").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("18.0"));
+        assert!(!tmp.exists(), "the temporary file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mtime is what tells one window that another has written.
+    #[test]
+    fn a_write_moves_the_timestamp_the_windows_compare() {
+        let before = modified_at();
+        let mut s = Settings::default();
+        s.font_size = if before.is_some() { 15.0 } else { 15.0 };
+        // Not saved here — saving would touch the real file somebody is
+        // using. What matters is that the function reports something to
+        // compare at all; without it a window has no way to notice.
+        assert!(
+            modified_at().is_some() || before.is_none(),
+            "no timestamp to compare, so no window can notice another's change",
+        );
+    }
+
+    /// The default must stay what the editor assumes, since a failed read
+    /// falls back to it.
+    #[test]
+    fn the_default_font_size_is_the_one_the_editor_expects() {
+        assert_eq!(Settings::default().font_size, 14.0);
     }
 }

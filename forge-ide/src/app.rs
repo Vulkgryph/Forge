@@ -2642,13 +2642,13 @@ fn draw_perm_mode_row(
             ui.vertical(|ui| {
                 ui.set_max_width(content_width(ui, 8.0));
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(label).size(12.5).color(color).strong());
+                    ui.label(egui::RichText::new(label).size(crate::settings::panel_text(12.5)).color(color).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if is_current { paint_checkmark(ui, color); }
                     });
                 });
                 ui.add_space(3.0);
-                ui.label(egui::RichText::new(description).size(9.5)
+                ui.label(egui::RichText::new(description).size(crate::settings::panel_text(9.5))
                     .color(egui::Color32::from_gray(150)));
             });
         });
@@ -3284,7 +3284,7 @@ fn draw_read_group(ui: &mut egui::Ui, items: &[ChatItem], start: usize, end: usi
                                 _ => None,
                             });
                             if let Some(meta) = meta {
-                                ui.label(egui::RichText::new(meta).size(11.0).color(egui::Color32::from_gray(130)));
+                                ui.label(egui::RichText::new(meta).size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(130)));
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 match (approval, &result) {
@@ -3302,7 +3302,7 @@ fn draw_read_group(ui: &mut egui::Ui, items: &[ChatItem], start: usize, end: usi
                                 ui.add_sized(
                                     egui::vec2(avail, 16.0),
                                     egui::Label::new(
-                                        egui::RichText::new(desc).size(12.0)
+                                        egui::RichText::new(desc).size(crate::settings::panel_text(12.0))
                                             .color(egui::Color32::from_gray(205)),
                                     )
                                     .truncate(),
@@ -3390,10 +3390,10 @@ fn draw_write_card(
                     let header = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(d) = &diff {
                             ui.label(egui::RichText::new(format!("+{} \u{2212}{}", d.added, d.removed))
-                                .size(11.0).monospace().color(egui::Color32::from_gray(150)));
+                                .size(crate::settings::panel_text(11.0)).monospace().color(egui::Color32::from_gray(150)));
                             ui.add_space(6.0);
                             let popup_id = ui.make_persistent_id(("tool_diff_popup", idx));
-                            let btn = ui.add(egui::Button::new(egui::RichText::new("Open diff").size(11.0))
+                            let btn = ui.add(egui::Button::new(egui::RichText::new("Open diff").size(crate::settings::panel_text(11.0)))
                                 .fill(egui::Color32::from_rgb(36, 39, 44)));
                             if btn.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
                             egui::popup_below_widget(
@@ -3417,7 +3417,7 @@ fn draw_write_card(
                             ui.add_sized(
                                 egui::vec2(avail, 16.0),
                                 egui::Label::new(
-                                    egui::RichText::new(desc).size(12.5)
+                                    egui::RichText::new(desc).size(crate::settings::panel_text(12.5))
                                         .color(egui::Color32::from_gray(220)),
                                 )
                                 .truncate(),
@@ -3439,7 +3439,7 @@ fn draw_write_card(
                                 let first_line: String = strip_ansi(c.trim()).lines().next().unwrap_or("").chars().take(70).collect();
                                 if !first_line.is_empty() {
                                     let resp = ui.label(egui::RichText::new(soft_wrap(&first_line, wrap_run(ui, 10.5, true)))
-                                        .monospace().size(10.5).color(egui::Color32::from_gray(140)));
+                                        .monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(140)));
                                     click_target = click_target.union(resp);
                                 }
                             }
@@ -3461,7 +3461,7 @@ fn draw_write_card(
                                     .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new(soft_wrap(&full, wrap_run(ui, 10.5, true)))
-                                            .monospace().size(10.5).color(egui::Color32::from_gray(150)));
+                                            .monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                     });
                             }
                         }
@@ -3474,10 +3474,10 @@ fn draw_write_card(
                     if matches!(approval, ApprovalState::Pending) {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let approve = ui.add(egui::Button::new(egui::RichText::new("Approve").size(11.0))
+                            let approve = ui.add(egui::Button::new(egui::RichText::new("Approve").size(crate::settings::panel_text(11.0)))
                                 .fill(egui::Color32::from_rgb(40, 80, 40)));
                             if approve.clicked() { *pending_action = Some((idx, true)); }
-                            let deny = ui.add(egui::Button::new(egui::RichText::new("Deny").size(11.0))
+                            let deny = ui.add(egui::Button::new(egui::RichText::new("Deny").size(crate::settings::panel_text(11.0)))
                                 .fill(egui::Color32::from_rgb(80, 40, 40)));
                             if deny.clicked() { *pending_action = Some((idx, false)); }
                         });
@@ -3566,12 +3566,12 @@ fn draw_terminal_card(
                             (_, true, false)              => paint_cross(ui, status_color),
                             (_, true, true)                => paint_checkmark(ui, status_color),
                         }
-                        ui.label(egui::RichText::new("shell").monospace().size(10.5).color(egui::Color32::from_gray(120)));
+                        ui.label(egui::RichText::new("shell").monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(120)));
                     });
                     ui.add_space(2.0);
                     let cmd = describe_tool_call(name, args);
                     ui.label(egui::RichText::new(format!("$ {}", soft_wrap(&cmd, wrap_run(ui, 11.5, true))))
-                        .monospace().size(11.5).color(egui::Color32::from_gray(225)));
+                        .monospace().size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(225)));
                     if let Some(c) = content {
                         let trimmed = strip_ansi(c.trim());
                         if !trimmed.is_empty() {
@@ -3583,17 +3583,17 @@ fn draw_terminal_card(
                                 .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                 .show(ui, |ui| {
                                     ui.label(egui::RichText::new(soft_wrap(&trimmed, wrap_run(ui, 11.0, true)))
-                                        .monospace().size(11.0).color(egui::Color32::from_gray(165)));
+                                        .monospace().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(165)));
                                 });
                         }
                     }
                     if matches!(approval, ApprovalState::Pending) {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let approve = ui.add(egui::Button::new(egui::RichText::new("Approve").size(11.0))
+                            let approve = ui.add(egui::Button::new(egui::RichText::new("Approve").size(crate::settings::panel_text(11.0)))
                                 .fill(egui::Color32::from_rgb(40, 80, 40)));
                             if approve.clicked() { *pending_action = Some((idx, true)); }
-                            let deny = ui.add(egui::Button::new(egui::RichText::new("Deny").size(11.0))
+                            let deny = ui.add(egui::Button::new(egui::RichText::new("Deny").size(crate::settings::panel_text(11.0)))
                                 .fill(egui::Color32::from_rgb(80, 40, 40)));
                             if deny.clicked() { *pending_action = Some((idx, false)); }
                         });
@@ -3702,16 +3702,16 @@ fn draw_question_card(
                         } else {
                             paint_ring(ui, egui::Color32::from_rgb(224, 158, 90));
                         }
-                        ui.label(egui::RichText::new("question").size(11.5).color(egui::Color32::from_rgb(140, 180, 220)));
+                        ui.label(egui::RichText::new("question").size(crate::settings::panel_text(11.5)).color(egui::Color32::from_rgb(140, 180, 220)));
                     });
                     ui.add_space(3.0);
 
                     if items.is_empty() {
-                        ui.label(egui::RichText::new(soft_wrap(question, wrap_run(ui, 12.5, false))).size(12.5).color(egui::Color32::from_gray(220)));
+                        ui.label(egui::RichText::new(soft_wrap(question, wrap_run(ui, 12.5, false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::from_gray(220)));
                         if answered {
                             if !free_text.trim().is_empty() {
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new(soft_wrap(free_text, wrap_run(ui, 11.0, false))).italics().size(11.0).color(egui::Color32::from_gray(160)));
+                                ui.label(egui::RichText::new(soft_wrap(free_text, wrap_run(ui, 11.0, false))).italics().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(160)));
                             }
                         } else {
                             ui.add_space(4.0);
@@ -3729,16 +3729,16 @@ fn draw_question_card(
                         for (qi, q) in items.iter().enumerate() {
                             if qi > 0 { ui.add_space(8.0); }
                             if !q.header.is_empty() {
-                                ui.label(egui::RichText::new(&q.header).strong().size(11.5).color(egui::Color32::from_rgb(140, 180, 220)));
+                                ui.label(egui::RichText::new(&q.header).strong().size(crate::settings::panel_text(11.5)).color(egui::Color32::from_rgb(140, 180, 220)));
                             }
-                            ui.label(egui::RichText::new(soft_wrap(&q.question, wrap_run(ui, 12.0, false))).size(12.0).color(egui::Color32::from_gray(220)));
+                            ui.label(egui::RichText::new(soft_wrap(&q.question, wrap_run(ui, 12.0, false))).size(crate::settings::panel_text(12.0)).color(egui::Color32::from_gray(220)));
                             ui.add_space(3.0);
                             let sel = selected.get(qi).cloned().unwrap_or_default();
                             if answered {
                                 let labels: Vec<&str> = sel.iter()
                                     .filter_map(|&oi| q.options.get(oi)).map(|o| o.label.as_str()).collect();
                                 let summary = if labels.is_empty() { "(no answer)".to_string() } else { labels.join(", ") };
-                                ui.label(egui::RichText::new(summary).italics().size(11.0).color(egui::Color32::from_gray(160)));
+                                ui.label(egui::RichText::new(summary).italics().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(160)));
                             } else {
                                 for (oi, opt) in q.options.iter().enumerate() {
                                     let is_sel = sel.contains(&oi);
@@ -3750,10 +3750,10 @@ fn draw_question_card(
                                         }
                                         ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)));
                                         ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new(&opt.label).size(11.5)
+                                            ui.label(egui::RichText::new(&opt.label).size(crate::settings::panel_text(11.5))
                                                 .color(if is_sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) }));
                                             if !opt.description.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, wrap_run(ui, 10.0, false))).size(10.0).color(egui::Color32::from_gray(140)));
+                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, wrap_run(ui, 10.0, false))).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(140)));
                                             }
                                         });
                                     });
@@ -3862,7 +3862,7 @@ fn draw_plan_card(
                         } else {
                             paint_ring(ui, accent);
                         }
-                        ui.label(egui::RichText::new("plan").size(11.5).color(accent));
+                        ui.label(egui::RichText::new("plan").size(crate::settings::panel_text(11.5)).color(accent));
                         if !plan_path.is_empty() {
                             // Shortened from the front, as on the tool cards, and
                             // sized so the disclosure triangle keeps its place.
@@ -3871,7 +3871,7 @@ fn draw_plan_card(
                             let shown = elide_path_head(ui, plan_path, &font, avail);
                             ui.add_sized(
                                 egui::vec2(avail, 16.0),
-                                egui::Label::new(egui::RichText::new(shown).monospace().size(10.0)
+                                egui::Label::new(egui::RichText::new(shown).monospace().size(crate::settings::panel_text(10.0))
                                     .color(egui::Color32::from_gray(140))).truncate(),
                             );
                         }
@@ -3886,7 +3886,7 @@ fn draw_plan_card(
                     }
                     if resolved {
                         ui.add_space(3.0);
-                        ui.label(egui::RichText::new(resolution).italics().size(11.0).color(accent));
+                        ui.label(egui::RichText::new(resolution).italics().size(crate::settings::panel_text(11.0)).color(accent));
                     }
 
                     if expanded {
@@ -4013,21 +4013,21 @@ fn draw_input_needed_card(
                     ui.horizontal(|ui| {
                         if resolved { paint_checkmark(ui, accent); } else { paint_ring(ui, accent); }
                         let label = if is_password { "password needed" } else { "input needed" };
-                        ui.label(egui::RichText::new(label).size(11.5).color(accent));
+                        ui.label(egui::RichText::new(label).size(crate::settings::panel_text(11.5)).color(accent));
                         if !command.is_empty() {
-                            ui.label(egui::RichText::new(soft_wrap(command, wrap_run(ui, 10.0, true))).monospace().size(10.0)
+                            ui.label(egui::RichText::new(soft_wrap(command, wrap_run(ui, 10.0, true))).monospace().size(crate::settings::panel_text(10.0))
                                 .color(egui::Color32::from_gray(140)));
                         }
                     });
                     ui.add_space(3.0);
-                    ui.label(egui::RichText::new(soft_wrap(prompt, wrap_run(ui, 11.5, false))).size(11.5).color(egui::Color32::from_gray(210)));
+                    ui.label(egui::RichText::new(soft_wrap(prompt, wrap_run(ui, 11.5, false))).size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(210)));
 
                     if resolved {
                         ui.add_space(3.0);
-                        ui.label(egui::RichText::new(resolution).italics().size(11.0).color(accent));
+                        ui.label(egui::RichText::new(resolution).italics().size(crate::settings::panel_text(11.0)).color(accent));
                         if resolution.starts_with("Auto-supplied") {
                             let link = ui.label(egui::RichText::new("forget saved password")
-                                .size(10.0).underline().color(egui::Color32::from_gray(150)));
+                                .size(crate::settings::panel_text(10.0)).underline().color(egui::Color32::from_gray(150)));
                             if link.interact(egui::Sense::click()).clicked() {
                                 *edit = Some(InputNeededEdit::ForgetSaved { item_idx });
                             }
@@ -4060,7 +4060,7 @@ fn draw_input_needed_card(
                             "To let the agent auto-answer this password for the rest of the \
                              session (never stored anywhere but a temp file, never shown to \
                              the model), type ALLOW below.")
-                            .size(9.5).color(egui::Color32::from_gray(140)));
+                            .size(crate::settings::panel_text(9.5)).color(egui::Color32::from_gray(140)));
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             let mut confirm = remember_confirm.to_string();
@@ -4151,16 +4151,16 @@ fn draw_checkpoint_card(
                     // conversation, not a dense list, so the line costs little.
                     ui.horizontal(|ui| {
                         paint_dot(ui, egui::Color32::from_gray(140));
-                        ui.label(egui::RichText::new("checkpoint").size(10.5).color(egui::Color32::from_gray(160)));
+                        ui.label(egui::RichText::new("checkpoint").size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(160)));
                         let preview_short: String = preview.chars().take(60).collect();
                         ui.add_sized(
                             egui::vec2(ui.available_width(), 16.0),
-                            egui::Label::new(egui::RichText::new(preview_short).size(10.5)
+                            egui::Label::new(egui::RichText::new(preview_short).size(crate::settings::panel_text(10.5))
                                 .color(egui::Color32::from_gray(190))).truncate(),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{message_count} msgs")).size(9.5)
+                        ui.label(egui::RichText::new(format!("{message_count} msgs")).size(crate::settings::panel_text(9.5))
                             .color(egui::Color32::from_gray(120)));
                         if !confirming {
                             if !preview_loading && preview_result.is_none() {
@@ -4176,19 +4176,19 @@ fn draw_checkpoint_card(
                     if preview_loading {
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new("Loading preview…")
-                            .size(10.0).color(egui::Color32::from_gray(140)));
+                            .size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(140)));
                     }
                     if let Some(result) = preview_result {
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new(soft_wrap(result, wrap_run(ui, 10.0, false)))
-                            .size(10.0).color(egui::Color32::from_gray(190)));
+                            .size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(190)));
                     }
                     if confirming {
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new(
                             "Restore files and conversation to this point? Messages after it \
                              will still show here, but no longer apply.")
-                            .size(10.0).color(egui::Color32::from_rgb(230, 170, 110)));
+                            .size(crate::settings::panel_text(10.0)).color(egui::Color32::from_rgb(230, 170, 110)));
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             if ui.button("Confirm Rewind").clicked() {
@@ -4246,7 +4246,7 @@ fn draw_provider_busy_card(
             ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), wrap_run(ui, 12.5, false)))
                 .color(egui::Color32::from_rgb(255, 110, 100)));
             if resolved {
-                ui.label(egui::RichText::new(resolution).size(10.0).color(egui::Color32::from_gray(130)));
+                ui.label(egui::RichText::new(resolution).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(130)));
                 return;
             }
             let ep = endpoints.iter()
@@ -4312,7 +4312,7 @@ fn draw_subagent_strip_entry(
                     } else {
                         paint_dot(ui, egui::Color32::from_rgb(150, 170, 255));
                     }
-                    ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
+                    ui.label(egui::RichText::new(agent_type).monospace().size(crate::settings::panel_text(11.5)).strong()
                         .color(egui::Color32::from_rgb(150, 205, 210)));
                     // Same reservation as the checkpoint row: an approval count
                     // must not be pushed off by the prompt it belongs to.
@@ -4338,7 +4338,7 @@ fn draw_subagent_strip_entry(
                     };
                     ui.add_sized(
                         egui::vec2((ui.available_width() - reserved).max(16.0), 16.0),
-                        egui::Label::new(egui::RichText::new(line).size(10.5).color(colour))
+                        egui::Label::new(egui::RichText::new(line).size(crate::settings::panel_text(10.5)).color(colour))
                             .truncate(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4346,7 +4346,7 @@ fn draw_subagent_strip_entry(
                             .filter(|i| matches!(i, ChatItem::ToolRequest { approval: ApprovalState::Pending, .. }))
                             .count();
                         if pending_count > 0 {
-                            ui.label(egui::RichText::new(format!("{pending_count} awaiting approval")).size(10.0)
+                            ui.label(egui::RichText::new(format!("{pending_count} awaiting approval")).size(crate::settings::panel_text(10.0))
                                 .color(egui::Color32::from_rgb(224, 158, 90)));
                         }
                     });
@@ -4360,7 +4360,7 @@ fn draw_subagent_strip_entry(
                     egui::ScrollArea::vertical().id_salt(("subagent_items", path.to_vec())).max_height(130.0)
                         .show(ui, |ui| {
                             if items.is_empty() {
-                                ui.label(egui::RichText::new("No tool calls yet").italics().size(10.5)
+                                ui.label(egui::RichText::new("No tool calls yet").italics().size(crate::settings::panel_text(10.5))
                                     .color(egui::Color32::from_gray(120)));
                                 return;
                             }
@@ -4401,10 +4401,10 @@ fn draw_subagent_strip_entry(
                                     ChatItem::Subagent { agent_type: cat, summary, finished: true, .. } => {
                                         ui.horizontal(|ui| {
                                             paint_checkmark(ui, egui::Color32::from_rgb(150, 170, 255));
-                                            ui.label(egui::RichText::new(cat.as_str()).monospace().size(10.5)
+                                            ui.label(egui::RichText::new(cat.as_str()).monospace().size(crate::settings::panel_text(10.5))
                                                 .color(egui::Color32::from_rgb(150, 205, 210)));
                                             let s: String = summary.trim().chars().take(60).collect();
-                                            ui.label(egui::RichText::new(s).size(10.0).color(egui::Color32::from_gray(150)));
+                                            ui.label(egui::RichText::new(s).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(150)));
                                         });
                                         i += 1;
                                     }
@@ -4636,6 +4636,58 @@ mod todo_width_tests {
                  the task text stopped being drawn",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod editor_font_size_tests {
+    use super::*;
+
+    /// The tallest text actually painted by the editor, in pixels.
+    fn painted_text_height(font_size: f32) -> f32 {
+        fn walk(sh: &egui::Shape, acc: &mut f32) {
+            match sh {
+                egui::Shape::Vec(v) => for x in v { walk(x, acc) },
+                egui::Shape::Text(_) => {
+                    let h = sh.visual_bounding_rect().height();
+                    if h.is_finite() && h > *acc { *acc = h; }
+                }
+                _ => {}
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("forge-font-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = IdeApp::new_with_spec(NewWindowSpec {
+            cwd: Some(dir), ..Default::default()
+        });
+        app.settings.font_size = font_size;
+        let mut b = crate::buffer::Buffer::new();
+        b.lines = vec!["fn main() { println!(\"hello\"); }".to_string()];
+        app.buffers.push(b);
+        app.active = app.buffers.len() - 1;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let out = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_editor(ui));
+        });
+        let mut tallest = 0.0;
+        for c in &out.shapes { walk(&c.shape, &mut tallest); }
+        tallest
+    }
+
+    /// The setting has to reach the glyphs. Reported as doing nothing at all,
+    /// and the read path looked correct, so this asks the renderer directly
+    /// rather than asking the code to be read again.
+    #[test]
+    fn the_editor_font_size_setting_reaches_the_painted_text() {
+        let small = painted_text_height(10.0);
+        let large = painted_text_height(28.0);
+        assert!(small > 0.0, "the editor painted no text at all");
+        assert!(
+            large > small * 1.5,
+            "font size does not reach the glyphs: 10pt painted {small}, 28pt painted {large}",
+        );
     }
 }
 
@@ -4980,9 +5032,9 @@ fn draw_subagent_block(
                         } else {
                             paint_dot(ui, NAME);
                         }
-                        ui.label(egui::RichText::new("subagent").size(11.0)
+                        ui.label(egui::RichText::new("subagent").size(crate::settings::panel_text(11.0))
                             .color(egui::Color32::from_gray(140)));
-                        ui.label(egui::RichText::new(agent_type).monospace().size(11.5).strong()
+                        ui.label(egui::RichText::new(agent_type).monospace().size(crate::settings::panel_text(11.5)).strong()
                             .color(NAME));
                         // What it is doing *now*, in the transcript, rather than
                         // a pointer to somewhere else. `detail` is the argument
@@ -5003,7 +5055,7 @@ fn draw_subagent_block(
                                 ui.add_sized(
                                     egui::vec2(room, 14.0),
                                     egui::Label::new(
-                                        egui::RichText::new(text).monospace().size(10.0)
+                                        egui::RichText::new(text).monospace().size(crate::settings::panel_text(10.0))
                                             .color(egui::Color32::from_gray(140)),
                                     ).truncate(),
                                 );
@@ -5019,7 +5071,7 @@ fn draw_subagent_block(
                     let ask: String = prompt.trim().chars().take(120).collect();
                     if !ask.is_empty() {
                         ui.label(egui::RichText::new(soft_wrap(&ask, wrap_run(ui, 10.5, false)))
-                            .size(10.5).color(egui::Color32::from_gray(150)));
+                            .size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                     }
 
                     if expanded {
@@ -5059,7 +5111,7 @@ fn draw_subagent_block(
                             }
                         }
                         if items.is_empty() {
-                            ui.label(egui::RichText::new("no tool calls").italics().size(10.0)
+                            ui.label(egui::RichText::new("no tool calls").italics().size(crate::settings::panel_text(10.0))
                                 .color(egui::Color32::from_gray(110)));
                         }
                         let _ = inner;
@@ -5071,7 +5123,7 @@ fn draw_subagent_block(
                         ui.add_space(3.0);
                         let s: String = summary.trim().chars().take(300).collect();
                         ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, 10.5, false)))
-                            .size(10.5).color(egui::Color32::from_gray(185)));
+                            .size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(185)));
                     }
                 });
             });
@@ -6941,6 +6993,9 @@ impl IdeApp {
         if self.absorb_foreign_settings() {
             ctx.request_repaint();
         }
+        // Published for the frame, so the chat-item renderers and the file
+        // tree can scale without being handed the settings.
+        crate::settings::set_panel_text_scale(self.settings.panel_text_scale);
         // Load fonts on first frame and skip rendering — egui processes
         // set_fonts() asynchronously so the named family isn't ready until
         // the following frame.
@@ -11476,6 +11531,24 @@ impl IdeApp {
                             .size(13.0).monospace().color(egui::Color32::from_gray(220)));
                         if ui.add(egui::Button::new("−").min_size(egui::vec2(22.0, 22.0))).clicked() {
                             s.font_size = (s.font_size - 1.0).max(8.0); changed = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
+                // Panel text scale
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    lbl(ui, "Agent & Explorer Text");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        if ui.add(egui::Button::new("+").min_size(egui::vec2(22.0, 22.0))).clicked() {
+                            s.panel_text_scale = (s.panel_text_scale + 0.1).min(2.5); changed = true;
+                        }
+                        ui.label(egui::RichText::new(format!("{:.0}%", s.panel_text_scale * 100.0))
+                            .size(13.0).monospace().color(egui::Color32::from_gray(220)));
+                        if ui.add(egui::Button::new("−").min_size(egui::vec2(22.0, 22.0))).clicked() {
+                            s.panel_text_scale = (s.panel_text_scale - 0.1).max(0.6); changed = true;
                         }
                     });
                 });

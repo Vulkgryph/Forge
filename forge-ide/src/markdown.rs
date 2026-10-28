@@ -276,7 +276,7 @@ fn emit(ui: &mut egui::Ui, blocks: &[Block], max_run: usize) -> Option<String> {
             Block::Bullet { marker, job, links } => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(marker).size(12.5).color(T.bullet));
+                    ui.label(RichText::new(marker).size(crate::settings::panel_text(12.5)).color(T.bullet));
                     ui.add_space(4.0);
                     clicked = label_with_links(ui, job, links).or(clicked.take());
                 });
@@ -348,7 +348,7 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
     // space on its own — without this, a column ends up wrapping at
     // whatever narrow width its first layout pass happened to get (one
     // word per line), instead of using the space actually available.
-    let font = FontId::proportional(12.0);
+    let font = FontId::proportional(crate::settings::panel_text(12.0));
     let measure = |s: &str| -> f32 {
         ui.fonts(|f| f.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x)
     };
@@ -402,7 +402,7 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
                                     let mut j = LayoutJob::default();
                                     j.append(
                                         &crate::app::soft_wrap(h, max_run), 0.0,
-                                        TextFormat { font_id: FontId::proportional(12.0),
+                                        TextFormat { font_id: FontId::proportional(crate::settings::panel_text(12.0)),
                                                      color: T.heading, ..Default::default() },
                                     );
                                     j
@@ -461,7 +461,7 @@ fn render_code_block(ui: &mut egui::Ui, code: &str) {
                 .id_salt(("md_code_scroll", code))
                 .show(ui, |ui| {
                     ui.label(RichText::new(code)
-                        .monospace().size(11.5)
+                        .monospace().size(crate::settings::panel_text(11.5))
                         .color(Color32::from_rgb(214, 214, 214)));
                 });
         });

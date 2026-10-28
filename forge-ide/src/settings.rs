@@ -63,6 +63,17 @@ pub struct Settings {
     pub auto_close_brackets: bool,
     pub minimap:       bool,
 
+    /// How much to scale the text in the agent panel and the file explorer.
+    ///
+    /// A multiplier rather than a size, so the hierarchy those panels were
+    /// designed with survives: a label meant to be smaller than its body
+    /// stays smaller. 1.0 is what they were drawn at.
+    ///
+    /// Separate from `font_size`, which only ever sized the code in an open
+    /// file — a reach much narrower than the name suggested, and the reason
+    /// changing it looked like it did nothing.
+    pub panel_text_scale: f32,
+
     // Terminal
     pub terminal_font_size: f32,
 
@@ -165,6 +176,7 @@ impl Default for Settings {
             word_wrap:           false,
             auto_close_brackets: true,
             minimap:            true,
+            panel_text_scale:   1.0,
             terminal_font_size: 14.0,
             theme:              "Dark+".into(),
             restore_session:    true,
@@ -235,6 +247,46 @@ pub fn modified_at() -> Option<std::time::SystemTime> {
 }
 
 #[cfg(test)]
+mod panel_scale_tests {
+    use super::*;
+
+    /// The scale multiplies, so the hierarchy each panel was drawn with
+    /// survives: a label meant to be smaller than its body stays smaller.
+    /// Setting everything to one size would flatten that.
+    #[test]
+    fn scaling_preserves_the_relative_sizes() {
+        set_panel_text_scale(2.0);
+        let body = panel_text(12.5);
+        let label = panel_text(9.5);
+        assert!(label < body, "the smaller label stopped being smaller");
+        assert!((body / label - 12.5 / 9.5).abs() < 0.001, "the ratio changed");
+        set_panel_text_scale(1.0);
+    }
+
+    /// 1.0 is what the panels were drawn at, so the default must change
+    /// nothing at all.
+    #[test]
+    fn the_default_scale_leaves_every_size_alone() {
+        set_panel_text_scale(Settings::default().panel_text_scale);
+        for base in [9.5f32, 11.0, 12.5, 13.5] {
+            assert_eq!(panel_text(base), base);
+        }
+    }
+
+    /// Clamped, because a scale of zero is an invisible panel and a huge one
+    /// is a panel with a single word in it — and the value is persisted, so
+    /// either would survive a restart and leave nothing to fix it with.
+    #[test]
+    fn an_absurd_scale_is_refused_rather_than_stored() {
+        set_panel_text_scale(0.0);
+        assert!(panel_text(12.5) > 0.0, "a zero scale made the text vanish");
+        set_panel_text_scale(1000.0);
+        assert!(panel_text(12.5) < 100.0, "an enormous scale was accepted");
+        set_panel_text_scale(1.0);
+    }
+}
+
+#[cfg(test)]
 mod cross_window_tests {
     use super::*;
 
@@ -282,4 +334,26 @@ mod cross_window_tests {
     fn the_default_font_size_is_the_one_the_editor_expects() {
         assert_eq!(Settings::default().font_size, 14.0);
     }
+}
+
+/// The panel text scale currently in force, for code that draws without a
+/// handle on `Settings`.
+///
+/// The agent panel is drawn largely by free functions — one per kind of chat
+/// item — none of which take the settings. Threading a float through all of
+/// them, and through every future one, is a worse answer than publishing it
+/// once a frame: a drawing function that forgets to ask simply renders at
+/// the size it was written with, which is the old behaviour rather than a
+/// broken one.
+pub fn set_panel_text_scale(scale: f32) {
+    PANEL_TEXT_SCALE.with(|c| c.set(scale.clamp(0.5, 3.0)));
+}
+
+/// Scale a size that was written as a literal when the panel was designed.
+pub fn panel_text(base: f32) -> f32 {
+    PANEL_TEXT_SCALE.with(|c| base * c.get())
+}
+
+thread_local! {
+    static PANEL_TEXT_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
 }

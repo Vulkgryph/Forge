@@ -428,7 +428,7 @@ impl FileTree {
                         egui::pos2(text_x, cy),
                         egui::Align2::LEFT_CENTER,
                         &name,
-                        egui::FontId::proportional(13.5),
+                        egui::FontId::proportional(crate::settings::panel_text(13.5)),
                         name_color,
                     );
 
@@ -443,7 +443,7 @@ impl FileTree {
                                 egui::pos2(row_rect.right() - 14.0, cy),
                                 egui::Align2::RIGHT_CENTER,
                                 st.letter(),
-                                egui::FontId::proportional(11.0),
+                                egui::FontId::proportional(crate::settings::panel_text(11.0)),
                                 st.color(),
                             );
                         }

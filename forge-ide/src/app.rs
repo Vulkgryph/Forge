@@ -4640,6 +4640,30 @@ mod todo_width_tests {
 }
 
 #[cfg(test)]
+mod auto_mode_respawn_tests {
+    use super::*;
+    use crate::settings::AgentPermissionMode as Mode;
+
+    /// Which modes approve without asking. The respawn has to re-assert this
+    /// on the replacement process, which starts with auto mode off.
+    #[test]
+    fn the_approving_modes_are_the_ones_that_must_survive_a_respawn() {
+        assert!(mode_auto_approves(Mode::DangerouslySkipAll));
+        assert!(!mode_auto_approves(Mode::AlwaysAsk));
+    }
+
+    /// A fresh session has auto mode off, which is why the respawn cannot
+    /// simply inherit it. Stated as a test so that if the default ever
+    /// changes, whoever changes it finds this.
+    #[test]
+    fn a_fresh_session_starts_with_auto_mode_off() {
+        let s = crate::agent_panel::AgentSession::failed(String::new());
+        assert!(!s.auto_mode,
+                "a new process starts with auto mode on — the respawn fix assumes otherwise");
+    }
+}
+
+#[cfg(test)]
 mod composer_focus_tests {
     use super::*;
 
@@ -10756,6 +10780,16 @@ impl IdeApp {
             // Already the tab's mode — this is the process catching up with it.
             self.agent_tabs[idx].permission_mode = mode;
             self.agent_tabs[idx].set_permission_mode_forced(mode, Some(replacement));
+            // The replacement is a new process, and a new process starts with
+            // auto mode off. Without this, choosing a mode that approves
+            // automatically worked for the rest of the turn and was then
+            // silently dropped when the turn ended and the agent was
+            // replaced — the mode said one thing and the process did
+            // another, which is the worst way for a permission setting to be
+            // wrong.
+            if mode_auto_approves(mode) && !self.agent_tabs[idx].session.auto_mode {
+                self.agent_tabs[idx].session.toggle_auto_mode();
+            }
             self.output_log(format!("{} is now fully in effect", mode.label()), OutputLevel::Info);
         }
 

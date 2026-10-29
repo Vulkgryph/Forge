@@ -89,6 +89,18 @@ check "nothing unpushed" bash -c '
 
 if ! $quick; then
     echo
+    echo "Builds"
+    # A plain build, not only the test build. They are not the same: a field
+    # read solely by a test is dead code in the binary, and with warnings
+    # denied that is an error CI hits and `cargo test` never does. That
+    # happened — found by a Windows gate, reproduced on macOS in one command,
+    # and not a platform difference at all.
+    check "agent and clients build with warnings denied" \
+        env RUSTFLAGS=-D\ warnings cargo build -q -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
+    check "editor builds with warnings denied" \
+        env RUSTFLAGS=-D\ warnings cargo build -q -p forge-ide -p forge-proto -p forge-server
+
+    echo
     echo "Tests"
     check "agent, protocol, search, terminal client" \
         cargo test -q -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs

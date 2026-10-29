@@ -1575,10 +1575,7 @@ impl AgentSession {
                     None => { self.set_activity("Thinking…".into(), None); self.items.push(item); }
                 }
             }
-            AgentMsg::ToolProgress { tool_name, expected_secs, .. } => {
-                // The elapsed figure in the message is not used: `activity_since`
-                // already tracks it and advances every frame, so the bar moves
-                // smoothly instead of stepping once a second.
+            AgentMsg::ToolProgress { tool_name, elapsed_secs, expected_secs } => {
                 self.thinking = false;
                 self.set_activity(
                     tool_name,
@@ -1586,6 +1583,22 @@ impl AgentSession {
                         .filter(|s| *s > 0)
                         .map(|s| Expectation::AtMost(std::time::Duration::from_secs(s))),
                 );
+                // The panel's own clock drives the bar, so it advances every
+                // frame rather than stepping once a second when the next
+                // message lands. But it starts when the panel first hears
+                // about the step, and the agent may have been running the
+                // tool long before that — a window reopened onto a working
+                // agent would otherwise show a bar starting from zero on a
+                // command two minutes in. Where the agent reports more
+                // elapsed than this panel has counted, believe the agent.
+                if let Some(started) = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(elapsed_secs))
+                {
+                    match self.activity_since {
+                        Some(known) if known <= started => {}
+                        _ => self.activity_since = Some(started),
+                    }
+                }
             }
             AgentMsg::BackgroundTasks { tasks } => {
                 self.background = tasks;

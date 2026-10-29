@@ -5901,9 +5901,17 @@ impl IdeApp {
                     // when the save has a session id, not just a UI replay.
                     let saved = crate::agent_panel::load_conversations(&app.cwd);
                     app.agent_tabs = state.agent_tabs.iter()
-                        .filter_map(|id| saved.iter().find(|c| &c.id == id))
-                        .map(|conv| {
-                            let mode = app.settings.default_agent_permission_mode;
+                        .enumerate()
+                        .filter_map(|(i, id)| saved.iter().find(|c| &c.id == id).map(|c| (i, c)))
+                        .map(|(i, conv)| {
+                            // What this tab was last set to, not the default.
+                            // A permission mode that quietly reverts on reopen
+                            // is the one direction it must never revert in —
+                            // and it reverted towards whatever the default
+                            // happened to be, which may be stricter or looser
+                            // than what was chosen.
+                            let mode = state.agent_modes.get(i).copied()
+                                .unwrap_or(app.settings.default_agent_permission_mode);
                             let resume = (!conv.forge_session_id.is_empty())
                                 .then_some(conv.forge_session_id.as_str());
                             // With a reconnect in flight, no process yet: a
@@ -5990,15 +5998,16 @@ impl IdeApp {
         // the per-frame auto-save to already be current, since this can run
         // right after a message lands and before the agent view's own next
         // frame would have re-saved it.
-        let restorable_agents: Vec<(usize, &str)> = self.agent_tabs.iter().enumerate()
+        let restorable_agents: Vec<(usize, &str, crate::settings::AgentPermissionMode)> =
+            self.agent_tabs.iter().enumerate()
             .filter(|(_, t)| !t.session.items.is_empty())
             .map(|(i, t)| {
                 crate::agent_panel::save_conversation(&t.session, &t.conv_id, &self.cwd);
-                (i, t.conv_id.as_str())
+                (i, t.conv_id.as_str(), t.permission_mode)
             })
             .collect();
         let agent_active = restorable_agents.iter()
-            .position(|&(i, _)| i == self.agent_active).unwrap_or(0);
+            .position(|&(i, _, _)| i == self.agent_active).unwrap_or(0);
 
         crate::session::SessionState {
             open_files: restorable.into_iter().map(|(_, p)| p).collect(),
@@ -6011,7 +6020,8 @@ impl IdeApp {
                 })
                 .collect(),
             agent_visible: self.agent_visible,
-            agent_tabs:    restorable_agents.into_iter().map(|(_, id)| id.to_string()).collect(),
+            agent_tabs: restorable_agents.iter().map(|(_, id, _)| id.to_string()).collect(),
+            agent_modes: restorable_agents.iter().map(|(_, _, m)| *m).collect(),
             agent_active,
         }
     }
@@ -10603,7 +10613,7 @@ impl IdeApp {
                                         // left padding) — a label added directly to a horizontal
                                         // layout never wraps, regardless of set_max_width/soft_wrap.
                                         ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 12.5, false))).color(egui::Color32::WHITE));
+                                            ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 12.5, false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::WHITE));
                                         });
                                     });
                             }).response.rect;
@@ -10641,9 +10651,9 @@ impl IdeApp {
                                     // nothing to tell a reader that the part
                                     // they are wading through is not the reply.
                                     ui.label(egui::RichText::new("thinking")
-                                        .size(9.5)
+                                        .size(crate::settings::panel_text(9.5))
                                         .color(egui::Color32::from_gray(105)));
-                                    ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(11.0)
+                                    ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(crate::settings::panel_text(11.0))
                                         .color(egui::Color32::from_gray(130)));
                                 });
                             });
@@ -10676,13 +10686,13 @@ impl IdeApp {
                                         let first_line = trimmed_full.lines().next().unwrap_or("");
                                         let header = ui.horizontal(|ui| {
                                             paint_disclosure_triangle(ui, *expanded, egui::Color32::from_gray(140));
-                                            ui.label(egui::RichText::new(if *success { "ok" } else { "err" }).size(11.5).color(badge));
-                                            ui.label(egui::RichText::new(name).monospace().size(11.5).color(egui::Color32::from_gray(180)));
+                                            ui.label(egui::RichText::new(if *success { "ok" } else { "err" }).size(crate::settings::panel_text(11.5)).color(badge));
+                                            ui.label(egui::RichText::new(name).monospace().size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(180)));
                                         });
                                         let mut click_target = header.response.clone();
                                         if !*expanded && !first_line.is_empty() {
                                             let one_liner: String = first_line.chars().take(60).collect();
-                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, wrap_run(ui, 10.5, true))).monospace().size(10.5).color(egui::Color32::from_gray(150)));
+                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, wrap_run(ui, 10.5, true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                             click_target = click_target.union(resp);
                                         }
                                         if click_target.interact(egui::Sense::click()).clicked() {
@@ -10691,7 +10701,7 @@ impl IdeApp {
                                         if *expanded {
                                             let preview: String = trimmed_full.chars().take(400).collect();
                                             if !preview.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&preview, wrap_run(ui, 10.5, true))).monospace().size(10.5).color(egui::Color32::from_gray(150)));
+                                                ui.label(egui::RichText::new(soft_wrap(&preview, wrap_run(ui, 10.5, true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                                 if content.chars().count() > 400 {
                                                     ui.label(egui::RichText::new("...").color(egui::Color32::from_gray(110)));
                                                 }
@@ -10767,7 +10777,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(content_width(ui, pad_r));
-                                    ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, 10.5, false))).size(10.5).color(egui::Color32::from_gray(110)));
+                                    ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, 10.5, false))).size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(110)));
                                 });
                             });
                         }

@@ -44,6 +44,20 @@ pub struct SessionState {
     /// transcript. A tab with no messages yet has nothing to save and isn't
     /// recorded here.
     pub agent_tabs:   Vec<String>,
+    /// The permission mode each restored tab had, parallel to `agent_tabs`.
+    ///
+    /// Not persisted at all until now, so every reopened tab fell back to
+    /// the configured default and whatever had been chosen was silently
+    /// discarded — a permission setting quietly reverting, which is the one
+    /// direction it must never revert in.
+    ///
+    /// A parallel list rather than a field on the tab, so state written by
+    /// an older build still loads: absent, it is empty, and each tab takes
+    /// the default exactly as before. Zipped by position, and a tab with no
+    /// entry falls back, so the two lists disagreeing in length cannot
+    /// mis-assign a mode to the wrong conversation.
+    #[serde(default)]
+    pub agent_modes:  Vec<crate::settings::AgentPermissionMode>,
     pub agent_active: usize,
 }
 

@@ -72,8 +72,8 @@ enum Block {
 #[derive(Default)]
 struct MdBlockComputer;
 
-impl egui::util::cache::ComputerMut<(&str, usize), std::sync::Arc<Vec<Block>>> for MdBlockComputer {
-    fn compute(&mut self, (text, max_run): (&str, usize)) -> std::sync::Arc<Vec<Block>> {
+impl egui::util::cache::ComputerMut<(&str, usize, u32), std::sync::Arc<Vec<Block>>> for MdBlockComputer {
+    fn compute(&mut self, (text, max_run, _scale): (&str, usize, u32)) -> std::sync::Arc<Vec<Block>> {
         std::sync::Arc::new(parse_blocks(text, max_run))
     }
 }
@@ -129,7 +129,13 @@ pub fn take_clicked_link(ctx: &egui::Context) -> Option<String> {
 /// from the pristine original lines, fixes this at the root.
 pub fn render(ui: &mut egui::Ui, text: &str, max_run: usize) {
     let blocks = ui.memory_mut(|mem| {
-        mem.caches.cache::<MdBlockCache<'_>>().get((text, max_run))
+        // The scale is part of the key. Blocks carry their sizes, baked in
+        // at parse time, so a message already in the cache would otherwise be
+        // served back at the size it was first drawn at and the scale would
+        // appear to do nothing to anything already on screen. Quantised to a
+        // hundredth so a float is not used as a hash key.
+        let scale_key = (crate::settings::panel_text(100.0)) as u32;
+        mem.caches.cache::<MdBlockCache<'_>>().get((text, max_run, scale_key))
     });
     if let Some(target) = emit(ui, &blocks, max_run) {
         ui.data_mut(|d| d.insert_temp(clicked_link_slot(), target));
@@ -216,28 +222,28 @@ fn parse_blocks(text: &str, max_run: usize) -> Vec<Block> {
 
         // ── Headings ──
         if let Some(rest) = line.strip_prefix("### ") {
-            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: 13.5, space_before: 6.0 });
+            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: crate::settings::panel_text(13.5), space_before: 6.0 });
             i += 1; continue;
         }
         if let Some(rest) = line.strip_prefix("## ") {
-            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: 15.0, space_before: 8.0 });
+            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: crate::settings::panel_text(15.0), space_before: 8.0 });
             i += 1; continue;
         }
         if let Some(rest) = line.strip_prefix("# ") {
-            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: 17.0, space_before: 10.0 });
+            out.push(Block::Heading { text: crate::app::soft_wrap(rest, max_run), size: crate::settings::panel_text(17.0), space_before: 10.0 });
             i += 1; continue;
         }
 
         // ── Bullet list ──
         if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
+            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), crate::settings::panel_text(12.5));
             out.push(Block::Bullet { marker: "•".to_string(), job, links });
             i += 1; continue;
         }
 
         // ── Numbered list ──
         if let Some((num, rest)) = parse_numbered_prefix(line) {
-            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), 12.5);
+            let (job, links) = parse_inline(&crate::app::soft_wrap(rest, max_run), crate::settings::panel_text(12.5));
             out.push(Block::Bullet { marker: format!("{}.", num), job, links });
             i += 1; continue;
         }
@@ -255,7 +261,7 @@ fn parse_blocks(text: &str, max_run: usize) -> Vec<Block> {
             para.push_str(lines[i].trim());
             i += 1;
         }
-        let (job, links) = parse_inline(&crate::app::soft_wrap(&para, max_run), 12.5);
+        let (job, links) = parse_inline(&crate::app::soft_wrap(&para, max_run), crate::settings::panel_text(12.5));
             out.push(Block::Paragraph(job, links));
     }
     out
@@ -412,7 +418,7 @@ fn render_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>], max_
                             for row in rows {
                                 for c in 0..ncols {
                                     let cell = row.get(c).map(String::as_str).unwrap_or("");
-                                    let job = parse_inline(&crate::app::soft_wrap(cell, max_run), 12.0);
+                                    let job = parse_inline(&crate::app::soft_wrap(cell, max_run), crate::settings::panel_text(12.0));
                                     place_cell(ui, col_widths[c], job.0);
                                 }
                                 ui.end_row();
@@ -633,6 +639,55 @@ fn parse_inline(text: &str, size: f32) -> (LayoutJob, Vec<Link>) {
 
     (job, links)
 }
+#[cfg(test)]
+mod scale_reaches_body_tests {
+    use super::*;
+
+    /// The scale has to reach the message body, not only the labels around
+    /// it. Body sizes are passed to `parse_inline` as an argument rather than
+    /// written as `.size(…)`, so a first pass that rewrote `.size(…)` scaled
+    /// every indicator and left every paragraph alone — which is exactly what
+    /// it looked like from outside.
+    #[test]
+    fn scaling_changes_the_height_of_a_plain_paragraph() {
+        // Height of the painted glyphs, which is what a size change moves —
+        // width is a poor proxy, since wrapping absorbs it.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let measure = |scale: f32| {
+            crate::settings::set_panel_text_scale(scale);
+            let out = ctx.run(Default::default(), |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ui.allocate_ui(egui::vec2(400.0, 1000.0), |ui| {
+                        render(ui, "a plain paragraph of message text", 80);
+                    });
+                });
+            });
+            let mut tallest = 0.0f32;
+            fn walk(sh: &egui::Shape, acc: &mut f32) {
+                match sh {
+                    egui::Shape::Vec(v) => for x in v { walk(x, acc) },
+                    egui::Shape::Text(_) => {
+                        let h = sh.visual_bounding_rect().height();
+                        if h.is_finite() && h > *acc { *acc = h; }
+                    }
+                    _ => {}
+                }
+            }
+            for c in &out.shapes { walk(&c.shape, &mut tallest); }
+            crate::settings::set_panel_text_scale(1.0);
+            tallest
+        };
+        let small = measure(1.0);
+        let large = measure(2.0);
+        assert!(small > 0.0, "no body text was painted");
+        assert!(
+            large > small * 1.5,
+            "the scale does not reach the message body: 1.0 painted {small}, 2.0 painted {large}",
+        );
+    }
+}
+
 #[cfg(test)]
 mod wrap_tests {
     use super::*;
@@ -1011,7 +1066,7 @@ mod link_tests {
     /// that is someone showing the markdown rather than using it.
     #[test]
     fn a_link_inside_code_stays_literal() {
-        let (job, links) = parse_inline("write `[a](b)` to link", 14.0);
+        let (job, links) = parse_inline("write `[a](b)` to link", crate::settings::panel_text(14.0));
         assert!(
             job.text.contains("[a](b)"),
             "a link inside a code span was rendered: {:?}",

@@ -6,9 +6,11 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Added
 
-- **A text size for the agent panel and the file explorer.** "Editor Font Size" only ever sized the code in an open file — a reach much narrower than the name suggests, and why changing it looked like it did nothing when what was on screen was an agent panel. The new setting scales the agent transcript, its cards and the file tree, as a multiplier rather than a size, so the hierarchy those panels were designed with survives: a label meant to be smaller than its body stays smaller.
+- **A text size for the agent panel and the file explorer.** "Editor Font Size" only ever sized the code in an open file — a reach much narrower than the name suggests, and why changing it looked like it did nothing when what was on screen was an agent panel. The new setting scales the agent transcript — message bodies included — its cards and the file tree, as a multiplier rather than a size, so the hierarchy those panels were designed with survives: a label meant to be smaller than its body stays smaller.
 
 ### Fixed
+
+- **A tab reopens in the permission mode it was left in.** Nothing persisted it, so every restored tab took the configured default and whatever had been chosen was discarded — in either direction, stricter or looser, which for a permission setting is the one way it must not go wrong.
 
 - **A settings change holds, with more than one window open.** Every window keeps its own copy of the settings and writes the whole file, so the last window to save quietly reverted whatever the others had changed — with several open, a change could be undone before it was noticed, which is why the editor font size appeared to do nothing at all. A window now picks up another's change before drawing from it, and saves are written to a neighbouring file and renamed over, so a window reading while another writes can no longer see a half-written file and fall back to defaults.
 

@@ -6,7 +6,7 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Added
 
-- **A text size for the agent panel and the file explorer.** "Editor Font Size" only ever sized the code in an open file — a reach much narrower than the name suggests, and why changing it looked like it did nothing when what was on screen was an agent panel. The new setting scales the agent transcript — message bodies included — its cards and the file tree, as a multiplier rather than a size, so the hierarchy those panels were designed with survives: a label meant to be smaller than its body stays smaller.
+- **A text size for the agent panel and the file explorer.** "Editor Font Size" only ever sized the code in an open file — a reach much narrower than the name suggests, and why changing it looked like it did nothing when what was on screen was an agent panel. The new setting scales the agent transcript — message bodies included — its cards and the file tree, wrapping along with the text so a shell card still breaks its lines where it should, as a multiplier rather than a size, so the hierarchy those panels were designed with survives: a label meant to be smaller than its body stays smaller.
 
 ### Fixed
 

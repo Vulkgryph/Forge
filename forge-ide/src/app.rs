@@ -3438,7 +3438,7 @@ fn draw_write_card(
                             if let Some(c) = content {
                                 let first_line: String = strip_ansi(c.trim()).lines().next().unwrap_or("").chars().take(70).collect();
                                 if !first_line.is_empty() {
-                                    let resp = ui.label(egui::RichText::new(soft_wrap(&first_line, wrap_run(ui, 10.5, true)))
+                                    let resp = ui.label(egui::RichText::new(soft_wrap(&first_line, wrap_run(ui, crate::settings::panel_text(10.5), true)))
                                         .monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(140)));
                                     click_target = click_target.union(resp);
                                 }
@@ -3460,7 +3460,7 @@ fn draw_write_card(
                                 egui::ScrollArea::vertical().id_salt(("tool_card_body", idx))
                                     .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                     .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(soft_wrap(&full, wrap_run(ui, 10.5, true)))
+                                        ui.label(egui::RichText::new(soft_wrap(&full, wrap_run(ui, crate::settings::panel_text(10.5), true)))
                                             .monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                     });
                             }
@@ -3570,7 +3570,7 @@ fn draw_terminal_card(
                     });
                     ui.add_space(2.0);
                     let cmd = describe_tool_call(name, args);
-                    ui.label(egui::RichText::new(format!("$ {}", soft_wrap(&cmd, wrap_run(ui, 11.5, true))))
+                    ui.label(egui::RichText::new(format!("$ {}", soft_wrap(&cmd, wrap_run(ui, crate::settings::panel_text(11.5), true))))
                         .monospace().size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(225)));
                     if let Some(c) = content {
                         let trimmed = strip_ansi(c.trim());
@@ -3582,7 +3582,7 @@ fn draw_terminal_card(
                             egui::ScrollArea::vertical().id_salt(("term_card_body", idx))
                                 .max_height(220.0).min_scrolled_height(180.0).drag_to_scroll(false)
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new(soft_wrap(&trimmed, wrap_run(ui, 11.0, true)))
+                                    ui.label(egui::RichText::new(soft_wrap(&trimmed, wrap_run(ui, crate::settings::panel_text(11.0), true)))
                                         .monospace().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(165)));
                                 });
                         }
@@ -3707,11 +3707,11 @@ fn draw_question_card(
                     ui.add_space(3.0);
 
                     if items.is_empty() {
-                        ui.label(egui::RichText::new(soft_wrap(question, wrap_run(ui, 12.5, false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::from_gray(220)));
+                        ui.label(egui::RichText::new(soft_wrap(question, wrap_run(ui, crate::settings::panel_text(12.5), false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::from_gray(220)));
                         if answered {
                             if !free_text.trim().is_empty() {
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new(soft_wrap(free_text, wrap_run(ui, 11.0, false))).italics().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(160)));
+                                ui.label(egui::RichText::new(soft_wrap(free_text, wrap_run(ui, crate::settings::panel_text(11.0), false))).italics().size(crate::settings::panel_text(11.0)).color(egui::Color32::from_gray(160)));
                             }
                         } else {
                             ui.add_space(4.0);
@@ -3731,7 +3731,7 @@ fn draw_question_card(
                             if !q.header.is_empty() {
                                 ui.label(egui::RichText::new(&q.header).strong().size(crate::settings::panel_text(11.5)).color(egui::Color32::from_rgb(140, 180, 220)));
                             }
-                            ui.label(egui::RichText::new(soft_wrap(&q.question, wrap_run(ui, 12.0, false))).size(crate::settings::panel_text(12.0)).color(egui::Color32::from_gray(220)));
+                            ui.label(egui::RichText::new(soft_wrap(&q.question, wrap_run(ui, crate::settings::panel_text(12.0), false))).size(crate::settings::panel_text(12.0)).color(egui::Color32::from_gray(220)));
                             ui.add_space(3.0);
                             let sel = selected.get(qi).cloned().unwrap_or_default();
                             if answered {
@@ -3753,7 +3753,7 @@ fn draw_question_card(
                                             ui.label(egui::RichText::new(&opt.label).size(crate::settings::panel_text(11.5))
                                                 .color(if is_sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) }));
                                             if !opt.description.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, wrap_run(ui, 10.0, false))).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(140)));
+                                                ui.label(egui::RichText::new(soft_wrap(&opt.description, wrap_run(ui, crate::settings::panel_text(10.0), false))).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(140)));
                                             }
                                         });
                                     });
@@ -3907,7 +3907,7 @@ fn draw_plan_card(
                             .max_height(280.0)
                             .min_scrolled_height(220.0)
                             .show(ui, |ui| {
-                                crate::markdown::render(ui, content, wrap_run(ui, 12.5, false));
+                                crate::markdown::render(ui, content, wrap_run(ui, crate::settings::panel_text(12.5), false));
                             });
                     }
 
@@ -4015,12 +4015,12 @@ fn draw_input_needed_card(
                         let label = if is_password { "password needed" } else { "input needed" };
                         ui.label(egui::RichText::new(label).size(crate::settings::panel_text(11.5)).color(accent));
                         if !command.is_empty() {
-                            ui.label(egui::RichText::new(soft_wrap(command, wrap_run(ui, 10.0, true))).monospace().size(crate::settings::panel_text(10.0))
+                            ui.label(egui::RichText::new(soft_wrap(command, wrap_run(ui, crate::settings::panel_text(10.0), true))).monospace().size(crate::settings::panel_text(10.0))
                                 .color(egui::Color32::from_gray(140)));
                         }
                     });
                     ui.add_space(3.0);
-                    ui.label(egui::RichText::new(soft_wrap(prompt, wrap_run(ui, 11.5, false))).size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(210)));
+                    ui.label(egui::RichText::new(soft_wrap(prompt, wrap_run(ui, crate::settings::panel_text(11.5), false))).size(crate::settings::panel_text(11.5)).color(egui::Color32::from_gray(210)));
 
                     if resolved {
                         ui.add_space(3.0);
@@ -4180,7 +4180,7 @@ fn draw_checkpoint_card(
                     }
                     if let Some(result) = preview_result {
                         ui.add_space(3.0);
-                        ui.label(egui::RichText::new(soft_wrap(result, wrap_run(ui, 10.0, false)))
+                        ui.label(egui::RichText::new(soft_wrap(result, wrap_run(ui, crate::settings::panel_text(10.0), false)))
                             .size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(190)));
                     }
                     if confirming {
@@ -4243,7 +4243,7 @@ fn draw_provider_busy_card(
         ui.add_space(pad_l);
         ui.vertical(|ui| {
             ui.set_max_width(content_width(ui, pad_r));
-            ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), wrap_run(ui, 12.5, false)))
+            ui.label(egui::RichText::new(soft_wrap(&format!("  {message}"), wrap_run(ui, crate::settings::panel_text(12.5), false)))
                 .color(egui::Color32::from_rgb(255, 110, 100)));
             if resolved {
                 ui.label(egui::RichText::new(resolution).size(crate::settings::panel_text(10.0)).color(egui::Color32::from_gray(130)));
@@ -4716,6 +4716,36 @@ mod auto_mode_respawn_tests {
 }
 
 #[cfg(test)]
+mod wrap_budget_scale_tests {
+    /// Every wrap budget in the agent panel must be computed at the size the
+    /// text is actually drawn at.
+    ///
+    /// `soft_wrap` inserts break opportunities against a character budget,
+    /// and `wrap_run` derives that budget from a font size. Scaling the drawn
+    /// size while leaving the budget at the old one makes every character
+    /// wider than the budget assumed — which showed up as terminal output in
+    /// the chat wrapping in the wrong places once the panel scale was raised.
+    ///
+    /// Asserted against the source, because the fault is a *pairing* between
+    /// two calls on the same line and no runtime check can see that one of
+    /// them was left behind.
+    #[test]
+    fn no_wrap_budget_is_computed_at_an_unscaled_size() {
+        let src = include_str!("app.rs");
+        let offenders: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("wrap_run(ui, ") && !l.contains("panel_text("))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a wrap budget is computed at a size the text is not drawn at:\n{}",
+            offenders.join("\n"),
+        );
+    }
+}
+
+#[cfg(test)]
 mod composer_focus_tests {
     use super::*;
 
@@ -5070,7 +5100,7 @@ fn draw_subagent_block(
                     // says why this block exists.
                     let ask: String = prompt.trim().chars().take(120).collect();
                     if !ask.is_empty() {
-                        ui.label(egui::RichText::new(soft_wrap(&ask, wrap_run(ui, 10.5, false)))
+                        ui.label(egui::RichText::new(soft_wrap(&ask, wrap_run(ui, crate::settings::panel_text(10.5), false)))
                             .size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                     }
 
@@ -5122,7 +5152,7 @@ fn draw_subagent_block(
                     if finished && !summary.trim().is_empty() {
                         ui.add_space(3.0);
                         let s: String = summary.trim().chars().take(300).collect();
-                        ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, 10.5, false)))
+                        ui.label(egui::RichText::new(soft_wrap(&s, wrap_run(ui, crate::settings::panel_text(10.5), false)))
                             .size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(185)));
                     }
                 });
@@ -10613,7 +10643,7 @@ impl IdeApp {
                                         // left padding) — a label added directly to a horizontal
                                         // layout never wraps, regardless of set_max_width/soft_wrap.
                                         ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 12.5, false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::WHITE));
+                                            ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, crate::settings::panel_text(12.5), false))).size(crate::settings::panel_text(12.5)).color(egui::Color32::WHITE));
                                         });
                                     });
                             }).response.rect;
@@ -10627,7 +10657,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(content_width(ui, pad_r));
-                                    crate::markdown::render(ui, text, wrap_run(ui, 12.5, false));
+                                    crate::markdown::render(ui, text, wrap_run(ui, crate::settings::panel_text(12.5), false));
                                 });
                             }).response.rect;
                             copy_message_button(
@@ -10653,7 +10683,7 @@ impl IdeApp {
                                     ui.label(egui::RichText::new("thinking")
                                         .size(crate::settings::panel_text(9.5))
                                         .color(egui::Color32::from_gray(105)));
-                                    ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, 11.0, false))).italics().size(crate::settings::panel_text(11.0))
+                                    ui.label(egui::RichText::new(soft_wrap(text, wrap_run(ui, crate::settings::panel_text(11.0), false))).italics().size(crate::settings::panel_text(11.0))
                                         .color(egui::Color32::from_gray(130)));
                                 });
                             });
@@ -10692,7 +10722,7 @@ impl IdeApp {
                                         let mut click_target = header.response.clone();
                                         if !*expanded && !first_line.is_empty() {
                                             let one_liner: String = first_line.chars().take(60).collect();
-                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, wrap_run(ui, 10.5, true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
+                                            let resp = ui.label(egui::RichText::new(soft_wrap(&one_liner, wrap_run(ui, crate::settings::panel_text(10.5), true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                             click_target = click_target.union(resp);
                                         }
                                         if click_target.interact(egui::Sense::click()).clicked() {
@@ -10701,7 +10731,7 @@ impl IdeApp {
                                         if *expanded {
                                             let preview: String = trimmed_full.chars().take(400).collect();
                                             if !preview.is_empty() {
-                                                ui.label(egui::RichText::new(soft_wrap(&preview, wrap_run(ui, 10.5, true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
+                                                ui.label(egui::RichText::new(soft_wrap(&preview, wrap_run(ui, crate::settings::panel_text(10.5), true))).monospace().size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(150)));
                                                 if content.chars().count() > 400 {
                                                     ui.label(egui::RichText::new("...").color(egui::Color32::from_gray(110)));
                                                 }
@@ -10767,7 +10797,7 @@ impl IdeApp {
                                 // words visible at the left edge.
                                 ui.vertical(|ui| {
                                     ui.set_max_width(content_width(ui, pad_r));
-                                    ui.label(egui::RichText::new(soft_wrap(&format!("  {msg}"), wrap_run(ui, 12.5, false))).color(egui::Color32::from_rgb(255,110,100)));
+                                    ui.label(egui::RichText::new(soft_wrap(&format!("  {msg}"), wrap_run(ui, crate::settings::panel_text(12.5), false))).color(egui::Color32::from_rgb(255,110,100)));
                                 });
                             });
                         }
@@ -10777,7 +10807,7 @@ impl IdeApp {
                                 ui.add_space(pad_l);
                                 ui.vertical(|ui| {
                                     ui.set_max_width(content_width(ui, pad_r));
-                                    ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, 10.5, false))).size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(110)));
+                                    ui.label(egui::RichText::new(soft_wrap(msg, wrap_run(ui, crate::settings::panel_text(10.5), false))).size(crate::settings::panel_text(10.5)).color(egui::Color32::from_gray(110)));
                                 });
                             });
                         }

@@ -98,6 +98,13 @@ specifically, because their terms are not those two:
     the authors' names for endorsement applies; Forge makes no such claim.
   Unicode-3.0 also applies to unicode-ident, in conjunction with its MIT or
     Apache-2.0 grant.
+  BSD 2-Clause — arrayref, reached on Linux builds through the dependency
+    graph of the terminal client. Permissive; requires the notice and
+    disclaimer be kept, which this file does.
+  Zlib — foldhash, reached on Linux builds through `hashbrown`. Permissive
+    and does not require attribution at all; named here because this file
+    claims to list every licence in the shipped graph, and a claim that is
+    only true on one platform is not true.
 
 
 Trademarks

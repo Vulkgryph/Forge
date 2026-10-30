@@ -6,6 +6,8 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **Eight advisories in the TLS and SSH stacks.** `rustls` 0.23.45 → 0.23.46 and `russh` 0.63.3 → 0.64.1. Between them: TLS master secrets reachable through a `Debug` format, an unauthenticated ServerHello poisoning a per-name cache, ECH rejection exposing buffered application data, unbounded allocation in the SSH agent protocol, and a server accepting a public-key authentication whose signature was never checked. Several apply only to server roles Forge does not take; they are taken anyway, because arguing a dependency's vulnerability does not apply is a worse position than not having it.
+
 - **A message can be addressed to one subagent.** A message sent while subagents were working went to all of them, because nothing said which one it was for — the code said so in a comment. Starting it with `@name` now reaches that one alone, matched against either the subagent's id or the kind of agent it is, with the address stripped so what it reads is the instruction. An address nobody answers to falls back to everyone rather than silently reaching nobody.
 
 - **A rolling-window trim records itself, so resuming does not undo it.** Resuming reverse-seeks for the last `compaction_commit` and reads forward from there. The compaction path writes that marker; the rolling-window path trimmed the history and wrote nothing, so a resumed session found no marker, read from the beginning, and reloaded every message the window had just dropped — a conversation trimmed to fit came back larger than the window. The record already had a `rolling_window` field; only one of the two paths was filling it in.

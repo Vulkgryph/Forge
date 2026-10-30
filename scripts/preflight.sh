@@ -81,9 +81,17 @@ echo "Repository"
 # check time, not here at parse time.
 # shellcheck disable=SC2016
 check "working tree is clean" bash -c '[ -z "$(git status --porcelain)" ]'
-check "on a branch with an upstream" bash -c 'git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null'
+# Skipped on a detached HEAD, which is what a tag checkout is — the release
+# workflow runs this against the tag, where having no upstream is correct
+# rather than a fault. Reporting it there is how a gate teaches people to
+# ignore gates.
+# shellcheck disable=SC2016
+check "on a branch with an upstream" bash -c '
+    git symbolic-ref -q HEAD >/dev/null || exit 0
+    git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null'
 # shellcheck disable=SC2016
 check "nothing unpushed" bash -c '
+    git symbolic-ref -q HEAD >/dev/null || exit 0
     n=$(git rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
     [ "$n" -eq 0 ] || { echo "$n commit(s) not pushed"; exit 1; }'
 

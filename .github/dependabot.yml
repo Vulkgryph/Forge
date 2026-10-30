@@ -1,0 +1,47 @@
+# Dependency updates.
+#
+# Not configured until now: the alerts were being raised, and nothing was
+# opening a pull request to act on them. Eight were open when this was
+# written — four in `rustls`, four in `russh` — against versions that had
+# had patched releases for some time.
+#
+# Weekly rather than daily. This repository has one maintainer; a daily
+# cadence on a graph this size produces more pull requests than anyone
+# reads, and a queue nobody reads is the same as no alerts at all.
+version: 2
+
+updates:
+  # Cargo, from the workspace root. One ecosystem entry covers every member
+  # crate, since they share a lockfile.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      # Matches the convention the rest of the history uses: a prefix naming
+      # what changed, and no first person.
+      prefix: "deps"
+    groups:
+      # Patch and minor updates arrive as one pull request rather than
+      # twenty. A security fix still comes on its own — Dependabot raises
+      # those outside the schedule and outside the group.
+      routine:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # The vendored winit carries a local patch for macOS drag-and-drop
+      # (see the workspace `[patch.crates-io]` and that crate's
+      # window_delegate.rs). An automated bump would silently drop it.
+      - dependency-name: winit
+
+  # The workflows themselves pin action versions, and a stale action is the
+  # kind of thing nobody notices until it stops working.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

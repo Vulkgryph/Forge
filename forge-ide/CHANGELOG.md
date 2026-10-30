@@ -10,6 +10,8 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ### Fixed
 
+- **A file's status letter is no longer painted over by its own name.** The explorer pins the modified/added/untracked badge to the right edge of the row, which is exact — but the filename was drawn with no width at all, so a long name ran the length of the row and covered the letter underneath. The badge was being drawn the whole time, just beneath the name, which is why a modified file looked no different from an unmodified one and only when its name was long. Names now stop short of the badge and show an ellipsis, and the room reserved is measured at the current panel scale rather than assumed.
+
 - **A tab reopens in the permission mode it was left in.** Nothing persisted it, so every restored tab took the configured default and whatever had been chosen was discarded — in either direction, stricter or looser, which for a permission setting is the one way it must not go wrong.
 
 - **A settings change holds, with more than one window open.** Every window keeps its own copy of the settings and writes the whole file, so the last window to save quietly reverted whatever the others had changed — with several open, a change could be undone before it was noticed, which is why the editor font size appeared to do nothing at all. A window now picks up another's change before drawing from it, and saves are written to a neighbouring file and renamed over, so a window reading while another writes can no longer see a half-written file and fall back to defaults.

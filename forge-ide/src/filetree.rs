@@ -424,11 +424,40 @@ impl FileTree {
                         egui::Color32::from_gray(210)
                     };
 
-                    p.text(
-                        egui::pos2(text_x, cy),
-                        egui::Align2::LEFT_CENTER,
-                        &name,
-                        egui::FontId::proportional(crate::settings::panel_text(13.5)),
+                    // The name stops before the status badge rather than being
+                    // painted straight over it.
+                    //
+                    // The badge is anchored to the row's right edge, which is
+                    // exact — but the name was drawn with no width at all, so a
+                    // long filename ran across the row and covered it. The
+                    // letter was being painted, underneath, which is why this
+                    // read as the name rendering oddly rather than as a missing
+                    // indicator: a file that was modified looked no different
+                    // from one that was not, and only for the long names.
+                    let name_font = egui::FontId::proportional(crate::settings::panel_text(13.5));
+                    let badge_room = if !is_dir && git_status.is_some() {
+                        // What the badge needs, measured rather than assumed:
+                        // it is one letter at a size that moves with the panel
+                        // scale, so a constant here would be wrong at any
+                        // scale but one.
+                        let badge_font = egui::FontId::proportional(crate::settings::panel_text(11.0));
+                        let w = ui.fonts(|f| f.glyph_width(&badge_font, 'M'));
+                        14.0 + w + 6.0
+                    } else {
+                        4.0
+                    };
+                    let name_width = (row_rect.right() - badge_room - text_x).max(16.0);
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        name.clone(), name_font, name_color,
+                    );
+                    job.wrap.max_width = name_width;
+                    job.wrap.max_rows = 1;
+                    job.wrap.break_anywhere = true;
+                    job.wrap.overflow_character = Some('…');
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    p.galley(
+                        egui::pos2(text_x, cy - galley.size().y / 2.0),
+                        galley,
                         name_color,
                     );
 
@@ -758,5 +787,52 @@ mod create_row_tests {
         assert!(tree.create_focus, "the box opened without asking for focus");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod badge_overlap_tests {
+    /// How wide a name is allowed to be, as the tree computes it.
+    fn name_width(row_right: f32, text_x: f32, badge_room: f32) -> f32 {
+        (row_right - badge_room - text_x).max(16.0)
+    }
+
+    /// A long name must stop before the status badge rather than be painted
+    /// over it.
+    ///
+    /// The badge is anchored to the row's right edge, which is exact; the
+    /// name had no width at all, so it ran the full length of whatever it
+    /// was called and covered the letter underneath. A modified file then
+    /// looked identical to an unmodified one, but only when its name was
+    /// long — which reads as the name rendering oddly rather than as a
+    /// missing indicator.
+    #[test]
+    fn a_name_never_reaches_the_badge() {
+        let row_right = 260.0;
+        let text_x = 28.0;
+        let badge_room = 14.0 + 9.0 + 6.0;          // edge inset, letter, gap
+        let w = name_width(row_right, text_x, badge_room);
+        assert!(
+            text_x + w <= row_right - 14.0,
+            "the name may extend to {}, and the badge starts at {}",
+            text_x + w, row_right - 14.0,
+        );
+    }
+
+    /// A file with no status gets nearly the whole row, since there is
+    /// nothing to keep clear of.
+    #[test]
+    fn a_file_with_no_badge_keeps_its_width() {
+        let with = name_width(260.0, 28.0, 14.0 + 9.0 + 6.0);
+        let without = name_width(260.0, 28.0, 4.0);
+        assert!(without > with, "an unmarked file was narrowed for a badge it does not have");
+    }
+
+    /// A row too narrow to hold anything still leaves room for some text,
+    /// rather than a negative width that paints nothing.
+    #[test]
+    fn a_very_narrow_row_still_shows_something() {
+        assert!(name_width(40.0, 28.0, 29.0) >= 16.0);
+        assert!(name_width(10.0, 28.0, 29.0) >= 16.0, "a negative width would paint nothing");
     }
 }

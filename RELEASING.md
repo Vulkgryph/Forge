@@ -192,6 +192,36 @@ invalidates every macOS folder permission a user has granted.
 Then confirm the bundle holds what it claims: both binaries present and
 executable, `Info.plist` in place, and the version it reports matching the tag.
 
+**That is not the artifact.** `package_macos.sh` produces a `.app`; a release
+ships a notarized `.dmg`, which is a second script:
+
+```sh
+bash forge-ide/scripts/sign_notarize_dmg.sh
+```
+
+It signs with the Developer ID, submits to Apple, waits for the ticket,
+staples it, and writes `target/dist/Forge-IDE-<version>.dmg` — named from the
+manifest, because an asset called `Forge IDE.dmg` tells nobody which build
+they downloaded. It needs notarization credentials stored once:
+
+```sh
+xcrun notarytool store-credentials "forge-notary" --apple-id <email> --team-id <team>
+```
+
+The prompt wants an app-specific password from appleid.apple.com, not the
+account password; notarytool refuses the latter with a 401.
+
+It works on a copy of the bundle on purpose. Signing rewrites the
+executables inside, and macOS checks each page of a running process against
+the signature recorded when the file was mapped — re-signing a bundle a
+window is running from kills that window with `CODESIGNING, Code 2, Invalid
+Page`. That has happened here. Running this with the IDE open is safe.
+
+Without the `.dmg` there is nothing to attach. A signed `.app` in
+`target/dist` is a local build, not a release, and the two are easy to
+confuse because the signing step is loud and the packaging step is a
+different file.
+
 ## 7. Publish
 
 Pushing the tag starts `.github/workflows/release.yml`, which re-runs every

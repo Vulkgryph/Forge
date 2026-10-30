@@ -44,7 +44,7 @@ russh-sftp        = "2.4"
 tokio             = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 dirs              = "5"
 toml              = "0.8"
-libloading        = "0.8"
+libloading        = "0.9"
 notify = "6"
 # Update-checker only — one blocking GET to the GitHub Releases API on
 # startup, in a background thread. rustls (not native-tls) so it doesn't

@@ -34,7 +34,7 @@ glob = "0.3"
 fxhash = "0.2"
 
 # For applying unified diffs
-diffy = "0.3"
+diffy = "0.5"
 
 # For temporary files
 tempfile = "3"

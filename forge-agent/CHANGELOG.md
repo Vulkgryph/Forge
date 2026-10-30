@@ -6,6 +6,10 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+- **A session interrupted while saving its metadata no longer disappears.** `meta.json` was written with a truncate-in-place write, so for as long as the data took to land the file existed and held nothing. Sessions are listed by reading that file and parsing it, and one that will not parse is skipped — so an interrupted write did not degrade a session, it hid one: the conversation log stayed on disk, absent from the session list, and `--resume-session` reported it as not found. Reachable on any crash, OOM kill, or force-quit during the write. The write is a rename over a neighbouring file now, so a reader sees either the old metadata or the new.
+
+  Found as a test failing about two in five Linux CI runs, where the harness ends a session with a SIGKILL. A reader thread against the previous code saw a torn file within five reads, which is how wide the window was.
+
 - **Eight advisories in the TLS and SSH stacks.** `rustls` 0.23.45 → 0.23.46 and `russh` 0.63.3 → 0.64.1. Between them: TLS master secrets reachable through a `Debug` format, an unauthenticated ServerHello poisoning a per-name cache, ECH rejection exposing buffered application data, unbounded allocation in the SSH agent protocol, and a server accepting a public-key authentication whose signature was never checked. Several apply only to server roles Forge does not take; they are taken anyway, because arguing a dependency's vulnerability does not apply is a worse position than not having it.
 
 - **A message can be addressed to one subagent.** A message sent while subagents were working went to all of them, because nothing said which one it was for — the code said so in a comment. Starting it with `@name` now reaches that one alone, matched against either the subagent's id or the kind of agent it is, with the address stripped so what it reads is the instruction. An address nobody answers to falls back to everyone rather than silently reaching nobody.

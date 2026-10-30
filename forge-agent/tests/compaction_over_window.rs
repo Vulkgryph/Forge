@@ -613,16 +613,27 @@ fn a_refused_compaction_still_bounds_and_records_the_conversation() {
     //    "70% before I restart, 203% after". A resume reads back from the last
     //    recorded shortening, so if nothing was recorded it replays everything
     //    that was only ever trimmed in memory.
-    //    Waited for by the file the agent actually requires, not by the
+    //    Asked for by the file the agent actually requires, not by the
     //    directory. `scan_sessions` needs `<session>/meta.json` to exist and
     //    to deserialize; a resume that cannot find it prints "Session not
     //    found" and returns, so the process exits before emitting `init`.
-    //    The directory is created first and the metadata written after, and
-    //    resuming inside that window made this test fail on CI as "the
-    //    resumed agent never started" — not a timeout, which is why widening
-    //    one would not have helped: nothing was waiting.
-    let session = wait_for_resumable_session(&home.join("workspace/.forge/sessions"))
-        .expect("a session the agent can resume");
+    //
+    //    This failed about two in five Linux CI runs as "the resumed agent
+    //    never started". `stop()` above is a SIGKILL, and `write_meta` used to
+    //    truncate `meta.json` in place, so a kill landing between the truncate
+    //    and the data left a zero-byte file — present, unparseable, and
+    //    skipped, which hides the session rather than degrading it. The write
+    //    is a rename now, so the file is either the old metadata or the new.
+    //    Taking the directory as proof of a session is what let the test ask
+    //    for something the agent would refuse; it reports what is on disk
+    //    instead of leaving "never started" to be explained.
+    let sessions = home.join("workspace/.forge/sessions");
+    let session = wait_for_resumable_session(&sessions).unwrap_or_else(|| {
+        panic!(
+            "no session the agent can resume; on disk:\n{}",
+            describe_sessions(&sessions)
+        )
+    });
 
     let before_resume = provider.largest_request_chars();
     let mut resumed = Agent::start(&home, Some(&session));
@@ -665,11 +676,48 @@ fn a_refused_compaction_still_bounds_and_records_the_conversation() {
 
 /// The id of a session that `--resume-session` will accept, once one exists.
 ///
-/// A directory under `.forge/sessions` is not enough: the agent lists
-/// sessions by reading `meta.json` from each and parsing it, so a directory
-/// whose metadata has not been written yet — or has been written only
-/// partially — is not a session as far as resuming is concerned. Returns
-/// `None` if none becomes resumable within `WAIT`.
+/// A directory under `.forge/sessions` is not enough: the agent lists sessions
+/// by reading `meta.json` from each and parsing it, so a directory whose
+/// metadata is missing or unreadable is not a session as far as resuming is
+/// concerned. Returns `None` if none becomes resumable within `WAIT`.
+/// What is actually under `.forge/sessions`, for a failure message.
+///
+/// A bare "no resumable session" says nothing about which half is missing —
+/// whether the metadata was never written, written and removed, or written
+/// unparseably — and the fixture is gone by the time anyone reads the CI log.
+fn describe_sessions(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    match std::fs::read_dir(dir) {
+        Err(e) => out.push_str(&format!("  {}: {e}\n", dir.display())),
+        Ok(entries) => {
+            for entry in entries.filter_map(|e| e.ok()) {
+                out.push_str(&format!("  {}/\n", entry.file_name().to_string_lossy()));
+                if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                    for f in inner.filter_map(|e| e.ok()) {
+                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        out.push_str(&format!(
+                            "    {} ({len} bytes)\n",
+                            f.file_name().to_string_lossy()
+                        ));
+                    }
+                }
+                let meta = entry.path().join("meta.json");
+                match std::fs::read_to_string(&meta) {
+                    Err(e) => out.push_str(&format!("    meta.json unreadable: {e}\n")),
+                    Ok(t) => out.push_str(&format!(
+                        "    meta.json parses: {}\n",
+                        serde_json::from_str::<serde_json::Value>(&t).is_ok()
+                    )),
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("  (no entries)\n");
+    }
+    out
+}
+
 fn wait_for_resumable_session(sessions_dir: &std::path::Path) -> Option<String> {
     let deadline = std::time::Instant::now() + WAIT;
     while std::time::Instant::now() < deadline {

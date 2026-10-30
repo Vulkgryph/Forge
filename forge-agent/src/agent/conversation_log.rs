@@ -675,7 +675,30 @@ pub fn write_meta(workspace_root: &Path, meta: &SessionMeta) -> Result<()> {
         .join("meta.json");
     crate::workdir::ensure_parent_of(&meta_path)?;
     let json = serde_json::to_string_pretty(meta)?;
-    std::fs::write(&meta_path, json)?;
+
+    // Written to a neighbour and renamed over, not in place.
+    //
+    // `std::fs::write` truncates before it writes, so for as long as the data
+    // takes to land the file exists and holds nothing. A reader in that window
+    // does not see stale metadata — it sees a session it must skip, because
+    // `scan_sessions` drops any session whose `meta.json` will not
+    // deserialize, and `--resume-session` then reports the session as not
+    // found and exits. The conversation log is untouched and nothing will open
+    // it again.
+    //
+    // This is reachable whenever the process stops during the write: a crash,
+    // an OOM kill, a force-quit, or the SIGKILL the integration harness uses
+    // to end a session. It was losing roughly two in five Linux CI runs, and
+    // the window is wide enough that a reader thread sees a torn file within
+    // five reads.
+    //
+    // A rename is atomic, so a reader sees the old metadata or the new one.
+    let tmp = meta_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    if let Err(e) = std::fs::rename(&tmp, &meta_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -971,5 +994,90 @@ mod title_truncation_tests {
         let text = format!("{} \u{1F600} tail", "word ".repeat(30));
         let preview = super::preview_text_for_rewind(&text);
         assert!(preview.chars().count() <= 73, "got {}", preview.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn meta_for(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            title: "a session".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            message_count: 4,
+            compaction_count: 1,
+            model: "test-model".to_string(),
+            rolling_window_plan: None,
+        }
+    }
+
+    /// A reader must never see a `meta.json` that exists but does not parse.
+    ///
+    /// `scan_sessions` skips a session whose metadata fails to deserialize, and
+    /// a resume that finds no match exits rather than starting. So a torn
+    /// `meta.json` does not degrade a session, it hides one: the conversation
+    /// log is still on disk and nothing will ever open it again.
+    ///
+    /// Written against a truncate-in-place write, where it fails within a few
+    /// hundred iterations by reading the zero-byte window between the truncate
+    /// and the data landing.
+    #[test]
+    fn meta_is_never_observed_half_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "forge-meta-atomicity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = "20261030_120000_abc";
+        std::fs::create_dir_all(dir.join(".forge/sessions").join(id)).unwrap();
+
+        let meta_path = dir.join(".forge/sessions").join(id).join("meta.json");
+        write_meta(&dir, &meta_for(id)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let reader = {
+            let (stop, torn, seen, meta_path) =
+                (Arc::clone(&stop), Arc::clone(&torn), Arc::clone(&seen), meta_path.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Exactly what scan_sessions does: a file that is there
+                    // but will not deserialize.
+                    if let Ok(text) = std::fs::read_to_string(&meta_path) {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        if serde_json::from_str::<SessionMeta>(&text).is_err() {
+                            torn.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+
+        for _ in 0..3_000 {
+            write_meta(&dir, &meta_for(id)).unwrap();
+            if torn.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let reads = seen.load(Ordering::Relaxed);
+        let was_torn = torn.load(Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(reads > 0, "the reader never observed the file at all");
+        assert!(
+            !was_torn,
+            "meta.json was observed existing and unparseable after {reads} reads, \
+             so a reader can see a session that cannot be resumed"
+        );
     }
 }

@@ -613,12 +613,16 @@ fn a_refused_compaction_still_bounds_and_records_the_conversation() {
     //    "70% before I restart, 203% after". A resume reads back from the last
     //    recorded shortening, so if nothing was recorded it replays everything
     //    that was only ever trimmed in memory.
-    let session = std::fs::read_dir(home.join("workspace/.forge/sessions"))
-        .expect("sessions dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .find(|n| !n.starts_with('.'))
-        .expect("a session directory");
+    //    Waited for by the file the agent actually requires, not by the
+    //    directory. `scan_sessions` needs `<session>/meta.json` to exist and
+    //    to deserialize; a resume that cannot find it prints "Session not
+    //    found" and returns, so the process exits before emitting `init`.
+    //    The directory is created first and the metadata written after, and
+    //    resuming inside that window made this test fail on CI as "the
+    //    resumed agent never started" — not a timeout, which is why widening
+    //    one would not have helped: nothing was waiting.
+    let session = wait_for_resumable_session(&home.join("workspace/.forge/sessions"))
+        .expect("a session the agent can resume");
 
     let before_resume = provider.largest_request_chars();
     let mut resumed = Agent::start(&home, Some(&session));
@@ -658,3 +662,37 @@ fn a_refused_compaction_still_bounds_and_records_the_conversation() {
 // fixture whose log outgrows its window by a multiple, which is a different
 // test from the ones here. Left undone and written down rather than left as a
 // passing test that exercises nothing.
+
+/// The id of a session that `--resume-session` will accept, once one exists.
+///
+/// A directory under `.forge/sessions` is not enough: the agent lists
+/// sessions by reading `meta.json` from each and parsing it, so a directory
+/// whose metadata has not been written yet — or has been written only
+/// partially — is not a session as far as resuming is concerned. Returns
+/// `None` if none becomes resumable within `WAIT`.
+fn wait_for_resumable_session(sessions_dir: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::time::Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                // Parsed, not merely present. A half-written file is the same
+                // problem one step later, and the agent skips what it cannot
+                // deserialize rather than failing loudly.
+                let meta = entry.path().join("meta.json");
+                if std::fs::read_to_string(&meta)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .is_some_and(|v| v.get("id").is_some())
+                {
+                    return Some(name);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    None
+}

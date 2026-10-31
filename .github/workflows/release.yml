@@ -32,7 +32,7 @@ jobs:
     name: every gate a machine can check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # check_private.py reads commit messages
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,14 @@ jobs:
 
       # The same script run before a release by hand, so the two cannot drift.
       # --quick skips the suites, which the jobs below run per platform.
+      #
+      # GH_TOKEN is for the advisory check inside it, which asks the GitHub
+      # Advisory Database about every crate in the lockfile. Without a token
+      # that query fails, and it is written to fail the run rather than report
+      # a clean tree it never looked at.
       - name: Preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: ./scripts/preflight.sh --quick
 
       - name: Shell and packaging checks
@@ -87,7 +94,7 @@ jobs:
     name: agent, protocol, search, terminal client
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
@@ -96,7 +103,7 @@ jobs:
     name: Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_windows_installer.ps1
@@ -107,7 +114,7 @@ jobs:
     name: editor (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p forge-ide -p forge-proto -p forge-server
@@ -132,7 +139,7 @@ jobs:
     needs: [gates, agent, windows, editor]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The body comes from the changelog, which is reviewed, rather than
       # from generated commit summaries, which are not — and which would

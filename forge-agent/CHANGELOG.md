@@ -4,6 +4,12 @@ All notable changes to Forge are documented here. The format follows [Keep a Cha
 
 ## [0.7.0] — 2026-10-27
 
+### Changed
+
+- **Two dependencies removed, the rest brought current.** `similar` and `diffy` were declared and used by nothing — no call site anywhere in the tree — so they are gone rather than updated. `nix` 0.29 → 0.31, which moved `fcntl` and `dup` to owned and borrowed descriptors; the pty path hands them the descriptor it already owns instead of a raw integer, and `openpty`'s own `OwnedFd`s are used directly rather than round-tripped through a raw fd, which removed two `unsafe` blocks. `tokio` 1.53.1 → 1.54.1, and with it `serde_json`, `ignore`, `futures`, `futures-util`, `tokio-stream`, `tokio-util`, `clap`, `uuid` and `libc`. Together with the renderer work this leaves the lockfile at 629 packages against 0.6.0's 650.
+
+- **Advisories are checked here rather than proposed from outside.** `scripts/check_advisories.py` asks the GitHub Advisory Database about every crate in the lockfile — the whole graph, not only direct dependencies — and runs as part of `preflight`. It fails rather than skips when the database cannot be reached, because a check that passes without running reads as a clean bill of health. No new tooling to install: it uses the `gh` a release already needs, and its range matching is self-tested on fixed cases including the `rustls` one from this release, since a comparison parsed too narrowly would report a clean tree.
+
 ### Fixed
 
 - **A session interrupted while saving its metadata no longer disappears.** `meta.json` was written with a truncate-in-place write, so for as long as the data took to land the file existed and held nothing. Sessions are listed by reading that file and parsing it, and one that will not parse is skipped — so an interrupted write did not degrade a session, it hid one: the conversation log stayed on disk, absent from the session list, and `--resume-session` reported it as not found. Reachable on any crash, OOM kill, or force-quit during the write. The write is a rename over a neighbouring file now, so a reader sees either the old metadata or the new.

@@ -4,6 +4,16 @@ All notable changes to Forge IDE are documented here. The format follows [Keep a
 
 ## [0.7.0] — 2026-10-27
 
+### Fixed
+
+- **Four more advisories in `russh`.** 0.64.1 → 0.65.0. Two reach Forge as it is used: an SSH client that allocates without bound on `EXT_INFO` packets, and a peer declaring a zero maximum packet size stalling channel writes for good — a silent hang rather than an error, which is the shape of bug that gets blamed on the network. The other two are in the agent-server role, which Forge does not take: an agent that never calls `Agent::confirm`, so a key added with `ssh-add -c` signs without asking, and unbounded allocation from repeated `SSH_AGENT_CONSTRAIN_CONFIRM` messages. Taken anyway, on the same reasoning as the eight before them.
+
+  Found by the advisory check added this release, not by a bot: all four were published the day before the release was cut, and the alerts GitHub had raised still read as zero open at the time. A check asked on demand is ahead of one that arrives on a schedule.
+
+### Changed
+
+- **`libloading` 0.8 → 0.9**, which the plugin loader uses. The transitive copy on 0.8 stays: `wgpu-hal`, `ash`, `dlib` and `x11rb` all pin it, and both versions coexist in the lockfile.
+
 ### Added
 
 - **A text size for the agent panel and the file explorer.** "Editor Font Size" only ever sized the code in an open file — a reach much narrower than the name suggests, and why changing it looked like it did nothing when what was on screen was an agent panel. The new setting scales the agent transcript — message bodies included — its cards and the file tree, wrapping along with the text so a shell card still breaks its lines where it should, as a multiplier rather than a size, so the hierarchy those panels were designed with survives: a label meant to be smaller than its body stays smaller.

@@ -32,8 +32,28 @@ what gets posted.
 
 It must exit 0. It checks the tracked tree for names and home directories,
 licence attribution in NOTICE, documented versions, dead documentation links,
-the installers' syntax and paths, and that the working tree is clean. It cannot
-check what you are about to write; that is the rest of this file.
+the installers' syntax and paths, advisories against every crate in the
+lockfile, and that the working tree is clean. It cannot check what you are
+about to write; that is the rest of this file.
+
+The advisory check needs network and an authenticated `gh`, because it asks the
+GitHub Advisory Database directly:
+
+```sh
+python3 scripts/check_advisories.py          # the whole lockfile, not just direct deps
+python3 scripts/check_advisories.py --json   # the same, machine-readable
+```
+
+It fails rather than skips when it cannot reach the database — a check that
+passes because it never ran reads as a clean bill of health — so `--offline` is
+how to decline it deliberately, and it says so in the output when you do.
+
+This is the replacement for Dependabot's pull requests, which this project does
+not take. GitHub's own Dependabot *alerts* are still on and still worth reading;
+they never open a pull request. Its *security updates* setting, which does, is
+off, and there is no `.github/dependabot.yml`. So routine version bumps are made
+here, deliberately, rather than proposed: `cargo update` for patch and minor,
+and majors one at a time with their call sites fixed and the suites run.
 
 ## 1. Decide the number
 
@@ -257,3 +277,16 @@ afterwards is damage control, never a remedy.
 If something does get out, say so here, and add a check that would have caught
 it. Three of these were found by a person reading carefully, which does not
 scale and did not catch the fourth.
+
+Then check the one setting that expires. Pull requests are refused by limiting
+interactions to collaborators, and GitHub caps that at six months with no
+permanent form:
+
+```sh
+gh api repos/Vulkgryph/Forge/interaction-limits                  # what is set, and until when
+gh api -X PUT repos/Vulkgryph/Forge/interaction-limits \
+    -f limit=collaborators_only -f expiry=six_months            # renew it
+```
+
+A lapse is silent: it shows up as pull requests becoming possible again, not as
+a warning. Renewing at each release keeps the gap smaller than the term.

@@ -43,6 +43,19 @@ check "the privacy guard does not cry wolf" \
     python3 scripts/test_check_private.py
 
 echo
+echo "Dependencies"
+# This project does not take pull requests, so Dependabot's are closed and its
+# version-update config is gone. The advisories still have to be looked at, and
+# this asks the same database Dependabot reads, against the lockfile as it
+# stands, for the whole graph rather than only direct dependencies.
+#
+# Fails rather than skips when the database cannot be reached: a check that
+# passes because it never ran reads as a clean bill of health. Pass --offline
+# to the script to skip it deliberately.
+check "no advisory affects the locked dependencies" \
+    python3 scripts/check_advisories.py
+
+echo
 echo "Attribution"
 check "NOTICE covers every licence shipped" \
     python3 scripts/check_notice_licences.py
@@ -110,9 +123,15 @@ if ! $quick; then
 
     echo
     echo "Tests"
+    # Warnings denied here too, not only in the builds above. `cargo build`
+    # never compiles a `#[cfg(test)]` item, so a warning that exists only in
+    # test code passed this script and failed CI, which sets RUSTFLAGS for
+    # every job. That is the same trap as a field only a test reads being dead
+    # code in the binary, seen from the other side.
     check "agent, protocol, search, terminal client" \
-        cargo test -q -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
-    check "editor" cargo test -q -p forge-ide -p forge-proto -p forge-server
+        env RUSTFLAGS=-D\ warnings cargo test -q -p forge-agent -p forge-agent-proto -p forge-search -p forge-tui-rs
+    check "editor" \
+        env RUSTFLAGS=-D\ warnings cargo test -q -p forge-ide -p forge-proto -p forge-server
 fi
 
 echo

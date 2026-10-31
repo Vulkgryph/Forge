@@ -5,6 +5,13 @@ contributions closed, to keep the maintenance scope constrained — see
 [Contributing](README.md#contributing) for why. **Issues are welcome**, and so
 is a fork.
 
+This is enforced, not only stated: the repository limits interactions to
+collaborators, so opening a pull request against it will be refused rather than
+left to sit unreviewed. GitHub caps that setting at six months and offers no
+permanent form of it, so it has an expiry date and gets renewed — a lapse shows
+up as pull requests becoming possible again, not as a warning. Renewing it is a
+step in [RELEASING.md](RELEASING.md).
+
 That is said first because the rest of this file reads like a contribution
 guide, and it would be unfair to let you work through it before mentioning it.
 It is still worth having: it is what to follow if you fork, what a bug report

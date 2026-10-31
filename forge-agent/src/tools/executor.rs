@@ -772,28 +772,29 @@ impl ToolExecutor {
 
     #[cfg(unix)]
     fn try_spawn_pty(&self, command: &str, full_dir: &std::path::Path) -> Option<SpawnedCommand> {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, OwnedFd};
 
         // Allocate master/slave PTY pair
         let pty = nix::pty::openpty(None, None).ok()?;
 
-        // Wrap in OwnedFd so the parent side is cleaned up automatically.
-        let master_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pty.master.into_raw_fd()) };
-        let slave_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pty.slave.into_raw_fd()) };
+        // Already owned: `openpty` hands back `OwnedFd`, so the parent side is
+        // cleaned up by the drop below without a trip through a raw fd.
+        let master_fd: OwnedFd = pty.master;
+        let slave_fd: OwnedFd = pty.slave;
+        // Still needed raw: `pre_exec` runs after fork, where an ioctl wants the
+        // number, and the closure cannot borrow the OwnedFd across the fork.
         let slave_raw = slave_fd.as_raw_fd();
 
         // Set FD_CLOEXEC on the original slave so it auto-closes in the child at exec.
         // The dup'd copies (for stdin/stdout/stderr) do NOT inherit CLOEXEC and survive exec.
         let _ = nix::fcntl::fcntl(
-            slave_raw,
+            &slave_fd,
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
 
         // Dup slave three times to get distinct Stdio handles for stdin/stdout/stderr.
         let dup_slave = || -> Option<std::process::Stdio> {
-            nix::unistd::dup(slave_raw)
-                .ok()
-                .map(|fd| unsafe { std::process::Stdio::from_raw_fd(fd) })
+            nix::unistd::dup(&slave_fd).ok().map(std::process::Stdio::from)
         };
         let stdin_s = dup_slave()?;
         let stdout_s = dup_slave()?;
@@ -1622,6 +1623,78 @@ mod tests {
     #[cfg(unix)]
     use super::ToolKind;
     use serde_json::json;
+
+    /// The spawned command really gets a terminal, not a pipe.
+    ///
+    /// `spawn_command` falls back to piped I/O whenever PTY allocation fails,
+    /// and says nothing when it does. So every other test here passes either
+    /// way, and a broken PTY path shows up only as `sudo` and `ssh` quietly
+    /// refusing to prompt. This asks the child itself: `test -t 1` is true on
+    /// a terminal and false on a pipe.
+    ///
+    /// Written while moving to nix 0.31, where `fcntl` and `dup` changed to
+    /// take descriptors rather than integers. Passing a raw fd where a
+    /// borrowed one was wanted would have compiled under the old API and
+    /// degraded silently under the new one.
+    ///
+    /// The answer comes back through a file rather than through the PTY
+    /// master, and the master is never read. Two earlier versions of this
+    /// test hung instead of failing: `read_to_end` on the master waits for
+    /// every slave descriptor to close, and the dup'd slaves deliberately do
+    /// not carry `FD_CLOEXEC` — that is what lets them survive exec — so any
+    /// other process this binary forks between the dup and the spawn inherits
+    /// them and holds the slave open. Setting `O_NONBLOCK` on the master did
+    /// not help either, so the read stayed blocked past its own deadline. A
+    /// file needs none of that to be true, and the thing under test is
+    /// whether the child saw a terminal, not whether this test can drain one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawned_command_is_given_a_real_terminal() {
+        let dir = std::env::temp_dir().join(format!("forge-pty-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let answer = dir.join("saw.txt");
+        let executor = ToolExecutor::new(dir.clone());
+
+        let spawned = executor
+            .spawn_command(&json!({
+                "command": format!(
+                    "if test -t 1; then echo ON_A_TERMINAL > {0}; else echo ON_A_PIPE > {0}; fi",
+                    answer.display()
+                ),
+                "working_dir": "."
+            }))
+            .expect("spawn");
+
+        // Present at all only on the PTY path; the pipe fallback leaves it None,
+        // so this alone distinguishes the two before anything is read.
+        assert!(
+            spawned.pty_master.is_some(),
+            "no PTY master, so the pipe fallback was taken"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut saw = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&answer) {
+                if text.contains("ON_A") {
+                    saw = text;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // kill_on_drop reaps the shell; nothing here waits on it, because a
+        // test should fail on its own deadline rather than wait on a child.
+        drop(spawned);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            saw.contains("ON_A_TERMINAL"),
+            "the child did not see a terminal on stdout; it reported {saw:?}"
+        );
+    }
 
     #[test]
     fn mismatch_hint_detects_whitespace_only_difference() {
